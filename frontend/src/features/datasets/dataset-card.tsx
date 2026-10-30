@@ -8,6 +8,7 @@ import type { Dataset, DatasetImport } from "@/features/datasets/api"
 import { DatasetActionsMenu } from "@/features/datasets/dataset-actions"
 import { DatasetThumbnail } from "@/features/datasets/dataset-thumbnail"
 import { jobPercent, stageLabel } from "@/features/datasets/import-status"
+import { DatasetProjectBadges } from "@/features/projects/dataset-project-badges"
 import {
   formatBytes,
   formatNumber,
@@ -110,6 +111,7 @@ type DatasetCardProps = {
   onScan: () => void
   onEdit: () => void
   onDelete: () => void
+  onManageProjects: () => void
 }
 
 export function DatasetCard({
@@ -117,6 +119,7 @@ export function DatasetCard({
   onScan,
   onEdit,
   onDelete,
+  onManageProjects,
 }: DatasetCardProps) {
   const percent = annotatedPercent(dataset)
 
@@ -134,6 +137,7 @@ export function DatasetCard({
         onScan={onScan}
         onEdit={onEdit}
         onDelete={onDelete}
+        onManageProjects={onManageProjects}
         className="absolute top-2 right-2 z-[1] bg-background/80 shadow-xs backdrop-blur hover:bg-background"
       />
 
@@ -195,6 +199,8 @@ export function DatasetCard({
             aria-label={`已标注 ${formatPercent(percent)}`}
           />
         </div>
+
+        <DatasetProjectBadges projects={dataset.projects} />
 
         <div className="mt-auto flex items-center justify-between gap-2 border-t pt-3 text-xs text-muted-foreground">
           <span className="truncate">

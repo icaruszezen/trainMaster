@@ -168,12 +168,12 @@ func TestIntegrationCreateAndUpdateDataset(t *testing.T) {
 	_, err = e.svc.UpdateDataset(ctx, 999999, UpdateDatasetInput{Name: &newName})
 	wantKind(t, err, ErrNotFound, "数据集不存在")
 
-	list, err := e.svc.ListDatasets(ctx, "")
+	list, err := e.svc.ListDatasets(ctx, DatasetQuery{})
 	if err != nil || len(list) != 2 || list[0].ID != d.ID || list[1].ID != other.ID {
 		t.Errorf("ListDatasets = %+v, %v", list, err)
 	}
 	for q, want := range map[string]int{"新": 1, "更新后": 1, "OTH": 1, "zzz": 0, " ": 2} {
-		if list, err := e.svc.ListDatasets(ctx, q); err != nil || len(list) != want {
+		if list, err := e.svc.ListDatasets(ctx, DatasetQuery{Search: q}); err != nil || len(list) != want {
 			t.Errorf("ListDatasets(%q) returned %d datasets, %v; want %d", q, len(list), err, want)
 		}
 	}

@@ -38,6 +38,7 @@ func scanDataset(row pgx.Row) (Dataset, error) {
 	d.CreatedAt, d.UpdatedAt = d.CreatedAt.UTC(), d.UpdatedAt.UTC()
 	d.ScannedAt = utcPtr(d.ScannedAt)
 	d.Covers = []ImageRef{}
+	d.Projects = []ProjectRef{}
 	return d, err
 }
 
@@ -57,10 +58,19 @@ func queryDataset(ctx context.Context, q querier, id int64, forUpdate bool) (Dat
 	return scanDataset(q.QueryRow(ctx, sql, id))
 }
 
-func queryDatasets(ctx context.Context, q querier, search string) ([]Dataset, error) {
-	rows, err := q.Query(ctx, `SELECT `+datasetColumns+` FROM datasets
-		WHERE $1 = '' OR strpos(lower(name), lower($1)) > 0 OR strpos(lower(description), lower($1)) > 0
-		ORDER BY updated_at DESC, id DESC`, search)
+// DatasetQuery selects datasets.
+type DatasetQuery struct {
+	Search    string // case-insensitive substring of the name or description, "" for any
+	ProjectID int64  // > 0: only the datasets of this project
+	NoProject bool   // only the datasets that belong to no project
+}
+
+func queryDatasets(ctx context.Context, q querier, f DatasetQuery) ([]Dataset, error) {
+	rows, err := q.Query(ctx, `SELECT `+datasetColumns+` FROM datasets d
+		WHERE ($1 = '' OR strpos(lower(name), lower($1)) > 0 OR strpos(lower(description), lower($1)) > 0)
+			AND ($2::bigint = 0 OR EXISTS (SELECT 1 FROM project_datasets pd WHERE pd.dataset_id = d.id AND pd.project_id = $2::bigint))
+			AND NOT ($3::boolean AND EXISTS (SELECT 1 FROM project_datasets pd WHERE pd.dataset_id = d.id))
+		ORDER BY updated_at DESC, id DESC`, f.Search, f.ProjectID, f.NoProject)
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +171,45 @@ func queryCovers(ctx context.Context, q querier, ids []int64) (map[int64][]Image
 	var mod time.Time
 	_, err = pgx.ForEachRow(rows, []any{&datasetID, &id, &size, &mod}, func() error {
 		out[datasetID] = append(out[datasetID], ImageRef{ID: id, Version: fileVersion(size, mod)})
+		return nil
+	})
+	return out, err
+}
+
+// touchDatasetProjects marks the projects of a dataset that is about to be
+// deleted as updated: they lose it through ON DELETE CASCADE. The caller
+// holds the dataset's row lock; the projects are locked after it in ID
+// order, the lock order of package project.
+func touchDatasetProjects(ctx context.Context, tx pgx.Tx, id int64) error {
+	rows, err := tx.Query(ctx, `SELECT id FROM projects
+		WHERE id IN (SELECT project_id FROM project_datasets WHERE dataset_id = $1)
+		ORDER BY id FOR NO KEY UPDATE`, id)
+	if err != nil {
+		return err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil || len(ids) == 0 {
+		return err
+	}
+	_, err = tx.Exec(ctx, "UPDATE projects SET updated_at = now() WHERE id = ANY($1)", ids)
+	return err
+}
+
+// queryDatasetProjects returns the projects of each of the given datasets,
+// by name.
+func queryDatasetProjects(ctx context.Context, q querier, ids []int64) (map[int64][]ProjectRef, error) {
+	rows, err := q.Query(ctx, `SELECT pd.dataset_id, p.id, p.name
+		FROM project_datasets pd JOIN projects p ON p.id = pd.project_id
+		WHERE pd.dataset_id = ANY($1)
+		ORDER BY pd.dataset_id, lower(p.name), p.id`, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int64][]ProjectRef)
+	var datasetID int64
+	var p ProjectRef
+	_, err = pgx.ForEachRow(rows, []any{&datasetID, &p.ID, &p.Name}, func() error {
+		out[datasetID] = append(out[datasetID], p)
 		return nil
 	})
 	return out, err

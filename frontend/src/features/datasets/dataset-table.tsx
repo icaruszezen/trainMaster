@@ -20,6 +20,7 @@ import {
   originLabels,
 } from "@/features/datasets/dataset-card"
 import { DatasetThumbnail } from "@/features/datasets/dataset-thumbnail"
+import { DatasetProjectBadges } from "@/features/projects/dataset-project-badges"
 import {
   formatBytes,
   formatDateTime,
@@ -33,6 +34,7 @@ type DatasetTableProps = {
   onScan: (dataset: Dataset) => void
   onEdit: (dataset: Dataset) => void
   onDelete: (dataset: Dataset) => void
+  onManageProjects: (dataset: Dataset) => void
 }
 
 export function DatasetTable({
@@ -40,6 +42,7 @@ export function DatasetTable({
   onScan,
   onEdit,
   onDelete,
+  onManageProjects,
 }: DatasetTableProps) {
   const navigate = useNavigate()
 
@@ -69,6 +72,7 @@ export function DatasetTable({
             <TableHead className="hidden text-right md:table-cell">
               大小
             </TableHead>
+            <TableHead className="hidden lg:table-cell">项目</TableHead>
             <TableHead className="hidden xl:table-cell">来源</TableHead>
             <TableHead className="hidden md:table-cell">更新时间</TableHead>
             <TableHead className="w-12 pr-4">
@@ -138,6 +142,19 @@ export function DatasetTable({
                 <TableCell className="hidden text-right tabular-nums md:table-cell">
                   {formatBytes(dataset.total_bytes)}
                 </TableCell>
+                <TableCell className="hidden lg:table-cell">
+                  {dataset.projects.length > 0 ? (
+                    <DatasetProjectBadges
+                      projects={dataset.projects}
+                      max={1}
+                      className="flex-nowrap"
+                    />
+                  ) : (
+                    <span className="text-xs text-muted-foreground/60">
+                      未纳入
+                    </span>
+                  )}
+                </TableCell>
                 <TableCell className="hidden xl:table-cell">
                   <Badge variant="outline" className="font-normal">
                     {originLabels[dataset.origin]}
@@ -155,6 +172,7 @@ export function DatasetTable({
                     onScan={() => onScan(dataset)}
                     onEdit={() => onEdit(dataset)}
                     onDelete={() => onDelete(dataset)}
+                    onManageProjects={() => onManageProjects(dataset)}
                   />
                 </TableCell>
               </TableRow>

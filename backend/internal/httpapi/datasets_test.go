@@ -28,6 +28,7 @@ import (
 
 	"github.com/icaruszezen/trainmaster/backend/internal/database/dbtest"
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
+	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 )
 
@@ -47,6 +48,7 @@ func newAPIEnv(t *testing.T, start bool) *apiEnv {
 	}
 	log := slog.New(slog.DiscardHandler)
 	svc := dataset.NewService(dataset.Options{DB: db.Pool, Storage: st, Logger: log})
+	projects := project.NewService(project.Options{DB: db.Pool, Logger: log})
 	if start {
 		ctx, cancel := context.WithCancel(context.Background())
 		if err := svc.Start(ctx); err != nil {
@@ -54,7 +56,7 @@ func newAPIEnv(t *testing.T, start bool) *apiEnv {
 		}
 		t.Cleanup(func() { cancel(); svc.Stop() })
 	}
-	h := NewHandler(Options{Logger: log, DB: fakeDB{}, Storage: st, StartedAt: time.Now(), Datasets: svc})
+	h := NewHandler(Options{Logger: log, DB: fakeDB{}, Storage: st, StartedAt: time.Now(), Datasets: svc, Projects: projects})
 	return &apiEnv{h: h, st: st}
 }
 
@@ -119,7 +121,7 @@ func wantKeys(t *testing.T, what string, obj map[string]any, keys ...string) {
 var (
 	datasetKeys = []string{"id", "name", "description", "dir_name", "path", "origin", "directory_missing",
 		"image_count", "annotated_count", "empty_count", "invalid_count", "object_count", "label_count", "total_bytes",
-		"covers", "active_import", "scanned_at", "created_at", "updated_at"}
+		"covers", "projects", "active_import", "scanned_at", "created_at", "updated_at"}
 	importKeys = []string{"id", "dataset_id", "source", "status", "on_conflict", "file_name", "file_size",
 		"file_count", "received_bytes", "received_files", "stage", "progress", "summary", "error",
 		"created_at", "updated_at", "started_at", "finished_at"}
@@ -208,6 +210,9 @@ func TestDatasetAPIArchiveImport(t *testing.T) {
 	}
 	if covers, ok := raw["covers"].([]any); !ok || len(covers) != 0 {
 		t.Errorf("covers = %#v, want []", raw["covers"])
+	}
+	if projects, ok := raw["projects"].([]any); !ok || len(projects) != 0 {
+		t.Errorf("projects = %#v, want []", raw["projects"])
 	}
 	id := int64(raw["id"].(float64))
 	dsPath := filepath.Join(e.st.Dir(storage.Datasets), "划痕-A")

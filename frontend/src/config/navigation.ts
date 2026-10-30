@@ -8,6 +8,7 @@
 import {
   Boxes,
   Database,
+  FolderKanban,
   Gauge,
   GitBranch,
   HardDrive,
@@ -26,6 +27,7 @@ import {
 
 export type ModuleId =
   | "dashboard"
+  | "projects"
   | "datasets"
   | "dataset-versions"
   | "annotation-tasks"
@@ -74,6 +76,28 @@ export const navGroups: NavGroup[] = [
         description: "平台概况、系统状态与常用流程入口。",
         status: "ready",
         features: [],
+      },
+    ],
+  },
+  {
+    id: "project",
+    title: "项目管理",
+    items: [
+      {
+        id: "projects",
+        title: "项目",
+        path: "/projects",
+        icon: FolderKanban,
+        description:
+          "按检测任务把数据集组织成项目，集中查看数据、标注与模型的进展。",
+        status: "ready",
+        apiPath: "/api/v1/projects",
+        features: [
+          "新建、修改、删除项目",
+          "数据集可以纳入一个或多个项目，数据集页面可按项目筛选",
+          "项目详情：所含数据集、图片与标注进度汇总",
+          "项目内所有数据集合计的标签分布",
+        ],
       },
     ],
   },

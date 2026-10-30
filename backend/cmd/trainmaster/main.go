@@ -18,6 +18,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/database"
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 	"github.com/icaruszezen/trainmaster/backend/internal/httpapi"
+	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 	"github.com/icaruszezen/trainmaster/backend/internal/web"
 )
@@ -84,6 +85,7 @@ func run() error {
 		StartedAt:      startedAt,
 		TrustedProxies: cfg.TrustedProxies,
 		Datasets:       datasets,
+		Projects:       project.NewService(project.Options{DB: db.Pool, Logger: log}),
 	}
 	if cfg.WebDir != "" {
 		h, err := web.New(cfg.WebDir)

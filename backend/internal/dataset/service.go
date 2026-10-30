@@ -165,10 +165,11 @@ func (s *Service) dirExists(dirName string) bool {
 
 // ---- datasets ----
 
-// ListDatasets returns the datasets whose name or description contains
-// search (ignoring case), most recently updated first.
-func (s *Service) ListDatasets(ctx context.Context, search string) ([]Dataset, error) {
-	ds, err := queryDatasets(ctx, s.db, strings.TrimSpace(search))
+// ListDatasets returns the datasets selected by q, most recently updated
+// first.
+func (s *Service) ListDatasets(ctx context.Context, q DatasetQuery) ([]Dataset, error) {
+	q.Search = strings.TrimSpace(q.Search)
+	ds, err := queryDatasets(ctx, s.db, q)
 	if err != nil {
 		return nil, err
 	}
@@ -203,12 +204,19 @@ func (s *Service) decorate(ctx context.Context, ds []Dataset) error {
 	if err != nil {
 		return fmt.Errorf("load active imports: %w", err)
 	}
+	projects, err := queryDatasetProjects(ctx, s.db, ids)
+	if err != nil {
+		return fmt.Errorf("load dataset projects: %w", err)
+	}
 	for i := range ds {
 		d := &ds[i]
 		d.Path = s.datasetDir(d.DirName)
 		d.DirectoryMissing = !s.dirExists(d.DirName)
 		if c := covers[d.ID]; c != nil {
 			d.Covers = c
+		}
+		if p := projects[d.ID]; p != nil {
+			d.Projects = p
 		}
 		d.ActiveImport = active[d.ID]
 	}
@@ -430,6 +438,9 @@ func (s *Service) DeleteDataset(ctx context.Context, id int64, deleteFiles bool)
 			return err
 		}
 		if canceled, err = pgx.CollectRows(rows, pgx.RowTo[int64]); err != nil {
+			return err
+		}
+		if err := touchDatasetProjects(ctx, tx, id); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, "DELETE FROM datasets WHERE id = $1", id); err != nil {

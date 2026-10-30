@@ -13,6 +13,8 @@ import { DatasetsPage } from "@/features/datasets/datasets-page"
 import { EvaluationsPage } from "@/features/evaluation/evaluations-page"
 import { InferencePage } from "@/features/models/inference-page"
 import { ModelsPage } from "@/features/models/models-page"
+import { ProjectDetailPage } from "@/features/projects/project-detail-page"
+import { ProjectsPage } from "@/features/projects/projects-page"
 import { MembersPage } from "@/features/system/members-page"
 import { SettingsPage } from "@/features/system/settings-page"
 import { StoragePage } from "@/features/system/storage-page"
@@ -28,6 +30,7 @@ export type RouteHandle = { notFound?: boolean }
 /** 每个导航模块对应的页面组件；类型保证不会漏登记。 */
 export const pages: Record<ModuleId, ComponentType> = {
   dashboard: DashboardPage,
+  projects: ProjectsPage,
   datasets: DatasetsPage,
   "dataset-versions": DatasetVersionsPage,
   "annotation-tasks": AnnotationTasksPage,
@@ -61,6 +64,7 @@ export const routes: RouteObject[] = [
             Component: pages[item.id],
           })),
           // 模块的子页面。静态路径优先于动态参数，/datasets/versions 仍是数据版本页。
+          { path: "/projects/:projectId", Component: ProjectDetailPage },
           { path: "/datasets/:datasetId", Component: DatasetDetailPage },
           {
             path: "*",
