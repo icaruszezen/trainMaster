@@ -16,6 +16,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/buildinfo"
 	"github.com/icaruszezen/trainmaster/backend/internal/config"
 	"github.com/icaruszezen/trainmaster/backend/internal/database"
+	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 	"github.com/icaruszezen/trainmaster/backend/internal/httpapi"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 	"github.com/icaruszezen/trainmaster/backend/internal/web"
@@ -66,12 +67,23 @@ func run() error {
 		log.Info("automatic migrations disabled (TM_DB_AUTO_MIGRATE=false)")
 	}
 
+	// Background dataset import/scan jobs. A shutdown signal cancels ctx,
+	// which interrupts running jobs (they end as failed; queued jobs run
+	// after the next start). Stop waits for the workers; deferred after
+	// db.Close, it runs before the pool closes.
+	datasets := dataset.NewService(dataset.Options{DB: db.Pool, Storage: store, Logger: log})
+	if err := datasets.Start(ctx); err != nil {
+		return interrupted(ctx, log, err)
+	}
+	defer datasets.Stop()
+
 	opts := httpapi.Options{
 		Logger:         log,
 		DB:             db,
 		Storage:        store,
 		StartedAt:      startedAt,
 		TrustedProxies: cfg.TrustedProxies,
+		Datasets:       datasets,
 	}
 	if cfg.WebDir != "" {
 		h, err := web.New(cfg.WebDir)
@@ -86,8 +98,8 @@ func run() error {
 		Handler:           httpapi.NewHandler(opts),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
-		// No Read/WriteTimeout: future image uploads and model downloads can
-		// legitimately take long.
+		// No Read/WriteTimeout: dataset uploads and future model downloads
+		// can legitimately take long.
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 	// Shutdown waits for in-flight requests but does not interrupt them.

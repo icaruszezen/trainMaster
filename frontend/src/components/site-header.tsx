@@ -12,6 +12,7 @@ import {
 import { Separator } from "@/components/ui/separator"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 import { useActiveNav, useIsNotFound } from "@/hooks/use-active-nav"
+import { useCurrentPageTitle } from "@/hooks/use-page-title"
 
 export function SiteHeader() {
   return (
@@ -31,11 +32,14 @@ export function SiteHeader() {
 
 /**
  * 面包屑：分组 › 页面；工作台只显示“工作台”。
+ * 子页面通过 usePageTitle 提供最后一级：分组 › 模块 › 子页面（如数据集名称）。
  * 模块路径下的 404（如 `/models/typo`）显示为：分组 › 模块 › 页面不存在。
  */
 function AppBreadcrumb() {
   const active = useActiveNav()
   const notFound = useIsNotFound() || !active
+  const pageTitle = useCurrentPageTitle()
+  const subPage = !notFound && !active.exact ? pageTitle : null
   const isCurrentPage = active?.exact && !notFound
 
   return (
@@ -61,6 +65,14 @@ function AppBreadcrumb() {
                   <Link to={active.item.path}>{active.item.title}</Link>
                 </BreadcrumbLink>
               )}
+            </BreadcrumbItem>
+          </>
+        )}
+        {subPage && (
+          <>
+            <BreadcrumbSeparator />
+            <BreadcrumbItem className="min-w-0">
+              <BreadcrumbPage className="truncate">{subPage}</BreadcrumbPage>
             </BreadcrumbItem>
           </>
         )}

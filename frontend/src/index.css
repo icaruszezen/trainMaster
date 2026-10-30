@@ -13,6 +13,18 @@
   --font-mono:
     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
     monospace;
+
+  /* 总量未知时的进度条（如等待服务端处理）：一段色块往复滑动。 */
+  --animate-progress-indeterminate: progress-indeterminate 1.4s ease-in-out
+    infinite;
+  @keyframes progress-indeterminate {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(250%);
+    }
+  }
 }
 
 @theme inline {

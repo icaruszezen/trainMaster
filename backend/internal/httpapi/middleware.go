@@ -112,7 +112,7 @@ func recoverer(log *slog.Logger) func(http.Handler) http.Handler {
 					"path", r.URL.Path,
 					"request_id", RequestID(r.Context()),
 					"stack", string(debug.Stack()))
-				writeError(w, http.StatusInternalServerError, codeInternal, "服务器内部错误")
+				writeError(w, http.StatusInternalServerError, codeInternal, msgInternalError)
 			}()
 			next.ServeHTTP(w, r)
 		})

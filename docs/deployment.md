@@ -109,6 +109,20 @@ docker compose down            # 停止并删除容器；宿主机上的数据�
 - 服务启动时会对每个子目录做写入探测，不可写时启动失败并在日志中提示检查挂载目录权限。
 - PostgreSQL 数据目录由 postgres 镜像自行管理，属主为容器内的 postgres 用户（uid 70），不要修改。
 
+### 直接放到服务器上的数据集
+
+除了在网页上上传，也可以把整理好的数据集文件夹（图片 + 同目录的 VOC `.xml`）直接拷贝到存储目录的 `datasets/` 下，然后在“数据集 → 添加已有目录”中选择它：
+
+```bash
+STORAGE_DIR=./data/storage                         # 改过 TM_HOST_STORAGE_DIR 时换成实际目录
+rsync -a /path/to/产线A-划痕/ "$STORAGE_DIR/datasets/产线A-划痕/"
+sudo chown -R 1000:1000 "$STORAGE_DIR/datasets/产线A-划痕"   # 换成你的 PUID:PGID
+```
+
+- 文件夹需要对 `PUID:PGID` 可读（浏览、扫描）；以后要往里导入文件或在页面上删除它时还需要可写。以 `PUID` 对应的用户身份拷贝时不需要 `chown`。
+- 只列出 `datasets/` 下的一级文件夹；以 `.` 开头的隐藏文件夹和符号链接不会列出。文件夹内的子目录会递归扫描，但其中的符号链接会被跳过，需要引用其他磁盘上的数据时请直接把那块磁盘挂载进来（或把 `TM_HOST_STORAGE_DIR` 设到那块磁盘上）。
+- 之后在服务器上增删、修改了文件，在数据集详情页点“重新扫描”即可同步。
+
 ## 5. 升级
 
 ```bash
@@ -153,16 +167,16 @@ mkdir -p "$BACKUP"
 docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' \
   > "$BACKUP/db-$(date +%F).dump"
 
-# 存储目录：rsync 增量同步（适合大量图片）
-rsync -a --delete "$STORAGE_DIR/" "$BACKUP/storage/"
+# 存储目录：rsync 增量同步（适合大量图片）。cache/（缩略图）与 tmp/ 可以再生，不需要备份
+rsync -a --delete --exclude /cache/ --exclude /tmp/ "$STORAGE_DIR/" "$BACKUP/storage/"
 # 或打包成一个文件
-tar -C "$STORAGE_DIR" -czf "$BACKUP/storage-$(date +%F).tar.gz" .
+tar -C "$STORAGE_DIR" --exclude ./cache --exclude ./tmp -czf "$BACKUP/storage-$(date +%F).tar.gz" .
 ```
 
 可以把以上命令放入 cron 定时执行，例如每天凌晨（`/opt/trainMaster` 为仓库目录，存储目录按实际修改）：
 
 ```cron
-0 3 * * * cd /opt/trainMaster && docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > /backup/trainmaster/db-$(date +\%F).dump && rsync -a --delete ./data/storage/ /backup/trainmaster/storage/
+0 3 * * * cd /opt/trainMaster && docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > /backup/trainmaster/db-$(date +\%F).dump && rsync -a --delete --exclude /cache/ --exclude /tmp/ ./data/storage/ /backup/trainmaster/storage/
 ```
 
 ### 恢复
@@ -175,8 +189,8 @@ docker compose exec -T postgres sh -c \
   'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner' \
   < "$BACKUP/db-2026-10-30.dump"
 
-# 存储目录
-rsync -a --delete "$BACKUP/storage/" "$STORAGE_DIR/"
+# 存储目录（cache/、tmp/ 不在备份中，--exclude 保证它们不被删除）
+rsync -a --delete --exclude /cache/ --exclude /tmp/ "$BACKUP/storage/" "$STORAGE_DIR/"
 # 或：tar -C "$STORAGE_DIR" -xzf "$BACKUP/storage-2026-10-30.tar.gz"
 
 docker compose start app
@@ -261,7 +275,7 @@ docker compose up -d          # 不加 --build，直接使用导入的镜像
 
 ## 9. 反向代理（nginx 示例）
 
-需要通过域名、HTTPS 或统一入口访问时，在 trainMaster 前面加一层 nginx。后续上传图片、下载模型可能是大文件、长连接，注意 `client_max_body_size` 与超时设置：
+需要通过域名、HTTPS 或统一入口访问时，在 trainMaster 前面加一层 nginx。数据集导入会上传大量数据：压缩包按 8 MiB 分块上传（服务端单块上限 64 MiB），文件夹按批上传（服务端单批上限 256 MiB），因此 `client_max_body_size` 不能小于 `300m`（以后下载模型等可能更大，下例直接放宽到 2g）；同时注意超时设置：
 
 ```nginx
 server {
@@ -301,7 +315,12 @@ server {
 | 日志反复出现 `database not ready, retrying` 后退出 | postgres 未启动或账号密码不一致（修改过 `.env` 中的密码？见 3.1 的提示） |
 | 端口被占用 | 修改 `.env` 中的 `TM_HTTP_PORT` |
 | 页面能打开但工作台显示后端不可达 | `curl http://localhost:8080/api/readyz` 查看数据库与存储检查结果 |
-| 日志提示 `migration versions must never be reused or renamed` | 两个不同的迁移文件用了同一个编号（如不同分支各自新增了 `0002_*.sql`），或改了已执行文件的名字，见[架构说明 · 数据库迁移约定](architecture.md#6-数据库迁移约定) |
+| 导入时提示“存储空间不足” | 压缩包需要约 2 倍于压缩包大小的剩余空间（上传 + 解压）；清理磁盘或把 `TM_HOST_STORAGE_DIR` 换到更大的磁盘 |
+| 经 nginx 上传失败，提示 HTTP 413 | `client_max_body_size` 太小，见第 9 节 |
+| “添加已有目录”里看不到拷贝上去的文件夹 | 确认文件夹在 `TM_HOST_STORAGE_DIR/datasets/` 下一级、不是以 `.` 开头、不是符号链接，并且对 `PUID:PGID` 可读，见第 4 节；文件夹名不是 UTF-8 编码（如在 Linux 上用 `unzip` 解压 Windows 打包的 zip 得到的乱码名）时也不会列出，请重命名（或改用 `unzip -O GBK` / 7-Zip 解压） |
+| 扫描结果提示“文件名不是 UTF-8 编码，已跳过” | 同上，这些文件不会被索引；在服务器上重命名后点“重新扫描”。直接在页面上传压缩包则不会有这个问题（GBK 文件名会自动转换） |
+| 数据集显示“文件夹缺失” | 数据集文件夹在服务器上被移动或删除了；放回原位置后点“重新扫描”，或删除该数据集记录 |
+| 日志提示 `migration versions must never be reused or renamed` | 两个不同的迁移文件用了同一个编号（如不同分支各自新增了 `0002_*.sql`），或改了已执行文件的名字，见[架构说明 · 数据库迁移约定](architecture.md#7-数据库迁移约定) |
 
 容器日志按 10MB × 5 个文件轮转（`docker-compose.yml` 中的 `x-logging`），`docker compose logs` 只能看到最近的日志，需要长期保存时请接入日志系统。
 

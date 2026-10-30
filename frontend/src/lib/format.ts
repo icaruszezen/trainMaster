@@ -55,3 +55,82 @@ export function formatDuration(totalSeconds: number): string {
     .map(([value, unit]) => `${value} ${unit}`)
     .join(" ")
 }
+
+const numberFormat = new Intl.NumberFormat("zh-CN")
+
+/** 千分位格式化整数 / 小数，例如 `12345` → `"12,345"`。 */
+export function formatNumber(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "—"
+  }
+  return numberFormat.format(value)
+}
+
+/** 格式化百分比（输入 0–100），例如 `82.4` → `"82%"`。 */
+export function formatPercent(percent: number, fractionDigits = 0): string {
+  if (!Number.isFinite(percent)) {
+    return "—"
+  }
+  return `${Number(percent.toFixed(fractionDigits))}%`
+}
+
+function toDate(value: string | number | Date): Date | null {
+  const date = value instanceof Date ? value : new Date(value)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+const MINUTE = 60_000
+const HOUR = 60 * MINUTE
+const DAY = 24 * HOUR
+
+/**
+ * 相对时间，例如 `"刚刚"`、`"3 分钟前"`、`"2 天前"`、`"1 年前"`。
+ * 未来的时间（服务器与浏览器时钟有偏差）按“刚刚”处理。
+ */
+export function formatRelativeTime(
+  value: string | number | Date | null | undefined,
+  now: number = Date.now()
+): string {
+  const date = value == null ? null : toDate(value)
+  if (!date) {
+    return "—"
+  }
+
+  const elapsed = now - date.getTime()
+  if (elapsed < MINUTE) {
+    return "刚刚"
+  }
+  if (elapsed < HOUR) {
+    return `${Math.floor(elapsed / MINUTE)} 分钟前`
+  }
+  if (elapsed < DAY) {
+    return `${Math.floor(elapsed / HOUR)} 小时前`
+  }
+  const days = Math.floor(elapsed / DAY)
+  if (days < 30) {
+    return `${days} 天前`
+  }
+  if (days < 365) {
+    return `${Math.floor(days / 30)} 个月前`
+  }
+  return `${Math.floor(days / 365)} 年前`
+}
+
+const pad = (value: number) => String(value).padStart(2, "0")
+
+/** 本地时间 `"2026-10-30 15:48"`；`withSeconds` 时带秒。 */
+export function formatDateTime(
+  value: string | number | Date | null | undefined,
+  { withSeconds = false }: { withSeconds?: boolean } = {}
+): string {
+  const date = value == null ? null : toDate(value)
+  if (!date) {
+    return "—"
+  }
+
+  const day = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  return withSeconds
+    ? `${day} ${time}:${pad(date.getSeconds())}`
+    : `${day} ${time}`
+}

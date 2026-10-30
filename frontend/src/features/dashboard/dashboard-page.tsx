@@ -1,3 +1,4 @@
+import { useQuery } from "@tanstack/react-query"
 import {
   ArrowRight,
   Boxes,
@@ -10,22 +11,22 @@ import {
 import { Link } from "react-router"
 
 import { PageHeader } from "@/components/page-header"
+import { StatCard } from "@/components/stat-card"
 import {
   Card,
-  CardAction,
   CardContent,
   CardDescription,
-  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import { Skeleton } from "@/components/ui/skeleton"
 import { getNavItem, type ModuleId } from "@/config/navigation"
+import { datasetsQuery } from "@/features/datasets/api"
 import { SystemStatusCard } from "@/features/system/system-status-card"
+import { formatNumber, formatPercent, percentOf } from "@/lib/format"
 
-/** 统计项：对应模块开发完成后再接入真实数据。 */
-const stats: { title: string; icon: LucideIcon }[] = [
-  { title: "数据集", icon: Database },
-  { title: "图片", icon: Images },
+/** 尚未开发的模块的统计项：对应模块完成后再接入真实数据。 */
+const plannedStats: { title: string; icon: LucideIcon }[] = [
   { title: "标注任务", icon: ListChecks },
   { title: "训练任务", icon: Rocket },
   { title: "模型", icon: Boxes },
@@ -73,19 +74,16 @@ export function DashboardPage() {
       />
 
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-3 xl:grid-cols-5">
-        {stats.map((stat) => (
-          <Card key={stat.title} className="gap-3">
-            <CardHeader>
-              <CardDescription>{stat.title}</CardDescription>
-              <CardTitle className="text-2xl tabular-nums">—</CardTitle>
-              <CardAction>
-                <stat.icon className="size-4 text-muted-foreground" />
-              </CardAction>
-            </CardHeader>
-            <CardFooter className="text-xs text-muted-foreground">
-              功能开发中
-            </CardFooter>
-          </Card>
+        <DatasetStats />
+        {plannedStats.map((stat) => (
+          <StatCard
+            key={stat.title}
+            title={stat.title}
+            icon={stat.icon}
+            value="—"
+          >
+            功能开发中
+          </StatCard>
         ))}
       </div>
 
@@ -131,6 +129,48 @@ export function DashboardPage() {
           </CardContent>
         </Card>
       </div>
+    </>
+  )
+}
+
+/** 数据集与图片两张统计卡片，数据来自数据集列表。 */
+function DatasetStats() {
+  const { data, isPending } = useQuery(datasetsQuery())
+
+  // 后台刷新失败时保留已加载的数字。
+  if (data === undefined) {
+    const value = isPending ? <Skeleton className="h-8 w-16" /> : "—"
+    const footer = isPending ? "正在加载…" : "无法获取数据"
+    return (
+      <>
+        <StatCard title="数据集" icon={Database} value={value}>
+          {footer}
+        </StatCard>
+        <StatCard title="图片" icon={Images} value={value}>
+          {footer}
+        </StatCard>
+      </>
+    )
+  }
+
+  const images = data.items.reduce((sum, d) => sum + d.image_count, 0)
+  const annotated = data.items.reduce((sum, d) => sum + d.annotated_count, 0)
+  return (
+    <>
+      <StatCard title="数据集" icon={Database} value={formatNumber(data.total)}>
+        <Link
+          to="/datasets"
+          className="inline-flex items-center gap-1 self-start underline-offset-4 hover:text-foreground hover:underline"
+        >
+          {data.total > 0 ? "查看全部" : "创建数据集"}
+          <ArrowRight className="size-3" />
+        </Link>
+      </StatCard>
+      <StatCard title="图片" icon={Images} value={formatNumber(images)}>
+        {images > 0
+          ? `已标注 ${formatPercent(percentOf(annotated, images))}`
+          : "暂无图片"}
+      </StatCard>
     </>
   )
 }

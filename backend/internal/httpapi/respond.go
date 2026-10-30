@@ -17,10 +17,22 @@ import (
 
 // Error codes shared by all endpoints.
 const (
-	codeNotFound         = "not_found"
-	codeMethodNotAllowed = "method_not_allowed"
-	codeNotImplemented   = "not_implemented"
-	codeInternal         = "internal_error"
+	codeBadRequest           = "bad_request"            // 400: malformed request (JSON, query parameter, multipart)
+	codeNotFound             = "not_found"              // 404
+	codeMethodNotAllowed     = "method_not_allowed"     // 405
+	codeConflict             = "conflict"               // 409: the current state does not allow the operation
+	codeUploadOffsetMismatch = "upload_offset_mismatch" // 409: chunk offset differs from the bytes received so far
+	codePayloadTooLarge      = "payload_too_large"      // 413
+	codeValidationFailed     = "validation_failed"      // 422: a field value is invalid; the message names the problem
+	codeUnsupportedImage     = "unsupported_image"      // 422: no thumbnail can be generated for the image
+	codeInternal             = "internal_error"         // 500
+	codeNotImplemented       = "not_implemented"        // 501: planned module
+	codeInsufficientStorage  = "insufficient_storage"   // 507: not enough free disk space
+)
+
+const (
+	msgMalformedRequest = "请求格式不正确"
+	msgInternalError    = "服务器内部错误"
 )
 
 // List is the response body for collection endpoints.

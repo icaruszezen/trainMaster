@@ -2,6 +2,8 @@ import { matchRoutes } from "react-router"
 import { describe, expect, it } from "vitest"
 
 import { navItems } from "@/config/navigation"
+import { DatasetDetailPage } from "@/features/datasets/dataset-detail-page"
+import { DatasetVersionsPage } from "@/features/datasets/dataset-versions-page"
 import { NotFoundPage } from "@/pages/not-found-page"
 import { pages, routes } from "@/router"
 
@@ -28,7 +30,13 @@ describe("routes", () => {
 
   it("falls back to the 404 page for unknown paths", () => {
     expect(leafComponent("/nope")).toBe(NotFoundPage)
-    expect(leafComponent("/datasets/123")).toBe(NotFoundPage)
+    expect(leafComponent("/datasets/123/extra")).toBe(NotFoundPage)
+  })
+
+  it("routes dataset ids to the detail page without shadowing versions", () => {
+    expect(leafComponent("/datasets/123")).toBe(DatasetDetailPage)
+    expect(leafComponent("/datasets/versions")).toBe(DatasetVersionsPage)
+    expect(leaf("/datasets/123")?.handle).toBeUndefined()
   })
 
   it("marks only the 404 route as not found", () => {

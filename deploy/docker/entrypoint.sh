@@ -20,8 +20,8 @@ case "$PUID:$PGID" in
 esac
 
 if [ "$(id -u)" = "0" ]; then
-	for dir in "$DATA_DIR" "$DATA_DIR/images" "$DATA_DIR/datasets" "$DATA_DIR/models" \
-		"$DATA_DIR/runs" "$DATA_DIR/exports" "$DATA_DIR/tmp"; do
+	for dir in "$DATA_DIR" "$DATA_DIR/datasets" "$DATA_DIR/models" "$DATA_DIR/runs" \
+		"$DATA_DIR/exports" "$DATA_DIR/cache" "$DATA_DIR/tmp"; do
 		if ! mkdir -p "$dir"; then
 			warn "无法创建目录 $dir"
 			continue
