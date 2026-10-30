@@ -69,7 +69,7 @@ cd backend && gofmt -l . && go vet ./... && go test ./... && go build ./...
 cd frontend && npm run lint && npm run typecheck && npm test && npm run build
 ```
 
-后端单元测试不依赖数据库。数据库集成测试（迁移、并发加锁、`app_settings` 读写）通过 `TM_TEST_DATABASE_URL` 启用，未设置时自动跳过。请使用一次性的数据库：
+后端单元测试不依赖数据库（数据集模块的压缩包、VOC、缩略图等测试使用 `backend/internal/dataset/testdata/` 中的小样本，来源见其中的 README）。数据库集成测试（迁移、并发加锁、`app_settings` 读写、数据集导入 / 扫描 / 接口）通过 `TM_TEST_DATABASE_URL` 启用，未设置时自动跳过。数据集相关的测试会为每个测试新建并删除一个独立的数据库，所以该账号需要 `CREATEDB` 权限（postgres 超级用户即可）。请使用一次性的数据库：
 
 ```bash
 docker run -d --rm --name tm-test-pg -e POSTGRES_PASSWORD=x -p 55432:5432 postgres:17-alpine
@@ -82,18 +82,18 @@ CI（`.github/workflows/ci.yml`）在每次 push 到 main 和每个 Pull Request
 
 ## 4. 添加新的后端 API
 
-以实现“数据集”模块为例：
+以实现“标签体系”模块为例（数据集模块 `internal/dataset` + `internal/httpapi/datasets.go` 是一个完整的参考实现）：
 
-1. **建表**：新增迁移文件 `backend/internal/database/migrations/0002_create_datasets.sql`（编号连续，不要修改已有文件，不要写 `BEGIN/COMMIT`），约定见 [架构说明 · 数据库迁移约定](architecture.md#6-数据库迁移约定)。
-2. **写 handler**：在 `backend/internal/httpapi/` 下新建 `datasets.go`。成功时用 `writeJSON` 返回资源对象，列表用 `NewList(items, total)`，失败时用 `writeError(w, status, code, message)`（`message` 用中文，面向用户）。
+1. **建表**：新增迁移文件 `backend/internal/database/migrations/0003_create_labels.sql`（编号连续，不要修改已有文件，不要写 `BEGIN/COMMIT`），约定见 [架构说明 · 数据库迁移约定](architecture.md#7-数据库迁移约定)。
+2. **写 handler**：在 `backend/internal/httpapi/` 下新建 `labels.go`。成功时用 `writeJSON` 返回资源对象，列表用 `NewList(items, total)`，失败时用 `writeError(w, status, code, message)`（`message` 用中文，面向用户）。
 3. **注入依赖**：handler 需要数据库或存储时，在 `Options` / `server` 中增加所需依赖（例如 `*database.DB`，或按功能定义的小接口，便于测试时替换）。文件路径一律通过 `storage.Resolve(key, rel)` 得到，数据库中只存相对路径。
 4. **注册路由**：在 `router.go` 的 `/v1` 路由组中挂载新路由，并从 `plannedModules` 中删除对应的占位项：
 
    ```go
-   r.Route("/datasets", func(r chi.Router) {
-       r.Get("/", s.listDatasets)
-       r.Post("/", s.createDataset)
-       r.Get("/{id}", s.getDataset)
+   r.Route("/annotation/labels", func(r chi.Router) {
+       r.Get("/", s.listLabels)
+       r.Post("/", s.createLabel)
+       r.Get("/{id}", s.getLabel)
    })
    ```
 
@@ -104,7 +104,7 @@ CI（`.github/workflows/ci.yml`）在每次 push 到 main 和每个 Pull Request
 
 前端的导航、路由、面包屑和占位页文案都来自 `frontend/src/config/navigation.ts`。
 
-**实现一个已有的占位模块**（如“数据集”）：直接替换对应页面文件的内容，例如 `src/features/datasets/datasets-page.tsx`；完成后把 `navigation.ts` 中该模块的 `status` 改为 `"ready"`。
+**实现一个已有的占位模块**（如“标签体系”）：直接替换对应页面文件的内容，例如 `src/features/annotation/labels-page.tsx`；完成后把 `navigation.ts` 中该模块的 `status` 改为 `"ready"`。可参考已实现的数据集模块 `src/features/datasets/`。
 
 **新增一个模块**：
 
@@ -117,7 +117,12 @@ CI（`.github/workflows/ci.yml`）在每次 push 到 main 和每个 Pull Request
 
 ## 6. 添加 shadcn/ui 组件
 
-项目使用 shadcn/ui 的 new-york 风格、neutral 配色，配置在 `frontend/components.json`。组件源码在 `frontend/src/components/ui/`，可以直接修改。与上游不同的本地修改：`sidebar.tsx` 中移动端抽屉的读屏文案（`SheetTitle` / `SheetDescription`）改成了中文——用 CLI 覆盖该组件后请重新改回。
+项目使用 shadcn/ui 的 new-york 风格、neutral 配色，配置在 `frontend/components.json`。组件源码在 `frontend/src/components/ui/`，可以直接修改。与上游不同的本地修改（用 CLI 覆盖这些组件后请重新改回）：
+
+- `sidebar.tsx`：移动端抽屉的读屏文案（`SheetTitle` / `SheetDescription`）改成了中文；
+- `dialog.tsx`：关闭按钮的读屏文案改为“关闭”；
+- `spinner.tsx`：`aria-label` 改为“加载中”；
+- `sonner.tsx`：使用项目自带的 `useTheme`（`@/components/theme-provider`）而不是 `next-themes`，并依赖 npm 包 `sonner`。
 
 **方式一：CLI（需要能访问 ui.shadcn.com）**
 

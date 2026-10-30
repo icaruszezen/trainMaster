@@ -49,9 +49,9 @@ export type NavItem = {
   description: string
   /** ready：已有真实页面；planned：功能占位页。 */
   status: "ready" | "planned"
-  /** 规划中的功能，展示在占位页上。 */
+  /** 规划中的模块：展示在占位页上的规划功能；已上线的模块：已有的主要能力。 */
   features: string[]
-  /** 后端为该模块预留的 API 路径（当前返回 501）。 */
+  /** 该模块的后端 API 路径前缀（规划中的模块返回 501）。 */
   apiPath?: string
 }
 
@@ -86,15 +86,16 @@ export const navGroups: NavGroup[] = [
         title: "数据集",
         path: "/datasets",
         icon: Database,
-        description: "集中管理产线采集的工业图片，按项目组织数据集。",
-        status: "planned",
+        description:
+          "上传图片压缩包或文件夹、添加服务器上已有的目录，浏览图片与 VOC 标注。",
+        status: "ready",
         apiPath: "/api/v1/datasets",
         features: [
-          "创建数据集与项目分组",
-          "从本地目录批量导入或上传图片",
-          "缩略图浏览、筛选与检索",
-          "图片元数据：产线、工位、相机、批次",
-          "数据统计与质量检查：重复、损坏、分辨率",
+          "上传压缩包（zip / tar / 7z / rar 等）或整个文件夹导入图片",
+          "自动识别与图片同目录、同名的 VOC 标注",
+          "把服务器数据目录下已有的文件夹添加为数据集",
+          "缩略图浏览，按标注状态、标签筛选，查看标注框",
+          "标签分布统计与导入记录",
         ],
       },
       {

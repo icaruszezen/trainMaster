@@ -7,6 +7,7 @@ import { AnnotationWorkspacePage } from "@/features/annotation/annotation-worksp
 import { LabelsPage } from "@/features/annotation/labels-page"
 import { PrelabelPage } from "@/features/annotation/prelabel-page"
 import { DashboardPage } from "@/features/dashboard/dashboard-page"
+import { DatasetDetailPage } from "@/features/datasets/dataset-detail-page"
 import { DatasetVersionsPage } from "@/features/datasets/dataset-versions-page"
 import { DatasetsPage } from "@/features/datasets/datasets-page"
 import { EvaluationsPage } from "@/features/evaluation/evaluations-page"
@@ -59,6 +60,8 @@ export const routes: RouteObject[] = [
             path: item.path,
             Component: pages[item.id],
           })),
+          // 模块的子页面。静态路径优先于动态参数，/datasets/versions 仍是数据版本页。
+          { path: "/datasets/:datasetId", Component: DatasetDetailPage },
           {
             path: "*",
             Component: NotFoundPage,

@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 )
 
@@ -35,12 +36,14 @@ type Options struct {
 	// X-Forwarded-For header determines the client IP. Empty: the header
 	// is ignored and the TCP peer is the client.
 	TrustedProxies []string
+	// Datasets serves /api/v1/datasets. If nil, those routes are not
+	// mounted (tests of other areas need no database).
+	Datasets *dataset.Service
 }
 
 // plannedModules are API areas reserved for upcoming features. Each answers
 // 501 for any method and sub-path until a real router replaces its entry.
 var plannedModules = []string{
-	"/datasets",
 	"/annotation/tasks",
 	"/annotation/labels",
 	"/training/jobs",
@@ -52,12 +55,13 @@ type server struct {
 	log       *slog.Logger
 	db        Database
 	storage   *storage.Storage
+	datasets  *dataset.Service
 	startedAt time.Time
 }
 
 // NewHandler returns the root HTTP handler.
 func NewHandler(o Options) http.Handler {
-	s := &server{log: o.Logger, db: o.DB, storage: o.Storage, startedAt: o.StartedAt}
+	s := &server{log: o.Logger, db: o.DB, storage: o.Storage, datasets: o.Datasets, startedAt: o.StartedAt}
 
 	r := chi.NewRouter()
 	r.Use(requestID)
@@ -81,6 +85,9 @@ func NewHandler(o Options) http.Handler {
 
 		r.Route("/v1", func(r chi.Router) {
 			r.Get("/system/info", s.systemInfo)
+			if s.datasets != nil {
+				r.Route("/datasets", s.datasetRoutes)
+			}
 
 			for _, p := range plannedModules {
 				r.HandleFunc(p, notImplemented)

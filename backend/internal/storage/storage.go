@@ -18,16 +18,16 @@ import (
 type Key string
 
 const (
-	Images   Key = "images"   // original images, later split per dataset
-	Datasets Key = "datasets" // dataset version snapshots and exported training sets (YOLO/VOC/COCO)
+	Datasets Key = "datasets" // one folder per dataset: images with their VOC annotations next to them
 	Models   Key = "models"   // model weights
 	Runs     Key = "runs"     // training/evaluation run artifacts (logs, curves, checkpoints)
-	Exports  Key = "exports"  // packaged exports and reports
+	Exports  Key = "exports"  // exported training sets (YOLO/VOC/COCO), packaged exports and reports
+	Cache    Key = "cache"    // regenerable data such as thumbnails; safe to delete at any time
 	Tmp      Key = "tmp"      // temporary files such as in-progress uploads
 )
 
 // Keys lists every managed subdirectory in display order.
-var Keys = []Key{Images, Datasets, Models, Runs, Exports, Tmp}
+var Keys = []Key{Datasets, Models, Runs, Exports, Cache, Tmp}
 
 // ErrInvalidPath is returned by Resolve for paths that are absolute or
 // would escape the target directory.

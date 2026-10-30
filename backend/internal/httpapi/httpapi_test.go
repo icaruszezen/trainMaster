@@ -114,13 +114,15 @@ func TestErrorEnvelopes(t *testing.T) {
 		{"GET", "/api", 404, "not_found"},
 		{"GET", "/api/v1", 404, "not_found"},
 		{"GET", "/api/v1/annotation", 404, "not_found"},
-		{"GET", "/api/v1/datasetsx", 404, "not_found"},
+		{"GET", "/api/v1/annotation/tasksx", 404, "not_found"},
+		// Without a dataset service the dataset routes are not mounted.
+		{"GET", "/api/v1/datasets", 404, "not_found"},
 		{"POST", "/api/healthz", 405, "method_not_allowed"},
 		{"DELETE", "/api/v1/system/info", 405, "method_not_allowed"},
 		{"PROPFIND", "/api/healthz", 405, "method_not_allowed"}, // unknown to chi
-		{"GET", "/api/v1/datasets", 501, "not_implemented"},
-		{"POST", "/api/v1/datasets/42/images", 501, "not_implemented"},
-		{"GET", "/api/v1/datasets/", 501, "not_implemented"},
+		{"GET", "/api/v1/annotation/tasks", 501, "not_implemented"},
+		{"POST", "/api/v1/annotation/tasks/42/items", 501, "not_implemented"},
+		{"GET", "/api/v1/training/jobs/", 501, "not_implemented"},
 		{"PUT", "/api/v1/annotation/tasks/7", 501, "not_implemented"},
 		{"GET", "/api/v1/annotation/labels", 501, "not_implemented"},
 		{"GET", "/api/v1/training/jobs", 501, "not_implemented"},
@@ -227,7 +229,7 @@ func TestSystemInfo(t *testing.T) {
 		t.Fatalf("directories = %v", dirs)
 	}
 	first := dirs[0].(map[string]any)
-	if first["key"] != "images" || first["writable"] != true || !strings.HasSuffix(first["path"].(string), "images") {
+	if first["key"] != "datasets" || first["writable"] != true || !strings.HasSuffix(first["path"].(string), "datasets") {
 		t.Errorf("directories[0] = %v", first)
 	}
 	for _, k := range []string{"root", "total_bytes", "free_bytes", "used_bytes"} {

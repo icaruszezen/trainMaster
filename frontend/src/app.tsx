@@ -1,22 +1,12 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+import { QueryClientProvider } from "@tanstack/react-query"
 import { createBrowserRouter } from "react-router"
 import { RouterProvider } from "react-router/dom"
 
 import { ThemeProvider } from "@/components/theme-provider"
+import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
-import { isPermanentError } from "@/lib/api"
+import { queryClient } from "@/lib/query-client"
 import { routes } from "@/router"
-
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      // 网络错误、网关 5xx 可能是暂时的，重试一次；4xx / 501 重试也没用。
-      retry: (failureCount, error) =>
-        failureCount < 1 && !isPermanentError(error),
-      staleTime: 10_000,
-    },
-  },
-})
 
 const router = createBrowserRouter(routes)
 
@@ -26,6 +16,12 @@ export function App() {
       <QueryClientProvider client={queryClient}>
         <TooltipProvider>
           <RouterProvider router={router} />
+          <Toaster
+            position="top-center"
+            closeButton
+            containerAriaLabel="通知"
+            toastOptions={{ closeButtonAriaLabel: "关闭通知" }}
+          />
         </TooltipProvider>
       </QueryClientProvider>
     </ThemeProvider>

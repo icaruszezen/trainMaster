@@ -39,9 +39,9 @@ func TestNewCreatesLayout(t *testing.T) {
 		}
 	}
 	// Probe files must not be left behind.
-	entries, _ := os.ReadDir(s.Dir(Images))
+	entries, _ := os.ReadDir(s.Dir(Datasets))
 	if len(entries) != 0 {
-		t.Errorf("images dir not empty after probing: %v", entries)
+		t.Errorf("datasets dir not empty after probing: %v", entries)
 	}
 	// Opening an existing layout again is fine.
 	if _, err := New(s.Root()); err != nil {
@@ -78,7 +78,7 @@ func TestNewFailsWhenNotWritable(t *testing.T) {
 
 func TestResolve(t *testing.T) {
 	s := newTestStorage(t)
-	base := s.Dir(Images)
+	base := s.Dir(Datasets)
 	ok := map[string]string{
 		"a.jpg":             filepath.Join(base, "a.jpg"),
 		"ds1/line-2/b.png":  filepath.Join(base, "ds1", "line-2", "b.png"),
@@ -87,15 +87,15 @@ func TestResolve(t *testing.T) {
 		"名称 with space.bmp": filepath.Join(base, "名称 with space.bmp"),
 	}
 	for rel, want := range ok {
-		got, err := s.Resolve(Images, rel)
+		got, err := s.Resolve(Datasets, rel)
 		if err != nil || got != want {
 			t.Errorf("Resolve(%q) = %q, %v; want %q", rel, got, err, want)
 		}
 	}
 
-	bad := []string{"", "..", "../x.jpg", "a/../../x.jpg", "/etc/passwd", "../images-other/x"}
+	bad := []string{"", "..", "../x.jpg", "a/../../x.jpg", "/etc/passwd", "../datasets-other/x"}
 	for _, rel := range bad {
-		if got, err := s.Resolve(Images, rel); !errors.Is(err, ErrInvalidPath) {
+		if got, err := s.Resolve(Datasets, rel); !errors.Is(err, ErrInvalidPath) {
 			t.Errorf("Resolve(%q) = %q, %v; want ErrInvalidPath", rel, got, err)
 		}
 	}

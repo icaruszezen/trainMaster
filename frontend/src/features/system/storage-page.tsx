@@ -26,12 +26,12 @@ import {
 
 /** 与后端 storage 包中的目录布局对应。 */
 const directoryPurposes: Record<string, string> = {
-  images: "原始图片",
-  datasets: "数据集版本与导出的训练集",
+  datasets: "数据集文件夹：每个数据集一个子目录，图片与同目录的 VOC 标注",
   models: "模型权重",
   runs: "训练 / 评估运行产物",
-  exports: "打包导出与报告",
-  tmp: "上传等临时文件",
+  exports: "导出的训练集（YOLO / VOC / COCO）、打包导出与报告",
+  cache: "缩略图等可再生的缓存，可随时删除",
+  tmp: "上传、解压等临时文件",
 }
 
 export function StoragePage() {

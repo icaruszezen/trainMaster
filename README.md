@@ -4,14 +4,14 @@
 
 它是桌面工具 [ez_training](https://github.com/icaruszezen/ez_training)（PyQt 版，覆盖数据集、预标注、标注、数据准备、训练、验证等）的团队 Web 版。
 
-> **当前阶段：平台框架。** 已完成 Go + React 工程骨架、shadcn/ui 风格的界面框架、各功能模块的占位页、Docker 部署与数据持久化。各业务功能将在后续迭代中逐个实现。
+> **当前进度：** 平台框架（Go + React 工程骨架、shadcn/ui 界面框架、Docker 部署与数据持久化）已完成；**数据集管理**已上线：压缩包 / 文件夹导入、VOC 标注自动识别、服务器上已有文件夹直接添加为数据集、缩略图浏览与标注预览。其余模块已有占位页，将在后续迭代中逐个实现。
 
 ## 功能模块
 
 | 分组 | 模块 | 页面路径 | 预留 API | 状态 |
 |---|---|---|---|---|
 | 概览 | 工作台（系统状态、平台流程入口） | `/` | `GET /api/v1/system/info` | 已完成 |
-| 数据管理 | 数据集：导入/上传图片、浏览检索、元数据、质量检查 | `/datasets` | `/api/v1/datasets` | 规划中 |
+| 数据管理 | 数据集：压缩包 / 文件夹导入、VOC 标注识别、添加已有目录、缩略图浏览与标注预览 | `/datasets` | `/api/v1/datasets` | 已完成 |
 | 数据管理 | 数据版本：划分、快照、导出 YOLO/VOC/COCO、增强 | `/datasets/versions` | `/api/v1/datasets` | 规划中 |
 | 标注 | 标注任务：分配、进度、审核返修、抽检 | `/annotation/tasks` | `/api/v1/annotation/tasks` | 规划中 |
 | 标注 | 标注工作台：矩形框/多边形/关键点、快捷键、撤销 | `/annotation/workspace` | `/api/v1/annotation/tasks` | 规划中 |
@@ -27,6 +27,22 @@
 | 系统管理 | 系统设置：平台配置、默认训练参数、视觉 API | `/system/settings` | — | 规划中 |
 
 “规划中”的模块已有独立的页面文件和路由，预留的 API 路径目前统一返回 `501 not_implemented`。
+
+## 数据集管理
+
+每个数据集就是存储目录下 `datasets/` 里的一个普通文件夹（宿主机默认 `./data/storage/datasets/<数据集名称>/`），图片和 VOC 标注文件直接以文件形式保存，可以用文件管理器、`rsync` 直接查看和备份。添加数据有三种方式：
+
+| 方式 | 说明 |
+|---|---|
+| 上传压缩包 | 支持 zip、tar、tar.gz / tgz、tar.bz2、tar.xz、tar.zst、7z、rar（含 RAR5）。分块上传、断点续传；Windows 下打包的中文文件名（GBK 编码）自动识别 |
+| 上传文件夹 | 在页面上选择或直接拖入整个文件夹，保留子目录结构 |
+| 添加已有目录 | 先把文件夹拷贝到服务器的 `datasets/` 目录下，再在页面上选择它作为新数据集；只建立索引，不移动文件 |
+
+- 新建数据集时自动在 `datasets/` 下创建与数据集**同名的文件夹**。
+- **VOC 标注自动识别**：与图片同目录、同名的 `.xml`（如 `NG/0001.jpg` ↔ `NG/0001.xml`），以及标准 VOC 结构 `JPEGImages/` ↔ `Annotations/`。页面上可以按已标注 / 空标注 / 标注无效 / 未标注、按标签筛选，查看图片时叠加显示标注框。
+- 导入到已有数据集时，同名文件可选择跳过或覆盖；在服务器上直接增删文件后，点“重新扫描”即可同步。
+
+识别规则、导入流程和接口详见 [架构说明 · 数据集与导入](docs/architecture.md#6-数据集与导入)。
 
 ## 技术栈
 
@@ -71,15 +87,15 @@ docker compose logs -f app                # 查看应用日志
 data/
 ├── postgres/          # PostgreSQL 数据目录（TM_HOST_POSTGRES_DIR），属主为容器内 postgres 用户（uid 70）
 └── storage/           # 文件存储根目录（TM_HOST_STORAGE_DIR），挂载为容器内 /data
-    ├── images/        # 原始图片，直接以文件保存（后续按数据集分子目录）
-    ├── datasets/      # 数据集版本快照、导出的训练集（YOLO / VOC / COCO）
+    ├── datasets/      # 数据集：每个数据集一个文件夹，图片与 VOC 标注直接以文件保存
     ├── models/        # 模型权重文件
     ├── runs/          # 训练/评估运行产物（日志、曲线、中间权重）
-    ├── exports/       # 打包导出、报告
-    └── tmp/           # 上传等临时文件
+    ├── exports/       # 导出的训练集（YOLO / VOC / COCO）、打包导出与报告
+    ├── cache/         # 缩略图等可再生缓存（可随时删除，无需备份）
+    └── tmp/           # 上传、解压等临时文件
 ```
 
-- **数据库只存元数据**（数据集、标注、任务等记录），图片和模型等大文件都在 `storage/` 下，可以直接用文件管理器、`rsync` 等工具查看和备份。
+- **数据库只存元数据**（数据集、图片索引、导入记录等），图片和模型等大文件都在 `storage/` 下，可以直接用文件管理器、`rsync` 等工具查看和备份。
 - 应用启动时会自动创建上述子目录并检查是否可写；应用进程以 `.env` 中的 `PUID:PGID` 运行，建议设为宿主机上存储目录属主的 UID/GID（`id` 命令查看）。
 - 存储目录可以放在任意磁盘，例如在 `.env` 中设置 `TM_HOST_STORAGE_DIR=/mnt/bigdisk/trainmaster`。
 - 默认的 `./data` 位于 git 检出目录内，适合试用。**正式部署建议把 `TM_HOST_STORAGE_DIR`、`TM_HOST_POSTGRES_DIR` 设为仓库之外的绝对路径**（如 `/srv/trainmaster/storage`、`/srv/trainmaster/postgres`）：在仓库里执行 `git clean -x` 之类的清理命令会把 `./data` 一并删除。
@@ -95,13 +111,13 @@ mkdir -p "$BACKUP"
 
 # 备份数据库（在线备份，PostgreSQL 自定义格式）
 docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$BACKUP/db-$(date +%F).dump"
-# 备份文件存储（增量同步）
-rsync -a --delete "$STORAGE_DIR/" "$BACKUP/storage/"
+# 备份文件存储（增量同步；缓存和临时文件不需要备份）
+rsync -a --delete --exclude /cache/ --exclude /tmp/ "$STORAGE_DIR/" "$BACKUP/storage/"
 
 # 恢复
 docker compose stop app
 docker compose exec -T postgres sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner' < "$BACKUP/db-2026-10-30.dump"
-rsync -a --delete "$BACKUP/storage/" "$STORAGE_DIR/"
+rsync -a --delete --exclude /cache/ --exclude /tmp/ "$BACKUP/storage/" "$STORAGE_DIR/"
 docker compose start app
 ```
 
@@ -131,6 +147,7 @@ trainMaster/
 │       ├── database/            # 连接池、启动重试、迁移执行器
 │       │   └── migrations/      # NNNN_name.sql（嵌入二进制）
 │       ├── storage/             # 数据目录布局、可写检查、磁盘用量、安全路径解析
+│       ├── dataset/             # 数据集：文件识别、VOC 解析、解压、扫描、缩略图、导入任务
 │       ├── httpapi/             # 路由、中间件、统一响应与错误、handler
 │       └── web/                 # 前端静态文件服务（SPA 回退、缓存策略）
 ├── frontend/                    # React + Vite + shadcn/ui
@@ -150,8 +167,8 @@ trainMaster/
 
 ## 路线图
 
-1. **平台框架**（当前）：工程骨架、界面框架、模块占位、Docker 部署与持久化、CI。
-2. **数据集**：数据集与项目分组、图片导入/上传、缩略图浏览与检索、图片元数据。
+1. **平台框架**（已完成）：工程骨架、界面框架、模块占位、Docker 部署与持久化、CI。
+2. **数据集**（进行中）：已完成压缩包 / 文件夹导入、VOC 标注识别、已有目录添加、缩略图浏览与标注预览；后续：项目分组、图片元数据（产线、工位、相机、批次）、质量检查（重复、损坏、分辨率）。
 3. **标注**：标签体系、标注工作台（矩形框/多边形）、标注任务分配与审核。
 4. **数据版本**：训练/验证/测试划分、版本快照、导出 YOLO / VOC / COCO。
 5. **训练**：GPU 训练节点（独立 worker 服务）、任务队列、实时日志与曲线。
