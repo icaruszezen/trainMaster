@@ -1,0 +1,3 @@
+# 统一使用 LF 换行：Windows 上默认的 core.autocrlf=true 会让 gofmt 把每个 Go 文件
+# 都报告为未格式化，容器入口脚本也需要 LF。
+* text=auto eol=lf

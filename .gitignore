@@ -8,3 +8,23 @@ Thumbs.db
 # Env
 .env
 .env.local
+
+# Runtime data (bind-mounted storage, PostgreSQL) and backups
+/data/
+/backend/data/
+/backup/
+*.dump
+
+# Build output & dependencies
+/backend/bin/
+/frontend/dist/
+node_modules/
+*.tsbuildinfo
+
+# Logs, coverage, test output
+*.log
+coverage/
+*.out
+
+# Local compose customizations (see docs/deployment.md)
+docker-compose.override.yml

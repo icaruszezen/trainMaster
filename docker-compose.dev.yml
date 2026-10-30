@@ -1,0 +1,10 @@
+# 本地开发叠加：只把 PostgreSQL 端口暴露到本机，供 `go run` 启动的后端连接。
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
+#   （或 make dev-db）
+#
+# 端口只绑定 127.0.0.1，避免把使用默认密码的数据库暴露到局域网。
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${TM_DEV_DB_PORT:-5432}:5432"

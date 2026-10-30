@@ -1,0 +1,17 @@
+# 白名单：只把构建需要的源码发送给 Docker。
+# 数据目录（./data 或自定义的存储目录）、.git、.env 等一律不进入构建上下文。
+*
+!backend/
+!frontend/
+!deploy/docker/entrypoint.sh
+
+# 白名单目录中仍需排除的内容
+**/node_modules
+frontend/dist
+**/coverage
+**/.env
+**/.env.*
+**/*.log
+**/.DS_Store
+backend/bin
+backend/data

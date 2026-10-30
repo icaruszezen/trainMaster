@@ -1,0 +1,112 @@
+# trainMaster 默认部署：PostgreSQL + 应用（前端已打包进应用镜像）。
+#
+#   cp .env.example .env      # 按需修改
+#   docker compose up -d --build
+#
+# 所有持久化数据都绑定挂载到宿主机目录（默认 ./data/ 下），便于直接备份与迁移：
+#   ./data/storage   图片、数据集、模型等文件 → 容器内 /data
+#   ./data/postgres  PostgreSQL 数据目录
+# 变量含义见 .env.example；未设置时使用下面 ${VAR:-默认值} 中的默认值。
+
+name: trainmaster
+
+# 容器日志按大小轮转（每个容器最多约 50MB），避免长期运行后写满磁盘。
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: ${TM_DB_USER:-trainmaster}
+      POSTGRES_PASSWORD: ${TM_DB_PASSWORD:-trainmaster}
+      POSTGRES_DB: ${TM_DB_NAME:-trainmaster}
+      # 使用 PostgreSQL 内置的排序规则（不依赖镜像的 libc），数据目录可以在
+      # alpine 与 Debian 版 postgres 镜像之间直接切换。只在首次初始化时生效。
+      POSTGRES_INITDB_ARGS: --locale-provider=builtin --builtin-locale=C.UTF-8
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ${TM_HOST_POSTGRES_DIR:-./data/postgres}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    # 默认不对外暴露端口；本地开发需要时叠加 docker-compose.dev.yml。
+
+  app:
+    build:
+      context: .
+      args:
+        # 基础镜像，可换成内网镜像仓库中的同名镜像
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
+        GO_IMAGE: ${GO_IMAGE:-golang:1.24-alpine}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-alpine:3.23}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+        ALPINE_MIRROR: ${ALPINE_MIRROR:-}
+        # 版本信息，留空则使用源码默认值（make up 会自动填入 git 提交号与构建时间）
+        VERSION: ${TM_VERSION:-}
+        COMMIT: ${TM_COMMIT:-}
+        BUILD_TIME: ${TM_BUILD_TIME:-}
+    image: trainmaster:${TM_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${TM_HTTP_PORT:-8080}:8080"
+    environment:
+      TM_DB_HOST: postgres
+      TM_DB_PORT: "5432"
+      TM_DB_USER: ${TM_DB_USER:-trainmaster}
+      TM_DB_PASSWORD: ${TM_DB_PASSWORD:-trainmaster}
+      TM_DB_NAME: ${TM_DB_NAME:-trainmaster}
+      TM_LOG_LEVEL: ${TM_LOG_LEVEL:-info}
+      TM_LOG_FORMAT: json
+      TM_TRUSTED_PROXIES: ${TM_TRUSTED_PROXIES:-}
+      # 容器以 root 启动，修正 /data 目录属主后以 PUID:PGID 运行服务
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # 图片等文件数据直接保存在宿主机本地目录
+      - ${TM_HOST_STORAGE_DIR:-./data/storage}:/data
+    # 应用的优雅关闭超时为 15s
+    stop_grace_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # 预留：GPU 训练节点（尚未实现）。
+  # 训练 worker 将作为独立服务接入：通过 API 领取训练任务，与 app 共享同一个
+  # 存储目录读取数据集、写入运行产物和模型权重。需要宿主机安装 NVIDIA 驱动与
+  # NVIDIA Container Toolkit。训练节点在其他机器上时，可通过共享存储（NFS 等）
+  # 挂载同一目录。
+  #
+  # trainer:
+  #   image: trainmaster-trainer:${TM_IMAGE_TAG:-latest}
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - app
+  #   environment:
+  #     TM_SERVER_URL: http://app:8080
+  #     TM_DATA_DIR: /data
+  #     PUID: ${PUID:-1000}
+  #     PGID: ${PGID:-1000}
+  #     TZ: ${TZ:-Asia/Shanghai}
+  #   volumes:
+  #     - ${TM_HOST_STORAGE_DIR:-./data/storage}:/data
+  #   shm_size: 8gb  # PyTorch DataLoader 多进程需要较大的共享内存
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
