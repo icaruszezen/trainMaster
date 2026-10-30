@@ -810,6 +810,19 @@ func TestIntegrationRecoveryAndJanitor(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// The rest of the janitor's pass (the expired upload's staging folder,
+	// leftovers of failed deletes) finishes after the expiry is visible.
+	gone := func(path string) bool {
+		_, err := os.Stat(path)
+		return os.IsNotExist(err)
+	}
+	trash := filepath.Join(e.datasetsDir(), deletingPrefix+"77")
+	for deadline = time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if gone(e.svc.stagingDir(stale.ID)) && gone(trash) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if job, _ := e.svc.GetImport(ctx, d.ID, uploading.ID); job.Status != StatusUploading {
 		t.Errorf("active upload = %+v", job)
 	}
@@ -821,7 +834,7 @@ func TestIntegrationRecoveryAndJanitor(t *testing.T) {
 	if _, err := os.Stat(e.svc.stagingDir(uploading.ID)); err != nil {
 		t.Errorf("staging of an active upload was removed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(e.datasetsDir(), deletingPrefix+"77")); !os.IsNotExist(err) {
+	if _, err := os.Stat(trash); !os.IsNotExist(err) {
 		t.Errorf("leftover of a failed delete remains: %v", err)
 	}
 }
