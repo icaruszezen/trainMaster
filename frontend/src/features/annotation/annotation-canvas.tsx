@@ -29,6 +29,7 @@ import {
   moveBox,
   pinchState,
   resizeBox,
+  resizeGrabOffset,
   revealBox,
   sameBox,
   scaleLimits,
@@ -41,6 +42,7 @@ import {
   zoomTo,
   type Box,
   type Handle,
+  type OverlayAnchor,
   type Point,
   type Size,
   type Viewport,
@@ -65,6 +67,21 @@ const MAX_LABELED_OBJECTS = 300
 /** 放大到这个倍数以上时按像素显示（不做平滑），便于对齐缺陷边缘。 */
 const PIXELATED_SCALE = 4
 const ZOOM_STEP = 1.25
+
+/** 事件是否发生在叠加的浮层（`data-canvas-overlay`）里：其中的滚轮、手势不缩放画布。 */
+const inOverlay = (target: EventTarget | null) =>
+  target instanceof Element && target.closest("[data-canvas-overlay]") !== null
+
+/**
+ * Safari 的触控板捏合事件（`gesturestart` / `gesturechange` / `gestureend`），
+ * TypeScript 的 DOM 类型中没有，这里只声明用到的字段。
+ */
+type SafariGestureEvent = UIEvent & {
+  /** 相对手势开始时的缩放倍数。 */
+  scale: number
+  clientX: number
+  clientY: number
+}
 
 export type ImageAdjustments = { brightness: number; contrast: number }
 
@@ -116,6 +133,8 @@ type Drag =
       pointerId: number
       uid: string
       handle: Handle
+      /** 按下时手柄控制的边与指针的偏移（屏幕像素），见 `resizeGrabOffset`。 */
+      offset: Point
       original: Box
       box: Box
     }
@@ -147,8 +166,11 @@ type AnnotationCanvasProps = {
   /** 画的框太小（宽或高不足 1 像素）被丢弃。 */
   onRejectBox: () => void
   onCommitBox: (uid: string, box: Box) => void
-  /** 叠加在画布上的内容（如类别选择框），`anchor` 给出框旁边的位置。 */
-  overlay?: (anchor: (box: Box) => Point | null) => ReactNode
+  /**
+   * 叠加在画布上的内容（如类别选择框），相对画布定位；`anchor` 给出框在画布上
+   * 的位置与画布尺寸。浮层内的滚轮、手势不缩放画布。
+   */
+  overlay?: (anchor: (box: Box) => OverlayAnchor | null) => ReactNode
 }
 
 type ImageLoad = "loading" | "ok" | "error"
@@ -219,6 +241,17 @@ export function AnnotationCanvas({
   const [spaceHeld, setSpaceHeld] = useState(false)
   const pointers = useRef(new Map<number, Point>())
 
+  // 换成其它工具或变为只读时取消正在画的框（包括两次单击画框中等待第二次
+  // 单击的框），否则之后的单击会把它画完。
+  const canDraw = tool === "rect" && !readOnly
+  const [couldDraw, setCouldDraw] = useState(canDraw)
+  if (couldDraw !== canDraw) {
+    setCouldDraw(canDraw)
+    if (!canDraw && drag?.kind === "draw") {
+      setDrag(null)
+    }
+  }
+
   // 给非 React 事件（滚轮）读取的最新值。
   const latest = useRef({ viewport, limits })
   useEffect(() => {
@@ -238,6 +271,13 @@ export function AnnotationCanvas({
       return
     }
     const onWheel = (event: WheelEvent) => {
+      if (inOverlay(event.target)) {
+        // 浮层（如类别列表）照常滚动；捏合（Ctrl+滚轮）仍不缩放整个页面。
+        if (event.ctrlKey) {
+          event.preventDefault()
+        }
+        return
+      }
       event.preventDefault()
       const { viewport: current, limits: currentLimits } = latest.current
       if (!current) {
@@ -263,8 +303,54 @@ export function AnnotationCanvas({
         )
       )
     }
-    element.addEventListener("wheel", onWheel, { passive: false })
-    return () => element.removeEventListener("wheel", onWheel)
+
+    // Safari（macOS）的触控板捏合不产生 Ctrl+滚轮，而是 gesture* 事件：阻止
+    // 页面缩放，以手势开始的位置为中心按手势的倍数缩放图片。触屏上的双指缩放
+    // 由指针事件处理（此时已有两个按下的指针），这里不重复处理。
+    let gesture: { origin: Viewport; anchor: Point } | null = null
+    const onGestureStart = (event: Event) => {
+      event.preventDefault()
+      gesture = null
+      const current = latest.current.viewport
+      if (!current || inOverlay(event.target) || pointers.current.size >= 2) {
+        return
+      }
+      const { clientX, clientY } = event as SafariGestureEvent
+      const rect = element.getBoundingClientRect()
+      gesture = {
+        origin: current,
+        anchor: { x: clientX - rect.left, y: clientY - rect.top },
+      }
+    }
+    const onGestureChange = (event: Event) => {
+      event.preventDefault()
+      const { scale } = event as SafariGestureEvent
+      if (gesture && Number.isFinite(scale) && scale > 0) {
+        setUserViewport(
+          zoomAt(gesture.origin, scale, gesture.anchor, latest.current.limits)
+        )
+      }
+    }
+    const onGestureEnd = (event: Event) => {
+      event.preventDefault()
+      gesture = null
+    }
+    const gestures = "ongesturestart" in window
+    const options = { passive: false }
+    element.addEventListener("wheel", onWheel, options)
+    if (gestures) {
+      element.addEventListener("gesturestart", onGestureStart, options)
+      element.addEventListener("gesturechange", onGestureChange, options)
+      element.addEventListener("gestureend", onGestureEnd, options)
+    }
+    return () => {
+      element.removeEventListener("wheel", onWheel)
+      if (gestures) {
+        element.removeEventListener("gesturestart", onGestureStart)
+        element.removeEventListener("gesturechange", onGestureChange)
+        element.removeEventListener("gestureend", onGestureEnd)
+      }
+    }
   }, [containerRef])
 
   // 按住空格平移。
@@ -436,7 +522,7 @@ export function AnnotationCanvas({
     const point = toImage(viewport, screen)
 
     // 两次单击画框的第二次单击。
-    if (drag?.kind === "draw" && drag.click) {
+    if (drag?.kind === "draw" && drag.click && canDraw) {
       finishDraw(drag.anchor, drawPoint(drag.anchor, point, event.shiftKey))
       return
     }
@@ -451,6 +537,7 @@ export function AnnotationCanvas({
           pointerId: event.pointerId,
           uid: editableSelection.uid,
           handle,
+          offset: resizeGrabOffset(viewport, editableSelection, handle, screen),
           original: editableSelection,
           box: editableSelection,
         })
@@ -458,7 +545,7 @@ export function AnnotationCanvas({
       }
     }
 
-    if (tool === "rect" && !readOnly) {
+    if (canDraw) {
       element.setPointerCapture(event.pointerId)
       setDrag({
         kind: "draw",
@@ -588,9 +675,14 @@ export function AnnotationCanvas({
       }
       case "resize":
         if (drag.pointerId === event.pointerId) {
+          // 边随指针移动的距离移动（不跳到指针处）。
+          const grabbed = toImage(viewport, {
+            x: screen.x + drag.offset.x,
+            y: screen.y + drag.offset.y,
+          })
           setDrag({
             ...drag,
-            box: resizeBox(drag.original, drag.handle, point, imageSize),
+            box: resizeBox(drag.original, drag.handle, grabbed, imageSize),
           })
         }
         return
@@ -748,7 +840,10 @@ export function AnnotationCanvas({
     adjustments.brightness !== 1 || adjustments.contrast !== 1
       ? `brightness(${adjustments.brightness}) contrast(${adjustments.contrast})`
       : undefined
+  // 按文件中存储的像素方向显示（不按 EXIF 方向旋转）：原图尺寸、缩略图和 VOC
+  // 坐标都以它为准。
   const imageStyle = (s: Size, v: Viewport) => ({
+    imageOrientation: "none" as const,
     width: s.width,
     height: s.height,
     transform: `translate(${v.x}px, ${v.y}px) scale(${v.scale})`,
@@ -789,7 +884,9 @@ export function AnnotationCanvas({
       tabIndex={-1}
       role="application"
       aria-label={`标注画布：${image.file_name}`}
-      className="relative min-h-0 min-w-0 flex-1 touch-none overflow-hidden bg-muted/60 outline-none select-none"
+      // overflow-clip：不是滚动容器，浮层里的输入框获得焦点时不会把画布滚开
+      // （那样指针位置与图片的对应关系就错了）。
+      className="relative min-h-0 min-w-0 flex-1 touch-none overflow-clip bg-muted/60 outline-none select-none"
       style={{ cursor }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
@@ -799,16 +896,18 @@ export function AnnotationCanvas({
       onDoubleClick={onDoubleClick}
       onContextMenu={(event) => event.preventDefault()}
     >
-      {/* 原图尺寸未知时先加载原图读出尺寸（不显示）。 */}
+      {/* 原图尺寸未知时先加载原图读出尺寸（不显示）：按存储的像素方向、原尺寸
+          排版后读排版尺寸，naturalWidth / naturalHeight 总是按 EXIF 方向旋转后的尺寸。 */}
       {!imageSize && native && (
         <img
           src={fileUrl(datasetId, image)}
           alt=""
-          className="invisible absolute"
+          className="invisible absolute top-0 left-0 max-w-none"
+          style={{ imageOrientation: "none" }}
           onLoad={(event) => {
-            const { naturalWidth, naturalHeight } = event.currentTarget
-            if (naturalWidth > 0 && naturalHeight > 0) {
-              const known = { width: naturalWidth, height: naturalHeight }
+            const { offsetWidth, offsetHeight } = event.currentTarget
+            if (offsetWidth > 0 && offsetHeight > 0) {
+              const known = { width: offsetWidth, height: offsetHeight }
               setNatural(known)
               onSizeKnown(known)
             }
@@ -924,7 +1023,11 @@ export function AnnotationCanvas({
         </div>
       )}
 
-      {overlay?.(anchor)}
+      {overlay && (
+        <div data-canvas-overlay="" className="contents">
+          {overlay(anchor)}
+        </div>
+      )}
     </div>
   )
 }

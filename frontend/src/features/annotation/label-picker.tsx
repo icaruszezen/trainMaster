@@ -1,9 +1,20 @@
-import { useId, useState, type CSSProperties, type KeyboardEvent } from "react"
+import {
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react"
 import { Plus } from "lucide-react"
 
 import { Input } from "@/components/ui/input"
 import { Kbd } from "@/components/ui/kbd"
 import { classNameError, filterClasses } from "@/features/annotation/classes"
+import {
+  nearestScrollTop,
+  placeOverlay,
+  type OverlayAnchor,
+} from "@/features/annotation/geometry"
 import { classHotkey } from "@/features/annotation/shortcuts"
 import type { DatasetClass } from "@/features/datasets/api"
 import { cn } from "@/lib/utils"
@@ -17,8 +28,12 @@ type LabelPickerProps = {
   /** 选中一个类别；`created` 表示输入的是新类别（调用方把它加入类别列表）。 */
   onPick: (name: string, created: boolean) => void
   onClose: () => void
+  /**
+   * 框在画布上的位置：选择框放在框下方，放不下时放到上方，超出右边时左移，
+   * 始终在画布内；没有时放在画布顶部居中。
+   */
+  anchor?: OverlayAnchor | null
   className?: string
-  style?: CSSProperties
 }
 
 type Option =
@@ -26,9 +41,9 @@ type Option =
   | { kind: "create"; name: string }
 
 /**
- * 类别选择框：输入筛选（不区分大小写），↑ / ↓ 选择，Enter 确定，Esc 关闭。
- * 输入的名称不在类别列表中时可以新建（列表项写明“新建类别”，避免手误建出
- * 多余的类别）。
+ * 类别选择框（相对画布绝对定位）：输入筛选（不区分大小写），↑ / ↓ 选择，
+ * Enter 确定，Esc 关闭。输入的名称不在类别列表中时可以新建（列表项写明“新建
+ * 类别”，避免手误建出多余的类别）。
  */
 export function LabelPicker({
   classes,
@@ -37,12 +52,41 @@ export function LabelPicker({
   title,
   onPick,
   onClose,
+  anchor,
   className,
-  style,
 }: LabelPickerProps) {
   const [query, setQuery] = useState("")
   const [active, setActive] = useState(0)
   const listId = useId()
+  const rootRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const listRef = useRef<HTMLUListElement>(null)
+
+  // 量出选择框的尺寸后放到框旁边（绘制前完成，不会闪动）；框随缩放移动、
+  // 筛选后列表变短时重新计算。
+  useLayoutEffect(() => {
+    const element = rootRef.current
+    if (!element) {
+      return
+    }
+    const position = anchor
+      ? placeOverlay(anchor, {
+          width: element.offsetWidth,
+          height: element.offsetHeight,
+        })
+      : null
+    const left = position ? `${Math.round(position.x)}px` : ""
+    const top = position ? `${Math.round(position.y)}px` : ""
+    if (element.style.left !== left || element.style.top !== top) {
+      element.style.left = left
+      element.style.top = top
+    }
+  })
+
+  // 不用 autoFocus：获得焦点时不滚动任何祖先元素（画布滚开后指针位置就对不上了）。
+  useLayoutEffect(() => {
+    inputRef.current?.focus({ preventScroll: true })
+  }, [])
 
   const indexed = classes.map((cls, index) => ({ ...cls, index }))
   const matches = filterClasses(indexed, query)
@@ -74,6 +118,21 @@ export function LabelPicker({
     }
   }
 
+  // 用键盘移动时把这一项滚动到可见（只滚动列表本身）。
+  const moveActive = (index: number) => {
+    setActive(index)
+    const list = listRef.current
+    const option = document.getElementById(`${listId}-${index}`)
+    if (list && option) {
+      list.scrollTop = nearestScrollTop(
+        list.scrollTop,
+        list.clientHeight,
+        option.offsetTop,
+        option.offsetHeight
+      )
+    }
+  }
+
   const onKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     if (event.nativeEvent.isComposing) {
       return
@@ -81,11 +140,11 @@ export function LabelPicker({
     switch (event.key) {
       case "ArrowDown":
         event.preventDefault()
-        setActive((activeIndex + 1) % Math.max(1, options.length))
+        moveActive((activeIndex + 1) % Math.max(1, options.length))
         return
       case "ArrowUp":
         event.preventDefault()
-        setActive(
+        moveActive(
           (activeIndex - 1 + options.length) % Math.max(1, options.length)
         )
         return
@@ -104,21 +163,23 @@ export function LabelPicker({
   const error = name !== "" && !canCreate && matches.length === 0
   return (
     <div
+      ref={rootRef}
       className={cn(
-        "z-20 flex w-64 flex-col gap-2 rounded-lg border bg-popover p-2 text-popover-foreground shadow-lg",
+        "absolute z-20 flex w-64 max-w-[calc(100%-1rem)] flex-col gap-2 rounded-lg border bg-popover p-2 text-popover-foreground shadow-lg",
+        !anchor && "top-4 left-1/2 -translate-x-1/2",
         className
       )}
-      style={style}
       onPointerDown={(event) => event.stopPropagation()}
       onDoubleClick={(event) => event.stopPropagation()}
     >
       <p className="px-1 text-xs font-medium text-muted-foreground">{title}</p>
       <Input
-        autoFocus
+        ref={inputRef}
         value={query}
         onChange={(event) => {
           setQuery(event.target.value)
           setActive(0)
+          listRef.current?.scrollTo({ top: 0 })
         }}
         onKeyDown={onKeyDown}
         onBlur={(event) => {
@@ -140,10 +201,12 @@ export function LabelPicker({
         className="h-8"
       />
       <ul
+        ref={listRef}
         id={listId}
         role="listbox"
         aria-label="类别"
-        className="max-h-60 overflow-y-auto"
+        // relative：列表项的 offsetTop 相对列表计算，用于滚动到可见。
+        className="relative max-h-60 overflow-y-auto"
       >
         {options.map((option, index) => {
           const key =

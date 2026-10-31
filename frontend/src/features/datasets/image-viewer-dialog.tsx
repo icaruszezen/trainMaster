@@ -509,9 +509,18 @@ function ImageStage({
             alt={image.file_name}
             decoding="async"
             draggable={false}
+            // 按文件中存储的像素方向显示（不按 EXIF 方向旋转），与原图尺寸、
+            // 缩略图和标注框坐标一致。
+            style={{ imageOrientation: "none" }}
             onLoad={(event) => {
-              const { naturalWidth, naturalHeight } = event.currentTarget
-              setNatural({ w: naturalWidth, h: naturalHeight })
+              // naturalWidth / naturalHeight 总是按 EXIF 方向旋转后的尺寸；尺寸
+              // 未知时图片按原尺寸排版（见下），读排版尺寸。
+              const element = event.currentTarget
+              setNatural(
+                scale === 0 && element.offsetWidth > 0
+                  ? { w: element.offsetWidth, h: element.offsetHeight }
+                  : { w: element.naturalWidth, h: element.naturalHeight }
+              )
               setLoaded(true)
             }}
             onError={() => {
@@ -523,10 +532,12 @@ function ImageStage({
               )
             }}
             className={cn(
-              "absolute inset-0 size-full object-fill shadow-sm transition-opacity duration-200",
+              "absolute shadow-sm transition-opacity duration-200",
               loaded ? "opacity-100" : "opacity-0",
-              // 尺寸未知时先以原尺寸加载，以便读到 naturalWidth。
-              scale === 0 && "invisible"
+              // 尺寸未知时先以原尺寸（不可见地）加载，以便读出尺寸。
+              scale > 0
+                ? "inset-0 size-full object-fill"
+                : "invisible top-0 left-0 max-w-none"
             )}
           />
           {w && h && loaded && objects.length > 0 && (
