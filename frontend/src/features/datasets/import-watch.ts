@@ -13,6 +13,7 @@ import {
   type DatasetImport,
 } from "@/features/datasets/api"
 import { summaryText } from "@/features/datasets/import-status"
+import { projectKeys } from "@/features/projects/api"
 import { isPermanentError } from "@/lib/api"
 import { queryClient } from "@/lib/query-client"
 
@@ -37,6 +38,8 @@ export function refreshStartedImport(datasetId: number) {
   void queryClient.invalidateQueries({
     queryKey: datasetKeys.imports(datasetId),
   })
+  // 项目详情的数据集列表同样显示进行中的任务。
+  void queryClient.invalidateQueries({ queryKey: projectKeys.all })
 }
 
 /** 任务结束：刷新查询并提示结果（每个任务只提示一次，用户取消的不提示）。 */
@@ -47,6 +50,8 @@ function settle(job: DatasetImport, datasetName: string) {
   settledImports.add(job.id)
 
   void queryClient.invalidateQueries({ queryKey: datasetKeys.all })
+  // 项目的图片数、标注进度与标签分布是其数据集的合计。
+  void queryClient.invalidateQueries({ queryKey: projectKeys.all })
 
   const action = job.source === "scan" ? "扫描" : "导入"
   if (job.status === "succeeded") {

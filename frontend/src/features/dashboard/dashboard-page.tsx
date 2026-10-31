@@ -3,6 +3,7 @@ import {
   ArrowRight,
   Boxes,
   Database,
+  FolderKanban,
   Images,
   ListChecks,
   Rocket,
@@ -22,6 +23,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton"
 import { getNavItem, type ModuleId } from "@/config/navigation"
 import { datasetsQuery } from "@/features/datasets/api"
+import { projectsQuery } from "@/features/projects/api"
 import { SystemStatusCard } from "@/features/system/system-status-card"
 import { formatNumber, formatPercent, percentOf } from "@/lib/format"
 
@@ -73,7 +75,8 @@ export function DashboardPage() {
         description="面向团队内部的工业视觉平台：图片数据集管理、标注、模型训练与模型评估一体化。"
       />
 
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-3 xl:grid-cols-5">
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-3">
+        <ProjectStat />
         <DatasetStats />
         {plannedStats.map((stat) => (
           <StatCard
@@ -130,6 +133,35 @@ export function DashboardPage() {
         </Card>
       </div>
     </>
+  )
+}
+
+/** 项目数量，数据来自项目列表。 */
+function ProjectStat() {
+  const { data, isPending } = useQuery(projectsQuery())
+
+  // 后台刷新失败时保留已加载的数字。
+  if (data === undefined) {
+    return (
+      <StatCard
+        title="项目"
+        icon={FolderKanban}
+        value={isPending ? <Skeleton className="h-8 w-16" /> : "—"}
+      >
+        {isPending ? "正在加载…" : "无法获取数据"}
+      </StatCard>
+    )
+  }
+  return (
+    <StatCard title="项目" icon={FolderKanban} value={formatNumber(data.total)}>
+      <Link
+        to="/projects"
+        className="inline-flex items-center gap-1 self-start underline-offset-4 hover:text-foreground hover:underline"
+      >
+        {data.total > 0 ? "查看全部" : "创建项目"}
+        <ArrowRight className="size-3" />
+      </Link>
+    </StatCard>
   )
 }
 

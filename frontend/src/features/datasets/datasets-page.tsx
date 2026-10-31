@@ -2,6 +2,7 @@ import { useMemo, useState } from "react"
 import { keepPreviousData, useQuery } from "@tanstack/react-query"
 import {
   Database,
+  FolderKanban,
   FolderOpen,
   HardDrive,
   Images,
@@ -15,6 +16,7 @@ import {
   Upload,
   X,
 } from "lucide-react"
+import { useSearchParams } from "react-router"
 
 import { PageHeader } from "@/components/page-header"
 import { StatCard } from "@/components/stat-card"
@@ -38,12 +40,18 @@ import {
   Select,
   SelectContent,
   SelectItem,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import { datasetsQuery, type Dataset } from "@/features/datasets/api"
+import {
+  datasetsQuery,
+  parseProjectFilter,
+  type Dataset,
+  type DatasetProjectFilter,
+} from "@/features/datasets/api"
 import {
   CreateDatasetDialog,
   type CreateTab,
@@ -58,6 +66,8 @@ import { DatasetTable } from "@/features/datasets/dataset-table"
 import { DatasetsRootHint } from "@/features/datasets/directory-picker"
 import { LoadError } from "@/features/datasets/load-error"
 import { useDatasetsRoot } from "@/features/datasets/use-datasets-root"
+import { projectsQuery, type Project } from "@/features/projects/api"
+import { DatasetProjectsDialog } from "@/features/projects/dataset-projects-dialog"
 import { useSystemInfo } from "@/features/system/api"
 import { useDebouncedValue } from "@/hooks/use-debounced-value"
 import {
@@ -98,6 +108,37 @@ function readViewMode(): ViewMode {
   return readPreference(VIEW_STORAGE_KEY) === "list" ? "list" : "grid"
 }
 
+/**
+ * 项目筛选保存在地址栏中（`?project=12` / `?project=none`），项目页面可以直接
+ * 链接到筛选后的数据集列表。筛选的项目已被删除时视为不筛选。
+ */
+function useProjectFilter(projects: Project[] | undefined) {
+  const [params, setParams] = useSearchParams()
+  const parsed = parseProjectFilter(params.get("project"))
+  const project =
+    typeof parsed === "number"
+      ? projects?.find((candidate) => candidate.id === parsed)
+      : undefined
+  const filter: DatasetProjectFilter =
+    typeof parsed === "number" && projects && !project ? null : parsed
+
+  const setFilter = (next: DatasetProjectFilter) => {
+    setParams(
+      (previous) => {
+        const updated = new URLSearchParams(previous)
+        if (next === null) {
+          updated.delete("project")
+        } else {
+          updated.set("project", String(next))
+        }
+        return updated
+      },
+      { replace: true }
+    )
+  }
+  return { filter, project, setFilter }
+}
+
 export function DatasetsPage() {
   const [search, setSearch] = useState("")
   const q = useDebouncedValue(search.trim(), 300)
@@ -110,14 +151,19 @@ export function DatasetsPage() {
   const [createKey, setCreateKey] = useState(0)
   const [editing, setEditing] = useState<Dataset | null>(null)
   const [deleting, setDeleting] = useState<Dataset | null>(null)
+  const [assigning, setAssigning] = useState<Dataset | null>(null)
   const scan = useScanDataset()
 
-  // 不带搜索条件的完整列表用于统计；搜索结果单独查询。
+  const projects = useQuery(projectsQuery())
+  const projectFilter = useProjectFilter(projects.data?.items)
+
+  // 不带筛选条件的完整列表用于统计；筛选结果单独查询。
   const all = useQuery(datasetsQuery())
   const filtered = useQuery({
-    ...datasetsQuery(q),
+    ...datasetsQuery(q, projectFilter.filter),
     placeholderData: keepPreviousData,
   })
+  const isFiltered = q !== "" || projectFilter.filter !== null
 
   const items = useMemo(
     () => sortDatasets(filtered.data?.items ?? [], sort),
@@ -200,6 +246,12 @@ export function DatasetsPage() {
                 </InputGroupAddon>
               )}
             </InputGroup>
+            <ProjectFilterSelect
+              projects={projects.data?.items}
+              loading={projects.isPending}
+              value={projectFilter.filter}
+              onChange={projectFilter.setFilter}
+            />
             <Select
               value={sort}
               onValueChange={(value) => setSort(value as SortKey)}
@@ -216,7 +268,7 @@ export function DatasetsPage() {
               </SelectContent>
             </Select>
             <p className="text-sm text-muted-foreground tabular-nums">
-              {q ? `找到 ${items.length} 个` : `共 ${items.length} 个`}
+              {isFiltered ? `找到 ${items.length} 个` : `共 ${items.length} 个`}
             </p>
             <ToggleGroup
               type="single"
@@ -250,16 +302,19 @@ export function DatasetsPage() {
                 </EmptyMedia>
                 <EmptyTitle className="text-base">没有匹配的数据集</EmptyTitle>
                 <EmptyDescription>
-                  没有名称或描述包含“{q}”的数据集。
+                  {noMatchText(q, projectFilter.filter, projectFilter.project)}
                 </EmptyDescription>
               </EmptyHeader>
               <EmptyContent>
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => setSearch("")}
+                  onClick={() => {
+                    setSearch("")
+                    projectFilter.setFilter(null)
+                  }}
                 >
-                  清除搜索
+                  清除筛选
                 </Button>
               </EmptyContent>
             </Empty>
@@ -272,6 +327,7 @@ export function DatasetsPage() {
                   onScan={() => scan.mutate(dataset)}
                   onEdit={() => setEditing(dataset)}
                   onDelete={() => setDeleting(dataset)}
+                  onManageProjects={() => setAssigning(dataset)}
                 />
               ))}
             </div>
@@ -281,6 +337,7 @@ export function DatasetsPage() {
               onScan={(dataset) => scan.mutate(dataset)}
               onEdit={setEditing}
               onDelete={setDeleting}
+              onManageProjects={setAssigning}
             />
           )}
         </>
@@ -300,7 +357,91 @@ export function DatasetsPage() {
         dataset={deleting}
         onOpenChange={(open) => !open && setDeleting(null)}
       />
+      <DatasetProjectsDialog
+        dataset={assigning}
+        onOpenChange={(open) => !open && setAssigning(null)}
+      />
     </>
+  )
+}
+
+function noMatchText(
+  q: string,
+  filter: DatasetProjectFilter,
+  project: Project | undefined
+) {
+  const scope =
+    filter === "none"
+      ? "未纳入项目的数据集中"
+      : project
+        ? `项目“${project.name}”中`
+        : filter !== null
+          ? "所选项目中"
+          : ""
+  if (q) {
+    return `${scope}没有名称或描述包含“${q}”的数据集。`
+  }
+  return filter === "none"
+    ? "所有数据集都已纳入项目。"
+    : `${scope}还没有数据集。`
+}
+
+/** 按项目筛选：全部项目 / 未纳入项目 / 某个项目。 */
+function ProjectFilterSelect({
+  projects,
+  loading,
+  value,
+  onChange,
+}: {
+  /** 还在加载或加载失败时为 undefined。 */
+  projects: Project[] | undefined
+  loading: boolean
+  value: DatasetProjectFilter
+  onChange: (value: DatasetProjectFilter) => void
+}) {
+  const sorted = useMemo(
+    () =>
+      [...(projects ?? [])].sort((a, b) =>
+        nameCollator.compare(a.name, b.name)
+      ),
+    [projects]
+  )
+  // 从链接进入（?project=ID）时项目列表可能还没加载：先占一个选项，
+  // 否则选择框是空的，看不出列表已经筛选过。
+  const pendingValue =
+    typeof value === "number" && !sorted.some((p) => p.id === value)
+      ? value
+      : null
+
+  return (
+    <Select
+      value={value === null ? "all" : String(value)}
+      onValueChange={(next) =>
+        onChange(
+          next === "all" ? null : next === "none" ? "none" : Number(next)
+        )
+      }
+    >
+      <SelectTrigger className="w-40" aria-label="按项目筛选">
+        <FolderKanban className="text-muted-foreground" />
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value="all">全部项目</SelectItem>
+        <SelectItem value="none">未纳入项目</SelectItem>
+        {(sorted.length > 0 || pendingValue !== null) && <SelectSeparator />}
+        {pendingValue !== null && (
+          <SelectItem value={String(pendingValue)}>
+            {loading ? "加载中…" : `项目 #${pendingValue}`}
+          </SelectItem>
+        )}
+        {sorted.map((project) => (
+          <SelectItem key={project.id} value={String(project.id)}>
+            <span className="max-w-56 truncate">{project.name}</span>
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   )
 }
 

@@ -40,6 +40,9 @@ func (s *server) datasetRoutes(r chi.Router) {
 		r.Post("/imports/{importID}/files", s.uploadImportFiles)
 		r.Post("/imports/{importID}/commit", s.commitDatasetImport)
 		r.Post("/imports/{importID}/cancel", s.cancelDatasetImport)
+		if s.projects != nil {
+			r.Put("/projects", s.setDatasetProjects)
+		}
 	})
 }
 
@@ -52,10 +55,16 @@ func (s *server) datasetError(w http.ResponseWriter, r *http.Request, err error)
 		writeError(w, status, code, de.Message)
 		return
 	}
+	s.unexpectedError(w, r, err)
+}
+
+// unexpectedError logs an error that is not the client's fault and
+// answers 500.
+func (s *server) unexpectedError(w http.ResponseWriter, r *http.Request, err error) {
 	if r.Context().Err() != nil && errors.Is(err, context.Canceled) {
 		return // the client went away; nobody reads the response
 	}
-	s.log.Error("dataset request failed", "method", r.Method, "path", r.URL.Path,
+	s.log.Error("request failed", "method", r.Method, "path", r.URL.Path,
 		"request_id", RequestID(r.Context()), "err", err)
 	writeError(w, http.StatusInternalServerError, codeInternal, msgInternalError)
 }
@@ -177,7 +186,21 @@ func enumParam(w http.ResponseWriter, r *http.Request, name string, values ...st
 // ---- datasets ----
 
 func (s *server) listDatasets(w http.ResponseWriter, r *http.Request) {
-	items, err := s.datasets.ListDatasets(r.Context(), r.URL.Query().Get("q"))
+	q := dataset.DatasetQuery{Search: r.URL.Query().Get("q")}
+	// project_id: a project's datasets, or "none" for those in no project.
+	switch v := r.URL.Query().Get("project_id"); v {
+	case "":
+	case "none":
+		q.NoProject = true
+	default:
+		id, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || id <= 0 {
+			badRequest(w, "参数 project_id 无效，应为项目 ID 或 none")
+			return
+		}
+		q.ProjectID = id
+	}
+	items, err := s.datasets.ListDatasets(r.Context(), q)
 	if err != nil {
 		s.datasetError(w, r, err)
 		return

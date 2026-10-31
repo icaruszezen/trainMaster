@@ -1,6 +1,6 @@
 import { useId, useState, type FormEvent } from "react"
 import { useMutation } from "@tanstack/react-query"
-import { Ellipsis, Pencil, RefreshCw, Trash2 } from "lucide-react"
+import { Ellipsis, FolderKanban, Pencil, RefreshCw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import {
@@ -56,6 +56,7 @@ import {
   validateDatasetName,
   validateDescription,
 } from "@/features/datasets/naming"
+import { projectKeys } from "@/features/projects/api"
 import { ApiError } from "@/lib/api"
 import { formatNumber } from "@/lib/format"
 import { queryClient } from "@/lib/query-client"
@@ -86,6 +87,8 @@ type DatasetActionsMenuProps = {
   dataset: Dataset
   onEdit: () => void
   onDelete: () => void
+  /** 打开“纳入项目”对话框。 */
+  onManageProjects: () => void
   /** 不传时菜单中不显示“重新扫描”（详情页把它放在了工具栏上）。 */
   onScan?: () => void
   className?: string
@@ -95,6 +98,7 @@ export function DatasetActionsMenu({
   dataset,
   onEdit,
   onDelete,
+  onManageProjects,
   onScan,
   className,
 }: DatasetActionsMenuProps) {
@@ -124,6 +128,10 @@ export function DatasetActionsMenu({
         <DropdownMenuItem onSelect={onEdit}>
           <Pencil />
           编辑信息
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={onManageProjects}>
+          <FolderKanban />
+          纳入项目
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem variant="destructive" onSelect={onDelete}>
@@ -197,6 +205,8 @@ function EditDatasetForm({
     onSuccess: (updated) => {
       queryClient.setQueryData(datasetKeys.detail(updated.id), updated)
       void queryClient.invalidateQueries({ queryKey: datasetKeys.lists() })
+      // 项目详情中列出了数据集的名称。
+      void queryClient.invalidateQueries({ queryKey: projectKeys.all })
       toast.success("已保存数据集信息")
       onDone()
     },
@@ -349,6 +359,8 @@ function DeleteDatasetForm({
       void queryClient.invalidateQueries({
         queryKey: datasetKeys.directories(),
       })
+      // 数据集会从它所属的项目中移出。
+      void queryClient.invalidateQueries({ queryKey: projectKeys.all })
       if (result?.files_removed === false) {
         // 记录已删除，但文件夹没能完全删除（如权限不足）：说明留在了哪里。
         toast.warning(`已删除数据集“${dataset.name}”`, {
@@ -397,6 +409,13 @@ function DeleteDatasetForm({
             </code>
           </span>
         </label>
+        {dataset.projects.length > 0 && (
+          <p className="text-muted-foreground">
+            数据集也会从所属的 {formatNumber(dataset.projects.length)} 个项目（
+            {dataset.projects.map((project) => project.name).join("、")}
+            ）中移出。
+          </p>
+        )}
         {deleteFiles ? (
           <p className="text-destructive">
             整个文件夹将被永久删除，无法找回：包括其中的所有文件和子文件夹，不只是已索引的{" "}

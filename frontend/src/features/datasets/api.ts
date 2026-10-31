@@ -17,6 +17,9 @@ export type DatasetOrigin = "upload" | "directory"
 /** 图片的引用；`version` 随文件变化而变化，用于缩略图 / 原图的缓存失效。 */
 export type DatasetImageRef = { id: number; version: string }
 
+/** 数据集所属的项目（见 `features/projects`）。 */
+export type DatasetProjectRef = { id: number; name: string }
+
 export type Dataset = {
   id: number
   name: string
@@ -44,6 +47,8 @@ export type Dataset = {
   total_bytes: number
   /** 最多 4 张，用于卡片封面。 */
   covers: DatasetImageRef[]
+  /** 纳入了该数据集的项目，按名称排序。 */
+  projects: DatasetProjectRef[]
   /** 最近一个上传中 / 排队中 / 执行中的导入任务。 */
   active_import: DatasetImport | null
   scanned_at: string | null
@@ -178,6 +183,21 @@ export type ImageStatusFilter =
   "all" | "annotated" | "empty" | "unannotated" | "invalid"
 export type ImageSort = "path" | "-mod_time" | "-objects"
 
+/** 数据集列表的项目筛选：某个项目的 id、`"none"`（未纳入任何项目）或不限（null）。 */
+export type DatasetProjectFilter = number | "none" | null
+
+/** 解析地址栏 `?project=` 的取值：项目 id 或 `none`，其它值视为不筛选。 */
+export function parseProjectFilter(value: string | null): DatasetProjectFilter {
+  if (value === "none") {
+    return "none"
+  }
+  if (!value || !/^[1-9]\d{0,15}$/.test(value)) {
+    return null
+  }
+  const id = Number(value)
+  return Number.isSafeInteger(id) ? id : null
+}
+
 export type ImageFilters = {
   status: ImageStatusFilter
   /** 精确匹配的标签名，`""` 表示不限。 */
@@ -230,9 +250,11 @@ export function fileUrl(datasetId: number, image: DatasetImageRef) {
 export const datasetKeys = {
   all: ["datasets"] as const,
   lists: () => [...datasetKeys.all, "list"] as const,
-  list: (q: string) => [...datasetKeys.lists(), { q }] as const,
+  list: (q: string, project: DatasetProjectFilter) =>
+    [...datasetKeys.lists(), { q, project }] as const,
   directories: () => [...datasetKeys.all, "directories"] as const,
-  detail: (id: number) => [...datasetKeys.all, "detail", id] as const,
+  details: () => [...datasetKeys.all, "detail"] as const,
+  detail: (id: number) => [...datasetKeys.details(), id] as const,
   images: (id: number, filters: ImageFilters) =>
     [...datasetKeys.detail(id), "images", filters] as const,
   image: (id: number, imageId: number) =>
@@ -253,16 +275,25 @@ export function isActiveImport(job: Pick<DatasetImport, "status">) {
   return ACTIVE_STATUSES.has(job.status)
 }
 
-/** 数据集列表；有导入正在进行时每 3 秒刷新一次，以更新卡片上的进度。 */
-export function datasetsQuery(q = "") {
+/** 列表中有导入正在进行时每 3 秒刷新一次，以更新卡片上的进度。 */
+export function activeImportRefetchInterval(query: {
+  state: { data?: ListResponse<Dataset> }
+}) {
+  return query.state.data?.items.some((dataset) => dataset.active_import)
+    ? 3_000
+    : false
+}
+
+/** 数据集列表，可按名称 / 描述（`q`）与所属项目筛选。 */
+export function datasetsQuery(q = "", project: DatasetProjectFilter = null) {
   return queryOptions({
-    queryKey: datasetKeys.list(q),
+    queryKey: datasetKeys.list(q, project),
     queryFn: ({ signal }) =>
-      apiGet<ListResponse<Dataset>>(withQuery(BASE, { q }), { signal }),
-    refetchInterval: (query) =>
-      query.state.data?.items.some((dataset) => dataset.active_import)
-        ? 3_000
-        : false,
+      apiGet<ListResponse<Dataset>>(
+        withQuery(BASE, { q, project_id: project ?? "" }),
+        { signal }
+      ),
+    refetchInterval: activeImportRefetchInterval,
   })
 }
 
@@ -392,6 +423,13 @@ export function deleteDataset(id: number, deleteFiles: boolean) {
     "DELETE",
     deleteFiles ? `${datasetPath(id)}?delete_files=true` : datasetPath(id)
   )
+}
+
+/** 设置数据集纳入的项目（整体替换），返回更新后的数据集。 */
+export function setDatasetProjects(id: number, projectIds: number[]) {
+  return apiSend<Dataset>("PUT", `${datasetPath(id)}/projects`, {
+    project_ids: projectIds,
+  })
 }
 
 export function scanDataset(id: number) {

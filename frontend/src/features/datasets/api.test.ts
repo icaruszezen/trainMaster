@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { deleteDataset, imagesQuery } from "@/features/datasets/api"
+import {
+  datasetsQuery,
+  deleteDataset,
+  imagesQuery,
+  parseProjectFilter,
+  setDatasetProjects,
+} from "@/features/datasets/api"
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -63,5 +69,62 @@ describe("imagesQuery", () => {
     expect(requestOf(fetchMock).path).toBe(
       "/api/v1/datasets/3/images?offset=0&limit=60&status=invalid"
     )
+  })
+})
+
+describe("datasetsQuery", () => {
+  async function pathOf(options: { queryFn?: unknown }) {
+    const fetchMock = mockFetch(() => Response.json({ items: [], total: 0 }))
+    await (options.queryFn as (context: unknown) => Promise<unknown>)({
+      signal: new AbortController().signal,
+    })
+    return requestOf(fetchMock).path
+  }
+
+  it("filters by project", async () => {
+    expect(await pathOf(datasetsQuery())).toBe("/api/v1/datasets")
+    expect(await pathOf(datasetsQuery("", 12))).toBe(
+      "/api/v1/datasets?project_id=12"
+    )
+    expect(await pathOf(datasetsQuery("划痕", "none"))).toBe(
+      "/api/v1/datasets?q=%E5%88%92%E7%97%95&project_id=none"
+    )
+  })
+
+  it("caches each filter separately", () => {
+    const keys = [
+      datasetsQuery().queryKey,
+      datasetsQuery("", 12).queryKey,
+      datasetsQuery("", "none").queryKey,
+    ].map((key) => JSON.stringify(key))
+    expect(new Set(keys).size).toBe(3)
+  })
+})
+
+describe("setDatasetProjects", () => {
+  it("replaces the projects of a dataset", async () => {
+    const fetchMock = mockFetch(() => Response.json({ id: 3, projects: [] }))
+    await setDatasetProjects(3, [])
+    const [path, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ]
+    expect(path).toBe("/api/v1/datasets/3/projects")
+    expect(init.method).toBe("PUT")
+    expect(JSON.parse(String(init.body))).toEqual({ project_ids: [] })
+  })
+})
+
+describe("parseProjectFilter", () => {
+  it("accepts project ids and none", () => {
+    expect(parseProjectFilter("12")).toBe(12)
+    expect(parseProjectFilter("none")).toBe("none")
+  })
+
+  it("ignores anything else", () => {
+    for (const value of [null, "", "0", "-1", "012", "1.5", "abc", "None"]) {
+      expect(parseProjectFilter(value), String(value)).toBeNull()
+    }
+    expect(parseProjectFilter("99999999999999999")).toBeNull()
   })
 })

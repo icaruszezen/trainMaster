@@ -6,6 +6,7 @@ import {
   Clock,
   Copy,
   DatabaseZap,
+  FolderKanban,
   FolderX,
   ImagePlus,
   Images,
@@ -60,6 +61,8 @@ import { DatasetLabels } from "@/features/datasets/dataset-labels"
 import { ImportDialog } from "@/features/datasets/import-dialog"
 import { ImportProgressCard } from "@/features/datasets/import-progress-card"
 import { LoadError } from "@/features/datasets/load-error"
+import { DatasetProjectBadges } from "@/features/projects/dataset-project-badges"
+import { DatasetProjectsDialog } from "@/features/projects/dataset-projects-dialog"
 import { usePageTitle } from "@/hooks/use-page-title"
 import { ApiError } from "@/lib/api"
 import { copyText } from "@/lib/clipboard"
@@ -188,6 +191,7 @@ function DatasetDetail({ id }: { id: number }) {
   const [importKey, setImportKey] = useState(0)
   const [editing, setEditing] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [assigning, setAssigning] = useState(false)
 
   usePageTitle(query.data?.name)
 
@@ -241,12 +245,16 @@ function DatasetDetail({ id }: { id: number }) {
                 dataset={dataset}
                 onEdit={() => setEditing(true)}
                 onDelete={() => setDeleting(true)}
+                onManageProjects={() => setAssigning(true)}
                 className="size-9"
               />
             </>
           }
         />
-        <DatasetMeta dataset={dataset} />
+        <DatasetMeta
+          dataset={dataset}
+          onManageProjects={() => setAssigning(true)}
+        />
       </div>
 
       {dataset.directory_missing && (
@@ -320,11 +328,21 @@ function DatasetDetail({ id }: { id: number }) {
         onOpenChange={setDeleting}
         onDeleted={() => navigate("/datasets", { replace: true })}
       />
+      <DatasetProjectsDialog
+        dataset={assigning ? dataset : null}
+        onOpenChange={setAssigning}
+      />
     </>
   )
 }
 
-function DatasetMeta({ dataset }: { dataset: Dataset }) {
+function DatasetMeta({
+  dataset,
+  onManageProjects,
+}: {
+  dataset: Dataset
+  onManageProjects: () => void
+}) {
   const [copied, setCopied] = useState(false)
 
   const copyPath = async () => {
@@ -358,6 +376,18 @@ function DatasetMeta({ dataset }: { dataset: Dataset }) {
           </TooltipTrigger>
           <TooltipContent>{copied ? "已复制" : "复制路径"}</TooltipContent>
         </Tooltip>
+      </span>
+      <span className="inline-flex min-w-0 items-center gap-1.5">
+        <DatasetProjectBadges projects={dataset.projects} max={3} />
+        <Button
+          variant="ghost"
+          size="xs"
+          onClick={onManageProjects}
+          className="text-muted-foreground"
+        >
+          <FolderKanban />
+          {dataset.projects.length > 0 ? "管理项目" : "纳入项目"}
+        </Button>
       </span>
       <span title={formatDateTime(dataset.created_at)}>
         创建于 {formatRelativeTime(dataset.created_at)}

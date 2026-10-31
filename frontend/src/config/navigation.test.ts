@@ -65,6 +65,7 @@ describe("findActiveNavItem", () => {
     expect(activeId("/datasets/versions")).toBe("dataset-versions")
     expect(activeId("/datasets/versions/42")).toBe("dataset-versions")
     expect(activeId("/datasets/123")).toBe("datasets")
+    expect(activeId("/projects/7")).toBe("projects")
     expect(activeId("/models/inference")).toBe("inference")
     expect(activeId("/models/abc")).toBe("models")
   })

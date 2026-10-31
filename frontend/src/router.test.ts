@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest"
 import { navItems } from "@/config/navigation"
 import { DatasetDetailPage } from "@/features/datasets/dataset-detail-page"
 import { DatasetVersionsPage } from "@/features/datasets/dataset-versions-page"
+import { ProjectDetailPage } from "@/features/projects/project-detail-page"
 import { NotFoundPage } from "@/pages/not-found-page"
 import { pages, routes } from "@/router"
 
@@ -37,6 +38,12 @@ describe("routes", () => {
     expect(leafComponent("/datasets/123")).toBe(DatasetDetailPage)
     expect(leafComponent("/datasets/versions")).toBe(DatasetVersionsPage)
     expect(leaf("/datasets/123")?.handle).toBeUndefined()
+  })
+
+  it("routes project ids to the project detail page", () => {
+    expect(leafComponent("/projects/7")).toBe(ProjectDetailPage)
+    expect(leafComponent("/projects/7/extra")).toBe(NotFoundPage)
+    expect(leaf("/projects/7")?.handle).toBeUndefined()
   })
 
   it("marks only the 404 route as not found", () => {

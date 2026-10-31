@@ -52,25 +52,26 @@ const (
 
 // Dataset is a folder of images under the storage directory datasets/.
 type Dataset struct {
-	ID               int64      `json:"id"`
-	Name             string     `json:"name"`
-	Description      string     `json:"description"`
-	DirName          string     `json:"dir_name"`
-	Path             string     `json:"path"` // absolute folder path on the server
-	Origin           string     `json:"origin"`
-	DirectoryMissing bool       `json:"directory_missing"`
-	ImageCount       int        `json:"image_count"`
-	AnnotatedCount   int        `json:"annotated_count"` // VOC file with >= 1 object
-	EmptyCount       int        `json:"empty_count"`     // VOC file with 0 objects
-	InvalidCount     int        `json:"invalid_count"`   // VOC file that cannot be parsed
-	ObjectCount      int        `json:"object_count"`
-	LabelCount       int        `json:"label_count"`
-	TotalBytes       int64      `json:"total_bytes"`
-	Covers           []ImageRef `json:"covers"`        // up to 4 images for the card mosaic
-	ActiveImport     *Import    `json:"active_import"` // latest uploading/queued/running job
-	ScannedAt        *time.Time `json:"scanned_at"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	ID               int64        `json:"id"`
+	Name             string       `json:"name"`
+	Description      string       `json:"description"`
+	DirName          string       `json:"dir_name"`
+	Path             string       `json:"path"` // absolute folder path on the server
+	Origin           string       `json:"origin"`
+	DirectoryMissing bool         `json:"directory_missing"`
+	ImageCount       int          `json:"image_count"`
+	AnnotatedCount   int          `json:"annotated_count"` // VOC file with >= 1 object
+	EmptyCount       int          `json:"empty_count"`     // VOC file with 0 objects
+	InvalidCount     int          `json:"invalid_count"`   // VOC file that cannot be parsed
+	ObjectCount      int          `json:"object_count"`
+	LabelCount       int          `json:"label_count"`
+	TotalBytes       int64        `json:"total_bytes"`
+	Covers           []ImageRef   `json:"covers"`        // up to 4 images for the card mosaic
+	Projects         []ProjectRef `json:"projects"`      // the projects that include the dataset, by name
+	ActiveImport     *Import      `json:"active_import"` // latest uploading/queued/running job
+	ScannedAt        *time.Time   `json:"scanned_at"`
+	CreatedAt        time.Time    `json:"created_at"`
+	UpdatedAt        time.Time    `json:"updated_at"`
 }
 
 // ImageRef identifies an image and the version of its file, for
@@ -78,6 +79,12 @@ type Dataset struct {
 type ImageRef struct {
 	ID      int64  `json:"id"`
 	Version string `json:"version"`
+}
+
+// ProjectRef names a project a dataset belongs to (internal/project).
+type ProjectRef struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
 }
 
 // Image is an indexed image of a dataset.
@@ -194,6 +201,10 @@ const (
 func fileVersion(size int64, modTime time.Time) string {
 	return strconv.FormatInt(modTime.UnixMicro(), 36) + "-" + strconv.FormatInt(size, 36)
 }
+
+// ImageVersion is fileVersion for other packages that reference images
+// (e.g. the cover images of a project).
+func ImageVersion(size int64, modTime time.Time) string { return fileVersion(size, modTime) }
 
 // dbTime truncates a file time to what a timestamptz column keeps.
 func dbTime(t time.Time) time.Time { return time.UnixMicro(t.UnixMicro()).UTC() }

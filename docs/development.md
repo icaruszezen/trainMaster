@@ -84,7 +84,7 @@ CI（`.github/workflows/ci.yml`）在每次 push 到 main 和每个 Pull Request
 
 以实现“标签体系”模块为例（数据集模块 `internal/dataset` + `internal/httpapi/datasets.go` 是一个完整的参考实现）：
 
-1. **建表**：新增迁移文件 `backend/internal/database/migrations/0003_create_labels.sql`（编号连续，不要修改已有文件，不要写 `BEGIN/COMMIT`），约定见 [架构说明 · 数据库迁移约定](architecture.md#7-数据库迁移约定)。
+1. **建表**：新增迁移文件 `backend/internal/database/migrations/0004_create_labels.sql`（编号连续，不要修改已有文件，不要写 `BEGIN/COMMIT`），约定见 [架构说明 · 数据库迁移约定](architecture.md#7-数据库迁移约定)。
 2. **写 handler**：在 `backend/internal/httpapi/` 下新建 `labels.go`。成功时用 `writeJSON` 返回资源对象，列表用 `NewList(items, total)`，失败时用 `writeError(w, status, code, message)`（`message` 用中文，面向用户）。
 3. **注入依赖**：handler 需要数据库或存储时，在 `Options` / `server` 中增加所需依赖（例如 `*database.DB`，或按功能定义的小接口，便于测试时替换）。文件路径一律通过 `storage.Resolve(key, rel)` 得到，数据库中只存相对路径。
 4. **注册路由**：在 `router.go` 的 `/v1` 路由组中挂载新路由，并从 `plannedModules` 中删除对应的占位项：

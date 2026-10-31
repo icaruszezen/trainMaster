@@ -168,12 +168,12 @@ func TestIntegrationCreateAndUpdateDataset(t *testing.T) {
 	_, err = e.svc.UpdateDataset(ctx, 999999, UpdateDatasetInput{Name: &newName})
 	wantKind(t, err, ErrNotFound, "数据集不存在")
 
-	list, err := e.svc.ListDatasets(ctx, "")
+	list, err := e.svc.ListDatasets(ctx, DatasetQuery{})
 	if err != nil || len(list) != 2 || list[0].ID != d.ID || list[1].ID != other.ID {
 		t.Errorf("ListDatasets = %+v, %v", list, err)
 	}
 	for q, want := range map[string]int{"新": 1, "更新后": 1, "OTH": 1, "zzz": 0, " ": 2} {
-		if list, err := e.svc.ListDatasets(ctx, q); err != nil || len(list) != want {
+		if list, err := e.svc.ListDatasets(ctx, DatasetQuery{Search: q}); err != nil || len(list) != want {
 			t.Errorf("ListDatasets(%q) returned %d datasets, %v; want %d", q, len(list), err, want)
 		}
 	}
@@ -810,6 +810,19 @@ func TestIntegrationRecoveryAndJanitor(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// The rest of the janitor's pass (the expired upload's staging folder,
+	// leftovers of failed deletes) finishes after the expiry is visible.
+	gone := func(path string) bool {
+		_, err := os.Stat(path)
+		return os.IsNotExist(err)
+	}
+	trash := filepath.Join(e.datasetsDir(), deletingPrefix+"77")
+	for deadline = time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if gone(e.svc.stagingDir(stale.ID)) && gone(trash) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if job, _ := e.svc.GetImport(ctx, d.ID, uploading.ID); job.Status != StatusUploading {
 		t.Errorf("active upload = %+v", job)
 	}
@@ -821,7 +834,7 @@ func TestIntegrationRecoveryAndJanitor(t *testing.T) {
 	if _, err := os.Stat(e.svc.stagingDir(uploading.ID)); err != nil {
 		t.Errorf("staging of an active upload was removed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(e.datasetsDir(), deletingPrefix+"77")); !os.IsNotExist(err) {
+	if _, err := os.Stat(trash); !os.IsNotExist(err) {
 		t.Errorf("leftover of a failed delete remains: %v", err)
 	}
 }
