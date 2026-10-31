@@ -413,6 +413,21 @@ describe("placeOverlay", () => {
       )
     ).toEqual({ x: 100, y: 8 })
   })
+
+  it("fits exactly when its height is capped to the canvas minus the margins", () => {
+    // The label picker caps its height at 100% - 2 * margin on short canvases.
+    const short = { width: 667, height: 175 }
+    const capped = { width: 256, height: 175 - 16 }
+    for (const [top, bottom] of [
+      [0, 20],
+      [70, 100],
+      [150, 175],
+    ]) {
+      const { y } = placeOverlay({ x: 100, top, bottom, bounds: short }, capped)
+      expect(y).toBe(8)
+      expect(y + capped.height).toBe(short.height - 8)
+    }
+  })
 })
 
 describe("nearestScrollTop", () => {

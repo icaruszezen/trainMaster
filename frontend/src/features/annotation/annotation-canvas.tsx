@@ -107,7 +107,10 @@ type Drag =
     }
   | {
       kind: "draw"
-      /** 按下的指针；两次单击模式中松开后为 null。 */
+      /**
+       * 按下的指针；两次单击模式中第一次单击松开后为 null，第二次按下时又是
+       * 这个指针（松开时完成）。
+       */
       pointerId: number | null
       anchor: Point
       current: Point
@@ -263,6 +266,16 @@ export function AnnotationCanvas({
       onViewportChange(viewport)
     }
   }, [viewport, onViewportChange])
+
+  // 打开图片时（刚进入编辑器、用快捷键切换图片后）焦点不在任何元素上就让画布
+  // 获得焦点，Tab 随即可以依次选中框。焦点在输入框、对话框、图片列表等处时不
+  // 抢走它。画布不是输入控件，获得焦点不会弹出屏幕键盘，也不滚动页面。
+  useEffect(() => {
+    const focused = document.activeElement
+    if (focused === null || focused === document.body) {
+      containerRef.current?.focus({ preventScroll: true })
+    }
+  }, [containerRef])
 
   // 滚轮缩放：需要非被动监听才能阻止浏览器缩放整个页面。
   useEffect(() => {
@@ -521,9 +534,16 @@ export function AnnotationCanvas({
 
     const point = toImage(viewport, screen)
 
-    // 两次单击画框的第二次单击。
+    // 两次单击画框的第二次单击：松开时完成（见 onPointerUp）。按下时就完成的话，
+    // 弹出的类别选择框（类别列表为空时）刚获得焦点，随后的 mousedown 就把焦点
+    // 移回画布、关掉了它，框也随之丢弃。
     if (drag?.kind === "draw" && drag.click && canDraw) {
-      finishDraw(drag.anchor, drawPoint(drag.anchor, point, event.shiftKey))
+      element.setPointerCapture(event.pointerId)
+      setDrag({
+        ...drag,
+        pointerId: event.pointerId,
+        current: drawPoint(drag.anchor, point, event.shiftKey),
+      })
       return
     }
 
@@ -707,6 +727,10 @@ export function AnnotationCanvas({
         return
       case "draw": {
         if (drag.pointerId !== event.pointerId) {
+          return
+        }
+        if (drag.click) {
+          finishDraw(drag.anchor, drag.current) // 两次单击画框的第二次单击
           return
         }
         const screen = local(event)
