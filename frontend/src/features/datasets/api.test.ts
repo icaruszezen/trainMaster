@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
+  createExport,
+  createImport,
   datasetsQuery,
   deleteDataset,
   imagesQuery,
+  lastYoloImportQuery,
   parseProjectFilter,
   setDatasetProjects,
 } from "@/features/datasets/api"
@@ -126,5 +129,73 @@ describe("parseProjectFilter", () => {
       expect(parseProjectFilter(value), String(value)).toBeNull()
     }
     expect(parseProjectFilter("99999999999999999")).toBeNull()
+  })
+})
+
+describe("createImport", () => {
+  it("sends the annotation format and class order", async () => {
+    const fetchMock = mockFetch(() => Response.json({}, { status: 201 }))
+    await createImport(4, {
+      source: "folder",
+      file_name: "batch",
+      file_size: 100,
+      file_count: 3,
+      annotation_format: "yolo",
+      classes: ["scratch", "dent"],
+    })
+    const [path, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ]
+    expect(path).toBe("/api/v1/datasets/4/imports")
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      annotation_format: "yolo",
+      classes: ["scratch", "dent"],
+    })
+  })
+})
+
+describe("createExport", () => {
+  it("posts the format and returns the download link", async () => {
+    const link = {
+      url: "/api/v1/datasets/4/exports/abc",
+      file_name: "划痕-A-yolo.zip",
+      expires_at: "2026-10-31T03:00:00Z",
+    }
+    const fetchMock = mockFetch(() => Response.json(link, { status: 201 }))
+    await expect(
+      createExport(4, { format: "yolo", classes: ["scratch"] })
+    ).resolves.toEqual(link)
+    const [path, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ]
+    expect(path).toBe("/api/v1/datasets/4/exports")
+    expect(init.method).toBe("POST")
+    expect(JSON.parse(init.body as string)).toEqual({
+      format: "yolo",
+      classes: ["scratch"],
+    })
+  })
+})
+
+describe("lastYoloImportQuery", () => {
+  const run = (id: number) =>
+    (lastYoloImportQuery(id).queryFn as (context: unknown) => Promise<unknown>)(
+      { signal: new AbortController().signal }
+    )
+
+  it("asks for the newest successful YOLO import", async () => {
+    const job = { id: 7, annotation_format: "yolo", classes: ["划痕", "凹坑"] }
+    const fetchMock = mockFetch(() => Response.json({ items: [job], total: 3 }))
+    await expect(run(5)).resolves.toEqual(job)
+    expect(requestOf(fetchMock).path).toBe(
+      "/api/v1/datasets/5/imports?annotation_format=yolo&status=succeeded&limit=1"
+    )
+  })
+
+  it("is null when there is none", async () => {
+    mockFetch(() => Response.json({ items: [], total: 0 }))
+    await expect(run(5)).resolves.toBeNull()
   })
 })

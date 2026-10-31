@@ -685,9 +685,21 @@ func TestIntegrationUploadProtocol(t *testing.T) {
 	_, err = e.svc.GetImport(ctx, 999999, job.ID)
 	wantKind(t, err, ErrNotFound, "数据集不存在")
 
-	jobs, total, err := e.svc.ListImports(ctx, d.ID, 1)
+	jobs, total, err := e.svc.ListImports(ctx, d.ID, ImportQuery{Limit: 1})
 	if err != nil || total != 1 || len(jobs) != 1 || jobs[0].ID != job.ID {
 		t.Errorf("ListImports = %+v, %d, %v", jobs, total, err)
+	}
+	for _, q := range []ImportQuery{{Format: FormatVOC, Status: StatusCanceled}, {Status: StatusCanceled}} {
+		q.Limit = 5
+		if jobs, total, err := e.svc.ListImports(ctx, d.ID, q); err != nil || total != 1 || len(jobs) != 1 {
+			t.Errorf("ListImports(%+v) = %+v, %d, %v", q, jobs, total, err)
+		}
+	}
+	for _, q := range []ImportQuery{{Format: FormatYOLO}, {Status: StatusSucceeded}} {
+		q.Limit = 5
+		if jobs, total, err := e.svc.ListImports(ctx, d.ID, q); err != nil || total != 0 || len(jobs) != 0 {
+			t.Errorf("ListImports(%+v) = %+v, %d, %v", q, jobs, total, err)
+		}
 	}
 }
 

@@ -45,6 +45,10 @@ type CreateImportInput struct {
 	FileSize   int64  // archive size, or total size of the folder's files
 	FileCount  int    // number of files (folder)
 	OnConflict string // ConflictSkip (default) or ConflictOverwrite
+	// AnnotationFormat of the uploaded annotations (FormatVOC by default);
+	// they are converted to VOC. YOLO needs Classes, the names by class id.
+	AnnotationFormat string
+	Classes          []string
 }
 
 // CreateImport creates an import job in state uploading and prepares its
@@ -111,6 +115,10 @@ func validateImportInput(datasetID int64, in CreateImportInput) (newImport, erro
 	case ConflictSkip, ConflictOverwrite:
 	default:
 		return invalid("同名文件处理方式必须是 skip（跳过）或 overwrite（覆盖）")
+	}
+	var err error
+	if n.Format, n.Classes, err = normalizeFormat(in.AnnotationFormat, in.Classes, "标注"); err != nil {
+		return newImport{}, err
 	}
 	return n, nil
 }
@@ -184,18 +192,27 @@ func (s *Service) getImport(ctx context.Context, q querier, datasetID, importID 
 	return job, err
 }
 
-// ListImports returns the newest jobs of a dataset and the number of all
-// its jobs.
-func (s *Service) ListImports(ctx context.Context, datasetID int64, limit int) ([]Import, int, error) {
+// ImportQuery selects the jobs ListImports returns.
+type ImportQuery struct {
+	Format string // only jobs of this annotation format ("" for all)
+	Status string // only jobs in this status ("" for all)
+	Limit  int
+}
+
+// ListImports returns the newest jobs of a dataset matching q and the
+// number of all its jobs that match.
+func (s *Service) ListImports(ctx context.Context, datasetID int64, q ImportQuery) ([]Import, int, error) {
 	if _, err := queryDataset(ctx, s.db, datasetID, false); err != nil {
 		return nil, 0, err
 	}
+	const where = ` FROM dataset_imports WHERE dataset_id = $1
+		AND ($2 = '' OR annotation_format = $2) AND ($3 = '' OR status = $3)`
 	var total int
-	if err := s.db.QueryRow(ctx, "SELECT count(*) FROM dataset_imports WHERE dataset_id = $1", datasetID).Scan(&total); err != nil {
+	if err := s.db.QueryRow(ctx, "SELECT count(*)"+where, datasetID, q.Format, q.Status).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	jobs, err := collectImports(s.db.Query(ctx, "SELECT "+importColumns+` FROM dataset_imports
-		WHERE dataset_id = $1 ORDER BY id DESC LIMIT $2`, datasetID, limit))
+	jobs, err := collectImports(s.db.Query(ctx, "SELECT "+importColumns+where+" ORDER BY id DESC LIMIT $4",
+		datasetID, q.Format, q.Status, q.Limit))
 	return jobs, total, err
 }
 
@@ -319,9 +336,10 @@ func (s *Service) WriteArchiveChunk(ctx context.Context, datasetID, importID, of
 type FileSource func() (rel string, content io.Reader, err error)
 
 // AddFolderFiles stores uploaded files of a folder import in its staging
-// folder. Files that are neither images nor XML are skipped. Uploading the
-// same path again replaces the earlier copy without counting it twice, so
-// clients can retry a failed request as a whole.
+// folder. Files that are neither images nor annotation files of the job's
+// format are skipped. Uploading the same path again replaces the earlier
+// copy without counting it twice, so clients can retry a failed request as
+// a whole.
 func (s *Service) AddFolderFiles(ctx context.Context, datasetID, importID int64, next FileSource) (Import, error) {
 	job, err := s.GetImport(ctx, datasetID, importID)
 	if err != nil {
@@ -357,7 +375,7 @@ func (s *Service) AddFolderFiles(ctx context.Context, datasetID, importID int64,
 			if !ok {
 				return newError(ErrBadRequest, "文件路径无效：%s", rel)
 			}
-			if classify(clean) == kindIgnored {
+			if classifyFor(clean, job.AnnotationFormat) == kindIgnored {
 				continue
 			}
 			files, bytes, err := s.storeFolderFile(ctx, importID, partsDir, filepath.Join(staging, stagedFilesDir), clean, content)

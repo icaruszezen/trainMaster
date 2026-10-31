@@ -5,12 +5,26 @@ import type {
   ImportStatus,
   ImportSummaryKey,
 } from "@/features/datasets/api"
+import { annotationFormatNames } from "@/features/datasets/files"
 import { formatBytes, formatNumber, percentOf } from "@/lib/format"
 
 export const sourceLabels: Record<ImportSource, string> = {
   archive: "压缩包",
   folder: "文件夹",
   scan: "扫描",
+}
+
+/** 导入任务上传内容的标注格式简称（如“YOLO”）；扫描任务没有，返回 null。 */
+export function importFormatLabel(
+  job: Pick<DatasetImport, "source" | "annotation_format">
+): string | null {
+  if (job.source === "scan") {
+    return null
+  }
+  // 兼容没有记录格式的旧任务。
+  return (
+    annotationFormatNames[job.annotation_format] ?? annotationFormatNames.voc
+  )
 }
 
 export const statusLabels: Record<ImportStatus, string> = {
@@ -45,6 +59,8 @@ export function stageLabel(job: Pick<DatasetImport, "status" | "stage">) {
       switch (job.stage) {
         case "extracting":
           return "正在解压"
+        case "converting":
+          return "正在转换标注"
         case "importing":
           return "正在导入"
         case "scanning":
@@ -108,10 +124,19 @@ const namesInvalidPart: SummaryPart = [
 
 const importParts: SummaryPart[] = [
   ["images_added", (n) => `新增 ${formatNumber(n)} 张图片`],
+  ["annotations_converted", (n) => `转换 ${formatNumber(n)} 个标注为 VOC`],
   ["annotations_matched", (n) => `匹配 ${formatNumber(n)} 个标注`],
   ["images_replaced", (n) => `覆盖 ${formatNumber(n)} 张同名图片`],
   ["images_skipped", (n) => `跳过 ${formatNumber(n)} 张同名图片`],
   ["annotations_invalid", (n) => `${formatNumber(n)} 个标注无法解析`],
+  [
+    "annotations_failed",
+    (n) => `${formatNumber(n)} 个标注文件无法转换（对应图片按未标注导入）`,
+  ],
+  [
+    "objects_skipped",
+    (n) => `跳过 ${formatNumber(n)} 个无法转换为矩形框的目标`,
+  ],
   ["annotations_orphaned", (n) => `${formatNumber(n)} 个标注没有对应图片`],
   ["files_ignored", (n) => `忽略 ${formatNumber(n)} 个其他文件`],
   ["entries_unsafe", (n) => `${formatNumber(n)} 个不安全路径已跳过`],

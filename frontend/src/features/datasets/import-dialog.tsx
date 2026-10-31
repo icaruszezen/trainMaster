@@ -1,4 +1,4 @@
-import { useId, useState, type FormEvent } from "react"
+import { useId, useRef, useState, type FormEvent } from "react"
 import { FileArchive, FolderUp } from "lucide-react"
 import { toast } from "sonner"
 
@@ -20,10 +20,15 @@ import {
   type ConflictPolicy,
   type Dataset,
 } from "@/features/datasets/api"
+import {
+  ImportFormatFields,
+  useImportFormat,
+} from "@/features/datasets/import-format-fields"
 import { refreshStartedImport } from "@/features/datasets/import-watch"
 import {
   ArchivePicker,
   FolderPicker,
+  useFolderSummary,
   type FolderSelection,
 } from "@/features/datasets/source-pickers"
 import {
@@ -64,22 +69,36 @@ export function ImportDialog({
   onOpenChange,
 }: ImportDialogProps) {
   const conflictId = useId()
+  const classFieldRef = useRef<HTMLTextAreaElement>(null)
   const [tab, setTab] = useState<ImportTab>("archive")
   const [archive, setArchive] = useState<File | null>(null)
   const [folder, setFolder] = useState<FolderSelection | null>(null)
   const [onConflict, setOnConflict] = useState<ConflictPolicy>("skip")
+  const [submitted, setSubmitted] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const annotation = useImportFormat()
+  const folderSummary = useFolderSummary(folder, annotation.format)
 
   const hasSource =
     tab === "archive"
       ? archive !== null
-      : folder !== null && folder.summary.images > 0
-  const dirty = archive !== null || folder !== null
+      : folderSummary !== null && folderSummary.images > 0
+  const dirty = archive !== null || folder !== null || annotation.dirty
+
+  const selectFolder = (selection: FolderSelection | null) => {
+    setFolder(selection)
+    annotation.prefillFromFolder(selection)
+  }
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     if (submitting || !hasSource) {
+      return
+    }
+    setSubmitted(true)
+    if (annotation.invalid) {
+      classFieldRef.current?.focus()
       return
     }
     setSubmitting(true)
@@ -91,16 +110,18 @@ export function ImportDialog({
           file_name: archive.name,
           file_size: archive.size,
           on_conflict: onConflict,
+          ...annotation.importFields,
         })
         startArchiveUpload({ dataset, job, file: archive })
-      } else if (folder) {
-        const { uploads, uploadBytes } = folder.summary
+      } else if (folder && folderSummary) {
+        const { uploads, uploadBytes } = folderSummary
         const job = await createImport(dataset.id, {
           source: "folder",
           file_name: folder.name || dataset.dir_name,
           file_size: uploadBytes,
           file_count: uploads.length,
           on_conflict: onConflict,
+          ...annotation.importFields,
         })
         startFolderUpload({ dataset, job, files: uploads })
       }
@@ -145,8 +166,8 @@ export function ImportDialog({
               <code className="font-mono text-foreground">
                 datasets/{dataset.dir_name}/
               </code>
-              ，保持原有的子目录结构；同目录、同名的 .xml 会作为 VOC
-              标注一并导入。
+              ，保持原有的子目录结构。标注可以是 VOC、X-AnyLabeling 或 YOLO
+              格式，导入后统一转换为 VOC（.xml）保存。
             </DialogDescription>
           </DialogHeader>
 
@@ -155,6 +176,8 @@ export function ImportDialog({
             onValueChange={(value) => {
               setTab(value as ImportTab)
               setError(null)
+              // 文件夹里的 classes.txt 只对上传文件夹有效。
+              annotation.prefillFromFolder(value === "folder" ? folder : null)
             }}
             className="min-w-0 gap-4"
           >
@@ -172,17 +195,28 @@ export function ImportDialog({
               <ArchivePicker
                 file={archive}
                 onChange={setArchive}
+                format={annotation.format}
                 disabled={submitting}
               />
             </TabsContent>
             <TabsContent value="folder">
               <FolderPicker
                 selection={folder}
-                onChange={setFolder}
+                summary={folderSummary}
+                onChange={selectFolder}
+                format={annotation.format}
+                onFormatChange={annotation.setFormat}
                 disabled={submitting}
               />
             </TabsContent>
           </Tabs>
+
+          <ImportFormatFields
+            state={annotation}
+            showErrors={submitted}
+            disabled={submitting}
+            classFieldRef={classFieldRef}
+          />
 
           <div className="grid gap-3">
             <Label id={conflictId}>同名文件</Label>

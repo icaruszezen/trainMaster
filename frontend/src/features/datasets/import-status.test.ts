@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import type { DatasetImport } from "@/features/datasets/api"
 import {
+  importFormatLabel,
   jobDurationSeconds,
   jobPercent,
   progressDetail,
@@ -16,6 +17,8 @@ function job(overrides: Partial<DatasetImport> = {}): DatasetImport {
     source: "archive",
     status: "running",
     on_conflict: "skip",
+    annotation_format: "voc",
+    classes: [],
     file_name: "batch.zip",
     file_size: 1000,
     file_count: 0,
@@ -38,10 +41,27 @@ describe("stageLabel", () => {
     expect(stageLabel(job({ status: "uploading" }))).toBe("等待上传")
     expect(stageLabel(job({ status: "queued", stage: "" }))).toBe("等待处理")
     expect(stageLabel(job({ stage: "extracting" }))).toBe("正在解压")
+    expect(stageLabel(job({ stage: "converting" }))).toBe("正在转换标注")
     expect(stageLabel(job({ stage: "importing" }))).toBe("正在导入")
     expect(stageLabel(job({ stage: "scanning" }))).toBe("正在扫描")
     expect(stageLabel(job({ stage: "" }))).toBe("正在处理")
     expect(stageLabel(job({ status: "failed" }))).toBe("失败")
+  })
+})
+
+describe("importFormatLabel", () => {
+  it("names the annotation format of archive and folder imports", () => {
+    expect(importFormatLabel(job({ annotation_format: "yolo" }))).toBe("YOLO")
+    expect(
+      importFormatLabel(
+        job({ source: "folder", annotation_format: "xanylabeling" })
+      )
+    ).toBe("X-AnyLabeling")
+    expect(importFormatLabel(job({ annotation_format: "voc" }))).toBe("VOC")
+  })
+
+  it("returns null for scans", () => {
+    expect(importFormatLabel(job({ source: "scan" }))).toBeNull()
   })
 })
 
@@ -93,6 +113,12 @@ describe("jobPercent and progressDetail", () => {
     expect(
       jobPercent(job({ progress: { done: 1, total: 4, unit: "files" } }))
     ).toBe(25)
+    const converting = job({
+      stage: "converting",
+      progress: { done: 30, total: 120, unit: "files" },
+    })
+    expect(jobPercent(converting)).toBe(25)
+    expect(progressDetail(converting)).toBe("30 / 120 个文件")
   })
 
   it("is indeterminate when the total is unknown or the job is queued", () => {
@@ -119,6 +145,30 @@ describe("summaryText", () => {
         })
       )
     ).toBe("新增 120 张图片，匹配 118 个标注，跳过 2 张同名图片")
+  })
+
+  it("summarises converted annotations and conversion problems", () => {
+    expect(
+      summaryText(
+        job({
+          status: "succeeded",
+          annotation_format: "yolo",
+          summary: {
+            images_added: 120,
+            annotations_converted: 117,
+            annotations_matched: 117,
+            annotations_failed: 2,
+            objects_skipped: 5,
+            annotations_orphaned: 1,
+            files_ignored: 3,
+          },
+        })
+      )
+    ).toBe(
+      "新增 120 张图片，转换 117 个标注为 VOC，匹配 117 个标注，" +
+        "2 个标注文件无法转换（对应图片按未标注导入），" +
+        "跳过 5 个无法转换为矩形框的目标，1 个标注没有对应图片，忽略 3 个其他文件"
+    )
   })
 
   it("always mentions added images for imports", () => {

@@ -35,6 +35,7 @@ type DatasetTableProps = {
   onEdit: (dataset: Dataset) => void
   onDelete: (dataset: Dataset) => void
   onManageProjects: (dataset: Dataset) => void
+  onDownload: (dataset: Dataset) => void
 }
 
 export function DatasetTable({
@@ -43,6 +44,7 @@ export function DatasetTable({
   onEdit,
   onDelete,
   onManageProjects,
+  onDownload,
 }: DatasetTableProps) {
   const navigate = useNavigate()
 
@@ -170,6 +172,7 @@ export function DatasetTable({
                   <DatasetActionsMenu
                     dataset={dataset}
                     onScan={() => onScan(dataset)}
+                    onDownload={() => onDownload(dataset)}
                     onEdit={() => onEdit(dataset)}
                     onDelete={() => onDelete(dataset)}
                     onManageProjects={() => onManageProjects(dataset)}

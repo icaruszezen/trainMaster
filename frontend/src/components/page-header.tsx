@@ -19,7 +19,9 @@ export function PageHeader({ title, description, actions }: PageHeaderProps) {
         )}
       </div>
       {actions && (
-        <div className="flex shrink-0 items-center gap-2">{actions}</div>
+        <div className="flex max-w-full flex-wrap items-center gap-2">
+          {actions}
+        </div>
       )}
     </div>
   )

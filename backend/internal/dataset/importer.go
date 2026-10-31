@@ -59,6 +59,10 @@ type importSummary struct {
 	Unsafe                   int
 	NamesInvalid             int // found while indexing the dataset folder afterwards
 	archive                  bool
+	// Conversion of X-AnyLabeling / YOLO annotations (convert.go).
+	converted                bool
+	Converted, ConvertFailed int
+	ObjectsSkipped           int
 }
 
 func (r *importSummary) summary() map[string]int64 {
@@ -76,13 +80,18 @@ func (r *importSummary) summary() map[string]int64 {
 		m[sumFilesIgnored] = int64(r.Ignored)
 		m[sumEntriesUnsafe] = int64(r.Unsafe)
 	}
+	if r.converted {
+		m[sumAnnotationsConverted] = int64(r.Converted)
+		m[sumAnnotationsFailed] = int64(r.ConvertFailed)
+		m[sumObjectsSkipped] = int64(r.ObjectsSkipped)
+	}
 	return m
 }
 
 // runImport extracts (archives) and moves the staged files into the
 // dataset folder, then indexes the folder (spec §5.1 / §5.2).
 func (s *Service) runImport(ctx context.Context, d Dataset, job Import, p *progressTracker) (map[string]int64, error) {
-	sum := &importSummary{archive: job.Source == SourceArchive}
+	sum := &importSummary{archive: job.Source == SourceArchive, converted: job.AnnotationFormat != FormatVOC}
 	// Fail early, before extracting a large archive for nothing.
 	root, err := s.openDatasetRoot(d)
 	if err != nil {
@@ -97,8 +106,15 @@ func (s *Service) runImport(ctx context.Context, d Dataset, job Import, p *progr
 		}
 		staged = singleTopDir(staged)
 	}
+	var unconverted map[string]bool
+	if job.AnnotationFormat != FormatVOC {
+		unconverted, err = s.convertStaged(ctx, staged, job, sum, p)
+		if err != nil {
+			return sum.summary(), diskFull(err)
+		}
+	}
 
-	moved, err := s.moveStaged(ctx, root, staged, job.OnConflict, sum, p)
+	moved, err := s.moveStaged(ctx, root, staged, job.OnConflict, unconverted, sum, p)
 	err = diskFull(err)
 	if moved > 0 || err == nil {
 		res, serr := s.syncIndex(s.indexContext(), d, p)
@@ -132,8 +148,8 @@ func diskFull(err error) error {
 const freeSpaceRecheck = 64 << 20
 
 // extract unpacks the uploaded archive into dir, keeping only images and
-// XML files with safe names (spec §5.1 step 5). The archive is deleted
-// afterwards.
+// annotation files of the job's format with safe names (spec §5.1 step 5).
+// The archive is deleted afterwards.
 func (s *Service) extract(ctx context.Context, job Import, dir string, sum *importSummary, p *progressTracker) error {
 	archivePath := filepath.Join(s.stagingDir(job.ID), uploadFileName)
 	f, err := os.Open(archivePath)
@@ -164,7 +180,7 @@ func (s *Service) extract(ctx context.Context, job Import, dir string, sum *impo
 			sum.Unsafe++
 			return nil
 		}
-		if classify(rel) == kindIgnored {
+		if classifyFor(rel, job.AnnotationFormat) == kindIgnored {
 			sum.Ignored++
 			return nil
 		}
@@ -271,7 +287,11 @@ const (
 // moveStaged moves the images below staged (and the annotation paired
 // with each) into the dataset folder (spec §5.1 step 7). It returns how
 // many images were moved; on cancel it stops at the next image.
-func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConflict string, sum *importSummary, p *progressTracker) (int, error) {
+// unconverted are images whose annotation file could not be converted to
+// VOC: an image among them that replaces one in the dataset also drops the
+// replaced image's annotation, so it ends up unannotated as reported.
+func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConflict string, unconverted map[string]bool,
+	sum *importSummary, p *progressTracker) (int, error) {
 	set, err := walkFiles(ctx, s.log, staged, nil)
 	if errors.Is(err, fs.ErrNotExist) {
 		set, err = &fileSet{}, nil // nothing was staged
@@ -291,7 +311,7 @@ func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConfli
 	cache := newAnnotationCache(src)
 	images := set.imagePaths()
 	pairs := pairAnnotations(images, set.xmlPaths(), cache.filename)
-	sum.Orphaned = len(set.XMLs) - len(pairs)
+	sum.Orphaned += len(set.XMLs) - len(pairs)
 	sum.Ignored += set.Ignored
 
 	p.setStage(ctx, stageImporting, unitFiles, int64(len(images)))
@@ -307,6 +327,9 @@ func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConfli
 			valid = perr == nil
 		}
 		res, err := placeImage(dst, staged, rel, xmlRel, onConflict)
+		if err == nil && res == placedReplaced && xmlRel == "" && unconverted[rel] {
+			err = removeSidecarXML(dst, rel)
+		}
 		if err != nil {
 			return moved, err
 		}
@@ -380,6 +403,25 @@ func placeImage(dst *os.Root, staged, rel, xmlRel, onConflict string) (placement
 		return 0, err
 	}
 	return result, nil
+}
+
+// removeSidecarXML removes <stem>.xml next to the dataset image rel, the
+// file a converted annotation would have replaced.
+func removeSidecarXML(dst *os.Root, rel string) error {
+	xmlRel := sidecarPath(rel, ".xml")
+	exists, err := regularFileExists(dst, xmlRel)
+	switch {
+	case errors.Is(err, errUnsafeTarget), errors.Is(err, errOccupied):
+		return nil
+	case err != nil:
+		return err
+	case !exists:
+		return nil
+	}
+	if err := dst.Remove(filepath.FromSlash(xmlRel)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove replaced annotation: %w", err)
+	}
+	return nil
 }
 
 // errUnsafeTarget is returned when a target path contains a symbolic link

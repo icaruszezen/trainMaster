@@ -1,8 +1,9 @@
 // Package dataset implements dataset management: datasets are folders of
 // images (with Pascal VOC annotations next to them) under the storage
 // directory datasets/, indexed in PostgreSQL. It covers creating and
-// registering datasets, uploading archives and folders, background import
-// and scan jobs, image browsing and thumbnails.
+// registering datasets, uploading archives and folders (with VOC,
+// X-AnyLabeling or YOLO annotations, stored as VOC), background import and
+// scan jobs, image browsing, thumbnails and downloads in those formats.
 package dataset
 
 import (
@@ -47,6 +48,7 @@ type Service struct {
 	runner  *runner
 	thumbs  *thumbnailer
 	uploads keyedMutex // serializes writes to one import's staging data
+	exports exportTickets
 
 	// base is the context jobs index with after a user cancel; only
 	// stopping the service cancels it.
