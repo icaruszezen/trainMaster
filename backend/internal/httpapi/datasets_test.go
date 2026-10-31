@@ -711,6 +711,17 @@ func TestDatasetAPIAnnotationFormats(t *testing.T) {
 	if len(labels.Items) != 1 || labels.Items[0].Name != "ng" {
 		t.Errorf("labels = %+v", labels)
 	}
+	// The last successful YOLO import, for the default class order.
+	jobs := want[List[dataset.Import]](t, e.do("GET", base+"/imports?annotation_format=yolo&status=succeeded&limit=1", nil), 200)
+	if jobs.Total != 1 || len(jobs.Items) != 1 || jobs.Items[0].ID != importID {
+		t.Errorf("filtered imports = %+v", jobs)
+	}
+	jobs = want[List[dataset.Import]](t, e.do("GET", base+"/imports?annotation_format=xanylabeling", nil), 200)
+	if jobs.Total != 0 {
+		t.Errorf("xanylabeling imports = %+v", jobs)
+	}
+	wantError(t, e.do("GET", base+"/imports?annotation_format=coco", nil), 400, codeBadRequest, "参数 annotation_format 无效")
+	wantError(t, e.do("GET", base+"/imports?status=done", nil), 400, codeBadRequest, "参数 status 无效")
 
 	// Download it as X-AnyLabeling.
 	wantError(t, e.do("POST", base+"/exports", map[string]any{"format": "yolo"}), 422, codeValidationFailed, "需要提供类别顺序")

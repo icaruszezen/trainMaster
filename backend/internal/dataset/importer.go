@@ -106,13 +106,15 @@ func (s *Service) runImport(ctx context.Context, d Dataset, job Import, p *progr
 		}
 		staged = singleTopDir(staged)
 	}
+	var unconverted map[string]bool
 	if job.AnnotationFormat != FormatVOC {
-		if err := s.convertStaged(ctx, staged, job, sum, p); err != nil {
+		unconverted, err = s.convertStaged(ctx, staged, job, sum, p)
+		if err != nil {
 			return sum.summary(), diskFull(err)
 		}
 	}
 
-	moved, err := s.moveStaged(ctx, root, staged, job.OnConflict, sum, p)
+	moved, err := s.moveStaged(ctx, root, staged, job.OnConflict, unconverted, sum, p)
 	err = diskFull(err)
 	if moved > 0 || err == nil {
 		res, serr := s.syncIndex(s.indexContext(), d, p)
@@ -285,7 +287,11 @@ const (
 // moveStaged moves the images below staged (and the annotation paired
 // with each) into the dataset folder (spec §5.1 step 7). It returns how
 // many images were moved; on cancel it stops at the next image.
-func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConflict string, sum *importSummary, p *progressTracker) (int, error) {
+// unconverted are images whose annotation file could not be converted to
+// VOC: an image among them that replaces one in the dataset also drops the
+// replaced image's annotation, so it ends up unannotated as reported.
+func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConflict string, unconverted map[string]bool,
+	sum *importSummary, p *progressTracker) (int, error) {
 	set, err := walkFiles(ctx, s.log, staged, nil)
 	if errors.Is(err, fs.ErrNotExist) {
 		set, err = &fileSet{}, nil // nothing was staged
@@ -321,6 +327,9 @@ func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConfli
 			valid = perr == nil
 		}
 		res, err := placeImage(dst, staged, rel, xmlRel, onConflict)
+		if err == nil && res == placedReplaced && xmlRel == "" && unconverted[rel] {
+			err = removeSidecarXML(dst, rel)
+		}
 		if err != nil {
 			return moved, err
 		}
@@ -394,6 +403,25 @@ func placeImage(dst *os.Root, staged, rel, xmlRel, onConflict string) (placement
 		return 0, err
 	}
 	return result, nil
+}
+
+// removeSidecarXML removes <stem>.xml next to the dataset image rel, the
+// file a converted annotation would have replaced.
+func removeSidecarXML(dst *os.Root, rel string) error {
+	xmlRel := sidecarPath(rel, ".xml")
+	exists, err := regularFileExists(dst, xmlRel)
+	switch {
+	case errors.Is(err, errUnsafeTarget), errors.Is(err, errOccupied):
+		return nil
+	case err != nil:
+		return err
+	case !exists:
+		return nil
+	}
+	if err := dst.Remove(filepath.FromSlash(xmlRel)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove replaced annotation: %w", err)
+	}
+	return nil
 }
 
 // errUnsafeTarget is returned when a target path contains a symbolic link

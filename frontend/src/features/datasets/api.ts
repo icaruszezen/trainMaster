@@ -276,6 +276,8 @@ export const datasetKeys = {
     [...datasetKeys.detail(id), "image", imageId] as const,
   labels: (id: number) => [...datasetKeys.detail(id), "labels"] as const,
   imports: (id: number) => [...datasetKeys.detail(id), "imports"] as const,
+  lastYoloImport: (id: number) =>
+    [...datasetKeys.imports(id), "last-yolo"] as const,
   import: (id: number, importId: number) =>
     [...datasetKeys.detail(id), "import", importId] as const,
 }
@@ -392,6 +394,24 @@ export function importsQuery(id: number) {
     // 有任务进行中时定期刷新，让状态列跟上进度。
     refetchInterval: (query) =>
       query.state.data?.items.some(isActiveImport) ? 3_000 : false,
+  })
+}
+
+/** 最近一次成功的 YOLO 导入（下载为 YOLO 时沿用它的类别顺序）；没有时为 null。 */
+export function lastYoloImportQuery(id: number) {
+  return queryOptions({
+    queryKey: datasetKeys.lastYoloImport(id),
+    queryFn: async ({ signal }) => {
+      const list = await apiGet<ListResponse<DatasetImport>>(
+        withQuery(`${datasetPath(id)}/imports`, {
+          annotation_format: "yolo",
+          status: "succeeded",
+          limit: 1,
+        }),
+        { signal }
+      )
+      return list.items[0] ?? null
+    },
   })
 }
 

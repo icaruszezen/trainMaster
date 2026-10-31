@@ -82,20 +82,22 @@ func stagedImageInfo(root *os.Root, rel string) imageInfo {
 }
 
 // convertStaged converts the annotations of a JSON or YOLO upload below
-// staged to VOC (see the comment at the top of this file).
-func (s *Service) convertStaged(ctx context.Context, staged string, job Import, sum *importSummary, p *progressTracker) error {
+// staged to VOC (see the comment at the top of this file). unconverted
+// holds the images whose annotation file could not be converted.
+func (s *Service) convertStaged(ctx context.Context, staged string, job Import, sum *importSummary,
+	p *progressTracker) (unconverted map[string]bool, err error) {
 	root, err := os.OpenRoot(staged)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil // nothing was staged
+		return nil, nil // nothing was staged
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer root.Close()
 
 	images, sources, err := listStaged(ctx, staged, job.AnnotationFormat)
 	if err != nil {
-		return fmt.Errorf("list staged files: %w", err)
+		return nil, fmt.Errorf("list staged files: %w", err)
 	}
 	c := &converter{root: root, format: job.AnnotationFormat, classes: job.Classes, imagePaths: map[string]string{}}
 	pairs := c.pair(images, sources)
@@ -106,10 +108,11 @@ func (s *Service) convertStaged(ctx context.Context, staged string, job Import, 
 		paired = append(paired, img)
 	}
 	slices.Sort(paired)
+	unconverted = map[string]bool{}
 	p.setStage(ctx, stageConverting, unitFiles, int64(len(paired)))
 	for i, img := range paired {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		src := pairs[img]
 		dir, base := path.Split(img)
@@ -117,7 +120,7 @@ func (s *Service) convertStaged(ctx context.Context, staged string, job Import, 
 		a, err := c.read(src, info)
 		var rangeErr *classRangeError
 		if errors.As(err, &rangeErr) {
-			return &Error{Kind: ErrInvalid, Message: rangeErr.Error()}
+			return nil, &Error{Kind: ErrInvalid, Message: rangeErr.Error()}
 		}
 		if err == nil {
 			if info.Width == 0 {
@@ -133,9 +136,10 @@ func (s *Service) convertStaged(ctx context.Context, staged string, job Import, 
 			sum.ObjectsSkipped += a.Skipped
 		case isAnnotationError(err):
 			sum.ConvertFailed++
+			unconverted[img] = true
 			s.log.Info("annotation not converted", "import_id", job.ID, "path", src, "image", img, "err", err)
 		default:
-			return err
+			return nil, err
 		}
 		p.set(ctx, int64(i+1), int64(len(paired)))
 	}
@@ -143,10 +147,10 @@ func (s *Service) convertStaged(ctx context.Context, staged string, job Import, 
 	// ignored files.
 	for _, src := range sources {
 		if err := root.Remove(filepath.FromSlash(src)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("remove converted annotation: %w", err)
+			return nil, fmt.Errorf("remove converted annotation: %w", err)
 		}
 	}
-	return nil
+	return unconverted, nil
 }
 
 // annotationFileError marks problems of one annotation file, which only
@@ -497,40 +501,29 @@ const yoloCoordSlack = 0.01
 // classes fails the whole import (classRangeError). rel names the file in
 // that error.
 func parseYOLO(data []byte, rel string, classes []string, info imageInfo) (*convertedAnnotation, error) {
-	type line struct {
-		n      int
-		fields []string
-	}
-	var lines []line
-	sc := bufio.NewScanner(bytes.NewReader(textUTF8(data)))
-	sc.Buffer(make([]byte, 0, 64<<10), maxAnnotationBytes)
-	for n := 1; sc.Scan(); n++ {
-		if fields := strings.Fields(sc.Text()); len(fields) > 0 {
-			lines = append(lines, line{n, fields})
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return nil, badAnnotation("read labels: %v", err)
-	}
+	text := textUTF8(data)
 	// A class id past the list means the class order is wrong, whatever
 	// else is wrong with the file: check every line before anything else.
-	for _, l := range lines {
-		id, err := strconv.ParseFloat(l.fields[0], 64)
+	err := yoloLines(text, func(n int, fields []string) error {
+		id, err := strconv.ParseFloat(fields[0], 64)
 		if err == nil && id >= float64(len(classes)) && id == math.Trunc(id) && id <= math.MaxInt32 {
-			return nil, &classRangeError{file: rel, line: l.n, id: int(id), numLabels: len(classes)}
+			return &classRangeError{file: rel, line: n, id: int(id), numLabels: len(classes)}
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	a := &convertedAnnotation{}
-	for _, l := range lines {
-		n, fields := l.n, l.fields
+	err = yoloLines(text, func(n int, fields []string) error {
 		k := len(fields)
 		if k != 5 && k != 6 && (k < 7 || (k-1)%2 != 0) {
-			return nil, badAnnotation("line %d: %d values, want class cx cy w h or a polygon", n, k)
+			return badAnnotation("line %d: %d values, want class cx cy w h or a polygon", n, k)
 		}
 		id, err := strconv.ParseFloat(fields[0], 64)
 		if err != nil || id < 0 || id != math.Trunc(id) || id > math.MaxInt32 {
-			return nil, badAnnotation("line %d: class %q is not a class id", n, fields[0])
+			return badAnnotation("line %d: class %q is not a class id", n, fields[0])
 		}
 		coords := fields[1:]
 		if k == 6 {
@@ -540,21 +533,21 @@ func parseYOLO(data []byte, rel string, classes []string, info imageInfo) (*conv
 		for i, s := range coords {
 			f, err := strconv.ParseFloat(s, 64)
 			if err != nil || !finite(f) {
-				return nil, badAnnotation("line %d: %q is not a number", n, s)
+				return badAnnotation("line %d: %q is not a number", n, s)
 			}
 			if f < -yoloCoordSlack || f > 1+yoloCoordSlack {
-				return nil, badAnnotation("line %d: %s is not a normalized coordinate (0–1)", n, s)
+				return badAnnotation("line %d: %s is not a normalized coordinate (0–1)", n, s)
 			}
 			v[i] = f
 		}
 		if info.Width == 0 || info.Height == 0 {
-			return nil, badAnnotation("image size unknown: YOLO coordinates cannot be converted to pixels")
+			return badAnnotation("image size unknown: YOLO coordinates cannot be converted to pixels")
 		}
 		W, H := float64(info.Width), float64(info.Height)
 		var box [4]float64
 		if len(v) == 4 {
 			if v[2] < 0 || v[3] < 0 {
-				return nil, badAnnotation("line %d: negative box size", n)
+				return badAnnotation("line %d: negative box size", n)
 			}
 			box = [4]float64{(v[0] - v[2]/2) * W, (v[1] - v[3]/2) * H, (v[0] + v[2]/2) * W, (v[1] + v[3]/2) * H}
 		} else {
@@ -568,11 +561,33 @@ func parseYOLO(data []byte, rel string, classes []string, info imageInfo) (*conv
 		obj, ok := pixelBox(classes[int(id)], box, info.Width, info.Height)
 		if !ok {
 			a.Skipped++
-			continue
+			return nil
 		}
 		a.Objects = append(a.Objects, obj)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return a, nil
+}
+
+// yoloLines calls fn with the 1-based number and the fields of each
+// non-blank line of text, stopping at the first error.
+func yoloLines(text []byte, fn func(n int, fields []string) error) error {
+	sc := bufio.NewScanner(bytes.NewReader(text))
+	sc.Buffer(make([]byte, 0, 64<<10), maxAnnotationBytes)
+	for n := 1; sc.Scan(); n++ {
+		if fields := strings.Fields(sc.Text()); len(fields) > 0 {
+			if err := fn(n, fields); err != nil {
+				return err
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return badAnnotation("read labels: %v", err)
+	}
+	return nil
 }
 
 // ---- VOC output ----

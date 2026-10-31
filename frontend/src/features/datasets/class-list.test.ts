@@ -1,13 +1,11 @@
 import { describe, expect, it } from "vitest"
 
-import type { DatasetImport } from "@/features/datasets/api"
 import {
   CLASS_FILE_MAX_BYTES,
   CLASS_LIST_REQUIRED_MESSAGE,
   compareClassesWithLabels,
   decodeClassFile,
   defaultClassOrder,
-  lastYoloImport,
   parseClassList,
   readClassFile,
   toClassListText,
@@ -132,32 +130,6 @@ describe("defaultClassOrder", () => {
         ["划痕", "hole", "dent"]
       )
     ).toEqual(["划痕", "hole", "dent", "Crack"])
-  })
-})
-
-describe("lastYoloImport", () => {
-  it("finds the newest successful YOLO import with classes", () => {
-    const imports: Pick<
-      DatasetImport,
-      "id" | "annotation_format" | "status" | "classes"
-    >[] = [
-      { id: 4, annotation_format: "yolo", status: "failed", classes: ["x"] },
-      { id: 3, annotation_format: "voc", status: "succeeded", classes: [] },
-      {
-        id: 2,
-        annotation_format: "yolo",
-        status: "succeeded",
-        classes: ["a", "b"],
-      },
-      {
-        id: 1,
-        annotation_format: "yolo",
-        status: "succeeded",
-        classes: ["b", "a"],
-      },
-    ]
-    expect(lastYoloImport(imports)?.id).toBe(2)
-    expect(lastYoloImport(imports.slice(0, 2))).toBeUndefined()
   })
 })
 

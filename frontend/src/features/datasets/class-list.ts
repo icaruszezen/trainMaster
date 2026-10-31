@@ -2,7 +2,7 @@
  * YOLO 类别顺序（classes.txt）的解析与校验，规则与后端一致：每行一个类别名称，
  * 第 N 行对应类别编号 N-1。服务端的校验仍是最终结果。
  */
-import type { DatasetImport, DatasetLabel } from "@/features/datasets/api"
+import type { DatasetLabel } from "@/features/datasets/api"
 import { characterCount } from "@/features/datasets/naming"
 
 export const CLASS_NAME_MAX_LENGTH = 255
@@ -128,18 +128,6 @@ export function defaultClassOrder(
     .filter((name) => !known.has(name))
     .sort(byCodePoint)
   return [...base, ...rest]
-}
-
-/** 最近一次成功的 YOLO 导入（导入记录按时间倒序）；没有时为 undefined。 */
-export function lastYoloImport<
-  T extends Pick<DatasetImport, "annotation_format" | "status" | "classes">,
->(imports: readonly T[]) {
-  return imports.find(
-    (job) =>
-      job.annotation_format === "yolo" &&
-      job.status === "succeeded" &&
-      job.classes.length > 0
-  )
 }
 
 /**

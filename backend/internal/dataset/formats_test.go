@@ -360,10 +360,10 @@ func TestYOLODataYAML(t *testing.T) {
 }
 
 func TestYOLODataYAMLFolderNameNewline(t *testing.T) {
-	y := string(yoloDataYAML("ds\npath: /elsewhere", []string{"a"}, nil, ""))
-	for _, line := range strings.Split(y, "\n") {
-		if strings.HasPrefix(line, "path:") {
-			t.Errorf("folder name starts a YAML key:\n%s", y)
+	for _, br := range []string{"\n", "\r", "\u0085", "\u2028", "\u2029"} {
+		y := string(yoloDataYAML("ds"+br+"path: /elsewhere", []string{"a"}, nil, ""))
+		if strings.Contains(y, br+"path:") {
+			t.Errorf("folder name with %q starts a YAML key:\n%s", br, y)
 		}
 	}
 }

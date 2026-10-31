@@ -460,11 +460,24 @@ func (s *server) listDatasetImports(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	limit, ok := intParam(w, r, "limit", 20, 1, 100)
-	if !ok {
+	var q dataset.ImportQuery
+	if q.Limit, ok = intParam(w, r, "limit", 20, 1, 100); !ok {
 		return
 	}
-	items, total, err := s.datasets.ListImports(r.Context(), id, limit)
+	// Optional filters, e.g. the last successful YOLO import for its class
+	// order.
+	if r.URL.Query().Get("annotation_format") != "" {
+		if q.Format, ok = enumParam(w, r, "annotation_format", dataset.FormatVOC, dataset.FormatXAnyLabeling, dataset.FormatYOLO); !ok {
+			return
+		}
+	}
+	if r.URL.Query().Get("status") != "" {
+		if q.Status, ok = enumParam(w, r, "status", dataset.StatusUploading, dataset.StatusQueued, dataset.StatusRunning,
+			dataset.StatusSucceeded, dataset.StatusFailed, dataset.StatusCanceled); !ok {
+			return
+		}
+	}
+	items, total, err := s.datasets.ListImports(r.Context(), id, q)
 	if err != nil {
 		s.datasetError(w, r, err)
 		return

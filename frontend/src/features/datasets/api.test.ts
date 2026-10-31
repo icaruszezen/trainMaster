@@ -6,6 +6,7 @@ import {
   datasetsQuery,
   deleteDataset,
   imagesQuery,
+  lastYoloImportQuery,
   parseProjectFilter,
   setDatasetProjects,
 } from "@/features/datasets/api"
@@ -175,5 +176,26 @@ describe("createExport", () => {
       format: "yolo",
       classes: ["scratch"],
     })
+  })
+})
+
+describe("lastYoloImportQuery", () => {
+  const run = (id: number) =>
+    (lastYoloImportQuery(id).queryFn as (context: unknown) => Promise<unknown>)(
+      { signal: new AbortController().signal }
+    )
+
+  it("asks for the newest successful YOLO import", async () => {
+    const job = { id: 7, annotation_format: "yolo", classes: ["划痕", "凹坑"] }
+    const fetchMock = mockFetch(() => Response.json({ items: [job], total: 3 }))
+    await expect(run(5)).resolves.toEqual(job)
+    expect(requestOf(fetchMock).path).toBe(
+      "/api/v1/datasets/5/imports?annotation_format=yolo&status=succeeded&limit=1"
+    )
+  })
+
+  it("is null when there is none", async () => {
+    mockFetch(() => Response.json({ items: [], total: 0 }))
+    await expect(run(5)).resolves.toBeNull()
   })
 })

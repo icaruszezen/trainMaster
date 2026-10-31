@@ -149,6 +149,38 @@ func TestIntegrationYOLOClassOutOfRange(t *testing.T) {
 	}
 }
 
+// An image replaced in overwrite mode whose new label file cannot be
+// converted loses the old image's annotation: it is imported unannotated.
+func TestIntegrationConvertFailureOnOverwrite(t *testing.T) {
+	e := newTestEnv(t, true)
+	ctx := context.Background()
+	d, _ := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "overwrite"})
+	writeFiles(t, d.Path, map[string][]byte{
+		"a.png": pngFile(t, 8, 8), "a.xml": vocFile("a.png", "old"),
+		"b.png": pngFile(t, 8, 8), "b.xml": vocFile("b.png", "old"),
+		"c.png": pngFile(t, 8, 8), "c.xml": vocFile("c.png", "kept"),
+	})
+	img := string(pngFile(t, 100, 50))
+	archive := writeZip(t, []testEntry{
+		{Name: "a.png", Data: img}, {Name: "a.txt", Data: "0 0.5 0.5\n"},
+		{Name: "b.png", Data: img}, {Name: "b.txt", Data: yoloLine(0, 0.5, 0.5, 0.2, 0.2)},
+		{Name: "c.png", Data: img}, // no label file: the old annotation stays
+	})
+	job := e.uploadArchiveAs(t, d.ID, archive, CreateImportInput{OnConflict: ConflictOverwrite,
+		AnnotationFormat: FormatYOLO, Classes: []string{"new"}})
+	if job.Status != StatusSucceeded || job.Summary[sumImagesReplaced] != 3 || job.Summary[sumAnnotationsFailed] != 1 {
+		t.Fatalf("job = %s %v %q", job.Status, job.Summary, job.Error)
+	}
+	if got, want := datasetFiles(t, d.Path), []string{"a.png", "b.png", "b.xml", "c.png", "c.xml"}; !slices.Equal(got, want) {
+		t.Errorf("files = %v, want %v", got, want)
+	}
+	objects := e.imageObjects(t, d.ID)
+	if _, ok := objects["a.png"]; ok || len(objects["b.png"]) != 1 || objects["b.png"][0].Name != "new" ||
+		len(objects["c.png"]) != 1 || objects["c.png"][0].Name != "kept" {
+		t.Errorf("objects = %+v", objects)
+	}
+}
+
 func TestIntegrationXAnyLabelingFolderImport(t *testing.T) {
 	e := newTestEnv(t, true)
 	ctx := context.Background()

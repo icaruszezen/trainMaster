@@ -192,18 +192,27 @@ func (s *Service) getImport(ctx context.Context, q querier, datasetID, importID 
 	return job, err
 }
 
-// ListImports returns the newest jobs of a dataset and the number of all
-// its jobs.
-func (s *Service) ListImports(ctx context.Context, datasetID int64, limit int) ([]Import, int, error) {
+// ImportQuery selects the jobs ListImports returns.
+type ImportQuery struct {
+	Format string // only jobs of this annotation format ("" for all)
+	Status string // only jobs in this status ("" for all)
+	Limit  int
+}
+
+// ListImports returns the newest jobs of a dataset matching q and the
+// number of all its jobs that match.
+func (s *Service) ListImports(ctx context.Context, datasetID int64, q ImportQuery) ([]Import, int, error) {
 	if _, err := queryDataset(ctx, s.db, datasetID, false); err != nil {
 		return nil, 0, err
 	}
+	const where = ` FROM dataset_imports WHERE dataset_id = $1
+		AND ($2 = '' OR annotation_format = $2) AND ($3 = '' OR status = $3)`
 	var total int
-	if err := s.db.QueryRow(ctx, "SELECT count(*) FROM dataset_imports WHERE dataset_id = $1", datasetID).Scan(&total); err != nil {
+	if err := s.db.QueryRow(ctx, "SELECT count(*)"+where, datasetID, q.Format, q.Status).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	jobs, err := collectImports(s.db.Query(ctx, "SELECT "+importColumns+` FROM dataset_imports
-		WHERE dataset_id = $1 ORDER BY id DESC LIMIT $2`, datasetID, limit))
+	jobs, err := collectImports(s.db.Query(ctx, "SELECT "+importColumns+where+" ORDER BY id DESC LIMIT $4",
+		datasetID, q.Format, q.Status, q.Limit))
 	return jobs, total, err
 }
 

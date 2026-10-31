@@ -572,9 +572,10 @@ func yoloDataYAML(name string, classes []string, images []exportImage, prefix st
 	split = split && dirs["train"] && dirs[val]
 
 	// The folder name is in a comment: a line break in it (registered
-	// folders are not checked for one) must not start a YAML key.
+	// folders are not checked for one; YAML also breaks lines at U+2028
+	// and U+2029) must not start a YAML key.
 	name = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
 			return ' '
 		}
 		return r
