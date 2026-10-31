@@ -132,13 +132,15 @@ export function ClassListField({
         autoComplete="off"
         // 不自动换行：一行就是一个类别，折行会让编号看起来错位。
         wrap="off"
-        className="max-h-56 min-h-28 overflow-x-auto font-mono text-sm whitespace-pre"
+        // 固定尺寸：按内容伸缩时，没有换行的长行会把对话框撑宽。
+        className="field-sizing-fixed h-32 max-h-56 min-h-28 min-w-0 overflow-x-auto font-mono text-sm whitespace-pre"
       />
       <input
         ref={fileInputRef}
         type="file"
         accept=".txt,.names,text/plain"
-        className="sr-only"
+        // 不占位置（Field 会给子元素设置宽度），只通过“从文件读取”打开。
+        className="hidden"
         tabIndex={-1}
         aria-hidden
         onChange={(event) => {

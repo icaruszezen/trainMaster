@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/klauspost/compress/flate"
@@ -123,6 +124,8 @@ type Export struct {
 	images  []exportImage
 	log     *slog.Logger
 
+	entries map[string]bool // archive entry names written so far
+
 	// Counts for the log.
 	written, missing, annotations int
 }
@@ -160,7 +163,7 @@ func (s *Service) OpenExport(ctx context.Context, datasetID int64, token string)
 		return nil, err
 	}
 	return &Export{FileName: r.fileName, root: root, top: d.DirName, format: r.format, classes: r.classes,
-		images: images, log: s.log.With("dataset_id", d.ID, "format", r.format)}, nil
+		images: images, log: s.log.With("dataset_id", d.ID, "format", r.format), entries: map[string]bool{}}, nil
 }
 
 // Close releases the dataset folder.
@@ -171,9 +174,7 @@ func (e *Export) Close() error { return e.root.Close() }
 func (e *Export) Write(ctx context.Context, w io.Writer) error {
 	start := time.Now()
 	zw := zip.NewWriter(w)
-	zw.RegisterCompressor(zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
-		return flate.NewWriter(out, flate.BestSpeed)
-	})
+	zw.RegisterCompressor(zip.Deflate, newFlateWriter)
 	var err error
 	switch e.format {
 	case FormatYOLO:
@@ -194,6 +195,32 @@ func (e *Export) Write(ctx context.Context, w io.Writer) error {
 	return nil
 }
 
+// flateWriters reuses Deflate compressors across entries and downloads: a
+// new one allocates about 800 KB, more than most label files.
+var flateWriters sync.Pool
+
+// pooledFlate returns its compressor to flateWriters when the entry is done.
+type pooledFlate struct{ *flate.Writer }
+
+func (p pooledFlate) Close() error {
+	err := p.Writer.Close()
+	p.Writer.Reset(io.Discard) // do not keep the response alive
+	flateWriters.Put(p.Writer)
+	return err
+}
+
+func newFlateWriter(out io.Writer) (io.WriteCloser, error) {
+	if fw, ok := flateWriters.Get().(*flate.Writer); ok {
+		fw.Reset(out)
+		return pooledFlate{fw}, nil
+	}
+	fw, err := flate.NewWriter(out, flate.BestSpeed)
+	if err != nil {
+		return nil, err
+	}
+	return pooledFlate{fw}, nil
+}
+
 // storedExtensions are image formats that are compressed already; deflating
 // them again costs CPU for nothing. BMP and TIFF (often uncompressed) are
 // deflated.
@@ -203,7 +230,7 @@ var storedExtensions = map[string]bool{
 
 // copyFile adds the dataset file rel to the archive as name. ok is false
 // (and nothing is written) when the file cannot be opened, e.g. it was
-// deleted since the last scan.
+// deleted since the last scan, or an earlier file took the name.
 func (e *Export) copyFile(zw *zip.Writer, rel, name string) (ok bool, err error) {
 	f, err := e.root.Open(filepath.FromSlash(rel))
 	if err != nil {
@@ -220,7 +247,11 @@ func (e *Export) copyFile(zw *zip.Writer, rel, name string) (ok bool, err error)
 	if storedExtensions[strings.ToLower(path.Ext(rel))] {
 		method = zip.Store
 	}
-	out, err := zw.CreateHeader(e.header(name, method, fi.ModTime()))
+	h, ok := e.header(name, method, fi.ModTime())
+	if !ok {
+		return false, nil
+	}
+	out, err := zw.CreateHeader(h)
 	if err != nil {
 		return false, err
 	}
@@ -230,27 +261,41 @@ func (e *Export) copyFile(zw *zip.Writer, rel, name string) (ok bool, err error)
 	return true, nil
 }
 
-// addFile adds generated content to the archive.
-func (e *Export) addFile(zw *zip.Writer, name string, data []byte, modTime time.Time) error {
-	out, err := zw.CreateHeader(e.header(name, zip.Deflate, modTime))
+// addFile adds generated content to the archive; ok is false (and nothing
+// is written) when an earlier file took the name.
+func (e *Export) addFile(zw *zip.Writer, name string, data []byte, modTime time.Time) (ok bool, err error) {
+	h, ok := e.header(name, zip.Deflate, modTime)
+	if !ok {
+		return false, nil
+	}
+	out, err := zw.CreateHeader(h)
 	if err != nil {
-		return err
+		return false, err
 	}
 	_, err = out.Write(data)
-	return err
+	return err == nil, err
 }
 
-func (e *Export) header(name string, method uint16, modTime time.Time) *zip.FileHeader {
+// header returns the header of the entry for name, or ok false when an
+// earlier entry has the same name: extracting the archive would overwrite
+// one file with the other.
+func (e *Export) header(name string, method uint16, modTime time.Time) (h *zip.FileHeader, ok bool) {
 	// Windows tools treat "\" in entry names as a folder separator, so a
 	// file named "..\x.png" on the server could be unpacked outside the
 	// target folder. Uploads never create such names.
-	name = strings.ReplaceAll(name, `\`, "_")
-	h := &zip.FileHeader{Name: e.top + "/" + name, Method: method, Modified: modTime}
+	name = e.top + "/" + strings.ReplaceAll(name, `\`, "_")
+	if e.entries[name] {
+		e.log.Warn("export: archive name taken by an earlier file; leaving this one out", "name", name)
+		return nil, false
+	}
+	e.entries[name] = true
+	h = &zip.FileHeader{Name: name, Method: method, Modified: modTime}
 	h.SetMode(0o644)
-	return h
+	return h, true
 }
 
-// copyImage adds an image under name; ok is false when it is missing.
+// copyImage adds an image under name; ok is false when it is missing or
+// an earlier file took the name.
 func (e *Export) copyImage(zw *zip.Writer, img exportImage, name string) (bool, error) {
 	ok, err := e.copyFile(zw, img.Path, name)
 	if ok {
@@ -348,7 +393,6 @@ type xalExportShape struct {
 // writeXAnyLabeling copies the images and writes <stem>.json next to each
 // image with a usable VOC file.
 func (e *Export) writeXAnyLabeling(ctx context.Context, zw *zip.Writer) error {
-	taken := map[string]bool{}
 	for _, img := range e.images {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -364,20 +408,18 @@ func (e *Export) writeXAnyLabeling(ctx context.Context, zw *zip.Writer) error {
 		if a == nil {
 			continue
 		}
-		name := sidecarPath(img.Path, ".json")
-		if taken[name] {
-			e.log.Warn("export: two images share an annotation file name; the second keeps none", "image", img.Path, "file", name)
-			continue
-		}
-		taken[name] = true
 		data, err := xAnyLabelingJSON(path.Base(img.Path), a, img)
 		if err != nil {
 			return err
 		}
-		if err := e.addFile(zw, name, data, img.ModTime); err != nil {
+		// a.jpg and a.png share a.json: the second keeps none.
+		ok, err = e.addFile(zw, sidecarPath(img.Path, ".json"), data, img.ModTime)
+		if err != nil {
 			return err
 		}
-		e.annotations++
+		if ok {
+			e.annotations++
+		}
 	}
 	return nil
 }
@@ -421,10 +463,10 @@ func (e *Export) writeYOLO(ctx context.Context, zw *zip.Writer) error {
 		prefix = ""
 	}
 	now := time.Now()
-	if err := e.addFile(zw, yoloClassesFile, []byte(strings.Join(e.classes, "\n")+"\n"), now); err != nil {
+	if _, err := e.addFile(zw, yoloClassesFile, []byte(strings.Join(e.classes, "\n")+"\n"), now); err != nil {
 		return err
 	}
-	if err := e.addFile(zw, "data.yaml", yoloDataYAML(e.top, e.classes, e.images, prefix), now); err != nil {
+	if _, err := e.addFile(zw, "data.yaml", yoloDataYAML(e.top, e.classes, e.images, prefix), now); err != nil {
 		return err
 	}
 
@@ -432,7 +474,6 @@ func (e *Export) writeYOLO(ctx context.Context, zw *zip.Writer) error {
 	for i, name := range e.classes {
 		ids[name] = i
 	}
-	taken := map[string]bool{}
 	for _, img := range e.images {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -449,21 +490,19 @@ func (e *Export) writeYOLO(ctx context.Context, zw *zip.Writer) error {
 		if a == nil {
 			continue
 		}
-		label := ultralyticsLabelPath(name)
-		if taken[label] {
-			e.log.Warn("export: two images share a label file name; the second keeps none", "image", img.Path, "file", label)
-			continue
-		}
 		data, ok := yoloLabels(a, img, ids)
 		if !ok {
 			e.log.Info("export: image size unknown, no YOLO labels", "image", img.Path)
 			continue
 		}
-		taken[label] = true
-		if err := e.addFile(zw, label, data, img.ModTime); err != nil {
+		// a.jpg and a.png share a.txt: the second keeps none.
+		ok, err = e.addFile(zw, ultralyticsLabelPath(name), data, img.ModTime)
+		if err != nil {
 			return err
 		}
-		e.annotations++
+		if ok {
+			e.annotations++
+		}
 	}
 	return nil
 }
@@ -532,6 +571,14 @@ func yoloDataYAML(name string, classes []string, images []exportImage, prefix st
 	}
 	split = split && dirs["train"] && dirs[val]
 
+	// The folder name is in a comment: a line break in it (registered
+	// folders are not checked for one) must not start a YAML key.
+	name = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, name)
 	var b strings.Builder
 	fmt.Fprintf(&b, "# trainMaster 导出的 YOLO 数据集“%s”。\n# 路径相对于本文件所在的文件夹；类别编号与 classes.txt 一致。\n", name)
 	if split {

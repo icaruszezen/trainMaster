@@ -176,6 +176,8 @@ export function ImportDialog({
             onValueChange={(value) => {
               setTab(value as ImportTab)
               setError(null)
+              // 文件夹里的 classes.txt 只对上传文件夹有效。
+              annotation.prefillFromFolder(value === "folder" ? folder : null)
             }}
             className="min-w-0 gap-4"
           >

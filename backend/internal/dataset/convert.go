@@ -97,7 +97,7 @@ func (s *Service) convertStaged(ctx context.Context, staged string, job Import, 
 	if err != nil {
 		return fmt.Errorf("list staged files: %w", err)
 	}
-	c := &converter{root: root, format: job.AnnotationFormat, classes: job.Classes, json: map[string]jsonResult{}}
+	c := &converter{root: root, format: job.AnnotationFormat, classes: job.Classes, imagePaths: map[string]string{}}
 	pairs := c.pair(images, sources)
 	sum.Orphaned += len(sources) - len(pairs)
 
@@ -201,12 +201,10 @@ type converter struct {
 	root    *os.Root
 	format  string
 	classes []string
-	json    map[string]jsonResult // parsed once: pairing reads imagePath
-}
-
-type jsonResult struct {
-	file *xalFile
-	err  error
+	// imagePaths caches the imagePath of the JSON files pairing looked at.
+	// Only that is kept: read parses a file again, so a large upload does
+	// not hold every file's shapes in memory.
+	imagePaths map[string]string
 }
 
 // pair matches images with annotation files: pairSidecars with the rules of
@@ -234,11 +232,11 @@ func (c *converter) pair(images, sources []string) map[string]string {
 		if used[src] {
 			continue
 		}
-		f, err := c.jsonFile(src)
-		if err != nil || f.ImagePath == "" {
+		imagePath := c.jsonImagePath(src)
+		if imagePath == "" {
 			continue
 		}
-		target, ok := cleanEntryPath(path.Join(path.Dir(src), strings.ReplaceAll(f.ImagePath, `\`, "/")))
+		target, ok := cleanEntryPath(path.Join(path.Dir(src), strings.ReplaceAll(imagePath, `\`, "/")))
 		if !ok {
 			continue
 		}
@@ -254,24 +252,33 @@ func (c *converter) pair(images, sources []string) map[string]string {
 
 // jsonImageName is the image file name a JSON file records, for pairing.
 func (c *converter) jsonImageName(rel string) string {
-	f, err := c.jsonFile(rel)
-	if err != nil {
+	imagePath := c.jsonImagePath(rel)
+	if imagePath == "" {
 		return ""
 	}
-	return path.Base(strings.ReplaceAll(f.ImagePath, `\`, "/"))
+	return path.Base(strings.ReplaceAll(imagePath, `\`, "/"))
+}
+
+// jsonImagePath is the imagePath a JSON file records, "" when it has none
+// or the file cannot be read.
+func (c *converter) jsonImagePath(rel string) string {
+	if p, ok := c.imagePaths[rel]; ok {
+		return p
+	}
+	var p string
+	if f, err := c.jsonFile(rel); err == nil {
+		p = f.ImagePath
+	}
+	c.imagePaths[rel] = p
+	return p
 }
 
 func (c *converter) jsonFile(rel string) (*xalFile, error) {
-	if r, ok := c.json[rel]; ok {
-		return r.file, r.err
-	}
-	var f *xalFile
 	data, err := c.readFile(rel, maxJSONAnnotationBytes)
-	if err == nil {
-		f, err = parseXAnyLabeling(data)
+	if err != nil {
+		return nil, err
 	}
-	c.json[rel] = jsonResult{f, err}
-	return f, err
+	return parseXAnyLabeling(data)
 }
 
 // readFile reads a staged annotation file of at most limit bytes.
@@ -304,6 +311,12 @@ func (c *converter) read(rel string, info imageInfo) (*convertedAnnotation, erro
 	if err != nil {
 		return nil, err
 	}
+	return f.convert(info), nil
+}
+
+// convert turns the shapes into boxes for the image described by info; the
+// size the file records stands in when the image's is unknown.
+func (f *xalFile) convert(info imageInfo) *convertedAnnotation {
 	w, h := info.Width, info.Height
 	if w == 0 {
 		w, h = f.Width, f.Height
@@ -317,7 +330,7 @@ func (c *converter) read(rel string, info imageInfo) (*convertedAnnotation, erro
 		}
 		a.Objects = append(a.Objects, obj)
 	}
-	return a, nil
+	return a
 }
 
 // textUTF8 returns annotation text as UTF-8: a UTF-8 BOM is dropped, and
@@ -484,14 +497,33 @@ const yoloCoordSlack = 0.01
 // classes fails the whole import (classRangeError). rel names the file in
 // that error.
 func parseYOLO(data []byte, rel string, classes []string, info imageInfo) (*convertedAnnotation, error) {
-	a := &convertedAnnotation{}
+	type line struct {
+		n      int
+		fields []string
+	}
+	var lines []line
 	sc := bufio.NewScanner(bytes.NewReader(textUTF8(data)))
 	sc.Buffer(make([]byte, 0, 64<<10), maxAnnotationBytes)
 	for n := 1; sc.Scan(); n++ {
-		fields := strings.Fields(sc.Text())
-		if len(fields) == 0 {
-			continue
+		if fields := strings.Fields(sc.Text()); len(fields) > 0 {
+			lines = append(lines, line{n, fields})
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, badAnnotation("read labels: %v", err)
+	}
+	// A class id past the list means the class order is wrong, whatever
+	// else is wrong with the file: check every line before anything else.
+	for _, l := range lines {
+		id, err := strconv.ParseFloat(l.fields[0], 64)
+		if err == nil && id >= float64(len(classes)) && id == math.Trunc(id) && id <= math.MaxInt32 {
+			return nil, &classRangeError{file: rel, line: l.n, id: int(id), numLabels: len(classes)}
+		}
+	}
+
+	a := &convertedAnnotation{}
+	for _, l := range lines {
+		n, fields := l.n, l.fields
 		k := len(fields)
 		if k != 5 && k != 6 && (k < 7 || (k-1)%2 != 0) {
 			return nil, badAnnotation("line %d: %d values, want class cx cy w h or a polygon", n, k)
@@ -499,9 +531,6 @@ func parseYOLO(data []byte, rel string, classes []string, info imageInfo) (*conv
 		id, err := strconv.ParseFloat(fields[0], 64)
 		if err != nil || id < 0 || id != math.Trunc(id) || id > math.MaxInt32 {
 			return nil, badAnnotation("line %d: class %q is not a class id", n, fields[0])
-		}
-		if int(id) >= len(classes) {
-			return nil, &classRangeError{file: rel, line: n, id: int(id), numLabels: len(classes)}
 		}
 		coords := fields[1:]
 		if k == 6 {
@@ -542,9 +571,6 @@ func parseYOLO(data []byte, rel string, classes []string, info imageInfo) (*conv
 			continue
 		}
 		a.Objects = append(a.Objects, obj)
-	}
-	if err := sc.Err(); err != nil {
-		return nil, badAnnotation("read labels: %v", err)
 	}
 	return a, nil
 }

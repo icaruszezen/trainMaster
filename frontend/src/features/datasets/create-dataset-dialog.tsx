@@ -215,6 +215,12 @@ export function CreateDatasetDialog({
     annotation.prefillFromFolder(selection)
   }
 
+  const changeTab = (next: CreateTab) => {
+    setTab(next)
+    // 文件夹里的 classes.txt 只对上传文件夹有效。
+    annotation.prefillFromFolder(next === "folder" ? folder : null)
+  }
+
   const setName = (value: string) => {
     setNameDrafts((drafts) => ({ ...drafts, [tab]: value }))
   }
@@ -456,7 +462,7 @@ export function CreateDatasetDialog({
           <Tabs
             value={tab}
             onValueChange={(value) => {
-              setTab(value as CreateTab)
+              changeTab(value as CreateTab)
               setSubmitted(false)
               setFormError(null)
             }}
@@ -541,7 +547,7 @@ export function CreateDatasetDialog({
                         size="sm"
                         className="h-auto px-1 py-0 align-baseline text-xs underline"
                         onClick={() => {
-                          setTab("directory")
+                          changeTab("directory")
                           setSelectedNames([sameFolder.name])
                         }}
                       >

@@ -108,7 +108,7 @@ func (s *Service) runImport(ctx context.Context, d Dataset, job Import, p *progr
 	}
 	if job.AnnotationFormat != FormatVOC {
 		if err := s.convertStaged(ctx, staged, job, sum, p); err != nil {
-			return sum.summary(), err
+			return sum.summary(), diskFull(err)
 		}
 	}
 

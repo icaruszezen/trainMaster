@@ -163,7 +163,7 @@ export function DatasetImports({ dataset }: { dataset: Dataset }) {
                       <span>
                         {sourceLabels[job.source]}
                         {formatLabel && (
-                          <span className="text-muted-foreground">
+                          <span className="hidden text-muted-foreground sm:inline">
                             {" · "}
                             {formatLabel}
                           </span>

@@ -514,7 +514,10 @@ export function FolderSummaryView({
   if (summary.orphaned > 0) {
     notes.push({
       tone: "info",
-      text: `${formatNumber(summary.orphaned)} 个标注文件没有同名图片，不会导入`,
+      text:
+        summary.format === "xanylabeling"
+          ? `${formatNumber(summary.orphaned)} 个 .json 没有同目录、同名的图片，上传后会再按文件中记录的 imagePath 配对，仍配不上的不会导入`
+          : `${formatNumber(summary.orphaned)} 个标注文件没有同名图片，不会导入`,
     })
   }
   if (summary.ignored > 0) {

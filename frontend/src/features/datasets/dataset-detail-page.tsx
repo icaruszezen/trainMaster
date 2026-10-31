@@ -247,9 +247,11 @@ function DatasetDetail({ id }: { id: number }) {
                 variant="outline"
                 onClick={() => setExporting(true)}
                 disabled={!canExportDataset(dataset)}
+                aria-label="下载"
               >
                 <Download />
-                下载
+                {/* 手机宽度下只显示图标，让操作按钮保持一行。 */}
+                <span className="hidden sm:inline">下载</span>
               </Button>
               <Button onClick={openImport} disabled={dataset.directory_missing}>
                 <ImagePlus />

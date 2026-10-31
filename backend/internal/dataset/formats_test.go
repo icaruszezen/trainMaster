@@ -1,10 +1,16 @@
 package dataset
 
 import (
+	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"maps"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -159,11 +165,7 @@ func TestParseXAnyLabeling(t *testing.T) {
 	if f.ImagePath != `..\images\a.jpg` || f.Width != 100 || f.Height != 50 || len(f.Shapes) != 11 {
 		t.Errorf("file = %+v", f)
 	}
-	c := &converter{format: FormatXAnyLabeling, json: map[string]jsonResult{"a.json": {file: f}}}
-	a, err := c.read("a.json", imageInfo{}) // size from the file
-	if err != nil {
-		t.Fatal(err)
-	}
+	a := f.convert(imageInfo{}) // size from the file
 	want := []AnnotationObject{
 		{Name: "scratch", Xmin: 10, Ymin: 5, Xmax: 30, Ymax: 21, Difficult: true},
 		{Name: "dent", Xmin: 10, Ymin: 10, Xmax: 30, Ymax: 40},
@@ -176,7 +178,7 @@ func TestParseXAnyLabeling(t *testing.T) {
 	}
 
 	// The image's real size wins over the recorded one.
-	a, _ = c.read("a.json", imageInfo{Width: 200, Height: 100})
+	a = f.convert(imageInfo{Width: 200, Height: 100})
 	if a.Objects[3].Xmax != 110 || len(a.Objects) != 6 {
 		t.Errorf("with image size: %+v", a.Objects)
 	}
@@ -246,6 +248,19 @@ func TestParseYOLO(t *testing.T) {
 	var re *classRangeError
 	if !errors.As(err, &re) || re.Error() != "标注文件 labels/a.txt 第 3 行的类别编号为 3，但只提供了 3 个类别（编号 0–2），请检查类别顺序后重新导入" {
 		t.Errorf("class out of range: %v", err)
+	}
+	// The class id is checked before anything else can reject the file.
+	for _, tc := range []struct {
+		data string
+		info imageInfo
+	}{
+		{"0 0.5 0.5 0.2 0.2\n7 0.5 0.5 0.1 0.1\n", imageInfo{}}, // size unknown
+		{"0 0.5\n9 0.5 0.5 0.1 0.1\n", info},                    // earlier bad line
+		{"5 0.5\n", info},
+	} {
+		if _, err := parseYOLO([]byte(tc.data), "a.txt", classes, tc.info); !errors.As(err, &re) {
+			t.Errorf("parseYOLO(%q) = %v, want a class range error", tc.data, err)
+		}
 	}
 }
 
@@ -341,6 +356,53 @@ func TestYOLODataYAML(t *testing.T) {
 		if !strings.Contains(y, "train: images\nval: images\n") {
 			t.Errorf("%v: want no split\n%s", paths, y)
 		}
+	}
+}
+
+func TestYOLODataYAMLFolderNameNewline(t *testing.T) {
+	y := string(yoloDataYAML("ds\npath: /elsewhere", []string{"a"}, nil, ""))
+	for _, line := range strings.Split(y, "\n") {
+		if strings.HasPrefix(line, "path:") {
+			t.Errorf("folder name starts a YAML key:\n%s", y)
+		}
+	}
+}
+
+// Names that differ only in "\\" and "_" map to the same entry; the archive
+// must not hold it twice.
+func TestExportUniqueEntryNames(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{`x\1.jpg`, "x_1.jpg", `x\1.xml`} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	ann := `x\1.xml`
+	e := &Export{root: root, top: "ds", format: FormatVOC, entries: map[string]bool{},
+		images: []exportImage{{Path: `x\1.jpg`, AnnPath: &ann}, {Path: "x_1.jpg"}},
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil))}
+	var b bytes.Buffer
+	if err := e.Write(context.Background(), &b); err != nil {
+		t.Fatal(err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(b.Bytes()), int64(b.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, f := range zr.File {
+		names = append(names, f.Name)
+	}
+	if want := []string{"ds/x_1.jpg", "ds/x_1.xml"}; !slices.Equal(names, want) {
+		t.Errorf("entries = %q, want %q", names, want)
+	}
+	if e.written != 1 || e.missing != 1 {
+		t.Errorf("written %d, missing %d", e.written, e.missing)
 	}
 }
 

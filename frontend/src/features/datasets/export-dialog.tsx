@@ -18,6 +18,7 @@ import {
 import { Spinner } from "@/components/ui/spinner"
 import {
   createExport,
+  importsQuery,
   labelsQuery,
   type AnnotationFormat,
   type Dataset,
@@ -26,6 +27,7 @@ import { AnnotationFormatPicker } from "@/features/datasets/annotation-format-pi
 import {
   compareClassesWithLabels,
   defaultClassOrder,
+  lastYoloImport,
   parseClassList,
   toClassListText,
 } from "@/features/datasets/class-list"
@@ -91,9 +93,13 @@ function ExportForm({
 
   const labels = useQuery(labelsQuery(dataset.id))
   const labelItems = labels.data?.items
+  // 数据集由 YOLO 导入时，默认沿用导入时的类别顺序，类别编号保持不变。
+  const imports = useQuery(importsQuery(dataset.id))
+  const yoloImport = imports.data && lastYoloImport(imports.data.items)
+  const baseClasses = yoloImport?.classes
   const defaultText = useMemo(
-    () => toClassListText(defaultClassOrder(labelItems ?? [])),
-    [labelItems]
+    () => toClassListText(defaultClassOrder(labelItems ?? [], baseClasses)),
+    [labelItems, baseClasses]
   )
   const classesText = classesDraft ?? defaultText
   const classList = useMemo(() => parseClassList(classesText), [classesText])
@@ -180,11 +186,13 @@ function ExportForm({
             result={classList}
             showRequired={submitted}
             description={
-              labels.isPending
+              labels.isPending || imports.isPending
                 ? "正在读取数据集中的标签…"
                 : labels.error
                   ? `无法读取数据集中的标签（${labels.error.message}），请手动填写类别顺序。`
-                  : "默认按数据集中的标签名称排序；可直接编辑，或读取训练时使用的 classes.txt 以保持类别编号一致。"
+                  : yoloImport
+                    ? `默认沿用导入“${yoloImport.file_name}”时的类别顺序，其余标签按名称排在后面；可直接编辑，或读取训练时使用的 classes.txt。`
+                    : "默认按数据集中的标签名称排序；可直接编辑，或读取训练时使用的 classes.txt 以保持类别编号一致。"
             }
             onReset={
               classesDraft !== null && classesDraft !== defaultText
