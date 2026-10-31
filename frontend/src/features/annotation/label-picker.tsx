@@ -13,6 +13,7 @@ import { classNameError, filterClasses } from "@/features/annotation/classes"
 import {
   nearestScrollTop,
   placeOverlay,
+  pointerMoved,
   type OverlayAnchor,
 } from "@/features/annotation/geometry"
 import { classHotkey } from "@/features/annotation/shortcuts"
@@ -30,7 +31,8 @@ type LabelPickerProps = {
   onClose: () => void
   /**
    * 框在画布上的位置：选择框放在框下方，放不下时放到上方，超出右边时左移，
-   * 始终在画布内；没有时放在画布顶部居中。
+   * 上下都放不下时限制在画布内（可能盖住框）；没有时放在画布顶部居中。选择框的
+   * 高度不超过画布，画布较矮时列表变短（可以滚动），因此整个选择框都在画布内。
    */
   anchor?: OverlayAnchor | null
   className?: string
@@ -61,6 +63,8 @@ export function LabelPicker({
   const rootRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLUListElement>(null)
+  /** 上一次指针在列表项上移动的位置：只有指针真正移动时，高亮才跟随指针。 */
+  const lastPointer = useRef<{ x: number; y: number } | null>(null)
 
   // 量出选择框的尺寸后放到框旁边（绘制前完成，不会闪动）；框随缩放移动、
   // 筛选后列表变短时重新计算。
@@ -164,15 +168,19 @@ export function LabelPicker({
   return (
     <div
       ref={rootRef}
+      // 宽高都不超过画布（百分比相对画布计算，四周留出边距）：画布较矮时列表
+      // 变短、可以滚动到最后一项，选择框不会被画布裁掉。
       className={cn(
-        "absolute z-20 flex w-64 max-w-[calc(100%-1rem)] flex-col gap-2 rounded-lg border bg-popover p-2 text-popover-foreground shadow-lg",
-        !anchor && "top-4 left-1/2 -translate-x-1/2",
+        "absolute z-20 flex max-h-[calc(100%-1rem)] w-64 max-w-[calc(100%-1rem)] flex-col gap-2 rounded-lg border bg-popover p-2 text-popover-foreground shadow-lg",
+        !anchor && "top-4 left-1/2 max-h-[calc(100%-2rem)] -translate-x-1/2",
         className
       )}
       onPointerDown={(event) => event.stopPropagation()}
       onDoubleClick={(event) => event.stopPropagation()}
     >
-      <p className="px-1 text-xs font-medium text-muted-foreground">{title}</p>
+      <p className="shrink-0 px-1 text-xs font-medium text-muted-foreground">
+        {title}
+      </p>
       <Input
         ref={inputRef}
         value={query}
@@ -198,7 +206,7 @@ export function LabelPicker({
         aria-activedescendant={
           options.length > 0 ? `${listId}-${activeIndex}` : undefined
         }
-        className="h-8"
+        className="h-8 shrink-0"
       />
       <ul
         ref={listRef}
@@ -206,7 +214,8 @@ export function LabelPicker({
         role="listbox"
         aria-label="类别"
         // relative：列表项的 offsetTop 相对列表计算，用于滚动到可见。
-        className="relative max-h-60 overflow-y-auto"
+        // min-h-0：选择框高度受限时只有列表变短。
+        className="relative max-h-60 min-h-0 overflow-y-auto"
       >
         {options.map((option, index) => {
           const key =
@@ -220,7 +229,22 @@ export function LabelPicker({
               role="option"
               aria-selected={index === activeIndex}
               tabIndex={-1}
-              onPointerEnter={() => setActive(index)}
+              // 不用 pointerenter：用键盘移动、列表滚动后，浏览器会对停在原处的
+              // 指针下的这一项发出 pointerenter，有的浏览器还会补发位置不变的移动
+              // 事件（选择框刚在静止的指针下打开时也是），高亮就跳到指针所在的项了。
+              // 因此只在指针真正移动时（位置与上次不同；还没有记录时看事件的位移）
+              // 跟随指针。
+              onPointerMove={(event) => {
+                const point = { x: event.clientX, y: event.clientY }
+                const moved = pointerMoved(lastPointer.current, point, {
+                  x: event.movementX,
+                  y: event.movementY,
+                })
+                lastPointer.current = point
+                if (moved) {
+                  setActive(index)
+                }
+              }}
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => pick(option)}
               className={cn(

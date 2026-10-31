@@ -13,6 +13,7 @@ import {
   nearestScrollTop,
   normalizeBox,
   placeOverlay,
+  pointerMoved,
   resizeBox,
   resizeEdges,
   resizeGrabOffset,
@@ -413,6 +414,21 @@ describe("placeOverlay", () => {
       )
     ).toEqual({ x: 100, y: 8 })
   })
+
+  it("fits exactly when its height is capped to the canvas minus the margins", () => {
+    // The label picker caps its height at 100% - 2 * margin on short canvases.
+    const short = { width: 667, height: 175 }
+    const capped = { width: 256, height: 175 - 16 }
+    for (const [top, bottom] of [
+      [0, 20],
+      [70, 100],
+      [150, 175],
+    ]) {
+      const { y } = placeOverlay({ x: 100, top, bottom, bounds: short }, capped)
+      expect(y).toBe(8)
+      expect(y + capped.height).toBe(short.height - 8)
+    }
+  })
 })
 
 describe("nearestScrollTop", () => {
@@ -421,5 +437,25 @@ describe("nearestScrollTop", () => {
     expect(nearestScrollTop(0, 240, 288, 32)).toBe(80)
     expect(nearestScrollTop(200, 240, 96, 32)).toBe(96)
     expect(nearestScrollTop(0, 20, 64, 32)).toBe(64)
+  })
+})
+
+describe("pointerMoved", () => {
+  const still = { x: 0, y: 0 }
+
+  it("compares with the last recorded position", () => {
+    const last = { x: 100, y: 50 }
+    expect(pointerMoved(last, { x: 100, y: 50 }, still)).toBe(false)
+    // A same-position event counts as no movement even if it reports a delta.
+    expect(pointerMoved(last, { x: 100, y: 50 }, { x: 3, y: 0 })).toBe(false)
+    expect(pointerMoved(last, { x: 101, y: 50 }, still)).toBe(true)
+    expect(pointerMoved(last, { x: 100, y: 49 }, still)).toBe(true)
+  })
+
+  it("uses the event's own movement before any position is recorded", () => {
+    // Synthetic move under a resting pointer, e.g. right after the picker opened.
+    expect(pointerMoved(null, { x: 100, y: 50 }, still)).toBe(false)
+    expect(pointerMoved(null, { x: 100, y: 50 }, { x: -2, y: 0 })).toBe(true)
+    expect(pointerMoved(null, { x: 100, y: 50 }, { x: 0, y: 0.5 })).toBe(true)
   })
 })
