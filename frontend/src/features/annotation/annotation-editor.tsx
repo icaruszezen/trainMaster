@@ -1224,22 +1224,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
                     }
                     onPick={(name, created) => void onPick(name, created)}
                     onClose={() => setPicker(null)}
-                    className="absolute"
-                    style={
-                      point
-                        ? {
-                            left: Math.max(
-                              8,
-                              Math.min(point.x, window.innerWidth - 280)
-                            ),
-                            top: point.y + 6,
-                          }
-                        : {
-                            left: "50%",
-                            top: 16,
-                            transform: "translateX(-50%)",
-                          }
-                    }
+                    anchor={point}
                   />
                 )
               }}

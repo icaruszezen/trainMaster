@@ -13,7 +13,7 @@ import {
 import { PageTitleProvider, useCurrentPageTitle } from "@/hooks/use-page-title"
 import { cn } from "@/lib/utils"
 
-// SidebarProvider 会把折叠状态写入该 cookie，这里读回来以便刷新后保持。
+// SidebarProvider 会把普通页面的折叠状态写入该 cookie，这里读回来以便刷新后保持。
 function isSidebarOpenByDefault() {
   return !document.cookie.split("; ").includes("sidebar_state=false")
 }
@@ -21,7 +21,8 @@ function isSidebarOpenByDefault() {
 export function AppLayout() {
   const fullBleed = useIsFullBleed()
   const [sidebarOpen, setSidebarOpen] = useState(isSidebarOpenByDefault)
-  // 标注工作台默认收起侧边栏，把宽度留给图片；离开后恢复原来的状态。
+  // 标注工作台默认收起侧边栏，把宽度留给图片；离开后恢复原来的状态。在那里
+  // 展开 / 收起只是临时的，不写入 cookie，不影响普通页面刷新后的状态。
   const [fullBleedOpen, setFullBleedOpen] = useState(false)
 
   return (
@@ -29,6 +30,7 @@ export function AppLayout() {
       <SidebarProvider
         open={fullBleed ? fullBleedOpen : sidebarOpen}
         onOpenChange={fullBleed ? setFullBleedOpen : setSidebarOpen}
+        persist={!fullBleed}
       >
         <DocumentTitle />
         <AppSidebar />

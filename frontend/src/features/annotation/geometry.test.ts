@@ -10,9 +10,12 @@ import {
   hitCandidates,
   hitTest,
   moveBox,
+  nearestScrollTop,
   normalizeBox,
+  placeOverlay,
   resizeBox,
   resizeEdges,
+  resizeGrabOffset,
   revealBox,
   scaleLimits,
   screenAnchor,
@@ -226,6 +229,50 @@ describe("handles", () => {
   })
 })
 
+describe("resizeGrabOffset", () => {
+  const viewport = { scale: 2, x: 0, y: 0 }
+  const resizeTo = (box: Box, pointer: { x: number; y: number }) => {
+    const offset = resizeGrabOffset(viewport, box, "nw", { x: 14, y: 14 })
+    return resizeBox(
+      box,
+      "nw",
+      toImage(viewport, { x: pointer.x + offset.x, y: pointer.y + offset.y }),
+      size
+    )
+  }
+
+  it("is the distance from the pointer to the edge, not to the drawn handle", () => {
+    const small = { xmin: 10, ymin: 10, xmax: 15, ymax: 15 }
+    // The corner handle of a small box is drawn 6px outside the corner.
+    expect(resizeGrabOffset(viewport, small, "nw", { x: 14, y: 14 })).toEqual({
+      x: 6,
+      y: 6,
+    })
+    const large = { xmin: 10, ymin: 10, xmax: 40, ymax: 40 }
+    expect(resizeGrabOffset(viewport, large, "e", { x: 83, y: 30 })).toEqual({
+      x: -3,
+      y: 20,
+    })
+  })
+
+  it("moves the edge by the pointer delta instead of jumping to the pointer", () => {
+    const small = { xmin: 10, ymin: 10, xmax: 15, ymax: 15 }
+    expect(resizeTo(small, { x: 14, y: 14 })).toEqual(small)
+    expect(resizeTo(small, { x: 15, y: 15 })).toEqual({
+      xmin: 11,
+      ymin: 11,
+      xmax: 15,
+      ymax: 15,
+    })
+    expect(resizeTo(small, { x: 10, y: 12 })).toEqual({
+      xmin: 8,
+      ymin: 9,
+      xmax: 15,
+      ymax: 15,
+    })
+  })
+})
+
 describe("hitCandidates", () => {
   const boxes: (Box | null)[] = [
     { xmin: 0, ymin: 0, xmax: 50, ymax: 50 },
@@ -298,21 +345,81 @@ describe("wheelZoomFactor", () => {
 })
 
 describe("screenAnchor", () => {
-  it("is the bottom-left corner on screen, inside the container", () => {
+  it("is the left, top and bottom edge on screen, inside the container", () => {
     const viewport = { scale: 2, x: 10, y: 10 }
+    const bounds = { width: 400, height: 300 }
     expect(
-      screenAnchor(
-        viewport,
-        { xmin: 5, ymin: 5, xmax: 10, ymax: 10 },
-        { width: 400, height: 300 }
-      )
-    ).toEqual({ x: 20, y: 30 })
+      screenAnchor(viewport, { xmin: 5, ymin: 5, xmax: 10, ymax: 10 }, bounds)
+    ).toEqual({ x: 20, top: 20, bottom: 30, bounds })
     expect(
       screenAnchor(
         viewport,
         { xmin: -50, ymin: 100, xmax: 0, ymax: 200 },
-        { width: 400, height: 300 }
+        bounds
       )
-    ).toEqual({ x: 0, y: 300 })
+    ).toEqual({ x: 0, top: 210, bottom: 300, bounds })
+    expect(
+      screenAnchor(viewport, { xmin: 0, ymin: -50, xmax: 5, ymax: -20 }, bounds)
+    ).toEqual({ x: 10, top: 0, bottom: 0, bounds })
+  })
+})
+
+describe("placeOverlay", () => {
+  const bounds = { width: 600, height: 400 }
+  const size = { width: 256, height: 200 }
+
+  it("goes below the box, aligned with its left edge", () => {
+    expect(
+      placeOverlay({ x: 100, top: 50, bottom: 120, bounds }, size)
+    ).toEqual({ x: 100, y: 126 })
+  })
+
+  it("shifts left at the right edge and keeps a margin on the left", () => {
+    expect(
+      placeOverlay({ x: 500, top: 50, bottom: 120, bounds }, size)
+    ).toEqual({ x: 336, y: 126 })
+    expect(
+      placeOverlay(
+        { x: 0, top: 50, bottom: 120, bounds: { width: 200, height: 400 } },
+        size
+      )
+    ).toEqual({ x: 8, y: 126 })
+  })
+
+  it("flips above the box when it would overflow the bottom", () => {
+    expect(
+      placeOverlay({ x: 100, top: 250, bottom: 300, bounds }, size)
+    ).toEqual({ x: 100, y: 44 })
+    // Boxes below the visible area are anchored at the bottom edge.
+    expect(
+      placeOverlay({ x: 100, top: 400, bottom: 400, bounds }, size)
+    ).toEqual({ x: 100, y: 194 })
+  })
+
+  it("stays inside the canvas when it fits on neither side", () => {
+    // More room below: as low as fits.
+    expect(
+      placeOverlay({ x: 100, top: 180, bottom: 220, bounds }, size)
+    ).toEqual({ x: 100, y: 192 })
+    // More room above: as high as fits.
+    expect(
+      placeOverlay({ x: 100, top: 210, bottom: 260, bounds }, size)
+    ).toEqual({ x: 100, y: 8 })
+    // Taller than the canvas: top-aligned so the input stays visible.
+    expect(
+      placeOverlay(
+        { x: 100, top: 80, bottom: 120, bounds: { width: 600, height: 150 } },
+        size
+      )
+    ).toEqual({ x: 100, y: 8 })
+  })
+})
+
+describe("nearestScrollTop", () => {
+  it("scrolls only as far as needed to show the item", () => {
+    expect(nearestScrollTop(0, 240, 64, 32)).toBe(0)
+    expect(nearestScrollTop(0, 240, 288, 32)).toBe(80)
+    expect(nearestScrollTop(200, 240, 96, 32)).toBe(96)
+    expect(nearestScrollTop(0, 20, 64, 32)).toBe(64)
   })
 })

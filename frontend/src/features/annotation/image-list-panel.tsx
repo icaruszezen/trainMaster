@@ -67,23 +67,36 @@ export function ImageListPanel({
 }: ImageListPanelProps) {
   const followPage =
     position === null ? 0 : Math.floor(position / IMAGE_LIST_PAGE_SIZE)
-  // 手动翻页后停在那一页，直到当前图片换到了别的一页。
-  const [manual, setManual] = useState<{ follow: number; page: number } | null>(
-    null
-  )
-  const page = manual && manual.follow === followPage ? manual.page : followPage
+  const filtersKey = JSON.stringify([filters.status, filters.label, filters.q])
+  // 手动翻页后停在那一页，直到当前图片换到了别的一页或筛选条件变了。
+  const [manual, setManual] = useState<{
+    follow: number
+    filters: string
+    page: number
+  } | null>(null)
+  const page =
+    manual && manual.follow === followPage && manual.filters === filtersKey
+      ? manual.page
+      : followPage
   const query = useQuery(
     imagesPageQuery(dataset.id, filters, page * IMAGE_LIST_PAGE_SIZE)
   )
   const labels = useQuery(labelsQuery(dataset.id))
   const total = query.data?.total ?? 0
   const pages = Math.max(1, Math.ceil(total / IMAGE_LIST_PAGE_SIZE))
+  // 这一页超出了结果的范围（如图片被删除后）：退到最后一页。占位数据是上一个
+  // 查询（可能是别的筛选条件）的结果，不据此判断。
+  const lastPage = query.data && !query.isPlaceholderData ? pages - 1 : Infinity
+  if (page > lastPage) {
+    setManual({ follow: followPage, filters: filtersKey, page: lastPage })
+  }
   const statusOptions = imageStatusOptions(dataset, filters.status)
   const labelItems = labels.data?.items ?? []
   const labelMissing =
     filters.label !== "" && !labelItems.some((l) => l.name === filters.label)
 
-  const goPage = (next: number) => setManual({ follow: followPage, page: next })
+  const goPage = (next: number) =>
+    setManual({ follow: followPage, filters: filtersKey, page: next })
   // 当前图片换了（或翻到了它所在的一页）时滚动到它。
   const scrollToCurrent = useCallback(
     (element: HTMLButtonElement | null) =>

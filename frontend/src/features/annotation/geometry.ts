@@ -274,8 +274,37 @@ export function handlePoint(
   box: Box,
   handle: Handle
 ): Point {
+  return handlePosition(
+    viewport,
+    box,
+    handle,
+    isSmallOnScreen(viewport, box) ? SMALL_BOX_OUTSET : 0
+  )
+}
+
+/**
+ * 开始缩放时，手柄控制的边（角）与指针之间的偏移（屏幕像素）。拖动时先把它
+ * 加到指针上再换算成图片坐标，边就随指针移动的距离移动，而不会跳到指针处
+ * （小框的角手柄画在框外，按下的位置也不一定正好在手柄中心）。
+ */
+export function resizeGrabOffset(
+  viewport: Viewport,
+  box: Box,
+  handle: Handle,
+  pointer: Point
+): Point {
+  const edge = handlePosition(viewport, box, handle, 0)
+  return { x: edge.x - pointer.x, y: edge.y - pointer.y }
+}
+
+/** 手柄对应的边（角）在屏幕上的位置，角手柄向外偏移 `outset`。 */
+function handlePosition(
+  viewport: Viewport,
+  box: Box,
+  handle: Handle,
+  outset: number
+): Point {
   const rect = boxToScreen(viewport, box)
-  const outset = isSmallOnScreen(viewport, box) ? SMALL_BOX_OUTSET : 0
   const x = handle.includes("w")
     ? rect.x - outset
     : handle.includes("e")
@@ -455,11 +484,79 @@ export function wheelZoomFactor(deltaY: number, deltaMode: number) {
   return clamp(Math.exp(-pixels * 0.0014), 1 / 1.3, 1.3)
 }
 
-/** 画布上一个框的屏幕区域，供在框旁边显示浮层（如类别选择框）。 */
-export function screenAnchor(viewport: Viewport, box: Box, container: Size) {
+/** 画布上一个框的屏幕位置（限制在画布内），供在框旁边显示浮层。 */
+export type OverlayAnchor = {
+  /** 框的左边。 */
+  x: number
+  /** 框的上边。 */
+  top: number
+  /** 框的下边。 */
+  bottom: number
+  /** 画布尺寸：浮层放在这个范围内。 */
+  bounds: Size
+}
+
+/** 框在画布上的位置，供在框旁边显示浮层（如类别选择框），见 {@link placeOverlay}。 */
+export function screenAnchor(
+  viewport: Viewport,
+  box: Box,
+  container: Size
+): OverlayAnchor {
   const rect = boxToScreen(viewport, box)
+  const height = Math.max(0, container.height)
   return {
     x: clamp(rect.x, 0, Math.max(0, container.width)),
-    y: clamp(rect.y + rect.height, 0, Math.max(0, container.height)),
+    top: clamp(rect.y, 0, height),
+    bottom: clamp(rect.y + rect.height, 0, height),
+    bounds: { width: container.width, height: container.height },
   }
+}
+
+/**
+ * 浮层（尺寸 `size`）的左上角位置：与框左边对齐、放在框下方；超出画布右边时
+ * 左移，下方放不下时翻到框上方，上下都放不下时放在空间较大的一边并限制在画布
+ * 内（浮层比画布还高时顶部对齐，保证上方的输入框可见）。四周留 `margin`。
+ */
+export function placeOverlay(
+  anchor: OverlayAnchor,
+  size: Size,
+  gap = 6,
+  margin = 8
+): Point {
+  const { bounds } = anchor
+  const x = Math.max(
+    margin,
+    Math.min(anchor.x, bounds.width - margin - size.width)
+  )
+  const maxY = bounds.height - margin - size.height
+  const below = anchor.bottom + gap
+  const above = anchor.top - gap - size.height
+  if (below <= maxY) {
+    return { x, y: below }
+  }
+  if (above >= margin) {
+    return { x, y: above }
+  }
+  const preferred = bounds.height - anchor.bottom >= anchor.top ? below : above
+  return { x, y: Math.max(margin, Math.min(preferred, maxY)) }
+}
+
+/**
+ * 让列表中的一项完整可见的滚动位置（同 `scrollIntoView({ block: "nearest" })`，
+ * 但只滚动这个列表）：已经可见时不变，比列表还高时与顶部对齐。`itemTop` 是这一
+ * 项相对列表内容顶部的位置。
+ */
+export function nearestScrollTop(
+  scrollTop: number,
+  viewHeight: number,
+  itemTop: number,
+  itemHeight: number
+) {
+  if (itemTop < scrollTop || itemHeight > viewHeight) {
+    return itemTop
+  }
+  if (itemTop + itemHeight > scrollTop + viewHeight) {
+    return itemTop + itemHeight - viewHeight
+  }
+  return scrollTop
 }
