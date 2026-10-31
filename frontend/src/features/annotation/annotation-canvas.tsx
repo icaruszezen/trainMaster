@@ -536,8 +536,11 @@ export function AnnotationCanvas({
 
     // 两次单击画框的第二次单击：松开时完成（见 onPointerUp）。按下时就完成的话，
     // 弹出的类别选择框（类别列表为空时）刚获得焦点，随后的 mousedown 就把焦点
-    // 移回画布、关掉了它，框也随之丢弃。
+    // 移回画布、关掉了它，框也随之丢弃。触屏与部分触控笔的兼容鼠标事件在松开
+    // 之后才派发，所以这里还要取消 pointerdown，不再产生这些鼠标事件（click
+    // 照常触发，画布在上面已经获得焦点）。
     if (drag?.kind === "draw" && drag.click && canDraw) {
+      event.preventDefault()
       element.setPointerCapture(event.pointerId)
       setDrag({
         ...drag,
