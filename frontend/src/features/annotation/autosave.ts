@@ -33,7 +33,13 @@ export type SaverState = {
 export type SaveRequest<C> = {
   objects: AnnotationObject[]
   baseVersion: string
+  /** 不检查版本（冲突时用户选择了“覆盖”）。 */
   force: boolean
+  /**
+   * 文件无法在保留其它内容的情况下修改时，允许按平台的格式重新生成（用户选择了
+   * “仍然保存”，只在这时带上）。与 force 相互独立：不带 force 时仍然检查版本。
+   */
+  regenerate?: boolean
   /** reset() 时给出的上下文（如哪张图片），保存进行中切换了图片也不会写错。 */
   context: C
 }
@@ -43,7 +49,7 @@ export type SaveFunction<C> = (request: SaveRequest<C>) => Promise<string>
 
 export const ANNOTATION_CONFLICT = "annotation_conflict"
 
-/** 已有的标注文件无法在保留其它内容的情况下修改，只能选择重新生成（force）。 */
+/** 已有的标注文件无法在保留其它内容的情况下修改，只能选择重新生成（regenerate）。 */
 export const ANNOTATION_UNPATCHABLE = "annotation_unpatchable"
 
 export function isConflictError(error: unknown) {
@@ -75,6 +81,11 @@ export class AnnotationSaver<C> {
    * 成功前算作未保存的修改。
    */
   private forced = false
+  /**
+   * 最近一次因 `annotation_unpatchable` 被拒绝的保存是否带了 force（冲突后选择
+   * 了“覆盖”），{@link regenerate} 用同样的 force 重新发送。
+   */
+  private unpatchableForce = false
 
   private timer: ReturnType<typeof setTimeout> | null = null
   private inflight: Promise<boolean> | null = null
@@ -130,6 +141,7 @@ export class AnnotationSaver<C> {
     this.clearTimer()
     this.inflight = null
     this.forced = false
+    this.unpatchableForce = false
     this.baseline = serializeObjects(objects)
     this.currentText = this.baseline
     this.current = [...objects]
@@ -249,13 +261,31 @@ export class AnnotationSaver<C> {
     return this.flush()
   }
 
-  /** 冲突时选择“覆盖”：不再检查版本，用编辑器中的框覆盖文件。 */
+  /**
+   * 冲突时选择“覆盖”：不再检查版本，用编辑器中的框覆盖文件。覆盖不包括重新
+   * 生成文件：文件无法在保留其它内容的情况下修改时同样失败（`annotation_unpatchable`），
+   * 由用户再选择 {@link regenerate}。
+   */
   async overwrite(): Promise<boolean> {
     this.clearTimer()
     if (this.inflight) {
       await this.inflight
     }
     return this.run(true)
+  }
+
+  /**
+   * 文件无法在保留其它内容的情况下修改（`annotation_unpatchable`）时选择“仍然
+   * 保存”：允许按平台的格式重新生成整个文件。force 与被拒绝的那次保存相同：
+   * 普通保存仍然检查版本，提示期间文件被他人修改时进入冲突，不会覆盖别人的修改；
+   * 冲突后选择的覆盖则继续覆盖。
+   */
+  async regenerate(): Promise<boolean> {
+    this.clearTimer()
+    if (this.inflight) {
+      await this.inflight
+    }
+    return this.run(this.unpatchableForce, true)
   }
 
   dispose() {
@@ -288,7 +318,7 @@ export class AnnotationSaver<C> {
     }
   }
 
-  private run(force: boolean): Promise<boolean> {
+  private run(force: boolean, regenerate = false): Promise<boolean> {
     const generation = this.generation
     const objects = this.current
     const text = this.currentText
@@ -302,6 +332,7 @@ export class AnnotationSaver<C> {
       objects,
       baseVersion: this.version,
       force,
+      ...(regenerate ? { regenerate } : {}),
       context,
     }).then(
       (version) => {
@@ -331,6 +362,12 @@ export class AnnotationSaver<C> {
         if (isConflictError(error)) {
           this.setState({ status: "conflict", error: null })
         } else {
+          if (
+            error instanceof ApiError &&
+            error.code === ANNOTATION_UNPATCHABLE
+          ) {
+            this.unpatchableForce = force
+          }
           this.setState({
             status: "error",
             error: error instanceof Error ? error.message : "保存失败",

@@ -43,6 +43,9 @@ function setup(options: { autosave?: boolean } = {}) {
 const conflict = () =>
   new ApiError(409, "annotation_conflict", "标注文件已被修改")
 
+const unpatchable = () =>
+  new ApiError(409, "annotation_unpatchable", "无法在保留其它内容的情况下修改")
+
 beforeEach(() => {
   vi.useFakeTimers()
 })
@@ -127,23 +130,78 @@ describe("AnnotationSaver", () => {
     saver.reset([box("a")], "v1", "image-1")
     saver.update([box("b")])
     const flushed = saver.flush()
-    calls[0].reject(
-      new ApiError(
-        409,
-        "annotation_unpatchable",
-        "无法在保留其它内容的情况下修改"
-      )
-    )
+    calls[0].reject(unpatchable())
     await expect(flushed).resolves.toBe(false)
     expect(saver.getState()).toEqual({
       status: "error",
       error: "无法在保留其它内容的情况下修改",
       code: "annotation_unpatchable",
     })
-    const forced = saver.overwrite()
-    expect(calls[1].request.force).toBe(true)
+    const regenerated = saver.regenerate()
+    expect(calls[1].request).toMatchObject({
+      baseVersion: "v1",
+      force: false,
+      regenerate: true,
+      objects: [box("b")],
+    })
     calls[1].resolve("v2")
-    await expect(forced).resolves.toBe(true)
+    await expect(regenerated).resolves.toBe(true)
+    expect(saver.getState().status).toBe("saved")
+  })
+
+  it("regenerating still checks the version", async () => {
+    const { saver, calls } = setup()
+    saver.reset([box("a")], "v1", "image-1")
+    saver.update([box("b")])
+    const flushed = saver.flush()
+    calls[0].reject(unpatchable())
+    await expect(flushed).resolves.toBe(false)
+    // Someone else changed the file while the notice was shown.
+    const regenerated = saver.regenerate()
+    expect(calls[1].request).toMatchObject({ force: false, regenerate: true })
+    calls[1].reject(conflict())
+    await expect(regenerated).resolves.toBe(false)
+    expect(saver.getState().status).toBe("conflict")
+  })
+
+  it("overwriting does not regenerate the file without asking", async () => {
+    const { saver, calls } = setup()
+    saver.reset([box("a")], "v1", "image-1")
+    saver.update([box("b")])
+    const flushed = saver.flush()
+    calls[0].reject(conflict())
+    await expect(flushed).resolves.toBe(false)
+    const overwritten = saver.overwrite()
+    expect(calls[1].request.force).toBe(true)
+    expect(calls[1].request.regenerate).toBeUndefined()
+    // The newer file cannot be edited in place: the user is asked first.
+    calls[1].reject(unpatchable())
+    await expect(overwritten).resolves.toBe(false)
+    expect(saver.getState()).toMatchObject({
+      status: "error",
+      code: "annotation_unpatchable",
+    })
+    // "仍然保存" keeps overwriting.
+    const regenerated = saver.regenerate()
+    expect(calls[2].request).toMatchObject({
+      force: true,
+      regenerate: true,
+      objects: [box("b")],
+    })
+    calls[2].resolve("v3")
+    await expect(regenerated).resolves.toBe(true)
+    expect(saver.getVersion()).toBe("v3")
+
+    // The next image starts over.
+    saver.reset([box("x")], "w1", "image-2")
+    saver.update([box("y")])
+    void saver.regenerate()
+    expect(calls[3].request).toMatchObject({
+      baseVersion: "w1",
+      force: false,
+      regenerate: true,
+      context: "image-2",
+    })
   })
 
   it("stops on a conflict until the user overwrites", async () => {

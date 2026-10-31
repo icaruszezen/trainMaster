@@ -54,6 +54,16 @@ describe("persistAnnotation", () => {
     )
   })
 
+  it("asks to regenerate the file only when told to", async () => {
+    await persistAnnotation([box], "v1", true, context(), undefined, true)
+    expect(saveAnnotation).toHaveBeenCalledWith(
+      1,
+      2,
+      { objects: [box], base_version: "v1", force: true, regenerate: true },
+      undefined
+    )
+  })
+
   it("writes nothing for an image that had no file and still has no box", async () => {
     await expect(
       persistAnnotation([], "", false, context())

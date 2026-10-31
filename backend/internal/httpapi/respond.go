@@ -23,7 +23,7 @@ const (
 	codeConflict              = "conflict"               // 409: the current state does not allow the operation
 	codeUploadOffsetMismatch  = "upload_offset_mismatch" // 409: chunk offset differs from the bytes received so far
 	codeAnnotationConflict    = "annotation_conflict"    // 409: the annotation file changed since the version the edit started from
-	codeAnnotationUnpatchable = "annotation_unpatchable" // 409: the annotation file cannot be edited while keeping its other content; force rewrites it
+	codeAnnotationUnpatchable = "annotation_unpatchable" // 409: the annotation file cannot be edited while keeping its other content; regenerate rewrites it
 	codePayloadTooLarge       = "payload_too_large"      // 413
 	codeValidationFailed      = "validation_failed"      // 422: a field value is invalid; the message names the problem
 	codeUnsupportedImage      = "unsupported_image"      // 422: no thumbnail can be generated for the image

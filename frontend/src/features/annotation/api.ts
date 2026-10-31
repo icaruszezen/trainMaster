@@ -113,13 +113,16 @@ export type SaveContext = {
  * 写入空标注（负样本）；否则删除本次编辑中创建的文件，图片恢复为“未标注”，
  * 画了又删掉的框不会把图片误标为负样本。返回保存后的详情；没有任何写入时为 null。
  * `init` 用于关闭页面时补发的 `keepalive` 请求（与平时的保存走同一套规则）。
+ * `regenerate` 允许按平台的格式重新生成无法在保留其它内容的情况下修改的文件
+ * （用户选择了“仍然保存”）。
  */
 export async function persistAnnotation(
   objects: AnnotationObject[],
   baseVersion: string,
   force: boolean,
   context: SaveContext,
-  init?: RequestInit
+  init?: RequestInit,
+  regenerate = false
 ): Promise<DatasetImageDetail | null> {
   const { datasetId, imageId } = context
   if (objects.length === 0 && !context.hadFile && !context.negative) {
@@ -131,7 +134,12 @@ export async function persistAnnotation(
   return saveAnnotation(
     datasetId,
     imageId,
-    { objects, base_version: baseVersion, force },
+    {
+      objects,
+      base_version: baseVersion,
+      force,
+      ...(regenerate ? { regenerate } : {}),
+    },
     init
   )
 }

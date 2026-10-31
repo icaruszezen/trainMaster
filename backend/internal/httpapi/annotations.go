@@ -35,7 +35,8 @@ func (s *server) getImageNeighbors(w http.ResponseWriter, r *http.Request) {
 type saveAnnotationRequest struct {
 	Objects     *[]dataset.AnnotationObject `json:"objects"`
 	BaseVersion *string                     `json:"base_version"`
-	Force       bool                        `json:"force"`
+	Force       bool                        `json:"force"`      // skip the version check
+	Regenerate  bool                        `json:"regenerate"` // allow regenerating an unpatchable file
 }
 
 func (s *server) saveImageAnnotation(w http.ResponseWriter, r *http.Request) {
@@ -55,7 +56,7 @@ func (s *server) saveImageAnnotation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, codeValidationFailed, "缺少 base_version（开始编辑时的标注版本，没有标注时为空字符串）")
 		return
 	}
-	in := dataset.SaveAnnotationInput{Objects: *req.Objects, Force: req.Force}
+	in := dataset.SaveAnnotationInput{Objects: *req.Objects, Force: req.Force, Regenerate: req.Regenerate}
 	if req.BaseVersion != nil {
 		in.BaseVersion = *req.BaseVersion
 	}

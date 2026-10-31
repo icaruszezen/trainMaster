@@ -117,6 +117,38 @@ func TestAnnotationAPI(t *testing.T) {
 	}
 }
 
+func TestAnnotationRegenerateAPI(t *testing.T) {
+	e := newAPIEnv(t, true)
+	// The declaration inside the root switches the rest to GBK, so a new
+	// label written in UTF-8 cannot be put into the file in place.
+	unpatchable := `<annotation><?xml version="1.0" encoding="GBK"?><filename>d.png</filename>` +
+		`<object><name>a</name><bndbox><xmin>1</xmin><ymin>1</ymin><xmax>5</xmax><ymax>5</ymax></bndbox></object></annotation>`
+	ds := e.registerFolder(t, "regenerate", map[string]string{"d.png": string(testPNG(t, 16, 16)), "d.xml": unpatchable})
+	img := want[List[dataset.Image]](t, e.do("GET", fmt.Sprintf("/api/v1/datasets/%d/images", ds.ID), nil), 200).Items[0]
+	imgURL := fmt.Sprintf("/api/v1/datasets/%d/images/%d", ds.ID, img.ID)
+	version := want[dataset.ImageDetail](t, e.do("GET", imgURL, nil), 200).AnnotationVersion
+	objects := []any{map[string]any{"name": "划痕", "xmin": 1, "ymin": 1, "xmax": 5, "ymax": 5}}
+
+	wantError(t, e.do("PUT", imgURL+"/annotation", map[string]any{"objects": objects, "base_version": version}),
+		409, codeAnnotationUnpatchable, "无法在保留其中其它内容的情况下修改")
+	// force only skips the version check.
+	wantError(t, e.do("PUT", imgURL+"/annotation", map[string]any{"objects": objects, "force": true}),
+		409, codeAnnotationUnpatchable, "无法在保留其中其它内容的情况下修改")
+	// regenerate still checks it.
+	wantError(t, e.do("PUT", imgURL+"/annotation", map[string]any{"objects": objects, "base_version": "stale", "regenerate": true}),
+		409, codeAnnotationConflict, "已被修改")
+	wantError(t, e.do("PUT", imgURL+"/annotation", map[string]any{"objects": objects, "regenerate": true}),
+		422, codeValidationFailed, "缺少 base_version")
+	if data, err := os.ReadFile(filepath.Join(e.st.Dir(storage.Datasets), "regenerate", "d.xml")); err != nil || string(data) != unpatchable {
+		t.Errorf("refused saves changed d.xml: %s, %v", data, err)
+	}
+	saved := want[dataset.ImageDetail](t, e.do("PUT", imgURL+"/annotation", map[string]any{
+		"objects": objects, "base_version": version, "regenerate": true}), 200)
+	if len(saved.Objects) != 1 || saved.Objects[0].Name != "划痕" || saved.AnnotationVersion == version {
+		t.Errorf("regenerated = %+v", saved)
+	}
+}
+
 func TestClassesAPI(t *testing.T) {
 	e := newAPIEnv(t, false)
 	ds := want[dataset.Dataset](t, e.do("POST", "/api/v1/datasets", map[string]any{"name": "classes"}), 201)

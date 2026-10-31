@@ -748,6 +748,206 @@ func TestIntegrationAnnotationTargets(t *testing.T) {
 	}
 }
 
+// rescan scans the dataset folder again and waits for the scan.
+func (e *annotationEnv) rescan(t *testing.T) {
+	t.Helper()
+	job, err := e.svc.StartScan(context.Background(), e.d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job = e.waitJob(t, e.d.ID, job.ID); job.Status != StatusSucceeded {
+		t.Fatalf("rescan = %+v", job)
+	}
+}
+
+func objectNames(objects []AnnotationObject) []string {
+	names := []string{}
+	for _, o := range objects {
+		names = append(names, o.Name)
+	}
+	return names
+}
+
+func boxNamed(name string) []AnnotationObject {
+	return []AnnotationObject{{Name: name, Xmin: 1, Ymin: 1, Xmax: 5, Ymax: 5}}
+}
+
+// A paired image is not edited in a file the next scan would drop: when
+// another tool writes a file a scan prefers (LabelImg saves next to the
+// image), that file is shown and saved, and the image is paired with it.
+func TestIntegrationPairedAnnotationSuperseded(t *testing.T) {
+	e := newAnnotationEnv(t, map[string][]byte{
+		"VOC/JPEGImages/a.jpg":  pngFile(t, 16, 16),
+		"VOC/JPEGImages/b.jpg":  pngFile(t, 16, 16),
+		"VOC/JPEGImages/c.jpg":  pngFile(t, 16, 16),
+		"VOC/JPEGImages/c.png":  pngFile(t, 16, 16),
+		"VOC/Annotations/.keep": nil,
+		"flat/e.png":            pngFile(t, 16, 16),
+		"flat/e.xml":            vocFile("e.png", "dent"),
+	})
+	ctx := context.Background()
+	save := func(rel, base, label string) (ImageDetail, error) {
+		return e.svc.SaveAnnotation(ctx, e.d.ID, e.image(t, rel).ID, SaveAnnotationInput{Objects: boxNamed(label), BaseVersion: base})
+	}
+
+	first, err := save("VOC/JPEGImages/a.jpg", "", "platform1")
+	if err != nil || *first.AnnotationPath != "VOC/Annotations/a.xml" {
+		t.Fatalf("first save = %+v, %v", first, err)
+	}
+	platformFile := e.readFile(t, "VOC/Annotations/a.xml")
+	labelImg := vocFile("a.jpg", "labelimg")
+	writeFiles(t, e.dir, map[string][]byte{"VOC/JPEGImages/a.xml": labelImg})
+	got := e.detail(t, e.image(t, "VOC/JPEGImages/a.jpg"))
+	if got.AnnotationPath == nil || *got.AnnotationPath != "VOC/JPEGImages/a.xml" || got.AnnotationVersion != annotationVersion(labelImg) ||
+		!reflect.DeepEqual(objectNames(got.Objects), []string{"labelimg"}) || got.AnnotationBlocked != "" {
+		t.Fatalf("detail after LabelImg wrote a.xml = %+v", got)
+	}
+	// An edit started from the platform's file meets LabelImg's.
+	_, err = save("VOC/JPEGImages/a.jpg", first.AnnotationVersion, "platform2")
+	wantKind(t, err, ErrAnnotationChanged, "已被修改")
+	saved, err := save("VOC/JPEGImages/a.jpg", got.AnnotationVersion, "platform2")
+	if err != nil || *saved.AnnotationPath != "VOC/JPEGImages/a.xml" {
+		t.Fatalf("save = %+v, %v", saved, err)
+	}
+	if img := e.image(t, "VOC/JPEGImages/a.jpg"); img.AnnotationPath == nil || *img.AnnotationPath != "VOC/JPEGImages/a.xml" {
+		t.Errorf("not paired with the file it saved: %+v", img)
+	}
+	if data := e.readFile(t, "VOC/Annotations/a.xml"); !bytes.Equal(data, platformFile) {
+		t.Errorf("the superseded file changed:\n%s", data)
+	}
+
+	// c.xml next to the images names c.png, so a scan gives it to c.png and
+	// leaves c.jpg without annotation: c.jpg can no longer edit its file.
+	if _, err := save("VOC/JPEGImages/c.jpg", "", "platform"); err != nil {
+		t.Fatal(err)
+	}
+	cPlatform := e.readFile(t, "VOC/Annotations/c.xml")
+	writeFiles(t, e.dir, map[string][]byte{"VOC/JPEGImages/c.xml": vocFile("c.png", "labelimg")})
+	c := e.image(t, "VOC/JPEGImages/c.jpg")
+	if got := e.detail(t, c); len(got.Objects) != 0 || got.AnnotationPath != nil ||
+		!strings.Contains(got.AnnotationBlocked, "标注文件 VOC/JPEGImages/c.xml 属于同一文件夹中的另一张图片 VOC/JPEGImages/c.png") {
+		t.Errorf("c.jpg detail = %+v", got)
+	}
+	for _, force := range []bool{false, true} {
+		_, err = e.svc.SaveAnnotation(ctx, e.d.ID, c.ID, SaveAnnotationInput{Objects: boxNamed("x"), Force: force})
+		wantKind(t, err, ErrConflict, "另一张图片 VOC/JPEGImages/c.png")
+	}
+	if data := e.readFile(t, "VOC/Annotations/c.xml"); !bytes.Equal(data, cPlatform) {
+		t.Errorf("c.jpg's old file changed:\n%s", data)
+	}
+
+	// A preferred file in another case is not looked for when viewing (that
+	// would list the folder), but saving and deleting stop until a rescan.
+	sensitive := caseSensitive(t)
+	if sensitive {
+		bFirst, err := save("VOC/JPEGImages/b.jpg", "", "platform")
+		if err != nil || *bFirst.AnnotationPath != "VOC/Annotations/b.xml" {
+			t.Fatalf("b save = %+v, %v", bFirst, err)
+		}
+		writeFiles(t, e.dir, map[string][]byte{"VOC/JPEGImages/B.XML": vocFile("b.jpg", "labelimg")})
+		_, err = save("VOC/JPEGImages/b.jpg", bFirst.AnnotationVersion, "platform2")
+		wantKind(t, err, ErrConflict, "另一个标注文件 VOC/JPEGImages/B.XML，请先重新扫描")
+		_, err = e.svc.DeleteAnnotation(ctx, e.d.ID, e.image(t, "VOC/JPEGImages/b.jpg").ID, bFirst.AnnotationVersion, true)
+		wantKind(t, err, ErrConflict, "请先重新扫描")
+		if data := e.readFile(t, "VOC/Annotations/b.xml"); !strings.Contains(string(data), "<name>platform</name>") {
+			t.Errorf("b.jpg's old file changed:\n%s", data)
+		}
+		// So does a file found instead of a paired file that is gone.
+		if err := os.Rename(filepath.Join(e.dir, "flat", "e.xml"), filepath.Join(e.dir, "flat", "E.XML")); err != nil {
+			t.Fatal(err)
+		}
+		if got := e.detail(t, e.image(t, "flat/e.png")); got.AnnotationError != "标注文件已不存在，请重新扫描" {
+			t.Errorf("e.png detail = %+v", got)
+		}
+		_, err = save("flat/e.png", "", "platform")
+		wantKind(t, err, ErrConflict, "另一个标注文件 flat/E.XML，请先重新扫描")
+		if _, err := os.Stat(filepath.Join(e.dir, "flat", "e.xml")); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("wrote the paired file again: %v", err)
+		}
+	}
+
+	// The rescan agrees.
+	e.rescan(t)
+	if after := e.detail(t, e.image(t, "VOC/JPEGImages/a.jpg")); after.AnnotationPath == nil || *after.AnnotationPath != "VOC/JPEGImages/a.xml" ||
+		after.AnnotationVersion != saved.AnnotationVersion || !reflect.DeepEqual(objectNames(after.Objects), []string{"platform2"}) {
+		t.Errorf("a.jpg after a rescan = %+v", after)
+	}
+	if img := e.image(t, "VOC/JPEGImages/c.png"); img.AnnotationPath == nil || *img.AnnotationPath != "VOC/JPEGImages/c.xml" {
+		t.Errorf("c.png after a rescan = %+v", img)
+	}
+	if img := e.image(t, "VOC/JPEGImages/c.jpg"); img.AnnotationPath != nil {
+		t.Errorf("c.jpg after a rescan = %+v", img)
+	}
+	if sensitive {
+		b := e.detail(t, e.image(t, "VOC/JPEGImages/b.jpg"))
+		if b.AnnotationPath == nil || *b.AnnotationPath != "VOC/JPEGImages/B.XML" {
+			t.Fatalf("b.jpg after a rescan = %+v", b)
+		}
+		if _, err := save("VOC/JPEGImages/b.jpg", b.AnnotationVersion, "platform2"); err != nil {
+			t.Errorf("b.jpg save after a rescan: %v", err)
+		}
+	}
+}
+
+// A new annotation file is created only for the image a scan gives it to.
+func TestIntegrationNewAnnotationFileOwner(t *testing.T) {
+	e := newAnnotationEnv(t, map[string][]byte{
+		"VOC/JPEGImages/a.jpg":  pngFile(t, 16, 16),
+		"VOC/images/a.jpg":      pngFile(t, 16, 16),
+		"VOC/Annotations/.keep": nil,
+		"same/a.jpg":            pngFile(t, 16, 16),
+		"same/a.png":            pngFile(t, 16, 16),
+	})
+	ctx := context.Background()
+
+	// Both images take Annotations/a.xml, and the <filename> a.jpg of a new
+	// file names both: a scan gives it to the first in sorted order.
+	img := e.image(t, "VOC/images/a.jpg")
+	got := e.detail(t, img)
+	if !strings.Contains(got.AnnotationBlocked, "标注文件 VOC/Annotations/a.xml 属于另一张图片 VOC/JPEGImages/a.jpg（VOC 按文件名配对）") ||
+		strings.Contains(got.AnnotationBlocked, "同一文件夹") {
+		t.Errorf("images/a.jpg detail = %+v", got)
+	}
+	_, err := e.svc.SaveAnnotation(ctx, e.d.ID, img.ID, SaveAnnotationInput{Objects: boxNamed("for-images")})
+	wantKind(t, err, ErrConflict, "属于另一张图片 VOC/JPEGImages/a.jpg")
+	if _, err := os.Stat(filepath.Join(e.dir, "VOC", "Annotations", "a.xml")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("created a file for images/a.jpg: %v", err)
+	}
+	jpeg := e.image(t, "VOC/JPEGImages/a.jpg")
+	if got := e.detail(t, jpeg); got.AnnotationBlocked != "" {
+		t.Errorf("JPEGImages/a.jpg detail = %+v", got)
+	}
+	saved, err := e.svc.SaveAnnotation(ctx, e.d.ID, jpeg.ID, SaveAnnotationInput{Objects: boxNamed("for-jpeg")})
+	if err != nil || *saved.AnnotationPath != "VOC/Annotations/a.xml" {
+		t.Fatalf("JPEGImages/a.jpg save = %+v, %v", saved, err)
+	}
+
+	// In one folder the <filename> of the new file decides: a.png may create
+	// a.xml.
+	png := e.image(t, "same/a.png")
+	if got := e.detail(t, png); got.AnnotationBlocked != "" {
+		t.Errorf("same/a.png detail = %+v", got)
+	}
+	if _, err := e.svc.SaveAnnotation(ctx, e.d.ID, png.ID, SaveAnnotationInput{Objects: boxNamed("for-png")}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.rescan(t)
+	if got := e.detail(t, e.image(t, "VOC/JPEGImages/a.jpg")); !reflect.DeepEqual(objectNames(got.Objects), []string{"for-jpeg"}) {
+		t.Errorf("JPEGImages/a.jpg after a rescan = %+v", got)
+	}
+	if got := e.detail(t, e.image(t, "VOC/images/a.jpg")); len(got.Objects) != 0 ||
+		!strings.Contains(got.AnnotationBlocked, "属于另一张图片 VOC/JPEGImages/a.jpg") {
+		t.Errorf("images/a.jpg after a rescan = %+v", got)
+	}
+	if got := e.detail(t, e.image(t, "same/a.png")); !reflect.DeepEqual(objectNames(got.Objects), []string{"for-png"}) {
+		t.Errorf("same/a.png after a rescan = %+v", got)
+	}
+	if got := e.detail(t, e.image(t, "same/a.jpg")); !strings.Contains(got.AnnotationBlocked, "属于同一文件夹中的另一张图片 same/a.png") {
+		t.Errorf("same/a.jpg after a rescan = %+v", got)
+	}
+}
+
 // namespacedFile is labelImgFile with namespace declarations on the root
 // and a namespaced element in an object.
 var namespacedFile = strings.Replace(strings.Replace(labelImgFile, `<annotation verified="yes">`,
@@ -815,7 +1015,7 @@ func TestIntegrationSaveKeepsVOCContent(t *testing.T) {
 	}
 
 	// A file that parses but cannot be edited in place is regenerated only
-	// when forced.
+	// on purpose (see TestIntegrationRegenerateAnnotation).
 	d := e.image(t, "images/d.png")
 	detail = e.detail(t, d)
 	if detail.AnnotationError != "" || len(detail.Objects) != 1 {
@@ -827,9 +1027,9 @@ func TestIntegrationSaveKeepsVOCContent(t *testing.T) {
 	if got := e.readFile(t, "images/d.xml"); !bytes.Equal(got, unpatchable) {
 		t.Errorf("refused save changed the file:\n%s", got)
 	}
-	saved, err = e.svc.SaveAnnotation(ctx, e.d.ID, d.ID, SaveAnnotationInput{Objects: renamed, BaseVersion: detail.AnnotationVersion, Force: true})
+	saved, err = e.svc.SaveAnnotation(ctx, e.d.ID, d.ID, SaveAnnotationInput{Objects: renamed, BaseVersion: detail.AnnotationVersion, Regenerate: true})
 	if err != nil || !reflect.DeepEqual(saved.Objects, renamed) || saved.AnnotationVersion != annotationVersion(e.readFile(t, "images/d.xml")) {
-		t.Errorf("forced save = %+v, %v", saved, err)
+		t.Errorf("regenerating save = %+v, %v", saved, err)
 	}
 
 	// A file that is not valid XML is replaced by a new one when forced.
@@ -843,6 +1043,56 @@ func TestIntegrationSaveKeepsVOCContent(t *testing.T) {
 	}
 	if parsed, err := parseVOC(bytes.NewReader(e.readFile(t, "images/b.xml"))); err != nil || len(parsed.Objects) != 1 || parsed.Filename != "b.png" {
 		t.Errorf("rewritten b.xml = %+v, %v", parsed, err)
+	}
+}
+
+// Regenerating a file that cannot be edited in place and overwriting a
+// concurrent change are separate consents.
+func TestIntegrationRegenerateAnnotation(t *testing.T) {
+	e := newAnnotationEnv(t, map[string][]byte{"images/d.png": pngFile(t, 16, 16), "images/d.xml": unpatchable})
+	ctx := context.Background()
+	d := e.image(t, "images/d.png")
+	v0 := e.detail(t, d).AnnotationVersion
+	mine := boxNamed("划痕") // not ASCII: cannot be written into the GBK part
+	save := func(base string, force, regenerate bool) (ImageDetail, error) {
+		return e.svc.SaveAnnotation(ctx, e.d.ID, d.ID, SaveAnnotationInput{Objects: mine, BaseVersion: base, Force: force, Regenerate: regenerate})
+	}
+	wantFile := func(want []byte) {
+		t.Helper()
+		if got := e.readFile(t, "images/d.xml"); !bytes.Equal(got, want) {
+			t.Errorf("d.xml =\n%s\nwant\n%s", got, want)
+		}
+	}
+
+	_, err := save(v0, false, false)
+	wantKind(t, err, ErrAnnotationUnpatchable, "无法在保留其中其它内容的情况下修改")
+	// Overwriting a newer version does not regenerate the file either.
+	_, err = save("stale", true, false)
+	wantKind(t, err, ErrAnnotationUnpatchable, "无法在保留其中其它内容的情况下修改")
+	wantFile(unpatchable)
+
+	// Regenerating still checks the version: a change made while the user
+	// was asked is not lost.
+	theirs := vocFile("d.png", "b-box1", "b-box2")
+	writeFiles(t, e.dir, map[string][]byte{"images/d.xml": theirs})
+	_, err = save(v0, false, true)
+	wantKind(t, err, ErrAnnotationChanged, "已被修改")
+	wantFile(theirs)
+
+	// Both consents: the newer unpatchable file is replaced.
+	writeFiles(t, e.dir, map[string][]byte{"images/d.xml": unpatchable})
+	saved, err := save("stale", true, true)
+	if err != nil || !reflect.DeepEqual(saved.Objects, mine) || saved.AnnotationVersion != annotationVersion(e.readFile(t, "images/d.xml")) {
+		t.Errorf("forced regenerating save = %+v, %v", saved, err)
+	}
+	// A file that can be edited in place still is, also with regenerate.
+	writeFiles(t, e.dir, map[string][]byte{"images/d.xml": []byte(labelImgFile)})
+	v1 := e.detail(t, d).AnnotationVersion
+	if _, err = save(v1, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(e.readFile(t, "images/d.xml")); !strings.Contains(got, `verified="yes"`) || !strings.Contains(got, "<polygon>") {
+		t.Errorf("regenerate rewrote a file it could edit:\n%s", got)
 	}
 }
 

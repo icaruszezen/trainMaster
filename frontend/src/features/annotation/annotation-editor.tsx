@@ -271,12 +271,14 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   const [saver] = useState(
     () =>
       new AnnotationSaver<SaveContext>({
-        save: async ({ objects, baseVersion, force, context }) => {
+        save: async ({ objects, baseVersion, force, regenerate, context }) => {
           const saved = await persistAnnotation(
             objects,
             baseVersion,
             force,
-            context
+            context,
+            undefined,
+            regenerate
           )
           if (!saved) {
             return baseVersion
@@ -905,7 +907,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
             <Button
               size="sm"
               variant="outline"
-              onClick={() => void overwrite()}
+              onClick={() => void saver.regenerate()}
             >
               仍然保存（重新生成文件）
             </Button>
