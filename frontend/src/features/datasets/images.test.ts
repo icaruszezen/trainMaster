@@ -39,7 +39,15 @@ function detail(
   base: DatasetImage,
   overrides: Partial<DatasetImageDetail> = {}
 ): DatasetImageDetail {
-  return { ...base, objects: [], annotation_error: "", ...overrides }
+  return {
+    ...base,
+    objects: [],
+    annotation_error: "",
+    annotation_version: "",
+    annotation_unsupported: 0,
+    annotation_blocked: "",
+    ...overrides,
+  }
 }
 
 const annotated = (id: number) =>

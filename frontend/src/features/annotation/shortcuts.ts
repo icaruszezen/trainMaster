@@ -1,0 +1,389 @@
+/**
+ * 标注工作台的快捷键：按键 → 命令的映射（纯函数，便于测试），以及帮助面板中
+ * 的说明。
+ *
+ * - 字母、数字按物理按键（`KeyboardEvent.code`）匹配，与大小写锁定、键盘布局
+ *   无关；输入法正在组字时不处理。
+ * - 沿用 LabelImg 的习惯（W 画框、A / D 切换图片、Ctrl+D 复制框、方向键移动），
+ *   数字键切换类别（CVAT、X-AnyLabeling）。
+ * - 不绑定浏览器保留的组合键（Ctrl+W / T / N / L / R、Ctrl+1–9、Alt+← / → 等）。
+ */
+
+export type Tool = "select" | "rect" | "pan"
+
+export type Command =
+  | { type: "tool"; tool: Tool }
+  /** 上一张 / 下一张；`unannotated` 时跳到上一张 / 下一张未标注的图片。 */
+  | { type: "image"; direction: 1 | -1; unannotated: boolean }
+  /** 跳到第 N 张（聚焦图片序号输入框）。 */
+  | { type: "goto" }
+  | { type: "save" }
+  | { type: "undo" }
+  | { type: "redo" }
+  /** 复制选中的框；没有选中时复制本图所有框。 */
+  | { type: "copy" }
+  | { type: "paste" }
+  | { type: "duplicate" }
+  | { type: "delete" }
+  /** Tab / Shift+Tab：依次选中下一个 / 上一个框。 */
+  | { type: "cycle"; direction: 1 | -1 }
+  | { type: "escape" }
+  /**
+   * 数字键（下标从 0 开始，0 键是第 10 个类别）：有选中的框时修改它的类别，
+   * 否则切换当前类别。
+   */
+  | { type: "class"; index: number }
+  /** 打开类别选择框（可搜索），用于类别较多时。 */
+  | { type: "pickClass" }
+  | { type: "toggleDifficult" }
+  | { type: "toggleTruncated" }
+  /** 移动选中的框（像素）。 */
+  | { type: "nudge"; dx: number; dy: number }
+  /** 调整选中框的右边 / 下边（像素），→ / ↓ 变大。 */
+  | { type: "resize"; dx: number; dy: number }
+  | { type: "zoom"; direction: 1 | -1 }
+  | { type: "fit" }
+  | { type: "actualSize" }
+  | { type: "zoomToSelection" }
+  | { type: "toggleLabels" }
+  | { type: "toggleBoxes" }
+  /** 标为空标注（无目标，负样本）：写入没有目标的标注文件。 */
+  | { type: "negative" }
+  | { type: "help" }
+
+/** 与 `KeyboardEvent` 中用到的字段一致，便于测试。 */
+export type KeyInput = {
+  key: string
+  code: string
+  ctrlKey: boolean
+  metaKey: boolean
+  altKey: boolean
+  shiftKey: boolean
+}
+
+export type ShortcutContext = {
+  /** macOS 上用 ⌘ 代替 Ctrl。 */
+  mac: boolean
+  /** 有选中的框：方向键移动它；没有时 ← / → 切换图片。 */
+  hasSelection: boolean
+}
+
+export function isMac() {
+  return (
+    typeof navigator !== "undefined" &&
+    /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
+  )
+}
+
+const ARROWS: Record<string, [number, number]> = {
+  ArrowLeft: [-1, 0],
+  ArrowRight: [1, 0],
+  ArrowUp: [0, -1],
+  ArrowDown: [0, 1],
+}
+
+function digitIndex(code: string) {
+  const match = /^(?:Digit|Numpad)(\d)$/.exec(code)
+  if (!match) {
+    return null
+  }
+  const digit = Number(match[1])
+  return digit === 0 ? 9 : digit - 1
+}
+
+function withMod(code: string, shift: boolean, mac: boolean): Command | null {
+  const arrow = ARROWS[code]
+  if (arrow) {
+    const step = shift ? 10 : 1
+    return { type: "resize", dx: arrow[0] * step, dy: arrow[1] * step }
+  }
+  switch (code) {
+    case "KeyS":
+      return shift ? null : { type: "save" }
+    case "KeyZ":
+      return shift ? { type: "redo" } : { type: "undo" }
+    case "KeyY":
+      // macOS 上 ⌘Y 是浏览器的“历史记录”，重做用 ⌘⇧Z。
+      return shift || mac ? null : { type: "redo" }
+    case "KeyC":
+      return shift ? null : { type: "copy" }
+    case "KeyV":
+      return shift ? null : { type: "paste" }
+    case "KeyD":
+      return shift ? null : { type: "duplicate" }
+    case "Equal":
+    case "NumpadAdd":
+      return { type: "zoom", direction: 1 }
+    case "Minus":
+    case "NumpadSubtract":
+      return { type: "zoom", direction: -1 }
+    case "Digit0":
+    case "Numpad0":
+      return shift ? null : { type: "actualSize" }
+    default:
+      return null
+  }
+}
+
+/**
+ * 按键对应的命令，没有时为 null。调用方负责忽略输入框中的按键（见
+ * {@link shouldIgnoreKey}）与按住不放时的重复事件（见 {@link allowsRepeat}）。
+ */
+export function commandForKey(
+  event: KeyInput,
+  context: ShortcutContext
+): Command | null {
+  const mod = context.mac ? event.metaKey : event.ctrlKey
+  // macOS 上单独按 Ctrl 的组合、Windows 上的 Win 键组合都不处理。
+  const otherMod = context.mac ? event.ctrlKey : event.metaKey
+  if (otherMod || event.altKey) {
+    return null
+  }
+  const { code, shiftKey: shift } = event
+  if (mod) {
+    return withMod(code, shift, context.mac)
+  }
+
+  const arrow = ARROWS[code]
+  if (arrow) {
+    if (context.hasSelection) {
+      const step = shift ? 10 : 1
+      return { type: "nudge", dx: arrow[0] * step, dy: arrow[1] * step }
+    }
+    if (arrow[0] !== 0) {
+      return {
+        type: "image",
+        direction: arrow[0] as 1 | -1,
+        unannotated: shift,
+      }
+    }
+    return null
+  }
+
+  switch (code) {
+    case "Escape":
+      return { type: "escape" }
+    case "Tab":
+      return { type: "cycle", direction: shift ? -1 : 1 }
+    case "Delete":
+    case "Backspace":
+      return { type: "delete" }
+    case "PageUp":
+      return { type: "image", direction: -1, unannotated: false }
+    case "PageDown":
+      return { type: "image", direction: 1, unannotated: false }
+    case "KeyA":
+      return { type: "image", direction: -1, unannotated: shift }
+    case "KeyD":
+      return { type: "image", direction: 1, unannotated: shift }
+    case "Equal":
+    case "NumpadAdd":
+      return { type: "zoom", direction: 1 }
+    case "Minus":
+    case "NumpadSubtract":
+      return { type: "zoom", direction: -1 }
+    case "F1":
+      return { type: "help" }
+    case "Slash":
+      return shift ? { type: "help" } : null
+  }
+  if (event.key === "?") {
+    return { type: "help" } // 其它键盘布局上的问号
+  }
+  if (shift) {
+    return null
+  }
+
+  switch (code) {
+    case "KeyW":
+    case "KeyR":
+      return { type: "tool", tool: "rect" }
+    case "KeyV":
+      return { type: "tool", tool: "select" }
+    case "KeyG":
+      return { type: "goto" }
+    case "KeyT":
+      return { type: "pickClass" }
+    case "KeyQ":
+      return { type: "toggleDifficult" }
+    case "KeyE":
+      return { type: "toggleTruncated" }
+    case "KeyF":
+      return { type: "fit" }
+    case "KeyZ":
+      return { type: "zoomToSelection" }
+    case "KeyL":
+      return { type: "toggleLabels" }
+    case "KeyH":
+      return { type: "toggleBoxes" }
+    case "KeyN":
+      return { type: "negative" }
+  }
+  const index = digitIndex(code)
+  return index === null ? null : { type: "class", index }
+}
+
+/** 按住不放时是否重复执行（移动、缩放、撤销可以；切换图片、开关类的不行）。 */
+export function allowsRepeat(command: Command) {
+  return (
+    command.type === "nudge" ||
+    command.type === "resize" ||
+    command.type === "zoom" ||
+    command.type === "undo" ||
+    command.type === "redo"
+  )
+}
+
+/** 第 `index` 个类别的数字键（前 10 个类别有），没有时为 null。 */
+export function classHotkey(index: number) {
+  if (index < 0 || index > 9) {
+    return null
+  }
+  return index === 9 ? "0" : String(index + 1)
+}
+
+/**
+ * 焦点是否在输入控件中（输入框、下拉框、可编辑内容），或在对话框、菜单等
+ * 浮层中：这时快捷键交给控件本身。
+ */
+export function isTypingTarget(target: EventTarget | null) {
+  if (typeof Element === "undefined" || !(target instanceof Element)) {
+    return false
+  }
+  if (target instanceof HTMLElement && target.isContentEditable) {
+    return true
+  }
+  return (
+    target.closest(
+      'input, textarea, select, [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], [data-radix-popper-content-wrapper]'
+    ) !== null
+  )
+}
+
+// 自己用方向键的控件（单选组、标签页、滑块、菜单、列表等）。
+const ARROW_CONTROLS =
+  '[role="radio"], [role="tab"], [role="slider"], [role="menuitem"], [role="option"], [role="combobox"], [role="spinbutton"], [role="switch"], [role="checkbox"]'
+
+/**
+ * 是否忽略这次按键：
+ * - 输入法正在组字；
+ * - 焦点在输入控件 / 浮层中（Ctrl+S 例外，在输入框里也保存，并且不弹出浏览器
+ *   的“保存网页”）；
+ * - 焦点在按钮等控件上时的 Tab（照常移动焦点），以及自己用方向键的控件上的方向键。
+ */
+export function shouldIgnoreKey(
+  event: KeyInput & {
+    isComposing: boolean
+    keyCode: number
+    target: EventTarget | null
+  },
+  command: Command
+) {
+  if (event.isComposing || event.keyCode === 229) {
+    return true
+  }
+  if (command.type === "save") {
+    return false
+  }
+  const { target } = event
+  if (isTypingTarget(target)) {
+    return true
+  }
+  if (typeof Element === "undefined" || !(target instanceof Element)) {
+    return false
+  }
+  if (event.code === "Tab") {
+    // 只在焦点位于画布（或页面本身）时用 Tab 切换框。
+    return (
+      target !== target.ownerDocument.body &&
+      target.closest('[role="application"]') === null
+    )
+  }
+  return (
+    event.code.startsWith("Arrow") && target.closest(ARROW_CONTROLS) !== null
+  )
+}
+
+export type ShortcutHelp = {
+  title: string
+  items: { keys: string[]; label: string }[]
+}
+
+/** 帮助面板（? 键）中的快捷键说明。 */
+export function shortcutHelp(mac: boolean): ShortcutHelp[] {
+  const mod = mac ? "⌘" : "Ctrl"
+  return [
+    {
+      title: "画框与选择",
+      items: [
+        { keys: ["W", "R"], label: "画矩形框：拖动，或先后点击两个对角" },
+        { keys: ["Shift"], label: "画框时按住：画正方形" },
+        { keys: ["V"], label: "选择 / 编辑框（拖动空白处平移画面）" },
+        { keys: ["Esc"], label: "取消正在画的框 → 取消选中 → 回到选择工具" },
+        { keys: ["Tab", "Shift+Tab"], label: "选中下一个 / 上一个框" },
+        { keys: ["单击重叠处"], label: "再次单击依次选中下面的框" },
+      ],
+    },
+    {
+      title: "类别与属性",
+      items: [
+        {
+          keys: ["1 – 9", "0"],
+          label: "选中框时修改它的类别，否则切换当前类别",
+        },
+        { keys: ["T"], label: "搜索类别（类别较多时）" },
+        { keys: ["Q"], label: "切换“难例”（difficult，虚线框）" },
+        { keys: ["E"], label: "切换“截断”（truncated）" },
+      ],
+    },
+    {
+      title: "编辑",
+      items: [
+        { keys: ["方向键"], label: "移动选中的框 1 像素（加 Shift：10 像素）" },
+        {
+          keys: [`${mod}+方向键`],
+          label: "调整右边 / 下边 1 像素（加 Shift：10 像素）",
+        },
+        { keys: ["Delete", "Backspace"], label: "删除选中的框" },
+        {
+          keys: [`${mod}+C`, `${mod}+V`],
+          label: "复制 / 粘贴框，可粘贴到别的图片（没有选中时复制全部）",
+        },
+        { keys: [`${mod}+D`], label: "原地复制一份选中的框" },
+        { keys: [`${mod}+Z`], label: "撤销" },
+        {
+          keys: mac ? [`${mod}+Shift+Z`] : [`${mod}+Shift+Z`, `${mod}+Y`],
+          label: "重做",
+        },
+      ],
+    },
+    {
+      title: "图片与保存",
+      items: [
+        { keys: ["D", "A"], label: "下一张 / 上一张（自动保存）" },
+        { keys: ["Shift+D", "Shift+A"], label: "下一张 / 上一张未标注的图片" },
+        { keys: ["← / →"], label: "没有选中框时切换图片" },
+        { keys: ["G"], label: "跳到第 N 张" },
+        { keys: ["N"], label: "标为空标注（图片上没有目标，负样本）" },
+        { keys: [`${mod}+S`], label: "立即保存（停止编辑后也会自动保存）" },
+      ],
+    },
+    {
+      title: "视图",
+      items: [
+        { keys: ["滚轮", "双指捏合"], label: "以光标为中心缩放" },
+        {
+          keys: ["空格+拖动", "中键拖动"],
+          label: "平移画面",
+        },
+        { keys: ["+", "-"], label: "放大 / 缩小" },
+        { keys: ["F"], label: "适应窗口" },
+        { keys: [`${mod}+0`], label: "原图大小（100%）" },
+        { keys: ["Z"], label: "缩放到选中的框" },
+        { keys: ["H"], label: "显示 / 隐藏所有框" },
+        { keys: ["L"], label: "显示 / 隐藏类别名称" },
+        { keys: ["?", "F1"], label: "快捷键说明" },
+      ],
+    },
+  ]
+}

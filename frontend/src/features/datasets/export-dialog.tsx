@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/dialog"
 import { Spinner } from "@/components/ui/spinner"
 import {
+  classesQuery,
   createExport,
   labelsQuery,
   lastYoloImportQuery,
@@ -92,12 +93,20 @@ function ExportForm({
 
   const labels = useQuery(labelsQuery(dataset.id))
   const labelItems = labels.data?.items
-  // 数据集由 YOLO 导入时，默认沿用导入时的类别顺序，类别编号保持不变。
+  // 默认顺序：标注工作台中设置的类别列表；没有时，数据集由 YOLO 导入的沿用
+  // 导入时的类别顺序（类别编号保持不变）。读取类别列表失败时按没有处理。
+  const datasetClasses = useQuery(classesQuery(dataset.id))
+  const classNames = useMemo(
+    () => datasetClasses.data?.items.map((cls) => cls.name) ?? [],
+    [datasetClasses.data]
+  )
   const lastYolo = useQuery(lastYoloImportQuery(dataset.id))
   const yoloImport = lastYolo.data ?? null
-  const baseClasses = yoloImport?.classes
-  // 两个请求都有结果后才有默认顺序；在此之前不能按默认顺序下载。
-  const defaultsPending = labels.isPending || lastYolo.isPending
+  const fromClassList = classNames.length > 0
+  const baseClasses = fromClassList ? classNames : yoloImport?.classes
+  // 请求都有结果后才有默认顺序；在此之前不能按默认顺序下载。
+  const defaultsPending =
+    labels.isPending || lastYolo.isPending || datasetClasses.isPending
   const defaultText = useMemo(
     () =>
       defaultsPending
@@ -195,11 +204,13 @@ function ExportForm({
                 ? "正在读取数据集中的标签…"
                 : labels.error
                   ? `无法读取数据集中的标签（${labels.error.message}），请手动填写类别顺序。`
-                  : lastYolo.error
-                    ? `无法读取导入记录（${lastYolo.error.message}），默认按标签名称排序；请确认与训练时使用的 classes.txt 一致。`
-                    : yoloImport
-                      ? `默认沿用导入“${yoloImport.file_name}”时的类别顺序，其余标签按名称排在后面；可直接编辑，或读取训练时使用的 classes.txt。`
-                      : "默认按数据集中的标签名称排序；可直接编辑，或读取训练时使用的 classes.txt 以保持类别编号一致。"
+                  : fromClassList
+                    ? "默认沿用标注工作台中类别列表的顺序，其余标签按名称排在后面；可直接编辑，或读取训练时使用的 classes.txt。"
+                    : lastYolo.error
+                      ? `无法读取导入记录（${lastYolo.error.message}），默认按标签名称排序；请确认与训练时使用的 classes.txt 一致。`
+                      : yoloImport
+                        ? `默认沿用导入“${yoloImport.file_name}”时的类别顺序，其余标签按名称排在后面；可直接编辑，或读取训练时使用的 classes.txt。`
+                        : "默认按数据集中的标签名称排序；可直接编辑，或读取训练时使用的 classes.txt 以保持类别编号一致。"
             }
             onReset={
               classesDraft !== null && classesDraft !== defaultText

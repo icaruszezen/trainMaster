@@ -162,13 +162,16 @@ export const navGroups: NavGroup[] = [
         title: "标注工作台",
         path: "/annotation/workspace",
         icon: PenTool,
-        description: "面向缺陷检测场景的高效在线标注工具。",
-        status: "planned",
+        description:
+          "面向缺陷检测的在线矩形框标注：按固定顺序逐张标注，直接保存为数据集文件夹中的 VOC 文件。",
+        status: "ready",
+        apiPath: "/api/v1/datasets",
         features: [
-          "矩形框、多边形、关键点标注",
-          "快捷键与批量操作",
-          "缺陷类别快速切换",
-          "标注历史与撤销",
+          "矩形框：拖动或两次单击画框，拖动手柄调整，方向键逐像素微调",
+          "数据集类别列表，数字键 1–9 / 0 切换类别，可搜索",
+          "LabelImg 风格快捷键，撤销 / 重做，复制粘贴框、沿用上一张",
+          "滚轮 / 双指缩放到 32 倍，亮度、对比度调节",
+          "自动保存为 VOC（.xml），多人同时修改时提示冲突",
         ],
       },
       {

@@ -122,6 +122,7 @@ CI（`.github/workflows/ci.yml`）在每次 push 到 main 和每个 Pull Request
 - `sidebar.tsx`：移动端抽屉的读屏文案（`SheetTitle` / `SheetDescription`）改成了中文；
 - `dialog.tsx`：关闭按钮的读屏文案改为“关闭”；
 - `spinner.tsx`：`aria-label` 改为“加载中”；
+- `slider.tsx`：`aria-label` 加在滑块手柄（`role="slider"`）上，而不是外层容器，读屏软件才能读出名称；
 - `sonner.tsx`：使用项目自带的 `useTheme`（`@/components/theme-provider`）而不是 `next-themes`，并依赖 npm 包 `sonner`。
 
 **方式一：CLI（需要能访问 ui.shadcn.com）**

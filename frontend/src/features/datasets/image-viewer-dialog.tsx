@@ -13,8 +13,10 @@ import {
   CircleAlert,
   ExternalLink,
   ImageOff,
+  PenTool,
   X,
 } from "lucide-react"
+import { Link } from "react-router"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
@@ -40,6 +42,8 @@ import {
 import { isBrowserNativeImage } from "@/features/datasets/files"
 import { annotationPanel } from "@/features/datasets/images"
 import { labelColor, readableTextColor } from "@/features/datasets/label-colors"
+import { workspacePath } from "@/features/annotation/workspace-params"
+import { useElementSize } from "@/hooks/use-element-size"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -167,6 +171,15 @@ export function ImageViewerDialog({
                   <span className="sm:hidden">标注</span>
                 </Label>
               </div>
+              <Button variant="outline" size="sm" asChild>
+                <Link
+                  to={`${workspacePath(datasetId, image.id)}`}
+                  aria-label="在标注工作台中打开这张图片"
+                >
+                  <PenTool />
+                  <span className="hidden sm:inline">标注</span>
+                </Link>
+              </Button>
               <Button
                 variant="ghost"
                 size="sm"
@@ -419,27 +432,6 @@ function InfoRow({ label, children }: { label: string; children: ReactNode }) {
       <dd className="min-w-0">{children}</dd>
     </div>
   )
-}
-
-/** 观察元素的内容尺寸。 */
-function useElementSize<T extends HTMLElement>() {
-  const ref = useRef<T>(null)
-  const [size, setSize] = useState({ width: 0, height: 0 })
-
-  useEffect(() => {
-    const element = ref.current
-    if (!element) {
-      return
-    }
-    const observer = new ResizeObserver(([entry]) => {
-      const { width, height } = entry.contentRect
-      setSize({ width, height })
-    })
-    observer.observe(element)
-    return () => observer.disconnect()
-  }, [])
-
-  return [ref, size] as const
 }
 
 // 目标太多时只画框，不画标签名，避免遮挡图片。

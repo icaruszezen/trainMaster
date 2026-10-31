@@ -32,6 +32,11 @@ func (s *server) datasetRoutes(r chi.Router) {
 		r.Get("/images/{imageID}", s.getDatasetImage)
 		r.Get("/images/{imageID}/file", s.serveDatasetImage)
 		r.Get("/images/{imageID}/thumbnail", s.serveDatasetThumbnail)
+		r.Get("/images/{imageID}/neighbors", s.getImageNeighbors)
+		r.Put("/images/{imageID}/annotation", s.saveImageAnnotation)
+		r.Delete("/images/{imageID}/annotation", s.deleteImageAnnotation)
+		r.Get("/classes", s.listDatasetClasses)
+		r.Put("/classes", s.setDatasetClasses)
 		r.Get("/labels", s.listDatasetLabels)
 		r.Post("/scan", s.scanDataset)
 		r.Get("/imports", s.listDatasetImports)
@@ -90,6 +95,8 @@ func datasetErrorStatus(kind error) (int, string) {
 		return http.StatusInsufficientStorage, codeInsufficientStorage
 	case dataset.ErrUnsupportedImage:
 		return http.StatusUnprocessableEntity, codeUnsupportedImage
+	case dataset.ErrAnnotationChanged:
+		return http.StatusConflict, codeAnnotationConflict
 	}
 	return http.StatusInternalServerError, codeInternal
 }
@@ -104,7 +111,12 @@ const maxJSONBody = 1 << 20
 // decodeJSON reads a JSON request body into v. Unknown fields are
 // ignored. It writes the error response and returns false on failure.
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBody))
+	return decodeJSONLimit(w, r, v, maxJSONBody)
+}
+
+// decodeJSONLimit is decodeJSON for bodies of up to limit bytes.
+func decodeJSONLimit(w http.ResponseWriter, r *http.Request, v any, limit int64) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	err := dec.Decode(v)
 	if err == nil && dec.More() {
 		err = errors.New("trailing data after the JSON value")
@@ -309,15 +321,14 @@ func (s *server) listDatasetImages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	q := dataset.ImageQuery{Label: r.URL.Query().Get("label"), Search: strings.TrimSpace(r.URL.Query().Get("q"))}
+	q, ok := imageFilters(w, r)
+	if !ok {
+		return
+	}
 	if q.Offset, ok = intParam(w, r, "offset", 0, 0, 1<<31-1); !ok {
 		return
 	}
 	if q.Limit, ok = intParam(w, r, "limit", 60, 1, 200); !ok {
-		return
-	}
-	if q.Status, ok = enumParam(w, r, "status", dataset.FilterAll, dataset.FilterAnnotated, dataset.FilterEmpty,
-		dataset.FilterInvalid, dataset.FilterUnannotated); !ok {
 		return
 	}
 	items, total, err := s.datasets.ListImages(r.Context(), id, q)
@@ -326,6 +337,16 @@ func (s *server) listDatasetImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, NewList(items, total))
+}
+
+// imageFilters parses the filters of an image list: status, label and q
+// (a substring of the path).
+func imageFilters(w http.ResponseWriter, r *http.Request) (dataset.ImageQuery, bool) {
+	q := dataset.ImageQuery{Label: r.URL.Query().Get("label"), Search: strings.TrimSpace(r.URL.Query().Get("q"))}
+	var ok bool
+	q.Status, ok = enumParam(w, r, "status", dataset.FilterAll, dataset.FilterAnnotated, dataset.FilterEmpty,
+		dataset.FilterInvalid, dataset.FilterUnannotated)
+	return q, ok
 }
 
 func (s *server) getDatasetImage(w http.ResponseWriter, r *http.Request) {

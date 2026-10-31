@@ -17,3 +17,9 @@ export function useIsNotFound() {
   const handle = useMatches().at(-1)?.handle as RouteHandle | undefined
   return handle?.notFound === true
 }
+
+/** 当前页面是否占满顶栏以下的区域（见 RouteHandle.fullBleed）。 */
+export function useIsFullBleed() {
+  const handle = useMatches().at(-1)?.handle as RouteHandle | undefined
+  return handle?.fullBleed === true
+}

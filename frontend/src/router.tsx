@@ -2,6 +2,7 @@ import type { ComponentType } from "react"
 import type { RouteObject } from "react-router"
 
 import { navItems, type ModuleId } from "@/config/navigation"
+import { AnnotationEditorPage } from "@/features/annotation/annotation-editor-page"
 import { AnnotationTasksPage } from "@/features/annotation/annotation-tasks-page"
 import { AnnotationWorkspacePage } from "@/features/annotation/annotation-workspace-page"
 import { LabelsPage } from "@/features/annotation/labels-page"
@@ -24,8 +25,11 @@ import { AppLayout } from "@/layouts/app-layout"
 import { NotFoundPage } from "@/pages/not-found-page"
 import { RouteErrorPage } from "@/pages/route-error-page"
 
-/** 路由的 handle：404 路由带 notFound，标题与面包屑据此显示“页面不存在”。 */
-export type RouteHandle = { notFound?: boolean }
+/**
+ * 路由的 handle：404 路由带 notFound，标题与面包屑据此显示“页面不存在”；
+ * fullBleed 的页面（标注工作台）占满顶栏以下的区域，没有内边距、不滚动。
+ */
+export type RouteHandle = { notFound?: boolean; fullBleed?: boolean }
 
 /** 每个导航模块对应的页面组件；类型保证不会漏登记。 */
 export const pages: Record<ModuleId, ComponentType> = {
@@ -66,6 +70,11 @@ export const routes: RouteObject[] = [
           // 模块的子页面。静态路径优先于动态参数，/datasets/versions 仍是数据版本页。
           { path: "/projects/:projectId", Component: ProjectDetailPage },
           { path: "/datasets/:datasetId", Component: DatasetDetailPage },
+          {
+            path: "/annotation/workspace/:datasetId",
+            Component: AnnotationEditorPage,
+            handle: { fullBleed: true } satisfies RouteHandle,
+          },
           {
             path: "*",
             Component: NotFoundPage,

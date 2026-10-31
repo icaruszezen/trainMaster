@@ -86,6 +86,7 @@ flowchart LR
 | 404 | `not_found` | 接口或资源不存在（未设置 `TM_WEB_DIR` 时，非 `/api` 路径也返回它） |
 | 405 | `method_not_allowed` | 路径存在但不支持该方法（响应头 `Allow` 列出支持的方法） |
 | 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作等） |
+| 409 | `annotation_conflict` | 保存 / 删除标注时，标注文件在 `base_version` 之后已被修改（他人在另一个窗口保存，或用其它工具改了文件）。客户端应重新读取图片详情，或带 `force: true` 覆盖 |
 | 409 | `upload_offset_mismatch` | 分块上传的 `offset` 与服务端已接收的字节数不一致，客户端应重新获取任务后从 `received_bytes` 续传 |
 | 413 | `payload_too_large` | 请求体超过限制（单个分块 64 MiB，单次文件夹批量上传 256 MiB） |
 | 422 | `validation_failed` | 字段校验失败，`message` 说明具体问题（如数据集名称不合法） |
@@ -155,7 +156,12 @@ flowchart LR
 | `PUT /api/v1/datasets/{id}/projects` | `{project_ids: [...]}` 设置数据集所属的项目（整体替换，`[]` 表示移出所有项目，缺少该字段时返回 422），返回更新后的数据集；所选项目不存在时返回 422，不做任何修改 |
 | `DELETE /api/v1/datasets/{id}` | 删除数据集记录（同时移出所属的项目）；`?delete_files=true` 同时删除磁盘上的**整个**文件夹与缩略图缓存。成功返回 204；记录已删除但文件夹没能完全删除（如权限不足）时返回 200 `{"files_removed": false, "message": "…"}`，剩余文件恢复为原来的文件夹名，可以重新添加或手动清理。导入 / 扫描正在执行时返回 409 |
 | `GET /api/v1/datasets/{id}/images` | 图片列表，固定按图片顺序排列（见“图片顺序”）：`offset`、`limit`（≤ 200）、`status`（`all` / `annotated` 有目标 / `empty` 空标注 / `invalid` 标注无效 / `unannotated` 无标注文件）、`label`、`q`（路径包含） |
-| `GET /api/v1/datasets/{id}/images/{imageId}` | 单张图片详情：`objects` 等标注信息实时从 VOC 文件解析；文件无法解析或已不存在时 `annotation_error` 给出原因 |
+| `GET /api/v1/datasets/{id}/images/{imageId}` | 单张图片详情：`objects` 等标注信息实时从 VOC 文件解析；文件无法解析或已不存在时 `annotation_error` 给出原因。`annotation_version` 是标注文件内容的版本（没有文件时为 `""`），保存时原样带回；`annotation_unsupported` 是文件中平台无法显示的目标数（如多边形，保存时原样保留）；`annotation_blocked` 不为空时说明这张图片不能在平台中保存标注的原因（如同名的 `.xml` 属于同一文件夹中的另一张图片） |
+| `GET /api/v1/datasets/{id}/images/{imageId}/neighbors` | 按图片顺序的上一张 / 下一张：`{prev, next, position, matches, total}`，筛选参数同图片列表（`status`、`label`、`q`）；当前图片不符合筛选条件时 `matches: false`，`prev` / `next` 仍是它前后最近的符合条件的图片 |
+| `PUT /api/v1/datasets/{id}/images/{imageId}/annotation` | 保存标注：`{objects: [{name, xmin, ymin, xmax, ymax, difficult, truncated}], base_version, force?}`，写回数据集文件夹中的 VOC 文件并更新索引与计数，返回保存后的图片详情。`objects` 为 `[]` 时写入没有目标的文件（空标注 / 负样本）。见第 6 节“标注” |
+| `DELETE /api/v1/datasets/{id}/images/{imageId}/annotation?base_version=&force=` | 删除标注文件，图片恢复为“未标注”，返回图片详情；没有文件时也返回 200 |
+| `GET /api/v1/datasets/{id}/classes` | 类别列表：`{items: [{name, color}]}`，标注时可选的类别及顺序（`color` 为 `#rrggbb`，`""` 表示按名称自动配色） |
+| `PUT /api/v1/datasets/{id}/classes` | `{classes: [...]}` 整体替换类别列表（最多 1000 个，名称规则同 YOLO 类别，不能重复），返回新的列表。只修改列表，不改动任何标注文件 |
 | `GET /api/v1/datasets/{id}/images/{imageId}/file` | 原图（支持 Range 与条件请求） |
 | `GET /api/v1/datasets/{id}/images/{imageId}/thumbnail` | JPEG 缩略图，`size=sm`（320px）/ `lg`（1600px），生成后缓存在 `cache/` 下 |
 | `GET /api/v1/datasets/{id}/labels` | 标签分布：每个标签的目标数与图片数 |
@@ -219,6 +225,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - `src/lib/api.ts` 提供 `apiGet<T>()` 和 `apiSend<T>(method, path, body)`，非 2xx 时解析错误信封并抛出 `ApiError(status, code, message)`；网络错误转换为 `code = "network_error"`。
 - 服务端状态用 TanStack Query 管理，界面组件来自 `src/components/ui/`（shadcn/ui）。
 - 项目模块位于 `src/features/projects/`：项目列表页（卡片 / 列表视图）、项目详情页（数据集 / 标签分布 / 模型占位，当前标签页记在 URL 的 `?tab=`）、新建 / 编辑 / 删除对话框、添加数据集对话框，以及数据集页使用的“纳入项目”对话框和项目标记。数据集页的项目筛选记在 URL 的 `?project=<项目ID|none>`。
+- 标注模块位于 `src/features/annotation/`：工作台首页（选择数据集）与标注编辑器（`/annotation/workspace/:datasetId`，路由带 `handle.fullBleed`，占满内容区且默认收起侧边栏）。几何计算（`geometry.ts`）、框列表与撤销历史（`document.ts`）、自动保存（`autosave.ts`）、快捷键映射（`shortcuts.ts`）、类别列表编辑（`classes.ts`）都是与界面无关的纯函数 / 类，有单元测试；画布（`annotation-canvas.tsx`）用一张 `<img>` 加屏幕坐标的 SVG 叠加层绘制，指针事件统一处理鼠标、触控笔与触屏（双指缩放）。
 - 数据集模块位于 `src/features/datasets/`：列表页、详情页（图片 / 标签分布 / 导入记录）、新建与导入对话框、图片查看器（叠加 VOC 标注框）。上传由全局的上传管理器（`upload-manager.ts`，`useSyncExternalStore`）执行，切换页面不会中断；右下角的上传面板显示进度，上传中关闭页面会弹出提醒。
 
 开发时由 Vite（:5173）托管前端并把 `/api` 代理到 Go 服务（:8080）；生产环境由 Go 服务托管 `frontend/dist`。
@@ -302,7 +309,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | X-AnyLabeling | 图片按原路径；有效标注（已标注 / 空标注）的图片在同目录生成 `<名称>.json`（X-AnyLabeling 4.x 格式，矩形为 4 个点，`imageData` 为 null） |
 | YOLO | Ultralytics 布局：`images/…`（保持子目录；图片原本就全在 `images/` 下时不再加一层）、`labels/…`（`class cx cy w h`，6 位小数）、`classes.txt`、`data.yaml`（检测到 `images/train`、`images/val`（或 `valid`）、`images/test` 时按此划分，否则 train 与 val 都指向全部图片）。不在类别列表中的标签不导出；有标注文件但目标全部被排除的图片生成空 txt |
 
-下载为 YOLO 时，页面上的类别顺序默认沿用该数据集最近一次成功的 YOLO 导入所用的顺序（类别编号与导入时一致），数据集中其余的标签按名称排在后面；没有 YOLO 导入时按标签名称排序。
+下载为 YOLO 时，页面上的类别顺序默认为标注工作台中设置的类别列表；没有设置时沿用该数据集最近一次成功的 YOLO 导入所用的顺序（类别编号与导入时一致）；数据集中其余的标签按名称排在后面；都没有时按标签名称排序。在类别管理中“全部加入”数据集中的标签时，由 YOLO 导入的数据集先按导入时的顺序加入，导出时类别编号不变。
 
 压缩包中的文件按图片顺序排列。未标注或标注无法解析的图片只包含图片本身；扫描之后已被删除的图片会被跳过。两个文件在压缩包中的名称相同时（如 `a.jpg` 与 `a.png` 的 `a.json`），只保留按图片顺序在前的那个。打包中途出错时连接被中断，浏览器会显示下载失败，而不会留下不完整的压缩包。
 
@@ -321,6 +328,20 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 实现：`internal/dataset/order.go` 中的 `ImageSortKey` 把相对路径编码为字节串，按字节比较两个键即得到两张图片的先后；建立索引时写入 `dataset_images.sort_key`（`0005_image_sort_key.sql`，索引 `(dataset_id, sort_key, id)`），所有查询统一使用 `ORDER BY sort_key, id`（`dataset.ImageOrder`），分页由数据库完成。规则的版本（`imageOrderRevision` 加上所用 Unicode 数据的版本：`golang.org/x/text` 的排序、全角半角和规范化表，以及 Go 的 `unicode` 包）记录在 `app_settings` 的 `dataset.image_order` 中：服务启动时为还没有排序键的图片补上键；版本变化时（修改规则，或升级 Go / `golang.org/x/text` 带来新的 Unicode 数据后）重新计算全部键。修改规则时必须增加 `imageOrderRevision`，`TestImageSortKeyStable` 会在键变化时提醒。
 
+### 标注
+
+标注工作台（`/annotation/workspace/<数据集ID>?image=<图片ID>`）逐张编辑图片的矩形框，直接读写数据集文件夹中的 VOC 文件，因此文件夹始终可以用 LabelImg 等工具打开，也可以按任意格式下载。实现见 `internal/dataset/annotate.go`、`voc_patch.go` 与 `frontend/src/features/annotation/`。
+
+- **写到哪个文件**：已配对的 VOC 文件；没有时写 `<图片名>.xml`（与图片同目录）；图片位于 `JPEGImages/`（或 `images/`）且旁边有 `Annotations/` 文件夹时写到 `Annotations/<图片名>.xml`，与扫描时的配对规则一致。`a.jpg` 与 `a.png` 位于同一文件夹时，`a.xml` 属于 `<filename>` 指向的那张（扫描规则），另一张不能在平台中保存标注（详情中 `annotation_blocked` 给出原因），需要先重命名其中一张。符号链接、不是普通文件的目标拒绝写入。
+- **写入方式**：先写同目录下的隐藏临时文件，再改名覆盖目标，读取方和崩溃都不会看到写了一半的文件；保留原文件的权限。同一张图片的保存串行执行；文件写入、`dataset_images` 中这张图片的索引与数据集计数在同一个事务中更新（与导入一样先锁定数据集行），不需要重新扫描。坐标裁剪到图片范围并取整，宽或高为 0 的框拒绝保存。
+- **保留其它内容**：保存已有的 VOC 文件时只替换矩形框，其余内容原样保留：根元素的属性（如 LabelImg 审核后写入的 `verified="yes"`）、`<path>`、`<source>`、注释和其它自定义元素及其顺序；平台无法显示的目标（没有名称或没有数值 `<bndbox>`，如多边形）留在原处；没有修改的框保留原来的元素（包括 `<pose>`、`<occluded>` 等字段和小数坐标）。新的和修改过的框按 LabelImg 的格式写在原来第一个框的位置；`<size>` 与图片实际尺寸不一致时替换，没有时补上。文件统一写为 UTF-8。使用了 XML 命名空间或无法解析的文件改为重新生成（无法解析的文件只能在用户确认后覆盖）。
+- **并发修改**：每次读取图片详情都会返回 `annotation_version`（文件内容的哈希）；保存与删除必须带上开始编辑时的版本，文件在此之后变化（另一个窗口保存过，或在服务器上被其它工具修改）时返回 409 `annotation_conflict`，不会覆盖别人的修改。页面上可以选择载入最新版本，或带 `force: true` 用自己的版本覆盖。
+- **空标注与未标注**：没有任何框时有两种含义。图片原本就有标注文件，或用户明确标为“空标注（无目标）”时，写入没有目标的 VOC 文件（负样本）；否则（例如画了一个框又删掉）删除本次编辑中创建的文件，图片恢复为“未标注”，不会被误当成负样本。
+- **类别列表**：每个数据集一份（`datasets.classes`），决定标注时可选的类别、数字键 1–9、0 对应的类别和显示颜色，也是下载 YOLO 时的默认类别顺序。它只是元数据：框的类别以 VOC 文件为准，可以使用不在列表中的类别（页面上标为“不在列表”，可一键加入），修改列表不会改写任何标注文件。
+- **只读的情况**：数据集文件夹缺失、标注文件无法解析（需要用户确认后才能覆盖）、`annotation_blocked` 不为空、读不出图片尺寸时，页面只显示不编辑。
+
+前端编辑器的保存策略：停止编辑约 0.8 秒后自动保存，切换图片、离开页面前先保存（失败时不切换，并提示可以放弃修改）；关闭浏览器标签页时用 `keepalive` 请求补发最后的修改。上一张 / 下一张按“图片顺序”，可以只在符合筛选条件（如“未标注”）的图片之间切换。
+
 ### 缩略图
 
 缩略图在第一次请求时生成（`sm` 320px 用于网格，`lg` 1600px 用于查看器），保存为 `cache/thumbs/<数据集ID>/<图片ID>-<尺寸>-<版本>.jpg`。同时生成的数量按 CPU 核数和预估内存占用（按图片格式估算解码所需内存，如 JPEG 的采样方式与渐进式编码）限制，相同请求只生成一次；像素过多或长宽比极端、解码缩放所需内存过大的图片不生成缩略图（返回 `unsupported_image`，前端回退为原图或占位图）。文件变化后版本号改变，会生成新的缩略图。删除 `cache/` 不影响数据，缩略图会按需重新生成。
@@ -333,7 +354,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 因此迁移文件中**不要写 `BEGIN` / `COMMIT`**，也不能包含无法在事务中执行的语句（如 `CREATE INDEX CONCURRENTLY`）。
 - 迁移只向前：**已发布的迁移文件不要修改，也不要改名**，需要变更就新增一个文件。
 - 同一个版本号只能对应一个文件。执行器会比对 `schema_migrations` 中记录的文件名：数据库里已执行过的版本号在当前代码中对应另一个文件名时（典型情况是两个分支各自新增了 `0002_*.sql`，又共用一个开发数据库），启动直接失败并给出两个文件名，而不是悄悄跳过。此时给后合入的那个文件换一个新编号；开发数据库可以删掉 `data/postgres` 重建。
-- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
+- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表（见第 6 节“标注”）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
 
 ## 8. 日志
 

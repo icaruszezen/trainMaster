@@ -50,6 +50,7 @@ func TestParseVOC(t *testing.T) {
 			{Name: "划痕", Xmin: 10, Ymin: 20, Xmax: 101, Ymax: 201, Truncated: true},
 			{Name: "dent", Xmin: 1, Ymin: 2, Xmax: 3, Ymax: 4, Difficult: true},
 		},
+		Unsupported: 3,
 	}
 	if !reflect.DeepEqual(a, want) {
 		t.Errorf("got %+v\nwant %+v", a, want)

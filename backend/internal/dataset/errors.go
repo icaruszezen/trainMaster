@@ -17,6 +17,7 @@ var (
 	ErrTooLarge            = errors.New("payload too large")           // request body over the limit
 	ErrInsufficientStorage = errors.New("insufficient storage")        // not enough free disk space
 	ErrUnsupportedImage    = errors.New("unsupported image")           // no thumbnail can be generated
+	ErrAnnotationChanged   = errors.New("annotation changed")          // the file is not the version an edit started from
 	errCanceled            = errors.New("import canceled by the user") // cancel cause of a running job
 )
 
