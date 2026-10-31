@@ -823,7 +823,7 @@ func TestIntegrationSaveKeepsVOCContent(t *testing.T) {
 	}
 	renamed := []AnnotationObject{{Name: "划痕", Xmin: 1, Ymin: 1, Xmax: 5, Ymax: 5}}
 	_, err = e.svc.SaveAnnotation(ctx, e.d.ID, d.ID, SaveAnnotationInput{Objects: renamed, BaseVersion: detail.AnnotationVersion})
-	wantKind(t, err, ErrConflict, "标注文件 images/d.xml 无法在保留其中其它内容的情况下修改")
+	wantKind(t, err, ErrAnnotationUnpatchable, "标注文件 images/d.xml 无法在保留其中其它内容的情况下修改")
 	if got := e.readFile(t, "images/d.xml"); !bytes.Equal(got, unpatchable) {
 		t.Errorf("refused save changed the file:\n%s", got)
 	}

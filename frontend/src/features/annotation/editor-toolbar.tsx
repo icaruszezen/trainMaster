@@ -230,7 +230,7 @@ export function EditorToolbar(props: EditorToolbarProps) {
       <Separator />
 
       {/* 第二组：工具、撤销、缩放、视图 */}
-      <div className="order-last flex w-full items-center gap-1 md:order-none md:w-auto">
+      <div className="order-last flex w-full [scrollbar-width:none] items-center gap-1 overflow-x-auto md:order-none md:w-auto md:overflow-visible">
         <ToggleGroup
           type="single"
           size="sm"

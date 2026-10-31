@@ -42,6 +42,7 @@ import {
   type SaveContext,
 } from "@/features/annotation/api"
 import {
+  ANNOTATION_UNPATCHABLE,
   AnnotationSaver,
   isConflictError,
   type SaverState,
@@ -895,11 +896,29 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     notices.unshift({
       tone: "error",
       message: `保存失败：${saveState.error ?? "未知错误"}`,
-      action: (
-        <Button size="sm" variant="outline" onClick={() => void saver.flush()}>
-          重试
-        </Button>
-      ),
+      action:
+        saveState.code === ANNOTATION_UNPATCHABLE ? (
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" variant="outline" onClick={() => void reload()}>
+              载入文件（放弃我的修改）
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void overwrite()}
+            >
+              仍然保存（重新生成文件）
+            </Button>
+          </div>
+        ) : (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void saver.flush()}
+          >
+            重试
+          </Button>
+        ),
     })
   }
   // 冲突、保存失败、只读原因等需要处理的提示放在最显眼的位置。

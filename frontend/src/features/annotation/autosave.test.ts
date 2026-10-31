@@ -122,6 +122,30 @@ describe("AnnotationSaver", () => {
     await expect(retry).resolves.toBe(true)
   })
 
+  it("keeps the error code of a failed save", async () => {
+    const { saver, calls } = setup()
+    saver.reset([box("a")], "v1", "image-1")
+    saver.update([box("b")])
+    const flushed = saver.flush()
+    calls[0].reject(
+      new ApiError(
+        409,
+        "annotation_unpatchable",
+        "无法在保留其它内容的情况下修改"
+      )
+    )
+    await expect(flushed).resolves.toBe(false)
+    expect(saver.getState()).toEqual({
+      status: "error",
+      error: "无法在保留其它内容的情况下修改",
+      code: "annotation_unpatchable",
+    })
+    const forced = saver.overwrite()
+    expect(calls[1].request.force).toBe(true)
+    calls[1].resolve("v2")
+    await expect(forced).resolves.toBe(true)
+  })
+
   it("stops on a conflict until the user overwrites", async () => {
     const { saver, calls } = setup()
     saver.reset([], "v1", "image-1")

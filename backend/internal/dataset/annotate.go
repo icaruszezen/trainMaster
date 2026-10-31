@@ -452,7 +452,7 @@ func (s *Service) SaveAnnotation(ctx context.Context, datasetID, imageID int64, 
 				return data, nil
 			}
 			if !in.Force {
-				return nil, newError(ErrConflict, "标注文件 %s 无法在保留其中其它内容的情况下修改；"+
+				return nil, newError(ErrAnnotationUnpatchable, "标注文件 %s 无法在保留其中其它内容的情况下修改；"+
 					"如果仍要保存，将按平台的格式重新生成整个文件，文件中平台不编辑的内容会丢失", e.target.Path)
 			}
 		}

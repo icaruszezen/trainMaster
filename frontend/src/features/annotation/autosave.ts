@@ -26,6 +26,8 @@ export type SaverState = {
   status: SaveStatus
   /** `error` 时的说明。 */
   error: string | null
+  /** `error` 时接口返回的错误码（如 `annotation_unpatchable`），其它错误为空。 */
+  code?: string
 }
 
 export type SaveRequest<C> = {
@@ -40,6 +42,9 @@ export type SaveRequest<C> = {
 export type SaveFunction<C> = (request: SaveRequest<C>) => Promise<string>
 
 export const ANNOTATION_CONFLICT = "annotation_conflict"
+
+/** 已有的标注文件无法在保留其它内容的情况下修改，只能选择重新生成（force）。 */
+export const ANNOTATION_UNPATCHABLE = "annotation_unpatchable"
 
 export function isConflictError(error: unknown) {
   return error instanceof ApiError && error.code === ANNOTATION_CONFLICT
@@ -329,6 +334,7 @@ export class AnnotationSaver<C> {
           this.setState({
             status: "error",
             error: error instanceof Error ? error.message : "保存失败",
+            code: error instanceof ApiError ? error.code : undefined,
           })
         }
         return false
@@ -341,7 +347,8 @@ export class AnnotationSaver<C> {
   private setState(state: SaverState) {
     if (
       state.status === this.state.status &&
-      state.error === this.state.error
+      state.error === this.state.error &&
+      state.code === this.state.code
     ) {
       return
     }

@@ -98,6 +98,8 @@ func datasetErrorStatus(kind error) (int, string) {
 		return http.StatusUnprocessableEntity, codeUnsupportedImage
 	case dataset.ErrAnnotationChanged:
 		return http.StatusConflict, codeAnnotationConflict
+	case dataset.ErrAnnotationUnpatchable:
+		return http.StatusConflict, codeAnnotationUnpatchable
 	}
 	return http.StatusInternalServerError, codeInternal
 }

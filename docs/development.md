@@ -119,7 +119,7 @@ CI（`.github/workflows/ci.yml`）在每次 push 到 main 和每个 Pull Request
 
 项目使用 shadcn/ui 的 new-york 风格、neutral 配色，配置在 `frontend/components.json`。组件源码在 `frontend/src/components/ui/`，可以直接修改。与上游不同的本地修改（用 CLI 覆盖这些组件后请重新改回）：
 
-- `sidebar.tsx`：移动端抽屉的读屏文案（`SheetTitle` / `SheetDescription`）改成了中文；
+- `sidebar.tsx`：移动端抽屉的读屏文案（`SheetTitle` / `SheetDescription`）改成了中文；`SidebarProvider` 新增 `persist` 属性（默认 `true`，与上游相同），为 `false` 时展开 / 收起不写入 `sidebar_state` cookie，布局在全屏页面（标注编辑器）中传 `false`，那里的临时状态不会覆盖普通页面保存的状态；
 - `dialog.tsx`：关闭按钮的读屏文案改为“关闭”；
 - `spinner.tsx`：`aria-label` 改为“加载中”；
 - `slider.tsx`：`aria-label` 加在滑块手柄（`role="slider"`）上，而不是外层容器，读屏软件才能读出名称；
