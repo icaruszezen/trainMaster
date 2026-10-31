@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react"
+import { useCallback, useRef, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { ChevronLeft, ChevronRight } from "lucide-react"
 
@@ -16,6 +16,7 @@ import {
   IMAGE_LIST_PAGE_SIZE,
   imagesPageQuery,
 } from "@/features/annotation/api"
+import { focusCanvas, preventTypeahead } from "@/features/annotation/shortcuts"
 import { hasFilters } from "@/features/annotation/workspace-params"
 import {
   labelsQuery,
@@ -95,6 +96,16 @@ export function ImageListPanel({
   const labelMissing =
     filters.label !== "" && !labelItems.some((l) => l.name === filters.label)
 
+  // 筛选下拉框关闭后把焦点还给画布（在弹出的面板中时除外），快捷键随即可用；
+  // 焦点在下拉框按钮上时，字母键也不会按首字母改掉筛选条件。
+  const statusTrigger = useRef<HTMLButtonElement>(null)
+  const labelTrigger = useRef<HTMLButtonElement>(null)
+  const returnFocus = (event: Event, trigger: HTMLButtonElement | null) => {
+    if (focusCanvas(trigger)) {
+      event.preventDefault()
+    }
+  }
+
   const goPage = (next: number) =>
     setManual({ follow: followPage, filters: filtersKey, page: next })
   // 当前图片换了（或翻到了它所在的一页）时滚动到它。
@@ -120,10 +131,20 @@ export function ImageListPanel({
               onFiltersChange({ status: value as ImageStatusFilter })
             }
           >
-            <SelectTrigger size="sm" className="w-full" aria-label="标注状态">
+            <SelectTrigger
+              ref={statusTrigger}
+              size="sm"
+              className="w-full"
+              aria-label="标注状态"
+              onKeyDown={preventTypeahead}
+            >
               <SelectValue />
             </SelectTrigger>
-            <SelectContent>
+            <SelectContent
+              onCloseAutoFocus={(event) =>
+                returnFocus(event, statusTrigger.current)
+              }
+            >
               {statusOptions.map((option) => (
                 <SelectItem key={option.value} value={option.value}>
                   {option.label}（{formatNumber(option.count)}）
@@ -140,10 +161,20 @@ export function ImageListPanel({
             }
             disabled={labelItems.length === 0 && !filters.label}
           >
-            <SelectTrigger size="sm" className="w-full" aria-label="按标签筛选">
+            <SelectTrigger
+              ref={labelTrigger}
+              size="sm"
+              className="w-full"
+              aria-label="按标签筛选"
+              onKeyDown={preventTypeahead}
+            >
               <SelectValue placeholder="全部标签" />
             </SelectTrigger>
-            <SelectContent>
+            <SelectContent
+              onCloseAutoFocus={(event) =>
+                returnFocus(event, labelTrigger.current)
+              }
+            >
               <SelectItem value={ALL_LABELS}>全部标签</SelectItem>
               {labelMissing && (
                 <SelectItem value={labelValue(filters.label)}>

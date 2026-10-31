@@ -5,6 +5,8 @@ import {
   classHotkey,
   commandForKey,
   copiesSelectedText,
+  focusCanvas,
+  preventTypeahead,
   shortcutHelp,
   shouldIgnoreKey,
   type KeyInput,
@@ -301,6 +303,56 @@ describe("shouldIgnoreKey", () => {
         })
       ).toBe(true)
     })
+  })
+})
+
+describe("preventTypeahead", () => {
+  /** Whether the drop-down button would swallow the key. */
+  const swallows = (code: string, modifiers: Partial<KeyInput> = {}) => {
+    const preventDefault = vi.fn()
+    preventTypeahead({ ...key(code, modifiers), preventDefault })
+    return preventDefault.mock.calls.length > 0
+  }
+
+  it("stops typed characters from picking an option on a closed drop-down", () => {
+    expect(swallows("KeyD")).toBe(true)
+    expect(swallows("KeyS", { key: "S", shiftKey: true })).toBe(true)
+    expect(swallows("Digit1", { key: "1" })).toBe(true)
+  })
+
+  it("keeps the keys that open the drop-down and keys with modifiers", () => {
+    expect(swallows("Space", { key: " " })).toBe(false)
+    expect(swallows("Enter")).toBe(false)
+    expect(swallows("ArrowDown")).toBe(false)
+    expect(swallows("KeyS", { ctrlKey: true })).toBe(false)
+    expect(swallows("KeyS", { metaKey: true })).toBe(false)
+    expect(swallows("KeyS", { altKey: true })).toBe(false)
+  })
+})
+
+describe("focusCanvas", () => {
+  /** A drop-down button inside `within`, on a page with or without the canvas. */
+  const trigger = (within: string[], canvas: { focus: () => void } | null) =>
+    ({
+      closest: (selector: string) => (within.includes(selector) ? {} : null),
+      ownerDocument: {
+        querySelector: (selector: string) =>
+          selector === '[role="application"]' ? canvas : null,
+      },
+    }) as unknown as Element
+
+  it("moves the focus to the canvas", () => {
+    const canvas = { focus: vi.fn() }
+    expect(focusCanvas(trigger([], canvas))).toBe(true)
+    expect(canvas.focus).toHaveBeenCalledWith({ preventScroll: true })
+  })
+
+  it("leaves the focus alone in a sheet or dialog, or without a canvas", () => {
+    const canvas = { focus: vi.fn() }
+    expect(focusCanvas(trigger(['[role="dialog"]'], canvas))).toBe(false)
+    expect(focusCanvas(trigger([], null))).toBe(false)
+    expect(focusCanvas(null)).toBe(false)
+    expect(canvas.focus).not.toHaveBeenCalled()
   })
 })
 
