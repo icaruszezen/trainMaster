@@ -5,6 +5,7 @@ import {
   annotationKeys,
   applySavedDetail,
   persistAnnotation,
+  savedDetail,
   type SaveContext,
 } from "@/features/annotation/api"
 import {
@@ -126,5 +127,30 @@ describe("applySavedDetail", () => {
     expect(invalidate).toHaveBeenCalledWith({
       queryKey: datasetKeys.detail(1),
     })
+  })
+})
+
+describe("savedDetail", () => {
+  const detail = (version: string, names: string[]) =>
+    ({
+      id: 2,
+      annotation_version: version,
+      objects: names.map((name) => ({ ...box, name })),
+    }) as unknown as DatasetImageDetail
+
+  it("returns what the last successful save wrote, not the loaded detail", () => {
+    const client = new QueryClient()
+    const loaded = detail("", [])
+    client.setQueryData(annotationKeys.image(1, 2), loaded)
+    expect(savedDetail(client, 1, loaded)).toBe(loaded)
+
+    const saved = detail("v1", ["dent"])
+    applySavedDetail(client, 1, saved)
+    expect(savedDetail(client, 1, loaded)).toEqual(saved)
+  })
+
+  it("falls back to the loaded detail when the cache has none", () => {
+    const loaded = detail("v1", ["dent"])
+    expect(savedDetail(new QueryClient(), 1, loaded)).toBe(loaded)
   })
 })

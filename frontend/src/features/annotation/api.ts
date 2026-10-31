@@ -144,6 +144,22 @@ export async function persistAnnotation(
   )
 }
 
+/**
+ * 这张图片最后保存的详情：保存成功后由 {@link applySavedDetail} 写入缓存
+ * （重新读取时也会更新）；缓存中没有时为 `loaded`（编辑器载入时的详情）。
+ */
+export function savedDetail(
+  queryClient: QueryClient,
+  datasetId: number,
+  loaded: DatasetImageDetail
+) {
+  return (
+    queryClient.getQueryData<DatasetImageDetail>(
+      annotationKeys.image(datasetId, loaded.id)
+    ) ?? loaded
+  )
+}
+
 function labelKey(detail: DatasetImageDetail | undefined) {
   if (!detail) {
     return ""

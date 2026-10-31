@@ -33,7 +33,11 @@ import {
   normalizeBox,
   type Size,
 } from "@/features/annotation/geometry"
-import { classHotkey } from "@/features/annotation/shortcuts"
+import {
+  classHotkey,
+  focusCanvas,
+  preventTypeahead,
+} from "@/features/annotation/shortcuts"
 import type {
   AnnotationObject,
   DatasetClass,
@@ -448,7 +452,6 @@ function ObjectDetails({
   // id 不写死：页面上有多份面板（如切换布局时）也不会重复，标签对应各自的控件。
   const id = useId()
   const triggerRef = useRef<HTMLButtonElement>(null)
-  const pickedRef = useRef(false)
   const names = classes.map((cls) => cls.name)
   const options = names.includes(object.name) ? names : [...names, object.name]
   return (
@@ -462,15 +465,7 @@ function ObjectDetails({
         </Label>
         <Select
           value={object.name}
-          onOpenChange={(open) => {
-            if (open) {
-              pickedRef.current = false
-            }
-          }}
-          onValueChange={(name) => {
-            pickedRef.current = true
-            onChange({ name })
-          }}
+          onValueChange={(name) => onChange({ name })}
           disabled={readOnly}
         >
           <SelectTrigger
@@ -478,16 +473,15 @@ function ObjectDetails({
             id={`${id}-class`}
             size="sm"
             className="w-full"
+            onKeyDown={preventTypeahead}
           >
             <SelectValue />
           </SelectTrigger>
           <SelectContent
             onCloseAutoFocus={(event) => {
-              // 选好类别后把焦点还给画布：焦点留在下拉框上时，字母键会被它
-              // 用来按首字母选择类别，快捷键也就不能用了。
-              const picked = pickedRef.current
-              pickedRef.current = false
-              if (picked && focusCanvas(triggerRef.current)) {
+              // 下拉框关闭后（选了类别、按 Esc、点击别处、选了原来的类别）都把
+              // 焦点还给画布：焦点留在下拉框上时快捷键不能用。
+              if (focusCanvas(triggerRef.current)) {
                 event.preventDefault()
               }
             }}
@@ -543,24 +537,6 @@ function ObjectDetails({
       )}
     </div>
   )
-}
-
-/**
- * 把焦点移到标注画布上，返回是否移动了。`from` 在弹出的面板（对话框）中时
- * 不移动：面板会把焦点留在自己里面。
- */
-function focusCanvas(from: Element | null) {
-  if (!from || from.closest('[role="dialog"]')) {
-    return false
-  }
-  const canvas = from.ownerDocument.querySelector<HTMLElement>(
-    '[role="application"]'
-  )
-  if (!canvas) {
-    return false
-  }
-  canvas.focus({ preventScroll: true })
-  return true
 }
 
 function FlagField({

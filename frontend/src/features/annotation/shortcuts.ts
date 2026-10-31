@@ -298,8 +298,9 @@ const ARROW_CONTROLS =
  * - 输入法正在组字；
  * - 焦点在输入控件 / 浮层中（Ctrl+S 例外，在输入框里也保存，并且不弹出浏览器
  *   的“保存网页”）；
- * - 焦点在关闭的下拉框（如类别下拉框）上时输入字符的按键：下拉框会按首字母
- *   直接选中匹配的选项，快捷键再执行一次就会同时改掉框的类别；
+ * - 焦点在关闭的下拉框（如类别下拉框）上时输入字符的按键：下拉框可能按首字母
+ *   直接选中匹配的选项，快捷键再执行一次就会同时改掉框的类别（工作台中的下拉
+ *   框用 {@link preventTypeahead} 拦下了这些按键，这时按键什么也不做）；
  * - 焦点不在画布上时的 Tab（页面本身、按钮等控件上照常移动焦点），以及自己
  *   用方向键的控件上的方向键。
  */
@@ -335,6 +336,37 @@ export function shouldIgnoreKey(
   return (
     event.code.startsWith("Arrow") && element.closest(ARROW_CONTROLS) !== null
   )
+}
+
+/**
+ * 工作台中下拉框（类别、筛选条件）按钮的 onKeyDown：拦下不带 Ctrl / ⌘ / Alt
+ * 的单个字符（空格除外，空格打开下拉框）。关闭的下拉框会按首字母直接选中匹配
+ * 的选项，焦点留在按钮上时误按的快捷键会悄悄改掉框的类别或筛选条件；阻止默认
+ * 行为后 Radix 不再处理这次按键。打开后的列表中照常按首字母查找。
+ */
+export function preventTypeahead(
+  event: KeyInput & { preventDefault: () => void }
+) {
+  if (isPrintableKey(event) && event.key !== " ") {
+    event.preventDefault()
+  }
+}
+
+/**
+ * 下拉框关闭后把焦点移到标注画布上（快捷键随即可用），返回是否移动了。
+ * `from`（下拉框的按钮）在弹出的面板（对话框）中时不移动：面板会把焦点留在
+ * 自己里面；画布不在页面上（图片还在读取或无法打开）时也不移动。
+ */
+export function focusCanvas(from: Element | null) {
+  if (!from || from.closest('[role="dialog"]')) {
+    return false
+  }
+  const canvas = from.ownerDocument.querySelector<HTMLElement>(CANVAS)
+  if (!canvas) {
+    return false
+  }
+  canvas.focus({ preventScroll: true })
+  return true
 }
 
 /** 与 `Selection` 中用到的字段一致，便于测试。 */

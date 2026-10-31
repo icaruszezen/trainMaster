@@ -39,6 +39,7 @@ import {
   editorImageQuery,
   fetchImageAt,
   persistAnnotation,
+  savedDetail,
   type SaveContext,
 } from "@/features/annotation/api"
 import {
@@ -933,13 +934,33 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     setImagesOpen(false)
   }
 
-  // 用户选择放弃这张图片上没有保存成功的修改并切换（之后不再保存它们，离开时
-  // 也不再拦截）。
+  /**
+   * 放弃这张图片上没有保存成功的修改（“放弃修改并切换”“放弃修改并离开”）：
+   * 之后不再保存它们，切换、离开时也不再拦截；编辑器中的框回到最后保存的内容。
+   * 只重置保存器的话，要打开的图片读取失败（如服务无法访问）、又回到这张图片
+   * 时不会重新载入，放弃的框还在画布上，下次修改会把它们一起保存。
+   */
+  const discardChanges = () => {
+    saver.discard()
+    const start = loadedRef.current
+    if (!start) {
+      return
+    }
+    // 不用载入时的框：之前保存成功的修改不能一起丢掉。
+    const saved = savedDetail(queryClient, datasetId, start.detail)
+    const next = { detail: saved, token: start.token + 1 }
+    setLoaded(next)
+    dispatch({ type: "load", objects: saved.objects, key: docKey(next) })
+    setHighlight(null)
+    setPicker(null)
+  }
+
+  // 用户选择放弃这张图片上没有保存成功的修改并切换。
   const discardAndOpen = (from: number, id: number) => {
     if (imageIdRef.current !== from) {
       return // 提示过期：已经在别的图片上了
     }
-    saver.discard()
+    discardChanges()
     openImage(id)
   }
 
@@ -1520,7 +1541,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
                 // 拦截状态一起关闭。放弃后，卸载时的保存、自动保存都不再写入
                 // 这些修改。
                 event.preventDefault()
-                saver.discard()
+                discardChanges()
                 blocker.proceed?.()
               }}
             >
