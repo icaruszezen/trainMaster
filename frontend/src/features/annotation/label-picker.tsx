@@ -13,6 +13,7 @@ import { classNameError, filterClasses } from "@/features/annotation/classes"
 import {
   nearestScrollTop,
   placeOverlay,
+  pointerMoved,
   type OverlayAnchor,
 } from "@/features/annotation/geometry"
 import { classHotkey } from "@/features/annotation/shortcuts"
@@ -62,7 +63,7 @@ export function LabelPicker({
   const rootRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLUListElement>(null)
-  /** 上一次指针移动的位置：只有指针真正移动时，高亮才跟随指针。 */
+  /** 上一次指针在列表项上移动的位置：只有指针真正移动时，高亮才跟随指针。 */
   const lastPointer = useRef<{ x: number; y: number } | null>(null)
 
   // 量出选择框的尺寸后放到框旁边（绘制前完成，不会闪动）；框随缩放移动、
@@ -229,19 +230,20 @@ export function LabelPicker({
               aria-selected={index === activeIndex}
               tabIndex={-1}
               // 不用 pointerenter：用键盘移动、列表滚动后，浏览器会对停在原处的
-              // 指针下的这一项发出 pointerenter（有的浏览器还会补发一次位置不变的
-              // 移动事件），高亮就跳回指针所在的项了。
+              // 指针下的这一项发出 pointerenter，有的浏览器还会补发位置不变的移动
+              // 事件（选择框刚在静止的指针下打开时也是），高亮就跳到指针所在的项了。
+              // 因此只在指针真正移动时（位置与上次不同；还没有记录时看事件的位移）
+              // 跟随指针。
               onPointerMove={(event) => {
-                const last = lastPointer.current
-                if (
-                  last &&
-                  last.x === event.clientX &&
-                  last.y === event.clientY
-                ) {
-                  return
+                const point = { x: event.clientX, y: event.clientY }
+                const moved = pointerMoved(lastPointer.current, point, {
+                  x: event.movementX,
+                  y: event.movementY,
+                })
+                lastPointer.current = point
+                if (moved) {
+                  setActive(index)
                 }
-                lastPointer.current = { x: event.clientX, y: event.clientY }
-                setActive(index)
               }}
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => pick(option)}

@@ -560,3 +560,20 @@ export function nearestScrollTop(
   }
   return scrollTop
 }
+
+/**
+ * 指针移动事件是否表示指针真的移动了（列表的悬停高亮只在这时跟随指针）。内容在
+ * 静止的指针下滚动或出现时，有的浏览器会补发位置不变的移动事件。`last` 是上一次
+ * 记录的指针位置（视口坐标），与它比较；还没有记录时看事件自带的位移
+ * （`movementX` / `movementY`），位移为 0 视为没有移动。
+ */
+export function pointerMoved(
+  last: Point | null,
+  point: Point,
+  movement: Point
+): boolean {
+  if (last) {
+    return point.x !== last.x || point.y !== last.y
+  }
+  return movement.x !== 0 || movement.y !== 0
+}
