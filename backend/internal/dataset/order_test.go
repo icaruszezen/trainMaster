@@ -63,6 +63,24 @@ func TestImageSortKeyWindowsOrder(t *testing.T) {
 		"a01z < a1b",
 		"00 < 0 < 1 < 9 < 10 < 99 < 100",
 		"１2 < 3 < 12", // full-width and ASCII digits make two numbers: 1, 2
+		// Other number characters, by value.
+		"① < ② < ③ < ⑨ < ⑩ < ⑪ < ⑫ < ⑳",
+		"工位①_001.jpg < 工位②_001.jpg < 工位⑨_001.jpg < 工位⑩_001.jpg < 工位⑪_001.jpg < 工位⑫_001.jpg",
+		"a9 < a10 < a⅛ < a½ < a① < a⑵ < a⒊ < a④ < a⑩ < a⑳ < aⅠ < aⅣ < aⅤ < aⅨ < aⅩ < a∞ < ab",
+		"Ⅰ类缺陷_01.jpg < Ⅱ类缺陷_01.jpg < Ⅲ类缺陷_01.jpg < Ⅳ类缺陷_01.jpg",
+		"1级 < 9级 < Ⅰ级 < Ⅱ级 < Ⅲ级 < h级 < ia级 < z级",
+		"a10 < a߁߀ < a߃ < ab", // N'Ko digits are not compared as numbers
+		// Spaces, and the symbols of GB 2312.
+		"a b < a\u00a0b < a\u2009b < a\u200bb < a!b",
+		"a z.jpg < a\u200bz.jpg < ab.jpg",
+		"a~ < a¨ < a‖ < a′ < a¢ < a》 < a【 < a+ < a∈ < a≡ < a⊥ < a⌒ < a■ < a○ < a↑ < a§ < a・ < a♂ < a† < a‰ < a※ < a1",
+		"a《b < a¢z", // the same weight
+		"a≠b < a=z",
+		// Characters without weight.
+		"aa.jpg < a\ufffdb.jpg < b.jpg",
+		"测试\ufffd.jpg < 测试_1.jpg < 测试1.jpg",
+		"a\u200db.jpg < ab1.jpg < abc.jpg",
+		"a\u00adb.jpg < ab1.jpg < abc.jpg",
 	} {
 		wantOrder(t, strings.Split(order, " < ")...)
 	}
@@ -83,13 +101,15 @@ func TestImageSortKeyOrder(t *testing.T) {
 	// Names equal but for case, width or Unicode form: by code point.
 	wantOrder(t, "A.jpg", "a.jpg", "ａ.jpg")
 	wantOrder(t, "é.jpg", "é.jpg", "f.jpg")
-	// Characters without weight do not split numbers or words.
-	wantOrder(t, "a​b.jpg", "ab1.jpg", "abc.jpg")
+	wantOrder(t, "a①.jpg", "a⑴.jpg", "a⒈.jpg", "aⅠ.jpg", "aⅰ.jpg")
+	// The Chinese numbers in parentheses and circles follow the other
+	// numerals (Windows puts them after the Chinese characters).
+	wantOrder(t, "a∞.jpg", "a㈠.jpg", "a㈡.jpg", "a㈩.jpg", "a㊀.jpg", "a㊉.jpg", "ab.jpg")
 }
 
 func TestImageSortKeyDistinct(t *testing.T) {
 	r := rand.New(rand.NewPCG(3, 4))
-	const alphabet = "aAbB01９ _-'.()（）【】、。中文é́/"
+	const alphabet = "aAbB01９ _-'.()（）【】、。中文é́/①⑴Ⅰⅰ½㈠\u200b\ufffd"
 	chars := []rune(alphabet)
 	seen := map[string]string{}
 	for range 20000 {
@@ -138,20 +158,23 @@ func TestImageSortKeyConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-// TestImageSortKeyStable fails when the keys change, e.g. after an update
-// of golang.org/x/text: increase imageOrderRevision, so the stored keys are
-// recomputed, and update the hash here.
+// TestImageSortKeyStable fails when the keys change: increase
+// imageOrderRevision, so the stored keys are recomputed, and update the
+// hash here. When an upgrade of Go or golang.org/x/text changes the keys,
+// imageOrderVersion may change by itself; increase imageOrderRevision
+// anyway.
 func TestImageSortKeyStable(t *testing.T) {
 	paths := []string{
 		"IMG_0001.JPG", "img_2.jpg", "NG/划痕/0001.png", "OK/正常 (3).jpg", "a-b_c d.bmp", "ｆｕｌｌ１２.jpg", "é́x.tif",
-		"【标注】《说明》、。.png", "2023-01-05 08.30.11.jpg", "12345678901234567890123.jpg", "a​b²①…×→☆.jpg",
+		"【标注】《说明》、。.png", "2023-01-05 08.30.11.jpg", "12345678901234567890123.jpg", "a\u200bb²①…×→☆.jpg",
+		"Ⅲ类/⑩½㈠ ・‰≠\ufffd.jpg",
 	}
 	h := sha256.New()
 	for _, p := range paths {
 		h.Write(ImageSortKey(p))
 		h.Write([]byte{0xFF})
 	}
-	const want = "b8e8fa0185915dbd2dd42cbb9effd1a7832187624cc9d6b0b5f41a30441484df"
+	const want = "0a413a44c8be38a282cfda564a5a2bfe1e3586e350793294f91801f7b2bd35a4"
 	if got := hex.EncodeToString(h.Sum(nil)); got != want {
 		t.Errorf("sort keys changed (hash %s, want %s): increase imageOrderRevision", got, want)
 	}

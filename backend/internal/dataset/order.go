@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/text/collate"
 	"golang.org/x/text/language"
+	"golang.org/x/text/unicode/norm"
 	"golang.org/x/text/width"
 )
 
@@ -30,8 +31,9 @@ import (
 //     one with more leading zeros comes first (img01 < img1).
 //   - Spaces and punctuation come first, in the order of Windows' sort
 //     table (space ! # $ % & ( ) , . ; @ [ ] ^ _ ` { } ~ + =, so "a.jpg" <
-//     "a_1.jpg"), then digits, then letters (alphabetically, accents
-//     ignored), then Chinese characters in pinyin order.
+//     "a_1.jpg"), then numbers, then the other number characters by value
+//     (½ < ① < ⑩ < Ⅰ < Ⅳ), then letters (alphabetically, accents ignored),
+//     then Chinese characters in pinyin order.
 //   - Hyphens and apostrophes are skipped at first, as in Windows' "word
 //     sort" ("a-b" sorts next to "ab"); of two names equal without them,
 //     the one without comes first.
@@ -45,14 +47,16 @@ import (
 // index (ORDER BY ImageOrder).
 
 // imageOrderRevision numbers the rule ImageSortKey implements. Increase it
-// whenever the keys change, including through new collation tables in
-// golang.org/x/text (TestImageSortKeyStable fails then): the keys stored
-// for another version are recomputed when the server starts.
+// whenever the rule changes (TestImageSortKeyStable fails then): the keys
+// stored for another version are recomputed when the server starts.
 const imageOrderRevision = 1
 
-// imageOrderVersion identifies the keys stored in sort_key.
-var imageOrderVersion = fmt.Sprintf("%d/cldr-%s/unicode-%s", imageOrderRevision, collate.CLDRVersion,
-	collate.UnicodeVersion)
+// imageOrderVersion identifies the keys stored in sort_key: the rule and
+// the Unicode tables it reads (golang.org/x/text's collation, width and
+// normalization tables, and Go's unicode package), so that keys are also
+// recomputed after an upgrade of Go or golang.org/x/text changes them.
+var imageOrderVersion = fmt.Sprintf("%d/cldr-%s/collate-%s/width-%s/norm-%s/go-unicode-%s", imageOrderRevision,
+	collate.CLDRVersion, collate.UnicodeVersion, width.UnicodeVersion, norm.Version, unicode.Version)
 
 // imageOrderSetting is the app_settings key recording the imageOrderVersion
 // of the stored keys.
@@ -68,10 +72,11 @@ const maxSortKeyLen = 2048
 //
 //	tokens keyEnd specials keyEnd name keyEnd
 //
-// tokens are the characters compared first, in tokens of four kinds whose
+// tokens are the characters compared first, in tokens of five kinds whose
 // first bytes order them: a symbol (its group and rank in Windows' table),
-// a number (count of significant digits, digits, then leading zeros), an
-// other number (², ①) and a run of letters (collation weights). specials
+// a number (count of significant digits, digits, then leading zeros), a
+// numeral (its rank in Windows' table: ½, ①, Ⅳ), another number character
+// (collation weights) and a run of letters (collation weights). specials
 // are the hyphens and apostrophes set aside, each with its place in the
 // name. name is the name itself, the final tie-break. Every part ends with
 // a byte smaller than any that could continue it, so a prefix comes first.
@@ -82,25 +87,85 @@ const (
 
 	tokSymbol      = 0x01
 	tokNumber      = 0x02
-	tokOtherNumber = 0x03
-	tokText        = 0x04
+	tokNumeral     = 0x03
+	tokOtherNumber = 0x04
+	tokText        = 0x05
 
 	special = 0x01 // starts an entry of specials
 
 	rankOther = 0xFF // a symbol missing from windowsSymbols, after those of its group
 )
 
-// windowsSymbols lists, by group, the punctuation and symbols of Windows'
-// default sort table (also used for zh-CN) that file names commonly
-// contain, in the table's order. Groups sort in index order, all before
-// digits. Full-width forms are folded to these before the lookup.
+// windowsSymbols lists, by group, the spaces, punctuation and symbols of
+// Windows' default sort table (also used for zh-CN) that file names
+// commonly contain, those of GB 2312 included, in the table's order.
+// Groups sort in index order, all before digits. Full-width forms are
+// folded to these before the lookup.
 var windowsSymbols = [...]string{
-	7:  "  \t\n\v\f\r!\"#$%&()*,、.。/:;?@[\\]^_`{|}~¡¿‘’‚‛“”„‟‹›〈〉¢《£》¥「」『』【】〔€〕〖〗〘〙〚〛〝〞〟〃",
-	8:  "+<=≠>±«»×÷√≈≤≥",
-	9:  "↑→↓←",
-	10: "§©®°¶·‥…〒〓☆★",
-	11: "•※",
+	7: " \u00a0\t\n\v\f\r\u2000\u2001\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u200b\u2028\u2029" +
+		"!\"#$%&()*,、.。/:;?@[\\]^_`{|}~¡¨¯´¿ˇ˙‖‘’‚‛“”„‟′‹›〈〉¢£》¥「」『』【】〔€〕〖〗〘〙〚〛〝〞〟〃",
+	8:  "+⊗⁄⊙<=>±«»×÷∈∏∑√∝∠∥∧∨∩∪∫∮∴∵∶∷∽≈≌≡≤≥⊥",
+	9:  "⌒■▲◆○↑→↓←↔",
+	10: "§©®°¶·・‥…〒〓☆★♀♂",
+	11: "†‡•‰※",
 }
+
+// symbolTwins maps characters Windows' table weighs the same as one of
+// windowsSymbols to that character.
+var symbolTwins = map[rune]rune{
+	'\u1680': ' ', '\u180e': ' ', '\u202f': ' ', '\u205f': ' ', // other spaces
+	'\u2002': '\u2000', '\u2003': '\u2001', // en and em space, as the en and em quad
+	'ˉ': '*', '″': '′', '《': '¢', '¤': '》', '⊕': '+', '≮': '<', '≠': '=', '≯': '>',
+	'□': '■', '△': '▲', '◇': '◆', '◎': '○', '●': '○', '⇒': '→',
+}
+
+// windowsNumerals lists the number characters other than decimal digits
+// that file names commonly contain (superscripts, fractions, circled and
+// parenthesized numbers, Roman numerals, ...), in the order of Windows'
+// sort table, where they come after all numbers and before the letters.
+// Each string holds characters the table weighs the same.
+var windowsNumerals = [...]string{
+	"⁰₀↉⓪⓿㍘", "⅒", "⅑", "⅛", "⅐", "⅙", "⅕", "¼", "⅓", "⅜", "⅖", "½", "⅗", "⅝", "⅔", "¾", "⅘", "⅚", "⅞",
+	"¹₁①⑴⒈⓵⚀❶➀➊〡㋀㍙㏠", "²₂②⑵⒉⓶⚁❷➁➋〢㋁㍚㏡", "³₃③⑶⒊⓷⚂❸➂➌〣㋂㍛㏢", "⁴₄④⑷⒋⓸⚃❹➃➍〤㋃㍜㏣",
+	"⁵₅⑤⑸⒌⓹⚄❺➄➎〥㋄㍝㏤", "⁶₆ↅ⑥⑹⒍⓺⚅❻➅➏〦㋅㍞㏥", "⁷₇⑦⑺⒎⓻❼➆➐〧㋆㍟㏦", "⁸₈⑧⑻⒏⓼❽➇➑〨㋇㍠㏧",
+	"⁹₉⑨⑼⒐⓽❾➈➒〩㋈㍡㏨", "⑩⑽⒑⓾❿➉➓〸㉈㋉㋊㍢㏩", "⑪⑾⒒⓫㋋㍣㏪", "⑫⑿⒓⓬㍤㏫", "⑬⒀⒔⓭㍥㏬", "⑭⒁⒕⓮㍦㏭",
+	"⑮⒂⒖⓯㍧㏮", "⑯⒃⒗⓰㍨㏯", "⑰⒄⒘⓱㍩㏰", "⑱⒅⒙⓲㍪㏱", "⑲⒆⒚⓳㍫㏲", "⑳⒇⒛⓴〹㉉㍬㏳", "㉑㍭㏴", "㉒㍮㏵",
+	"㉓㍯㏶", "㉔㍰㏷", "㉕㏸", "㉖㏹", "㉗㏺", "㉘㏻", "㉙㏼", "〺㉊㉚㏽", "㉛㏾", "㉜", "㉝", "㉞", "㉟", "㊱",
+	"㊲", "㊳", "㊴", "㉋㊵", "㊶", "㊷", "㊸", "㊹", "㊺", "㊻", "㊼", "㊽", "㊾", "ↆ㉌㊿", "㉍", "㉎", "㉏", "⅟",
+	"Ⅰⅰ", "Ⅱⅱ", "Ⅲⅲ", "Ⅳⅳ", "Ⅴⅴ", "Ⅵⅵ", "Ⅶⅶ", "Ⅷⅷ", "Ⅸⅸ", "Ⅹⅹ", "Ⅺⅺ", "Ⅻⅻ", "Ⅼⅼ", "ⅭⅽↃↄ", "Ⅾⅾ",
+	"Ⅿⅿↀ", "ↁ", "ↂ", "ↇ", "ↈ", "∞⧜⧝⧞",
+}
+
+// hanNumerals are the numbers one to ten in parentheses and in circles.
+// Windows sorts them in this order after the Chinese characters; here they
+// follow the other numerals.
+const hanNumerals = "㈠㈡㈢㈣㈤㈥㈦㈧㈨㈩㊀㊁㊂㊃㊄㊅㊆㊇㊈㊉"
+
+// numeralRanks maps the characters of windowsNumerals and hanNumerals to
+// their rank.
+var numeralRanks = func() map[rune]byte {
+	m := map[rune]byte{}
+	rank := byte(1)
+	for _, chars := range windowsNumerals {
+		for _, r := range chars {
+			m[r] = rank
+		}
+		rank++
+	}
+	for _, r := range hanNumerals {
+		m[r] = rank
+		rank++
+	}
+	return m
+}()
+
+// windowsDigitZeros are the zeros of the sets of decimal digits Windows
+// compares as numbers, in code point order (ASCII, Arabic-Indic, the Indic
+// scripts, Thai, Lao, Tibetan, Myanmar, Khmer, Mongolian, ..., full-width).
+// Other decimal digits are other number characters.
+var windowsDigitZeros = [...]rune{0x30, 0x660, 0x6f0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xbe6, 0xc66,
+	0xce6, 0xd66, 0xe50, 0xed0, 0xf20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946, 0x1bb0, 0x1c40, 0x1c50,
+	0xa620, 0xa8d0, 0xa900, 0xaa50, 0xff10}
 
 // windowsSpecials lists the characters Windows' word sort sets aside
 // (hyphens, dashes, apostrophes), in the table's order. Control characters
@@ -123,6 +188,9 @@ var symbolRanks = func() map[rune][2]byte {
 		m[r] = [2]byte{0, rank}
 		rank++
 	}
+	for twin, r := range symbolTwins {
+		m[twin] = m[r]
+	}
 	return m
 }()
 
@@ -142,16 +210,16 @@ func symbolGroup(r rune) byte {
 type charKind uint8
 
 const (
-	charIgnored     charKind = iota // format characters (zero-width space, BOM, ...)
+	charIgnored     charKind = iota // format characters (zero-width joiner, BOM, ...)
 	charMark                        // combining marks: part of the letters before them
 	charSpecial                     // set aside (windowsSpecials, control characters)
 	charSymbol                      // spaces, punctuation, symbols
-	charOtherNumber                 // ², ½, ① and the like (not decimal digits)
+	charNumeral                     // windowsNumerals and hanNumerals
+	charOtherNumber                 // the other number characters
 	charText                        // letters and the rest
 )
 
-// charKindOf classifies a character that is not a decimal digit (digits
-// make numbers).
+// charKindOf classifies a character that is not a digit of a number.
 func charKindOf(r rune) charKind {
 	if r < utf8.RuneSelf {
 		switch {
@@ -168,6 +236,9 @@ func charKindOf(r rune) charKind {
 		}
 		return charSymbol
 	}
+	if _, ok := numeralRanks[r]; ok {
+		return charNumeral
+	}
 	switch {
 	case unicode.IsLetter(r), unicode.Is(unicode.Mc, r), unicode.Is(unicode.Nl, r):
 		return charText
@@ -177,7 +248,7 @@ func charKindOf(r rune) charKind {
 		return charIgnored
 	case unicode.Is(unicode.Cc, r):
 		return charSpecial
-	case unicode.Is(unicode.No, r):
+	case unicode.IsNumber(r): // also decimal digits outside windowsDigitZeros
 		return charOtherNumber
 	case unicode.IsPunct(r), unicode.IsSymbol(r), unicode.IsSpace(r):
 		return charSymbol
@@ -239,7 +310,7 @@ func ImageSortKey(rel string) []byte {
 func (k *nameKeyer) appendNameKey(key []byte, name string) []byte {
 	k.key, k.run, k.spec, k.chars = key, k.run[:0], k.spec[:0], 0
 	for i := 0; i < len(name); {
-		if r, _ := utf8.DecodeRuneInString(name[i:]); unicode.IsDigit(r) {
+		if r, _ := utf8.DecodeRuneInString(name[i:]); isDigit(r) {
 			k.flushText()
 			i += k.appendNumber(name[i:])
 			continue
@@ -247,7 +318,7 @@ func (k *nameKeyer) appendNameKey(key []byte, name string) []byte {
 		// Up to the next digit, full-width forms are folded. Digits are not:
 		// Windows does not join "１" and "2" into one number.
 		j := len(name)
-		if d := strings.IndexFunc(name[i:], unicode.IsDigit); d >= 0 {
+		if d := strings.IndexFunc(name[i:], isDigit); d >= 0 {
 			j = i + d
 		}
 		k.appendChars(width.Fold.String(name[i:j]))
@@ -265,10 +336,10 @@ func (k *nameKeyer) appendNameKey(key []byte, name string) []byte {
 // appendChars appends the tokens of characters that are not digits.
 func (k *nameKeyer) appendChars(s string) {
 	for i, r := range s {
-		size := utf8.RuneLen(r)
 		if r == utf8.RuneError {
-			size = 1 // never in a valid name
+			continue // U+FFFD, which Windows ignores (names are valid UTF-8)
 		}
+		size := utf8.RuneLen(r)
 		switch kind := charKindOf(r); kind {
 		case charText:
 			k.run = append(k.run, s[i:i+size]...)
@@ -283,6 +354,10 @@ func (k *nameKeyer) appendChars(s string) {
 		case charSymbol:
 			k.flushText()
 			k.appendSymbol(r, s[i:i+size])
+			k.chars++
+		case charNumeral:
+			k.flushText()
+			k.key = append(k.key, tokNumeral, numeralRanks[r])
 			k.chars++
 		default: // charOtherNumber
 			k.flushText()
@@ -337,19 +412,20 @@ func appendSpecial(spec []byte, r rune, chars int) []byte {
 // Windows splits longer runs into numbers of this many digits.
 const maxNumberDigits = 19
 
-// appendNumber appends the token of the number s starts with: up to
-// maxNumberDigits digits of one set of digits (Windows ends a number where
-// ASCII and full-width digits meet). The token holds the count of
-// significant digits and their values, so a shorter number comes first and
-// numbers of the same length compare digit by digit, then the leading
-// zeros, more zeros first. It returns the length of the number in s.
+// appendNumber appends the token of the number s starts with (s starts
+// with a digit): up to maxNumberDigits digits of one set of digits (Windows
+// ends a number where ASCII and full-width digits meet). The token holds
+// the count of significant digits and their values, so a shorter number
+// comes first and numbers of the same length compare digit by digit, then
+// the leading zeros, more zeros first. It returns the length of the number
+// in s.
 func (k *nameKeyer) appendNumber(s string) int {
 	k.key = append(k.key, tokNumber, 0)
 	countAt, digits, zeros, end := len(k.key)-1, 0, 0, 0
 	r, _ := utf8.DecodeRuneInString(s)
 	zero := digitZero(r)
 	for i, r := range s {
-		if digits == maxNumberDigits || !unicode.IsDigit(r) || digitZero(r) != zero {
+		if digits == maxNumberDigits || digitZero(r) != zero {
 			break
 		}
 		if v := byte(r - zero); v == 0 && len(k.key) == countAt+1 {
@@ -366,17 +442,29 @@ func (k *nameKeyer) appendNumber(s string) int {
 	return end
 }
 
-// digitZero is the zero of the decimal digit (category Nd) r. Unicode
-// encodes each set of decimal digits as a contiguous run starting at zero.
+// digitZero returns the zero of the set of digits r belongs to (see
+// windowsDigitZeros), or -1 if r is not a digit of a number.
 func digitZero(r rune) rune {
 	if r < utf8.RuneSelf {
-		return '0'
+		if '0' <= r && r <= '9' {
+			return '0'
+		}
+		return -1
 	}
-	first := r
-	for unicode.IsDigit(first - 1) {
-		first--
+	for _, zero := range windowsDigitZeros[1:] {
+		if r < zero {
+			break
+		}
+		if r <= zero+9 {
+			return zero
+		}
 	}
-	return r - (r-first)%10
+	return -1
+}
+
+// isDigit reports whether r is a digit of a number.
+func isDigit(r rune) bool {
+	return digitZero(r) >= 0
 }
 
 // appendEscaped appends w so that it can be followed by more key bytes and
@@ -408,6 +496,9 @@ func (s *Service) refreshSortKeys(ctx context.Context) error {
 		return err
 	}
 	all := stored != imageOrderVersion
+	if all {
+		s.log.Info("computing all image sort keys", "order_version", imageOrderVersion, "previous_version", stored)
+	}
 	start := time.Now()
 	n, err := s.updateSortKeys(ctx, all)
 	if err != nil {
