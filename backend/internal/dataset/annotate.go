@@ -10,9 +10,12 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -45,19 +48,24 @@ func annotationVersion(data []byte) string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// readAnnotationFile reads the file at rel, up to one byte more than
+// parseVOC reads, so an oversized file still fails to parse and gets a
+// version different from its first 16 MiB.
+func readAnnotationFile(root *os.Root, rel string) ([]byte, error) {
+	f, err := root.Open(filepath.FromSlash(rel))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, maxAnnotationBytes+1))
+}
+
 // readVersionedAnnotation reads and parses the VOC file at rel. The
 // version (and the content) is returned whenever the file could be read,
 // also when it cannot be parsed (so a broken file can be replaced on
 // purpose).
 func readVersionedAnnotation(root *os.Root, rel string) (a *vocAnnotation, version string, data []byte, err error) {
-	f, err := root.Open(filepath.FromSlash(rel))
-	if err != nil {
-		return nil, "", nil, err
-	}
-	defer f.Close()
-	// One byte more than parseVOC reads, so an oversized file still fails
-	// to parse and gets a version different from its first 16 MiB.
-	data, err = io.ReadAll(io.LimitReader(f, maxAnnotationBytes+1))
+	data, err = readAnnotationFile(root, rel)
 	if err != nil {
 		return nil, "", nil, err
 	}
@@ -71,74 +79,231 @@ func readVersionedAnnotation(root *os.Root, rel string) (a *vocAnnotation, versi
 type annotationTarget struct {
 	Path string // slash-separated, relative to the dataset folder
 	// Paired is true when the index paired the file with the image. An
-	// unpaired target is where a new file would go; it may already exist
-	// (written by another tool after the last scan).
+	// unpaired target is where a new file would go, or a file written by
+	// another tool after the last scan.
 	Paired bool
-	// Owner is set when the target cannot be used for this image: another
-	// image already uses the file. It names that image.
+	// Owner is set when the target cannot be used for this image because
+	// it belongs to another image (see resolveAnnotationTarget). It names
+	// that image.
 	Owner string
 }
 
 // resolveAnnotationTarget finds the VOC file of img: the one the index
-// paired with it, otherwise <stem>.xml next to it, or, for an image in a
-// Pascal VOC "JPEGImages" (or "images") folder with a sibling
-// "Annotations" folder, <stem>.xml in there, which is where a scan would
-// look for it (see pairAnnotations).
+// paired with it; for an image without one, the file a scan would pair
+// with it now (see annotationCandidate), which another tool may have
+// written since the last scan, or else where a new file goes (see
+// defaultAnnotationPath). Showing, saving and the next scan thus agree on
+// the file.
+//
+// An unpaired file may belong to another image: the index pairs it with
+// another image, or a scan would give it to another image that claims it
+// too (a.jpg and a.png both want a.xml, see claimOwner). Owner then names
+// that image, and the annotation of img can neither be shown nor saved.
 func resolveAnnotationTarget(ctx context.Context, q querier, root *os.Root, img Image) (annotationTarget, error) {
 	if img.AnnotationPath != nil {
 		return annotationTarget{Path: *img.AnnotationPath, Paired: true}, nil
 	}
-	t := annotationTarget{Path: defaultAnnotationPath(root, img.Path)}
-	// Another image may own that file: a.jpg and a.png both want a.xml.
+	t := annotationTarget{Path: annotationCandidate(root, img.Path)}
+	found := t.Path != ""
+	if !found {
+		t.Path = defaultAnnotationPath(root, img.Path)
+	}
 	err := q.QueryRow(ctx, `SELECT rel_path FROM dataset_images
 		WHERE dataset_id = $1 AND id <> $2 AND lower(annotation_path) = lower($3)
 		ORDER BY `+ImageOrder+` LIMIT 1`, img.DatasetID, img.ID, t.Path).Scan(&t.Owner)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+	case err != nil:
 		return t, err
+	}
+	if t.Owner == "" && found {
+		owner, err := claimOwner(ctx, q, root, img, t.Path)
+		if err != nil {
+			return t, err
+		}
+		t.Owner = owner
 	}
 	return t, nil
 }
 
-// defaultAnnotationPath is where a new VOC file for the image at rel goes.
+// claimOwner decides, like pairAnnotations, which image the VOC file rel
+// (found for img and not paired in the index) belongs to when other
+// indexed images claim it too: a.jpg and a.png both take a.xml, and
+// JPEGImages/a.jpg and images/a.jpg both take Annotations/a.xml. The
+// <filename> recorded in the file decides; without a match, the first
+// image in sorted order gets it. It returns that image, or "" if it is
+// img.
+func claimOwner(ctx context.Context, q querier, root *os.Root, img Image, rel string) (string, error) {
+	dir, base := path.Split(img.Path)
+	stem := strings.TrimSuffix(base, path.Ext(base))
+	// Only images with the same stem (ignoring case) can claim rel: in the
+	// folder of img or, for a VOC image folder, in another one next to it.
+	patterns := []string{likePrefix(dir+stem) + ".%"}
+	if parent, ok := vocImageFolder(dir); ok {
+		patterns = append(patterns, likePrefix(parent+"jpegimages/"+stem)+".%", likePrefix(parent+"images/"+stem)+".%")
+	}
+	rows, err := q.Query(ctx, `SELECT rel_path FROM dataset_images WHERE dataset_id = $1 AND id <> $2
+		AND lower(rel_path) LIKE ANY (SELECT lower(p) FROM unnest($3::text[]) AS p)`, img.DatasetID, img.ID, patterns)
+	if err != nil {
+		return "", err
+	}
+	others, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return "", err
+	}
+	claims := []string{img.Path}
+	for _, other := range others {
+		// A scan only sees the images that are still there.
+		if exists, _ := regularFileExists(root, other); exists && annotationCandidate(root, other) == rel {
+			claims = append(claims, other)
+		}
+	}
+	if len(claims) == 1 {
+		return "", nil
+	}
+	slices.Sort(claims)
+	filename := ""
+	if a, _, _, err := readVersionedAnnotation(root, rel); err == nil {
+		filename = a.Filename
+	}
+	if winner := pickByFilename(claims, filename); winner != img.Path {
+		return winner, nil
+	}
+	return "", nil
+}
+
+// likePrefix escapes the LIKE wildcards of s (with the default escape
+// character, the backslash).
+func likePrefix(s string) string {
+	return strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(s)
+}
+
+// annotationCandidate returns the VOC file a scan would pair with the
+// image at rel, trying the candidates of pairAnnotations in its order:
+// <stem>.xml next to the image, the same name ignoring case, then, for an
+// image in a VOC image folder, <stem>.xml (ignoring case) in a sibling
+// "Annotations" folder. Like a scan it only takes regular files, and it
+// does not consider other images claiming the file (see claimOwner). It
+// returns "" when there is none.
+func annotationCandidate(root *os.Root, rel string) string {
+	dir, base := path.Split(rel)
+	stem := strings.TrimSuffix(base, path.Ext(base))
+	if exact := dir + stem + ".xml"; isRegularFile(root, exact) {
+		return exact
+	}
+	want := strings.ToLower(stem + ".xml")
+	for _, name := range namesIn(root, dir, want) {
+		if isRegularFile(root, dir+name) {
+			return dir + name
+		}
+	}
+	parent, ok := vocImageFolder(dir)
+	if !ok {
+		return ""
+	}
+	found := ""
+	for _, ann := range annotationsDirs(root, parent) {
+		for _, name := range namesIn(root, parent+ann+"/", want) {
+			if p := parent + ann + "/" + name; isRegularFile(root, p) {
+				if found == "" || p < found {
+					found = p
+				}
+				break
+			}
+		}
+	}
+	return found
+}
+
+func isRegularFile(root *os.Root, rel string) bool {
+	ok, _ := regularFileExists(root, rel)
+	return ok
+}
+
+// vocImageFolder reports whether the folder dir ("" for the top level,
+// else slash-terminated) is a Pascal VOC image folder, "JPEGImages" or
+// "images" in any case, and returns its parent folder.
+func vocImageFolder(dir string) (parent string, ok bool) {
+	if dir == "" {
+		return "", false
+	}
+	parent, name := path.Split(strings.TrimSuffix(dir, "/"))
+	d := strings.ToLower(name)
+	return parent, d == "jpegimages" || d == "images"
+}
+
+// folderPath turns a folder ("" for the top level, else slash-terminated)
+// into a name for os.Root.
+func folderPath(dir string) string {
+	if dir = strings.TrimSuffix(dir, "/"); dir == "" {
+		return "."
+	}
+	return filepath.FromSlash(dir)
+}
+
+// namesIn returns the names in the folder dir ("" for the top level, else
+// slash-terminated) that are want in lower case and valid UTF-8, sorted.
+// It reads names only, so a folder of many images is listed quickly.
+func namesIn(root *os.Root, dir, want string) []string {
+	f, err := root.Open(folderPath(dir))
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var found []string
+	for {
+		names, err := f.Readdirnames(1024)
+		for _, name := range names {
+			if strings.ToLower(name) == want && utf8.ValidString(name) {
+				found = append(found, name)
+			}
+		}
+		if err != nil { // io.EOF at the end
+			break
+		}
+	}
+	slices.Sort(found)
+	return found
+}
+
+// annotationsDirs returns the names of the real folders called
+// "Annotations" (any case) in the folder parent ("" for the top level,
+// else slash-terminated), sorted.
+func annotationsDirs(root *os.Root, parent string) []string {
+	var dirs []string
+	for _, name := range namesIn(root, parent, "annotations") {
+		// Lstat does not follow symbolic links, like a scan.
+		if fi, err := root.Lstat(filepath.FromSlash(parent + name)); err == nil && fi.IsDir() {
+			dirs = append(dirs, name)
+		}
+	}
+	return dirs
+}
+
+// defaultAnnotationPath is where a new VOC file for the image at rel goes:
+// <stem>.xml next to it, or, for an image in a Pascal VOC "JPEGImages" (or
+// "images") folder with a sibling "Annotations" folder, <stem>.xml in
+// there. A scan pairs the image with that file (see pairAnnotations) as
+// long as no other candidate exists (see annotationCandidate).
 func defaultAnnotationPath(root *os.Root, rel string) string {
 	dir, base := path.Split(rel)
 	stem := strings.TrimSuffix(base, path.Ext(base))
-	if dir != "" {
-		parent, name := path.Split(strings.TrimSuffix(dir, "/"))
-		if d := strings.ToLower(name); d == "jpegimages" || d == "images" {
-			if ann := siblingAnnotationsDir(root, parent); ann != "" {
-				return path.Join(parent, ann, stem+".xml")
-			}
+	if parent, ok := vocImageFolder(dir); ok {
+		if ann := siblingAnnotationsDir(root, parent); ann != "" {
+			return parent + ann + "/" + stem + ".xml"
 		}
 	}
 	return dir + stem + ".xml"
 }
 
 // siblingAnnotationsDir returns the name of the real folder called
-// "Annotations" (any case) in the folder parent ("" for the top level), or
-// "" if there is none.
+// "Annotations" (any case) in the folder parent ("" for the top level),
+// the first in byte order if there are several, or "" if there is none.
 func siblingAnnotationsDir(root *os.Root, parent string) string {
-	dir := strings.TrimSuffix(parent, "/")
-	if dir == "" {
-		dir = "."
+	if dirs := annotationsDirs(root, parent); len(dirs) > 0 {
+		return dirs[0]
 	}
-	f, err := root.Open(filepath.FromSlash(dir))
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-	entries, err := f.ReadDir(-1)
-	if err != nil {
-		return ""
-	}
-	found := ""
-	for _, e := range entries {
-		// DirEntry types do not follow symbolic links.
-		if e.IsDir() && strings.EqualFold(e.Name(), "Annotations") && (found == "" || e.Name() < found) {
-			found = e.Name()
-		}
-	}
-	return found
+	return ""
 }
 
 // imageDetail describes img with its annotation as it is on disk now.
@@ -165,25 +330,22 @@ func (s *Service) imageDetail(ctx context.Context, d Dataset, img Image) (ImageD
 		return detail, nil
 	}
 	a, version, _, err := readVersionedAnnotation(root, t.Path)
+	describeAnnotation(&detail, t, a, version, err)
+	return detail, nil
+}
+
+// describeAnnotation sets the annotation fields of detail for the VOC file
+// of the target t, read by readVersionedAnnotation as a, version and err.
+func describeAnnotation(detail *ImageDetail, t annotationTarget, a *vocAnnotation, version string, err error) {
+	detail.Objects = []AnnotationObject{}
+	detail.Annotation = nil
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		detail.AnnotationState = annotationNone
 		if t.Paired { // a VOC file that is gone keeps its path, so the viewer can say which
 			detail.AnnotationError = "标注文件已不存在，请重新扫描"
 		}
-		return detail, nil
-	case version == "": // could not be read at all
-		detail.AnnotationState, detail.AnnotationError = annotationInvalid, annotationErrorMessage(err)
-	case err == nil && !t.Paired && a.Filename != "" && !strings.EqualFold(a.Filename, img.FileName):
-		// A file written after the last scan that names another image
-		// (a.xml of a.png next to a.jpg) is not this image's annotation.
-		if other, err := s.imageAt(ctx, img.DatasetID, path.Join(path.Dir(img.Path), a.Filename)); err != nil {
-			return detail, err
-		} else if other != "" {
-			detail.AnnotationState = annotationNone
-			return detail, nil
-		}
-		fallthrough
+		return
 	case err == nil:
 		if a.Objects != nil {
 			detail.Objects = a.Objects
@@ -194,29 +356,18 @@ func (s *Service) imageDetail(ctx context.Context, d Dataset, img Image) (ImageD
 			detail.AnnotationState = annotationAnnotated
 		}
 		detail.Annotation = &ImageAnnotation{Path: t.Path, ObjectCount: len(a.Objects), Labels: sortedLabels(a.labelCounts())}
-	default:
+	default: // could not be read, or not parsed
 		detail.AnnotationState, detail.AnnotationError = annotationInvalid, annotationErrorMessage(err)
 	}
 	p := t.Path
 	detail.AnnotationPath = &p
 	detail.AnnotationVersion = version
-	return detail, nil
-}
-
-// imageAt returns the indexed path that equals rel ignoring case, or "".
-func (s *Service) imageAt(ctx context.Context, datasetID int64, rel string) (string, error) {
-	var found string
-	err := s.db.QueryRow(ctx, `SELECT rel_path FROM dataset_images WHERE dataset_id = $1 AND lower(rel_path) = lower($2)
-		ORDER BY rel_path = $2 DESC, `+ImageOrder+` LIMIT 1`, datasetID, rel).Scan(&found)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", nil
-	}
-	return found, err
 }
 
 // normalizeObjects validates the boxes of an annotation to save. Labels
 // are trimmed; coordinates are clamped to the image (when its size is
-// known) and must then span at least one pixel.
+// known), must then be at most math.MaxInt32 (what parseVOC reads back)
+// and span at least one pixel.
 func normalizeObjects(objects []AnnotationObject, width, height int) ([]AnnotationObject, error) {
 	if len(objects) > maxSavedObjects {
 		return nil, newError(ErrInvalid, "一张图片最多保存 %d 个目标", maxSavedObjects)
@@ -234,6 +385,9 @@ func normalizeObjects(objects []AnnotationObject, width, height int) ([]Annotati
 		}
 		o.Xmin, o.Xmax = clampCoord(o.Xmin, width), clampCoord(o.Xmax, width)
 		o.Ymin, o.Ymax = clampCoord(o.Ymin, height), clampCoord(o.Ymax, height)
+		if max(o.Xmin, o.Ymin, o.Xmax, o.Ymax) > math.MaxInt32 {
+			return nil, newError(ErrInvalid, "第 %d 个目标（%s）的坐标超出范围（不能大于 %d）", i+1, o.Name, math.MaxInt32)
+		}
 		if o.Xmin >= o.Xmax || o.Ymin >= o.Ymax {
 			return nil, newError(ErrInvalid, "第 %d 个目标（%s）的框在图片范围内的宽或高为 0", i+1, o.Name)
 		}
@@ -273,10 +427,10 @@ var errAnnotationChanged = &Error{Kind: ErrAnnotationChanged,
 // SaveAnnotation writes the boxes of an image to its VOC file, creating the
 // file if needed (see resolveAnnotationTarget), and updates the index and
 // the dataset counters. An empty list writes a file without objects: an
-// "empty" annotation (a negative sample). It returns the image as it is
-// now.
+// "empty" annotation (a negative sample). It returns the image with the
+// annotation it wrote.
 func (s *Service) SaveAnnotation(ctx context.Context, datasetID, imageID int64, in SaveAnnotationInput) (ImageDetail, error) {
-	return s.editAnnotation(ctx, datasetID, imageID, in.BaseVersion, in.Force, func(e *annotationEdit) error {
+	return s.editAnnotation(ctx, datasetID, imageID, in.BaseVersion, in.Force, func(e *annotationEdit) ([]byte, error) {
 		info := stagedImageInfo(e.root, e.img.Path)
 		if info.Width == 0 && e.img.Width != nil && e.img.Height != nil {
 			info.Width, info.Height = *e.img.Width, *e.img.Height
@@ -286,58 +440,40 @@ func (s *Service) SaveAnnotation(ctx context.Context, datasetID, imageID int64, 
 		}
 		objects, err := normalizeObjects(in.Objects, info.Width, info.Height)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		// Edit the existing file in place (keeping what other tools wrote,
-		// see patchVOC); write a new one when there is none or it cannot
-		// be parsed.
-		var data []byte
-		if e.data != nil && e.current != nil {
-			data, err = patchVOC(e.data, info, objects)
-		}
-		if data == nil {
-			var b bytes.Buffer
-			if err := writeVOC(&b, path.Base(path.Dir(e.img.Path)), e.img.FileName, info, objects); err != nil {
-				return err
+		// Edit the existing file in place, keeping what other tools wrote
+		// (see patchVOC). A file that cannot be edited so is replaced by a
+		// new one only on purpose (force); so is a file that cannot be
+		// parsed (see editAnnotation).
+		if e.current != nil {
+			data, err := patchVOC(e.data, info, objects)
+			if err == nil {
+				return data, nil
 			}
-			data = b.Bytes()
+			if !in.Force {
+				return nil, newError(ErrConflict, "标注文件 %s 无法在保留其中其它内容的情况下修改；"+
+					"如果仍要保存，将按平台的格式重新生成整个文件，文件中平台不编辑的内容会丢失", e.target.Path)
+			}
 		}
-		if err := writeAnnotationFile(e.root, e.target.Path, data); err != nil {
-			return err
+		var b bytes.Buffer
+		if err := writeVOC(&b, path.Base(path.Dir(e.img.Path)), e.img.FileName, info, objects); err != nil {
+			return nil, err
 		}
-		fi, err := e.root.Lstat(filepath.FromSlash(e.target.Path))
-		if err != nil {
-			return fmt.Errorf("stat saved annotation: %w", err)
-		}
-		labels := map[string]int{}
-		for _, o := range objects {
-			labels[o.Name]++
-		}
-		state := annotationEmpty
-		if len(objects) > 0 {
-			state = annotationAnnotated
-		}
-		return e.updateIndex(&e.target.Path, dbTime(fi.ModTime()), fi.Size(), state, len(objects), labels)
+		return b.Bytes(), nil
 	})
 }
 
 // DeleteAnnotation removes the VOC file of an image, which becomes
 // unannotated. baseVersion and force work as in SaveAnnotation.
 func (s *Service) DeleteAnnotation(ctx context.Context, datasetID, imageID int64, baseVersion string, force bool) (ImageDetail, error) {
-	return s.editAnnotation(ctx, datasetID, imageID, baseVersion, force, func(e *annotationEdit) error {
-		if e.exists {
-			if err := e.root.Remove(filepath.FromSlash(e.target.Path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return fmt.Errorf("remove annotation: %w", err)
-			}
-		}
-		return e.updateIndex(nil, time.Time{}, 0, annotationNone, 0, map[string]int{})
+	return s.editAnnotation(ctx, datasetID, imageID, baseVersion, force, func(*annotationEdit) ([]byte, error) {
+		return nil, nil
 	})
 }
 
 // annotationEdit is the state an annotation change works on.
 type annotationEdit struct {
-	ctx     context.Context
-	tx      pgx.Tx
 	root    *os.Root
 	img     Image
 	target  annotationTarget
@@ -353,32 +489,40 @@ func ownerConflict(t annotationTarget) *Error {
 		"无法为这张图片单独保存标注；请先重命名其中一张图片", t.Path, t.Owner)
 }
 
-// updateIndex records the image's new annotation in its index row and
-// refreshes the dataset counters. annPath nil means no file.
-func (e *annotationEdit) updateIndex(annPath *string, modTime time.Time, size int64, state string, objects int, labels map[string]int) error {
+// updateAnnotationIndex records the new annotation of img in its index row
+// and refreshes the dataset counters. annPath nil means no file.
+func updateAnnotationIndex(ctx context.Context, tx pgx.Tx, img Image, annPath *string, modTime time.Time, size int64,
+	state string, objects int, labels map[string]int) error {
 	var mod *time.Time
 	var sz *int64
 	if annPath != nil {
 		mod, sz = &modTime, &size
 	}
-	tag, err := e.tx.Exec(e.ctx, `UPDATE dataset_images SET annotation_path = $3, annotation_mod_time = $4,
+	tag, err := tx.Exec(ctx, `UPDATE dataset_images SET annotation_path = $3, annotation_mod_time = $4,
 			annotation_size = $5, annotation_state = $6, object_count = $7, label_counts = $8, updated_at = now()
-		WHERE dataset_id = $1 AND id = $2`, e.img.DatasetID, e.img.ID, annPath, mod, sz, state, objects, labels)
+		WHERE dataset_id = $1 AND id = $2`, img.DatasetID, img.ID, annPath, mod, sz, state, objects, labels)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		return errImageNotFound // removed by a scan meanwhile
 	}
-	return recomputeAggregates(e.ctx, e.tx, e.img.DatasetID, false)
+	return recomputeAggregates(ctx, tx, img.DatasetID, false)
 }
 
-// editAnnotation runs change on the annotation of an image after checking
-// that the file is still at baseVersion. Changes of one image are
-// serialized, so the check and the write cannot interleave with another
-// save in this process; the index update commits only if change succeeds.
+// editAnnotation replaces the annotation file of an image with the content
+// change returns (nil removes the file) after checking that the file is
+// still at baseVersion, and updates the index and the dataset counters.
+// Changes of one image are serialized, so the check and the write cannot
+// interleave with another save in this process.
+//
+// The database is updated first and the file is put in place as the last
+// step before the commit; when the commit fails, the previous file is put
+// back, so the file and the index stay in step. The result describes the
+// file this request wrote (no file after a delete), so its version is the
+// one the next edit starts from even if the file changes again meanwhile.
 func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, baseVersion string, force bool,
-	change func(e *annotationEdit) error) (ImageDetail, error) {
+	change func(e *annotationEdit) ([]byte, error)) (ImageDetail, error) {
 	unlock, err := s.annotationLocks.lock(ctx, imageID)
 	if err != nil {
 		return ImageDetail{}, err
@@ -395,6 +539,8 @@ func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, 
 	}
 	defer root.Close()
 
+	var detail ImageDetail
+	var file *annotationFileChange
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		// Lock the dataset row like an import does before touching its
 		// counters, then read the image.
@@ -418,7 +564,7 @@ func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, 
 		if t.Owner != "" {
 			return ownerConflict(t)
 		}
-		e := &annotationEdit{ctx: ctx, tx: tx, root: root, img: img, target: t}
+		e := &annotationEdit{root: root, img: img, target: t}
 		exists, err := regularFileExists(root, t.Path)
 		switch {
 		case errors.Is(err, errUnsafeTarget):
@@ -443,38 +589,213 @@ func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, 
 		if !force && version != baseVersion {
 			return errAnnotationChanged
 		}
-		return change(e)
+		data, err := change(e)
+		if err != nil {
+			return err
+		}
+
+		// The database first; the file is changed last (see above).
+		file = &annotationFileChange{root: root, rel: t.Path, data: data, existed: exists, previous: e.data}
+		var written *vocAnnotation
+		if data != nil {
+			if len(data) > maxAnnotationBytes {
+				return newError(ErrInvalid, "标注文件将超过 %d MiB，无法保存", maxAnnotationBytes>>20)
+			}
+			if written, err = parseVOC(bytes.NewReader(data)); err != nil {
+				return fmt.Errorf("parse new annotation: %w", err)
+			}
+			fi, err := file.stage()
+			if err != nil {
+				return err
+			}
+			state := annotationEmpty
+			if len(written.Objects) > 0 {
+				state = annotationAnnotated
+			}
+			err = updateAnnotationIndex(ctx, tx, img, &t.Path, dbTime(fi.ModTime()), fi.Size(), state,
+				len(written.Objects), written.labelCounts())
+			if err != nil {
+				return err
+			}
+		} else if err := updateAnnotationIndex(ctx, tx, img, nil, time.Time{}, 0, annotationNone, 0, map[string]int{}); err != nil {
+			return err
+		}
+		if img, err = queryImage(ctx, tx, datasetID, imageID); err != nil {
+			return err
+		}
+		detail = ImageDetail{Image: img}
+		if data != nil {
+			describeAnnotation(&detail, annotationTarget{Path: t.Path, Paired: true}, written, annotationVersion(data), nil)
+		} else {
+			describeAnnotation(&detail, annotationTarget{}, nil, "", fs.ErrNotExist)
+		}
+
+		// Refreshing the counters of a large dataset takes a while: make
+		// sure nobody changed the file meanwhile.
+		if !force && !annotationUnchanged(root, t.Path, version) {
+			return errAnnotationChanged
+		}
+		return file.apply()
 	})
 	if err != nil {
+		if file != nil {
+			file.undo(s.log)
+		}
 		return ImageDetail{}, diskFullAnnotation(err)
 	}
-	img, err := queryImage(ctx, s.db, datasetID, imageID)
-	if err != nil {
-		return ImageDetail{}, err
+	if file != nil {
+		file.finish(s.log)
 	}
-	return s.imageDetail(ctx, d, img)
+	return detail, nil
 }
 
-// writeAnnotationFile replaces the file at rel with data: it writes a
-// hidden temporary file in the same folder and renames it over the target,
-// so readers (and a crash) never see half a file. The permissions of an
-// existing file are kept.
-func writeAnnotationFile(root *os.Root, rel string, data []byte) error {
+// annotationUnchanged reports whether the file at rel still has the given
+// version ("" for no file).
+func annotationUnchanged(root *os.Root, rel, version string) bool {
+	exists, err := regularFileExists(root, rel)
+	if err != nil || !exists {
+		return err == nil && version == ""
+	}
+	data, err := readAnnotationFile(root, rel)
+	return err == nil && annotationVersion(data) == version
+}
+
+// annotationFileChange replaces (data set) or removes (data nil) the
+// annotation file rel. It becomes final with the database commit: stage
+// writes the new content to a hidden file next to rel, apply puts it in
+// place or moves the old file aside, and finish (after the commit) or undo
+// (when anything failed) tidies up.
+type annotationFileChange struct {
+	root     *os.Root
+	rel      string
+	data     []byte // the new content, nil to remove the file
+	existed  bool   // the file existed before
+	previous []byte // its content then (at most maxAnnotationBytes+1 bytes)
+	tmp      string // the hidden file: the new content, or the removed file
+	applied  bool   // rel has been replaced or removed
+}
+
+// stage writes the new content to the hidden file and returns its
+// information; renaming keeps the modification time.
+func (c *annotationFileChange) stage() (fs.FileInfo, error) {
+	tmp, err := writeTempAnnotation(c.root, c.rel, c.data)
+	if err != nil {
+		return nil, err
+	}
+	c.tmp = tmp
+	fi, err := c.root.Lstat(filepath.FromSlash(tmp))
+	if err != nil {
+		return nil, fmt.Errorf("stat saved annotation: %w", err)
+	}
+	return fi, nil
+}
+
+// apply puts the staged file in place, or moves the file to remove aside.
+func (c *annotationFileChange) apply() error {
+	if c.data != nil {
+		if err := renameInRoot(c.root, c.tmp, c.rel); err != nil {
+			return fmt.Errorf("write annotation: %w", err)
+		}
+		c.tmp, c.applied = "", true
+		return nil
+	}
+	if !c.existed {
+		return nil
+	}
+	dir := path.Dir(c.rel)
+	if err := ensureDirs(c.root, dir); err != nil {
+		if errors.Is(err, errUnsafeTarget) {
+			return newError(ErrConflict, "标注文件所在的文件夹 %s 不是普通文件夹（可能是符号链接），无法删除标注", dir)
+		}
+		return err
+	}
+	tmp := tempAnnotationName(dir)
+	if err := renameInRoot(c.root, c.rel, tmp); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // removed meanwhile
+		}
+		return fmt.Errorf("remove annotation: %w", err)
+	}
+	c.tmp, c.applied = tmp, true
+	return nil
+}
+
+// finish removes the file a committed delete moved aside.
+func (c *annotationFileChange) finish(log *slog.Logger) {
+	if c.tmp == "" {
+		return
+	}
+	if err := c.root.Remove(filepath.FromSlash(c.tmp)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		log.Warn("could not remove a deleted annotation file", "path", c.tmp, "err", err)
+	}
+}
+
+// undo reverts the file after a failure: it removes the staged file, or
+// puts the previous file back unless the file has changed again since.
+func (c *annotationFileChange) undo(log *slog.Logger) {
+	var err error
+	switch {
+	case !c.applied:
+		if c.tmp != "" {
+			err = c.root.Remove(filepath.FromSlash(c.tmp))
+		}
+	case c.data == nil: // a removal: move the file back
+		if exists, lerr := regularFileExists(c.root, c.rel); lerr == nil && !exists {
+			err = renameInRoot(c.root, c.tmp, c.rel)
+		} else {
+			err = fmt.Errorf("another file took its place; the removed file is kept as %s", c.tmp)
+		}
+	case !fileHolds(c.root, c.rel, c.data):
+		// Changed again meanwhile: leave it.
+	case !c.existed:
+		err = c.root.Remove(filepath.FromSlash(c.rel))
+	case len(c.previous) > maxAnnotationBytes:
+		err = errors.New("the previous file is too large to restore")
+	default:
+		err = writeAnnotationFile(c.root, c.rel, c.previous)
+	}
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		log.Error("could not restore an annotation file after a failed save", "path", c.rel, "err", err)
+	}
+}
+
+// fileHolds reports whether the file at rel has exactly the content data.
+func fileHolds(root *os.Root, rel string, data []byte) bool {
+	f, err := root.Open(filepath.FromSlash(rel))
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	got, err := io.ReadAll(io.LimitReader(f, int64(len(data))+1))
+	return err == nil && bytes.Equal(got, data)
+}
+
+// tempAnnotationName returns a new name for a hidden temporary file in the
+// folder dir. Scans skip hidden files.
+func tempAnnotationName(dir string) string {
+	return path.Join(dir, ".tm-annotation-"+rand.Text()[:12]+".tmp")
+}
+
+// writeTempAnnotation writes data to a new hidden temporary file in the
+// folder of the annotation file rel (creating the folder if needed), with
+// the permissions of the file at rel if there is one, and returns its
+// name.
+func writeTempAnnotation(root *os.Root, rel string, data []byte) (string, error) {
 	dir := path.Dir(rel)
 	if err := ensureDirs(root, dir); err != nil {
 		if errors.Is(err, errUnsafeTarget) {
-			return newError(ErrConflict, "标注文件所在的文件夹 %s 不是普通文件夹（可能是符号链接），无法保存", dir)
+			return "", newError(ErrConflict, "标注文件所在的文件夹 %s 不是普通文件夹（可能是符号链接），无法保存", dir)
 		}
-		return err
+		return "", err
 	}
 	perm := fs.FileMode(0o644)
 	if fi, err := root.Lstat(filepath.FromSlash(rel)); err == nil && fi.Mode().IsRegular() {
 		perm = fi.Mode().Perm()
 	}
-	tmp := path.Join(dir, ".tm-annotation-"+rand.Text()[:12]+".tmp")
+	tmp := tempAnnotationName(dir)
 	f, err := root.OpenFile(filepath.FromSlash(tmp), os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
-		return fmt.Errorf("create annotation: %w", err)
+		return "", fmt.Errorf("create annotation: %w", err)
 	}
 	_, err = f.Write(data)
 	if err == nil {
@@ -486,13 +807,32 @@ func writeAnnotationFile(root *os.Root, rel string, data []byte) error {
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
-	if err == nil {
-		// os.Root has no Rename in Go 1.24. Both names are inside root and
-		// their folder was checked by ensureDirs; rename never follows a
-		// symbolic link at the target, it replaces the link itself.
-		err = os.Rename(filepath.Join(root.Name(), filepath.FromSlash(tmp)), filepath.Join(root.Name(), filepath.FromSlash(rel)))
-	}
 	if err != nil {
+		_ = root.Remove(filepath.FromSlash(tmp))
+		return "", fmt.Errorf("write annotation: %w", err)
+	}
+	return tmp, nil
+}
+
+// renameInRoot renames the file from to the name to, replacing it; both
+// are slash-separated paths in root.
+func renameInRoot(root *os.Root, from, to string) error {
+	// os.Root has no Rename in Go 1.24. Both names are inside root and
+	// their folder was checked by ensureDirs; rename never follows a
+	// symbolic link at the target, it replaces the link itself.
+	return os.Rename(filepath.Join(root.Name(), filepath.FromSlash(from)), filepath.Join(root.Name(), filepath.FromSlash(to)))
+}
+
+// writeAnnotationFile replaces the file at rel with data: it writes a
+// hidden temporary file in the same folder and renames it over the target,
+// so readers (and a crash) never see half a file. The permissions of an
+// existing file are kept.
+func writeAnnotationFile(root *os.Root, rel string, data []byte) error {
+	tmp, err := writeTempAnnotation(root, rel, data)
+	if err != nil {
+		return err
+	}
+	if err := renameInRoot(root, tmp, rel); err != nil {
 		_ = root.Remove(filepath.FromSlash(tmp))
 		return fmt.Errorf("write annotation: %w", err)
 	}

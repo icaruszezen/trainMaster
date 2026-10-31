@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -40,6 +42,19 @@ func TestNormalizeObjects(t *testing.T) {
 	if got, err := normalizeObjects([]AnnotationObject{box("a", -3, 0, 5000, 4000)}, 0, 0); err != nil ||
 		got[0].Xmin != 0 || got[0].Xmax != 5000 || got[0].Ymax != 4000 {
 		t.Errorf("unknown size = %+v, %v", got, err)
+	}
+	// ... but they must stay within what a VOC file is read back with.
+	if got, err := normalizeObjects([]AnnotationObject{box("max", 0, 0, math.MaxInt32, math.MaxInt32)}, 0, 0); err != nil ||
+		got[0].Xmax != math.MaxInt32 {
+		t.Errorf("MaxInt32 = %+v, %v", got, err)
+	}
+	_, err = normalizeObjects([]AnnotationObject{box("a", 1, 1, 2, 2), box("huge", 1, 1, 3_000_000_000, 5)}, 0, 0)
+	wantKind(t, err, ErrInvalid, "第 2 个目标（huge）的坐标超出范围（不能大于 2147483647）")
+	_, err = normalizeObjects([]AnnotationObject{box("huge", 1, math.MaxInt32+1, 3, math.MaxInt32+2)}, 0, 0)
+	wantKind(t, err, ErrInvalid, "坐标超出范围")
+	// A known size clamps them first.
+	if got, err := normalizeObjects([]AnnotationObject{box("huge", 1, 1, 3_000_000_000, 5)}, 100, 80); err != nil || got[0].Xmax != 100 {
+		t.Errorf("clamped huge box = %+v, %v", got, err)
 	}
 
 	for _, tc := range []struct {
@@ -110,6 +125,176 @@ func TestDefaultAnnotationPath(t *testing.T) {
 		if got := defaultAnnotationPath(linked, "set/JPEGImages/a.jpg"); got != "set/JPEGImages/a.xml" {
 			t.Errorf("Annotations symlink: %q", got)
 		}
+	}
+}
+
+func TestAnnotationCandidate(t *testing.T) {
+	root := openTestRoot(t, map[string][]byte{
+		"a.xml": nil, "NG/c.xml": nil,
+		"VOC/JPEGImages/d.xml": nil, "VOC/Annotations/d.xml": nil, // the image's folder before Annotations
+		"VOC/images/f.png": nil, "VOC/Annotations/f.xml": nil,
+		"other/JPEGImagesX/g.jpg": nil, "other/Annotations/g.xml": nil, // not a VOC image folder
+		"dir/h.xml/x": nil, // a folder named like the file does not count
+	}, "VOC/JPEGImages", "empty")
+	check := func(root *os.Root, cases map[string]string) {
+		t.Helper()
+		for rel, want := range cases {
+			if got := annotationCandidate(root, rel); got != want {
+				t.Errorf("annotationCandidate(%q) = %q, want %q", rel, got, want)
+			}
+		}
+	}
+	check(root, map[string]string{
+		"a.jpg":                   "a.xml",
+		"NG/c.png":                "NG/c.xml",
+		"VOC/JPEGImages/d.jpg":    "VOC/JPEGImages/d.xml",
+		"VOC/images/f.png":        "VOC/Annotations/f.xml",
+		"other/JPEGImagesX/g.jpg": "",
+		"dir/h.png":               "",
+		"empty/x.png":             "",
+		"missing/x.png":           "",
+	})
+
+	if caseSensitive(t) {
+		// Names that differ in case only: the exact name first, then the
+		// first in byte order, as pairAnnotations does.
+		check(openTestRoot(t, map[string][]byte{
+			"a.xml": nil, "b.XML": nil, "B.xml": nil,
+			"NG/c.xml": nil, "NG/C.Xml": nil,
+			"VOC/Annotations/E.xml": nil, "VOC/annotations/e.xml": nil,
+			"dir/h.xml/x": nil, "dir/H.xml": nil,
+		}, "VOC/JPEGImages"), map[string]string{
+			"A.jpg":                "a.xml",
+			"b.jpg":                "B.xml",
+			"NG/c.png":             "NG/c.xml",
+			"NG/C.png":             "NG/C.Xml",
+			"VOC/JPEGImages/e.jpg": "VOC/Annotations/E.xml",
+			"dir/h.png":            "dir/H.xml",
+		})
+	}
+	if runtime.GOOS != "windows" {
+		// A scan does not follow symbolic links.
+		linked := openTestRoot(t, map[string][]byte{"set/real/a.xml": nil, "set/JPEGImages/b.xml": nil}, "set/JPEGImages")
+		if err := os.Symlink(filepath.Join(linked.Name(), "set", "real"), filepath.Join(linked.Name(), "set", "Annotations")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(linked.Name(), "set", "JPEGImages", "b.xml"), filepath.Join(linked.Name(), "set", "JPEGImages", "c.xml")); err != nil {
+			t.Fatal(err)
+		}
+		for rel, want := range map[string]string{"set/JPEGImages/a.jpg": "", "set/JPEGImages/c.jpg": ""} {
+			if got := annotationCandidate(linked, rel); got != want {
+				t.Errorf("annotationCandidate(%q) = %q, want %q", rel, got, want)
+			}
+		}
+	}
+}
+
+// caseSensitive reports whether the file system of the temporary folders
+// tells names apart that differ in case only.
+func caseSensitive(t *testing.T) bool {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string][]byte{"a": nil})
+	_, err := os.Lstat(filepath.Join(dir, "A"))
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+func TestAnnotationFileChangeUndo(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+	root := openTestRoot(t, map[string][]byte{"a.xml": []byte("old"), "d.xml": []byte("doomed")})
+	dir := root.Name()
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(filepath.Join(dir, "d.xml"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(rel string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(dir, rel))
+		if errors.Is(err, fs.ErrNotExist) {
+			return "<none>"
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	hidden := func() []string {
+		t.Helper()
+		entries, _ := os.ReadDir(dir)
+		var names []string
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".") {
+				names = append(names, e.Name())
+			}
+		}
+		return names
+	}
+
+	// A replacement is staged, applied, then undone: the old bytes are back.
+	c := &annotationFileChange{root: root, rel: "a.xml", data: []byte("new"), existed: true, previous: []byte("old")}
+	fi, err := c.stage()
+	if err != nil || fi.Size() != 3 || read("a.xml") != "old" {
+		t.Fatalf("stage = %v, %v; a.xml = %q", fi, err, read("a.xml"))
+	}
+	if err := c.apply(); err != nil || read("a.xml") != "new" {
+		t.Fatalf("apply = %v; a.xml = %q", err, read("a.xml"))
+	}
+	if after, err := os.Lstat(filepath.Join(dir, "a.xml")); err != nil || !after.ModTime().Equal(fi.ModTime()) {
+		t.Errorf("modification time %v after the rename, %v staged (%v)", after.ModTime(), fi.ModTime(), err)
+	}
+	c.undo(log)
+	if read("a.xml") != "old" || len(hidden()) != 0 {
+		t.Errorf("after undo: a.xml = %q, hidden files %v", read("a.xml"), hidden())
+	}
+
+	// Undone before it was applied: only the staged file goes.
+	c = &annotationFileChange{root: root, rel: "a.xml", data: []byte("new"), existed: true, previous: []byte("old")}
+	if _, err := c.stage(); err != nil {
+		t.Fatal(err)
+	}
+	c.undo(log)
+	if read("a.xml") != "old" || len(hidden()) != 0 {
+		t.Errorf("undo of a staged change: a.xml = %q, hidden files %v", read("a.xml"), hidden())
+	}
+
+	// A new file is removed again; one changed meanwhile stays.
+	c = &annotationFileChange{root: root, rel: "n.xml", data: []byte("new")}
+	if _, err := c.stage(); err != nil || c.apply() != nil {
+		t.Fatal("new file not written")
+	}
+	c.undo(log)
+	if read("n.xml") != "<none>" {
+		t.Errorf("new file after undo = %q", read("n.xml"))
+	}
+	c = &annotationFileChange{root: root, rel: "n.xml", data: []byte("new")}
+	if _, err := c.stage(); err != nil || c.apply() != nil {
+		t.Fatal("new file not written")
+	}
+	writeFiles(t, dir, map[string][]byte{"n.xml": []byte("someone else")})
+	c.undo(log)
+	if read("n.xml") != "someone else" {
+		t.Errorf("a file changed meanwhile was reverted: %q", read("n.xml"))
+	}
+
+	// A removal moves the file aside; undo moves it back as it was.
+	before, _ := os.Lstat(filepath.Join(dir, "d.xml"))
+	c = &annotationFileChange{root: root, rel: "d.xml", existed: true, previous: []byte("doomed")}
+	if err := c.apply(); err != nil || read("d.xml") != "<none>" {
+		t.Fatalf("apply removal = %v; d.xml = %q", err, read("d.xml"))
+	}
+	c.undo(log)
+	after, err := os.Lstat(filepath.Join(dir, "d.xml"))
+	if err != nil || read("d.xml") != "doomed" || !after.ModTime().Equal(before.ModTime()) || after.Mode() != before.Mode() || len(hidden()) != 0 {
+		t.Errorf("after undoing the removal: %v %v, %v; hidden files %v", after, err, before, hidden())
+	}
+	// Committed: the file is gone for good.
+	c = &annotationFileChange{root: root, rel: "d.xml", existed: true, previous: []byte("doomed")}
+	if err := c.apply(); err != nil {
+		t.Fatal(err)
+	}
+	c.finish(log)
+	if read("d.xml") != "<none>" || len(hidden()) != 0 {
+		t.Errorf("after the removal: d.xml = %q, hidden files %v", read("d.xml"), hidden())
 	}
 }
 
@@ -420,6 +605,11 @@ func TestIntegrationAnnotationTargets(t *testing.T) {
 		"late/x.png":            pngFile(t, 16, 16),
 		"late/y.png":            pngFile(t, 16, 16),
 		"late/y.jpg":            pngFile(t, 16, 16),
+		"late/w.png":            pngFile(t, 16, 16),
+		"late/w.jpg":            pngFile(t, 16, 16),
+		"late/q.png":            pngFile(t, 16, 16),
+		"late/r.png":            pngFile(t, 16, 16),
+		"VOC/JPEGImages/2.jpg":  pngFile(t, 16, 16),
 	})
 	ctx := context.Background()
 	box := []AnnotationObject{{Name: "dent", Xmin: 1, Ymin: 1, Xmax: 5, Ymax: 5}}
@@ -460,14 +650,83 @@ func TestIntegrationAnnotationTargets(t *testing.T) {
 	if _, err := e.svc.SaveAnnotation(ctx, e.d.ID, x.ID, SaveAnnotationInput{Objects: box, BaseVersion: got.AnnotationVersion}); err != nil {
 		t.Errorf("save over the late file: %v", err)
 	}
-	// ... unless it names another image of that folder.
-	writeFiles(t, e.dir, map[string][]byte{"late/y.xml": vocFile("y.jpg", "scratch")})
+	// ... unless a scan would give it to another image that wants it too:
+	// y.xml names y.jpg, so y.png can neither show nor save (not even
+	// forced) nor delete it.
+	yFile := vocFile("y.jpg", "scratch")
+	writeFiles(t, e.dir, map[string][]byte{"late/y.xml": yFile})
 	y := e.image(t, "late/y.png")
-	if got := e.detail(t, y); got.AnnotationState != annotationNone || got.AnnotationVersion != "" || len(got.Objects) != 0 {
+	if got := e.detail(t, y); got.AnnotationState != annotationNone || got.AnnotationVersion != "" || len(got.Objects) != 0 ||
+		got.AnnotationPath != nil || !strings.Contains(got.AnnotationBlocked, "标注文件 late/y.xml 属于同一文件夹中的另一张图片 late/y.jpg") {
 		t.Errorf("y.png sees y.jpg's late file: %+v", got)
 	}
-	if got := e.detail(t, e.image(t, "late/y.jpg")); got.AnnotationState != annotationAnnotated || len(got.Objects) != 1 {
-		t.Errorf("y.jpg does not see its late file: %+v", got)
+	for _, force := range []bool{false, true} {
+		_, err = e.svc.SaveAnnotation(ctx, e.d.ID, y.ID, SaveAnnotationInput{Objects: box, Force: force})
+		wantKind(t, err, ErrConflict, "属于同一文件夹中的另一张图片 late/y.jpg")
+		_, err = e.svc.DeleteAnnotation(ctx, e.d.ID, y.ID, "", force)
+		wantKind(t, err, ErrConflict, "属于同一文件夹中的另一张图片 late/y.jpg")
+	}
+	if data := e.readFile(t, "late/y.xml"); !bytes.Equal(data, yFile) {
+		t.Errorf("y.png changed y.jpg's file:\n%s", data)
+	}
+	yjpg := e.image(t, "late/y.jpg")
+	yDetail := e.detail(t, yjpg)
+	if yDetail.AnnotationState != annotationAnnotated || len(yDetail.Objects) != 1 || yDetail.AnnotationBlocked != "" {
+		t.Errorf("y.jpg does not see its late file: %+v", yDetail)
+	}
+	if _, err := e.svc.SaveAnnotation(ctx, e.d.ID, yjpg.ID, SaveAnnotationInput{Objects: box, BaseVersion: yDetail.AnnotationVersion}); err != nil {
+		t.Errorf("y.jpg save: %v", err)
+	}
+	// Without a <filename> that decides, the first image in sorted order
+	// gets the file, as in a scan.
+	writeFiles(t, e.dir, map[string][]byte{"late/w.xml": []byte("<annotation><object><name>w</name><bndbox><xmin>1</xmin><ymin>1</ymin><xmax>2</xmax><ymax>2</ymax></bndbox></object></annotation>")})
+	if got := e.detail(t, e.image(t, "late/w.png")); !strings.Contains(got.AnnotationBlocked, "另一张图片 late/w.jpg") {
+		t.Errorf("w.png detail = %+v", got)
+	}
+	if got := e.detail(t, e.image(t, "late/w.jpg")); got.AnnotationBlocked != "" || len(got.Objects) != 1 {
+		t.Errorf("w.jpg detail = %+v", got)
+	}
+	// A <filename> naming an image that does not want the file (another
+	// stem) does not take it away: a scan pairs q.xml with q.png.
+	writeFiles(t, e.dir, map[string][]byte{"late/q.xml": vocFile("r.png", "scratch")})
+	if got := e.detail(t, e.image(t, "late/q.png")); got.AnnotationBlocked != "" || got.AnnotationState != annotationAnnotated {
+		t.Errorf("q.png detail = %+v", got)
+	}
+
+	// The file a scan would pick is the one shown and saved: in a VOC
+	// layout, a.xml written next to the image (LabelImg's default) comes
+	// before Annotations/.
+	writeFiles(t, e.dir, map[string][]byte{"VOC/JPEGImages/2.xml": vocFile("2.jpg", "labelimg")})
+	two := e.image(t, "VOC/JPEGImages/2.jpg")
+	got = e.detail(t, two)
+	if got.AnnotationPath == nil || *got.AnnotationPath != "VOC/JPEGImages/2.xml" || len(got.Objects) != 1 || got.Objects[0].Name != "labelimg" {
+		t.Fatalf("VOC image with a file next to it: %+v", got)
+	}
+	saved, err = e.svc.SaveAnnotation(ctx, e.d.ID, two.ID, SaveAnnotationInput{Objects: box, BaseVersion: got.AnnotationVersion})
+	if err != nil || *saved.AnnotationPath != "VOC/JPEGImages/2.xml" {
+		t.Fatalf("save = %+v, %v", saved, err)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, "VOC", "Annotations", "2.xml")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("wrote a second file: %v", err)
+	}
+	job, err := e.svc.StartScan(ctx, e.d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.waitJob(t, e.d.ID, job.ID)
+	if after := e.detail(t, e.image(t, "VOC/JPEGImages/2.jpg")); after.AnnotationPath == nil || *after.AnnotationPath != "VOC/JPEGImages/2.xml" ||
+		after.AnnotationVersion != saved.AnnotationVersion || !reflect.DeepEqual(after.Objects, box) {
+		t.Errorf("after a rescan: %+v", after)
+	}
+	// ... and the rescan agrees with the owners above.
+	if img := e.image(t, "late/y.jpg"); img.AnnotationPath == nil || *img.AnnotationPath != "late/y.xml" {
+		t.Errorf("rescan paired y.xml with %+v", img)
+	}
+	if img := e.image(t, "late/w.jpg"); img.AnnotationPath == nil || *img.AnnotationPath != "late/w.xml" {
+		t.Errorf("rescan paired w.xml with %+v", img)
+	}
+	if img := e.image(t, "late/q.png"); img.AnnotationPath == nil || *img.AnnotationPath != "late/q.xml" {
+		t.Errorf("rescan paired q.xml with %+v", img)
 	}
 
 	if runtime.GOOS != "windows" {
@@ -489,11 +748,24 @@ func TestIntegrationAnnotationTargets(t *testing.T) {
 	}
 }
 
+// namespacedFile is labelImgFile with namespace declarations on the root
+// and a namespaced element in an object.
+var namespacedFile = strings.Replace(strings.Replace(labelImgFile, `<annotation verified="yes">`,
+	`<annotation verified="yes" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xml:lang="zh">`, 1),
+	"<occluded>1</occluded>", `<occluded>1</occluded><ext xmlns="urn:x"/>`, 1)
+
+// unpatchable parses, but the declaration inside the root switches parseVOC
+// to GBK there, so a new label written in UTF-8 would not read back.
+var unpatchable = []byte("<annotation><?xml version=\"1.0\" encoding=\"GBK\"?><filename>\xcd\xbc.png</filename>" +
+	"<object><name>a</name><bndbox><xmin>1</xmin><ymin>1</ymin><xmax>5</xmax><ymax>5</ymax></bndbox></object></annotation>")
+
 func TestIntegrationSaveKeepsVOCContent(t *testing.T) {
 	broken := []byte("<annotation><object>")
 	e := newAnnotationEnv(t, map[string][]byte{
 		"images/a.png": pngFile(t, 100, 80), "images/a.xml": []byte(labelImgFile),
 		"images/b.png": pngFile(t, 16, 16), "images/b.xml": broken,
+		"images/c.png": pngFile(t, 100, 80), "images/c.xml": []byte(namespacedFile),
+		"images/d.png": pngFile(t, 16, 16), "images/d.xml": unpatchable,
 	})
 	ctx := context.Background()
 	a := e.image(t, "images/a.png")
@@ -521,6 +793,43 @@ func TestIntegrationSaveKeepsVOCContent(t *testing.T) {
 	// The index counts the boxes only.
 	if img := e.image(t, "images/a.png"); img.Annotation == nil || img.Annotation.ObjectCount != 2 {
 		t.Errorf("indexed image = %+v", img)
+	}
+	// The version returned is the one of the bytes written.
+	if saved.AnnotationVersion != annotationVersion([]byte(data)) {
+		t.Errorf("saved version %q, file version %q", saved.AnnotationVersion, annotationVersion([]byte(data)))
+	}
+
+	// Namespaces do not stop the file from being edited in place; saving
+	// the same boxes leaves the file as it is.
+	c := e.image(t, "images/c.png")
+	detail = e.detail(t, c)
+	if detail.AnnotationUnsupported != 1 || len(detail.Objects) != 2 {
+		t.Fatalf("namespaced detail = %+v", detail)
+	}
+	saved, err = e.svc.SaveAnnotation(ctx, e.d.ID, c.ID, SaveAnnotationInput{Objects: detail.Objects, BaseVersion: detail.AnnotationVersion})
+	if err != nil || saved.AnnotationUnsupported != 1 || saved.AnnotationVersion != detail.AnnotationVersion {
+		t.Errorf("namespaced save = %+v, %v", saved, err)
+	}
+	if got := e.readFile(t, "images/c.xml"); string(got) != namespacedFile {
+		t.Errorf("namespaced file changed:\n%s", got)
+	}
+
+	// A file that parses but cannot be edited in place is regenerated only
+	// when forced.
+	d := e.image(t, "images/d.png")
+	detail = e.detail(t, d)
+	if detail.AnnotationError != "" || len(detail.Objects) != 1 {
+		t.Fatalf("unpatchable detail = %+v", detail)
+	}
+	renamed := []AnnotationObject{{Name: "划痕", Xmin: 1, Ymin: 1, Xmax: 5, Ymax: 5}}
+	_, err = e.svc.SaveAnnotation(ctx, e.d.ID, d.ID, SaveAnnotationInput{Objects: renamed, BaseVersion: detail.AnnotationVersion})
+	wantKind(t, err, ErrConflict, "标注文件 images/d.xml 无法在保留其中其它内容的情况下修改")
+	if got := e.readFile(t, "images/d.xml"); !bytes.Equal(got, unpatchable) {
+		t.Errorf("refused save changed the file:\n%s", got)
+	}
+	saved, err = e.svc.SaveAnnotation(ctx, e.d.ID, d.ID, SaveAnnotationInput{Objects: renamed, BaseVersion: detail.AnnotationVersion, Force: true})
+	if err != nil || !reflect.DeepEqual(saved.Objects, renamed) || saved.AnnotationVersion != annotationVersion(e.readFile(t, "images/d.xml")) {
+		t.Errorf("forced save = %+v, %v", saved, err)
 	}
 
 	// A file that is not valid XML is replaced by a new one when forced.
@@ -641,33 +950,97 @@ func TestIntegrationClasses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := e.svc.ListClasses(ctx, d.ID); err != nil || got == nil || len(got) != 0 {
-		t.Errorf("new dataset classes = %#v, %v", got, err)
+	empty, err := e.svc.ListClasses(ctx, d.ID)
+	if err != nil || empty.Classes == nil || len(empty.Classes) != 0 || len(empty.Version) != 32 {
+		t.Errorf("new dataset classes = %#v, %v", empty, err)
 	}
 	time.Sleep(2 * time.Millisecond)
-	set, err := e.svc.SetClasses(ctx, d.ID, []Class{{Name: " scratch ", Color: "#EF4444"}, {Name: "凹坑"}})
+	set, err := e.svc.SetClasses(ctx, d.ID, []Class{{Name: " scratch ", Color: "#EF4444"}, {Name: "凹坑"}}, &empty.Version)
 	want := []Class{{Name: "scratch", Color: "#ef4444"}, {Name: "凹坑"}}
-	if err != nil || !reflect.DeepEqual(set, want) {
+	if err != nil || !reflect.DeepEqual(set.Classes, want) || set.Version == empty.Version {
 		t.Errorf("SetClasses = %+v, %v", set, err)
 	}
-	if got, _ := e.svc.ListClasses(ctx, d.ID); !reflect.DeepEqual(got, want) {
-		t.Errorf("ListClasses = %+v, want %+v", got, want)
+	if got, _ := e.svc.ListClasses(ctx, d.ID); !reflect.DeepEqual(got, set) {
+		t.Errorf("ListClasses = %+v, want %+v", got, set)
 	}
 	if after, _ := e.svc.GetDataset(ctx, d.ID); !after.UpdatedAt.After(d.UpdatedAt) {
 		t.Errorf("updated_at not touched: %v, was %v", after.UpdatedAt, d.UpdatedAt)
 	}
-	_, err = e.svc.SetClasses(ctx, d.ID, []Class{{Name: "a"}, {Name: "a"}})
+	// A replacement from an older version is refused and changes nothing.
+	_, err = e.svc.SetClasses(ctx, d.ID, []Class{{Name: "crack"}}, &empty.Version)
+	wantKind(t, err, ErrConflict, "类别列表已被其他人修改，请载入最新的列表后再保存")
+	_, err = e.svc.SetClasses(ctx, d.ID, []Class{{Name: "a"}, {Name: "a"}}, nil)
 	wantKind(t, err, ErrInvalid, "重复")
-	if got, _ := e.svc.ListClasses(ctx, d.ID); !reflect.DeepEqual(got, want) {
+	if got, _ := e.svc.ListClasses(ctx, d.ID); !reflect.DeepEqual(got, set) {
 		t.Errorf("a refused list changed the classes: %+v", got)
 	}
-	if got, err := e.svc.SetClasses(ctx, d.ID, []Class{}); err != nil || len(got) != 0 {
+
+	// Adding a class appends it; adding it again changes nothing.
+	added, err := e.svc.AddClass(ctx, d.ID, Class{Name: " 孔洞 ", Color: "#00FF00"})
+	want = append(want, Class{Name: "孔洞", Color: "#00ff00"})
+	if err != nil || !reflect.DeepEqual(added.Classes, want) || added.Version == set.Version {
+		t.Errorf("AddClass = %+v, %v", added, err)
+	}
+	before, _ := e.svc.GetDataset(ctx, d.ID)
+	if again, err := e.svc.AddClass(ctx, d.ID, Class{Name: "孔洞", Color: "#123456"}); err != nil || !reflect.DeepEqual(again, added) {
+		t.Errorf("AddClass again = %+v, %v", again, err)
+	}
+	if after, _ := e.svc.GetDataset(ctx, d.ID); !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Error("adding an existing class touched the dataset")
+	}
+	for _, tc := range []struct {
+		class Class
+		msg   string
+	}{
+		{Class{Name: " "}, "类别名称为空"},
+		{Class{Name: "a\nb"}, "类别名称包含换行或控制字符"},
+		{Class{Name: strings.Repeat("长", 256)}, "类别名称不能超过 255 个字符"},
+		{Class{Name: "a", Color: "red"}, "类别“a”的颜色必须是 #rrggbb 格式"},
+	} {
+		_, err := e.svc.AddClass(ctx, d.ID, tc.class)
+		wantKind(t, err, ErrInvalid, tc.msg)
+	}
+
+	// Concurrent additions all arrive.
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := e.svc.AddClass(ctx, d.ID, Class{Name: fmt.Sprintf("c%d", i)}); err != nil {
+				t.Errorf("AddClass c%d: %v", i, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got, _ := e.svc.ListClasses(ctx, d.ID); len(got.Classes) != 3+8 {
+		t.Errorf("after concurrent additions: %+v", got.Classes)
+	}
+
+	// At most maxClasses.
+	full := make([]Class, maxClasses)
+	for i := range full {
+		full[i] = Class{Name: fmt.Sprintf("k%d", i)}
+	}
+	if _, err := e.svc.SetClasses(ctx, d.ID, full, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.svc.AddClass(ctx, d.ID, Class{Name: "one more"})
+	wantKind(t, err, ErrInvalid, "类别数量不能超过 1000 个")
+	if _, err := e.svc.AddClass(ctx, d.ID, Class{Name: "k0"}); err != nil {
+		t.Errorf("adding an existing class to a full list: %v", err)
+	}
+
+	if got, err := e.svc.SetClasses(ctx, d.ID, []Class{}, nil); err != nil || len(got.Classes) != 0 || got.Version != empty.Version {
 		t.Errorf("clear = %+v, %v", got, err)
 	}
 	if _, err := e.svc.ListClasses(ctx, 1<<40); !errors.Is(err, ErrNotFound) {
 		t.Errorf("ListClasses(unknown) = %v", err)
 	}
-	if _, err := e.svc.SetClasses(ctx, 1<<40, nil); !errors.Is(err, ErrNotFound) {
+	if _, err := e.svc.SetClasses(ctx, 1<<40, nil, nil); !errors.Is(err, ErrNotFound) {
 		t.Errorf("SetClasses(unknown) = %v", err)
+	}
+	if _, err := e.svc.AddClass(ctx, 1<<40, Class{Name: "a"}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("AddClass(unknown) = %v", err)
 	}
 }

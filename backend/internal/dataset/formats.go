@@ -1,6 +1,7 @@
 package dataset
 
 import (
+	"fmt"
 	"path"
 	"slices"
 	"strings"
@@ -78,13 +79,8 @@ func NormalizeClasses(raw []string) ([]string, error) {
 	seen := make(map[string]int, len(raw))
 	for i, name := range raw {
 		name = strings.TrimSpace(name)
-		switch {
-		case name == "":
-			return invalid("第 %d 个类别名称为空", i+1)
-		case !utf8.ValidString(name) || strings.ContainsFunc(name, unicode.IsControl):
-			return invalid("第 %d 个类别名称包含换行或控制字符", i+1)
-		case utf8.RuneCountInString(name) > maxClassNameRunes:
-			return invalid("第 %d 个类别名称不能超过 %d 个字符", i+1, maxClassNameRunes)
+		if problem := classNameProblem(name); problem != "" {
+			return invalid("第 %d 个类别%s", i+1, problem)
 		}
 		if j, dup := seen[name]; dup {
 			return invalid("类别“%s”重复（第 %d 个和第 %d 个）", name, j+1, i+1)
@@ -93,6 +89,20 @@ func NormalizeClasses(raw []string) ([]string, error) {
 		out[i] = name
 	}
 	return out, nil
+}
+
+// classNameProblem says what is wrong with a trimmed class name, as the
+// end of a sentence about it ("名称为空"), or returns "" for a valid name.
+func classNameProblem(name string) string {
+	switch {
+	case name == "":
+		return "名称为空"
+	case !utf8.ValidString(name) || strings.ContainsFunc(name, unicode.IsControl):
+		return "名称包含换行或控制字符"
+	case utf8.RuneCountInString(name) > maxClassNameRunes:
+		return fmt.Sprintf("名称不能超过 %d 个字符", maxClassNameRunes)
+	}
+	return ""
 }
 
 // normalizeFormat validates the annotation format of an import or export

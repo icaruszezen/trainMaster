@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/unicode"
 )
 
 // labelImgFile is a VOC file as LabelImg writes it after a review, with
@@ -203,22 +204,188 @@ func TestPatchVOCEncoding(t *testing.T) {
 	}
 }
 
+func TestPatchVOCKeepsBytes(t *testing.T) {
+	info := imageInfo{Width: 100, Height: 80, Depth: 3}
+	dent := AnnotationObject{Name: "dent", Xmin: 10, Ymin: 20, Xmax: 30, Ymax: 40}
+	scratch := AnnotationObject{Name: "scratch", Xmin: 1, Ymin: 1, Xmax: 5, Ymax: 5}
+	added := AnnotationObject{Name: "凹坑", Xmin: 50, Ymin: 50, Xmax: 60, Ymax: 60}
+	header := `<?xml version="1.0" encoding="utf-8"?>` + "\n"
+
+	// Namespaces (declarations, prefixed elements and attributes), entity
+	// and character references, CDATA and attribute quoting are copied as
+	// they are.
+	namespaced := header + `<annotation xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xml:lang='zh' xsi:noNamespaceSchemaLocation="voc.xsd">
+	<filename>a.png</filename>
+	<size><width>100</width><height>80</height></size>
+	<x:meta xmlns:x="urn:x" x:by="qa">&#x6807;&amp;<![CDATA[<raw>]]></x:meta>
+	<object>
+		<name>dent</name>
+		<ext xmlns="urn:ext"><score>0.9</score></ext>
+		<bndbox><xmin>10</xmin><ymin>20</ymin><xmax>30</xmax><ymax>40</ymax></bndbox>
+	</object>
+	<object>
+		<name>hole</name>
+		<polygon xmlns="urn:poly"><x1>1</x1><y1>1</y1></polygon>
+	</object>
+</annotation>
+`
+	if got, err := patchVOC([]byte(namespaced), info, []AnnotationObject{dent}); err != nil || string(got) != namespaced {
+		t.Errorf("unchanged namespaced file (%v):\n%s", err, got)
+	}
+	got, err := patchVOC([]byte(namespaced), info, []AnnotationObject{dent, added})
+	if want := strings.Replace(namespaced, "\t<object>\n\t\t<name>hole", "\t"+vocObjectText(added)+"\n\t<object>\n\t\t<name>hole", 1); err != nil || string(got) != want {
+		t.Errorf("added box (%v):\n%s\nwant:\n%s", err, got, want)
+	}
+	if parsed, err := parseVOC(bytes.NewReader(got)); err != nil || !reflect.DeepEqual(parsed.Objects, []AnnotationObject{dent, added}) || parsed.Unsupported != 1 {
+		t.Errorf("parsed = %+v, %v", parsed, err)
+	}
+
+	// A prefixed root and prefixed objects: a changed box is written in the
+	// default namespace, which parseVOC reads like the prefixed one.
+	prefixed := header + "<v:annotation xmlns:v=\"urn:voc\">\n\t<v:object><v:name>scratch</v:name><v:bndbox><v:xmin>1</v:xmin><v:ymin>1</v:ymin>" +
+		"<v:xmax>5</v:xmax><v:ymax>5</v:ymax></v:bndbox></v:object>\n</v:annotation>\n"
+	if got, err := patchVOC([]byte(prefixed), imageInfo{}, []AnnotationObject{scratch}); err != nil || string(got) != prefixed {
+		t.Errorf("unchanged prefixed file (%v):\n%s", err, got)
+	}
+	got, err = patchVOC([]byte(prefixed), imageInfo{}, []AnnotationObject{dent})
+	if want := header + "<v:annotation xmlns:v=\"urn:voc\">\n\t" + vocObjectText(dent) + "\n</v:annotation>\n"; err != nil || string(got) != want {
+		t.Errorf("changed prefixed box (%v):\n%s\nwant:\n%s", err, got, want)
+	}
+
+	// Windows line ends stay Windows line ends, also in new elements.
+	crlf := strings.ReplaceAll(labelImgFile, "\n", "\r\n")
+	if got, err := patchVOC([]byte(crlf), info, []AnnotationObject{dent, scratch}); err != nil || string(got) != crlf {
+		t.Errorf("unchanged CRLF file (%v):\n%q", err, got)
+	}
+	got, err = patchVOC([]byte(crlf), info, []AnnotationObject{added})
+	if err != nil || !strings.Contains(string(got), "\r\n\t"+strings.ReplaceAll(vocObjectText(added), "\n", "\r\n")+"\r\n") ||
+		strings.Count(string(got), "\n") != strings.Count(string(got), "\r\n") {
+		t.Errorf("CRLF file with a new box (%v):\n%q", err, got)
+	}
+}
+
+func TestPatchVOCStructure(t *testing.T) {
+	box := AnnotationObject{Name: "dent", Xmin: 1, Ymin: 2, Xmax: 3, Ymax: 4}
+	header := `<?xml version="1.0" encoding="utf-8"?>` + "\n"
+	for _, tt := range []struct {
+		name, in, want string
+	}{
+		{
+			name: "self-closing root",
+			in:   `<annotation verified="yes" />`,
+			want: header + `<annotation verified="yes">` + "\n\t" + vocObjectText(box) + "\n</annotation>\n",
+		},
+		{
+			name: "self-closing prefixed root",
+			in:   `<v:annotation xmlns:v="urn:voc"/>`,
+			want: header + `<v:annotation xmlns:v="urn:voc">` + "\n\t" + vocObjectText(box) + "\n</v:annotation>\n",
+		},
+		{
+			name: "text in the root",
+			in:   "<annotation>\n  some text &amp; more \n<filename>a.png</filename>tail</annotation>",
+			want: header + "<annotation>\n\tsome text &amp; more\n\t<filename>a.png</filename>\n\ttail\n\t" + vocObjectText(box) + "\n</annotation>\n",
+		},
+		{
+			name: "NUL padding and other bytes after the root",
+			in:   "<annotation><filename>a.png</filename></annotation>\n<!-- after -->\x00\x00\x00garbage<",
+			want: header + "<annotation>\n\t<filename>a.png</filename>\n\t" + vocObjectText(box) + "\n</annotation>\n",
+		},
+		{
+			name: "prolog kept, declaration and BOM replaced",
+			in:   "\xef\xbb\xbf<?xml version='1.0' standalone='yes'?>\n<!DOCTYPE annotation>\n<?style x?>\n<!-- c -->\n<annotation></annotation>",
+			want: header + "<!DOCTYPE annotation>\n<?style x?>\n<!-- c -->\n<annotation>\n\t" + vocObjectText(box) + "\n</annotation>\n",
+		},
+		{
+			name: "comments and processing instructions among the children",
+			in:   "<annotation><!--a--><?pi b?><object><name>dent</name><bndbox><xmin>1</xmin><ymin>2</ymin><xmax>3</xmax><ymax>4</ymax></bndbox></object></annotation>",
+			want: header + "<annotation>\n\t<!--a-->\n\t<?pi b?>\n\t<object><name>dent</name><bndbox><xmin>1</xmin><ymin>2</ymin><xmax>3</xmax><ymax>4</ymax></bndbox></object>\n</annotation>\n",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := patchVOC([]byte(tt.in), imageInfo{}, []AnnotationObject{box})
+			if err != nil || string(got) != tt.want {
+				t.Errorf("patched (%v):\n%q\nwant:\n%q", err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPatchVOCTranscodes(t *testing.T) {
+	box := AnnotationObject{Name: "划痕", Xmin: 10, Ymin: 20, Xmax: 101, Ymax: 201, Truncated: true}
+	doc := vocDoc(`<?xml version="1.0" encoding="GBK"?>`, "图片.jpg", "划痕")
+	gbk, err := simplifiedchinese.GBK.NewEncoder().String(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	utf16, err := unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewEncoder().String(
+		vocDoc(`<?xml version="1.0" encoding="UTF-16"?>`, "图片.jpg", "划痕"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unchanged boxes: the same file, in UTF-8.
+	want := `<?xml version="1.0" encoding="utf-8"?>` + "\n" + strings.TrimPrefix(doc, `<?xml version="1.0" encoding="GBK"?>`) + "\n"
+	for name, in := range map[string]string{"gbk": gbk, "utf-16": utf16} {
+		got, err := patchVOC([]byte(in), imageInfo{}, []AnnotationObject{box, {Name: "dent", Xmin: 1, Ymin: 2, Xmax: 3, Ymax: 4, Difficult: true}})
+		if err != nil || string(got) != want {
+			t.Errorf("%s (%v):\n%s\nwant:\n%s", name, err, got, want)
+		}
+	}
+	if _, err := patchVOC([]byte(`<?xml version="1.0" encoding="x-unknown"?><annotation/>`), imageInfo{}, nil); !errors.Is(err, errNotPatchable) {
+		t.Errorf("unknown encoding: %v", err)
+	}
+}
+
 func TestPatchVOCRefuses(t *testing.T) {
 	box := []AnnotationObject{{Name: "dent", Xmin: 1, Ymin: 2, Xmax: 3, Ymax: 4}}
 	for name, in := range map[string]string{
-		"namespace":          `<annotation xmlns="urn:x"><filename>a.png</filename></annotation>`,
-		"prefixed element":   `<annotation xmlns:x="urn:x"><x:extra/></annotation>`,
-		"prefixed attribute": `<annotation xmlns:x="urn:x" x:a="1"></annotation>`,
-		"xml attribute":      `<annotation xml:lang="zh"></annotation>`,
-		"text in root":       `<annotation>text<filename>a.png</filename></annotation>`,
-		"not well-formed":    `<annotation><object><name>a</name></annotation>`,
-		"unclosed root":      `<annotation><filename>a.png</filename>`,
-		"other root":         `<doc><filename>a.png</filename></doc>`,
-		"empty":              ``,
+		"not well-formed": `<annotation><object><name>a</name></annotation>`,
+		"unclosed root":   `<annotation><filename>a.png</filename>`,
+		"other root":      `<doc><filename>a.png</filename></doc>`,
+		"NUL in the root": "<annotation>\x00</annotation>",
+		"empty":           ``,
+		// parseVOC decodes the rest as GBK, patchVOC cannot.
+		"invalid UTF-8 after a declaration in the root": "<annotation><?xml version=\"1.0\" encoding=\"GBK\"?><filename>\xb5\xb5</filename></annotation>",
 	} {
 		got, err := patchVOC([]byte(in), imageInfo{}, box)
 		if !errors.Is(err, errNotPatchable) || got != nil {
 			t.Errorf("%s: patched = %q, %v; want errNotPatchable", name, got, err)
+		}
+	}
+	// The kept declaration in the root makes parseVOC read a new UTF-8 label
+	// as GBK: the result would not read back as written.
+	if got, err := patchVOC(unpatchable, imageInfo{}, []AnnotationObject{{Name: "a", Xmin: 1, Ymin: 1, Xmax: 5, Ymax: 5}}); err != nil {
+		t.Errorf("unchanged ASCII boxes after a declaration in the root: %q, %v", got, err)
+	}
+	if got, err := patchVOC(unpatchable, imageInfo{}, []AnnotationObject{{Name: "划痕", Xmin: 1, Ymin: 1, Xmax: 5, Ymax: 5}}); !errors.Is(err, errNotPatchable) {
+		t.Errorf("a new label after a declaration in the root: %q, %v", got, err)
+	}
+}
+
+// TestPatchVOCParsesAsParseVOC checks that every file parseVOC accepts
+// can be patched, and that the result parses to the new boxes with the
+// unsupported objects kept.
+func TestPatchVOCParsesAsParseVOC(t *testing.T) {
+	box := AnnotationObject{Name: "dent", Xmin: 1, Ymin: 2, Xmax: 3, Ymax: 4}
+	for _, in := range []string{
+		labelImgFile,
+		vocDoc(`<?xml version="1.0"?>`, "0001.jpg", "划痕"),
+		`<annotation xmlns="urn:x"><filename>a.png</filename><object><name>p</name><polygon/></object></annotation>`,
+		`<annotation xmlns:x="urn:x"><x:extra/><x:object><x:name>a</x:name><x:bndbox><x:xmin>1</x:xmin><x:ymin>1</x:ymin><x:xmax>2</x:xmax><x:ymax>2</x:ymax></x:bndbox></x:object></annotation>`,
+		`<annotation xml:lang="zh">text<filename>a.png</filename></annotation>` + "\x00\x00",
+		`<!-- c --><annotation/>`,
+	} {
+		before, err := parseVOC(strings.NewReader(in))
+		if err != nil {
+			t.Fatalf("parseVOC(%q): %v", in, err)
+		}
+		got, err := patchVOC([]byte(in), imageInfo{}, []AnnotationObject{box})
+		if err != nil {
+			t.Errorf("patchVOC(%q): %v", in, err)
+			continue
+		}
+		after, err := parseVOC(bytes.NewReader(got))
+		if err != nil || !reflect.DeepEqual(after.Objects, []AnnotationObject{box}) || after.Unsupported != before.Unsupported || after.Filename != before.Filename {
+			t.Errorf("patched %q = %+v, %v:\n%s", in, after, err, got)
 		}
 	}
 }

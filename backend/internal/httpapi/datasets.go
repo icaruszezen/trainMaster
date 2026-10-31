@@ -37,6 +37,7 @@ func (s *server) datasetRoutes(r chi.Router) {
 		r.Delete("/images/{imageID}/annotation", s.deleteImageAnnotation)
 		r.Get("/classes", s.listDatasetClasses)
 		r.Put("/classes", s.setDatasetClasses)
+		r.Post("/classes", s.addDatasetClass)
 		r.Get("/labels", s.listDatasetLabels)
 		r.Post("/scan", s.scanDataset)
 		r.Get("/imports", s.listDatasetImports)
