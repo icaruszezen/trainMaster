@@ -291,24 +291,24 @@ function ClassManagerForm({
                       : ""}
                   </span>
                   <div className="flex shrink-0">
-                    {row.color !== "" && (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon-sm"
-                        onClick={() =>
-                          setRows(
-                            rows.map((r, i) =>
-                              i === index ? { ...r, color: "" } : r
-                            )
+                    {/* 没有自定义颜色时隐藏（但占位），各行的输入框对齐。 */}
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      onClick={() =>
+                        setRows(
+                          rows.map((r, i) =>
+                            i === index ? { ...r, color: "" } : r
                           )
-                        }
-                        aria-label="恢复自动配色"
-                        title="恢复自动配色"
-                      >
-                        <RotateCcw />
-                      </Button>
-                    )}
+                        )
+                      }
+                      aria-label="恢复自动配色"
+                      title="恢复自动配色"
+                      className={row.color === "" ? "invisible" : undefined}
+                    >
+                      <RotateCcw />
+                    </Button>
                     <Button
                       type="button"
                       variant="ghost"

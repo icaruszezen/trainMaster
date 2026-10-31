@@ -271,7 +271,13 @@ export function EditorToolbar(props: EditorToolbarProps) {
           <Redo2 />
         </ToolButton>
         <Separator />
-        <ToolButton label="缩小" keys={["-"]} onClick={() => onZoom(-1)}>
+        {/* 手机上用双指缩放与缩放比例菜单，省出宽度给“类别与目标”按钮。 */}
+        <ToolButton
+          label="缩小"
+          keys={["-"]}
+          onClick={() => onZoom(-1)}
+          className="hidden sm:inline-flex"
+        >
           <ZoomOut />
         </ToolButton>
         <DropdownMenu>
@@ -286,6 +292,14 @@ export function EditorToolbar(props: EditorToolbarProps) {
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="center">
+            <DropdownMenuItem onSelect={() => onZoom(1)} className="sm:hidden">
+              放大
+              <DropdownMenuShortcut>+</DropdownMenuShortcut>
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => onZoom(-1)} className="sm:hidden">
+              缩小
+              <DropdownMenuShortcut>-</DropdownMenuShortcut>
+            </DropdownMenuItem>
             <DropdownMenuItem onSelect={onFit}>
               适应窗口
               <DropdownMenuShortcut>F</DropdownMenuShortcut>
@@ -296,7 +310,12 @@ export function EditorToolbar(props: EditorToolbarProps) {
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
-        <ToolButton label="放大" keys={["+"]} onClick={() => onZoom(1)}>
+        <ToolButton
+          label="放大"
+          keys={["+"]}
+          onClick={() => onZoom(1)}
+          className="hidden sm:inline-flex"
+        >
           <ZoomIn />
         </ToolButton>
         <ToolButton

@@ -745,6 +745,8 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       ),
     })
   }
+  // 冲突、保存失败、只读原因等需要处理的提示放在最显眼的位置。
+  const urgentNotices = notices.filter((notice) => notice.tone !== "info")
 
   // ---- 切换图片 ----
   const openImage = (id: number) => {
@@ -1048,6 +1050,13 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
 
   const sidePanel = current ? (
     <div className="grid content-start gap-5 p-3">
+      {urgentNotices.length > 0 && (
+        <div className="grid gap-2">
+          {urgentNotices.map((notice, index) => (
+            <NoticeBox key={index} notice={notice} />
+          ))}
+        </div>
+      )}
       <ClassPanel
         classes={classes}
         objects={doc.objects}
@@ -1087,7 +1096,11 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         onChange={(uid, patch) => change(updateObject(doc.objects, uid, patch))}
         onDelete={(uid) => change(removeObject(doc.objects, uid), null)}
       />
-      <ImageInfo detail={latest ?? current} size={size} notices={notices} />
+      <ImageInfo
+        detail={latest ?? current}
+        size={size}
+        notices={notices.filter((notice) => notice.tone === "info")}
+      />
     </div>
   ) : null
 
@@ -1146,11 +1159,9 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         </aside>
 
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-          {notices.length > 0 && (
+          {urgentNotices.length > 0 && (
             <div className="absolute inset-x-2 top-2 z-10 grid gap-2 lg:hidden">
-              {notices.slice(0, 1).map((notice, index) => (
-                <NoticeBox key={index} notice={notice} />
-              ))}
+              <NoticeBox notice={urgentNotices[0]} />
             </div>
           )}
           {current ? (
