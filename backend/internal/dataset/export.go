@@ -148,8 +148,10 @@ func (s *Service) OpenExport(ctx context.Context, datasetID int64, token string)
 	if err != nil {
 		return nil, err
 	}
+	// The archive lists the images in image order, which also decides which
+	// of two files with the same entry name is kept.
 	rows, err := s.db.Query(ctx, `SELECT rel_path, mod_time, width, height, annotation_path
-		FROM dataset_images WHERE dataset_id = $1`, d.ID)
+		FROM dataset_images WHERE dataset_id = $1 ORDER BY `+ImageOrder, d.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +159,6 @@ func (s *Service) OpenExport(ctx context.Context, datasetID int64, token string)
 	if err != nil {
 		return nil, fmt.Errorf("load images: %w", err)
 	}
-	slices.SortFunc(images, func(a, b exportImage) int { return strings.Compare(a.Path, b.Path) })
 	root, err := s.openDatasetRoot(d)
 	if err != nil {
 		return nil, err

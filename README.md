@@ -43,6 +43,7 @@
 - **VOC 标注自动识别**：与图片同目录、同名的 `.xml`（如 `NG/0001.jpg` ↔ `NG/0001.xml`），以及标准 VOC 结构 `JPEGImages/` ↔ `Annotations/`。页面上可以按已标注 / 空标注 / 标注无效 / 未标注、按标签筛选，查看图片时叠加显示标注框。
 - **上传时选择标注格式**：Pascal VOC（`.xml`）、[X-AnyLabeling](https://github.com/CVHub520/X-AnyLabeling)（`.json`，兼容 LabelMe）或 YOLO（`.txt`，同目录同名或 Ultralytics 的 `images/` ↔ `labels/` 结构）。X-AnyLabeling 与 YOLO 标注在导入时**自动转换为 VOC** 保存（多边形、旋转框等取外接矩形）；选择 YOLO 时需同时提供类别顺序（每行一个类别，可直接输入或读取 `classes.txt`，上传文件夹时自动读取其中的 `classes.txt`）。
 - **下载数据集**：在数据集详情页或卡片菜单中选择 VOC、X-AnyLabeling 或 YOLO 格式（YOLO 同样需要类别顺序，默认沿用最近一次 YOLO 导入时的顺序，没有时按标签名称排列），服务器边打包边下载 zip，YOLO 包含 `images/`、`labels/`、`classes.txt` 与 `data.yaml`。
+- **图片顺序固定**：图片网格、查看大图时的上一张 / 下一张、封面和下载的压缩包都按同一个顺序排列，与 Windows 资源管理器默认的“按名称”排序一致：文件夹在前，名称不区分大小写，数字按数值比较（`img2` 在 `img10` 前），中文按拼音。详见 [架构说明 · 图片顺序](docs/architecture.md#图片顺序)。
 - 导入到已有数据集时，同名文件可选择跳过或覆盖；在服务器上直接增删文件后，点“重新扫描”即可同步。
 
 识别规则、导入流程和接口详见 [架构说明 · 数据集与导入](docs/architecture.md#6-数据集与导入)。

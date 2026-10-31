@@ -320,9 +320,6 @@ func (s *server) listDatasetImages(w http.ResponseWriter, r *http.Request) {
 		dataset.FilterInvalid, dataset.FilterUnannotated); !ok {
 		return
 	}
-	if q.Sort, ok = enumParam(w, r, "sort", dataset.SortPath, dataset.SortModTime, dataset.SortObjects); !ok {
-		return
-	}
 	items, total, err := s.datasets.ListImages(r.Context(), id, q)
 	if err != nil {
 		s.datasetError(w, r, err)

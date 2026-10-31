@@ -196,7 +196,6 @@ export type DatasetDirectory = {
 /** `unannotated` 只含没有 xml 的图片；xml 无法解析的是 `invalid`。 */
 export type ImageStatusFilter =
   "all" | "annotated" | "empty" | "unannotated" | "invalid"
-export type ImageSort = "path" | "-mod_time" | "-objects"
 
 /** 数据集列表的项目筛选：某个项目的 id、`"none"`（未纳入任何项目）或不限（null）。 */
 export type DatasetProjectFilter = number | "none" | null
@@ -219,7 +218,6 @@ export type ImageFilters = {
   label: string
   /** 路径包含（不区分大小写）。 */
   q: string
-  sort: ImageSort
 }
 
 const BASE = "/api/v1/datasets"
@@ -345,7 +343,6 @@ export function imagesQuery(id: number, filters: ImageFilters) {
           status: filters.status === "all" ? "" : filters.status,
           label: filters.label,
           q: filters.q,
-          sort: filters.sort === "path" ? "" : filters.sort,
         }),
         { signal }
       ),

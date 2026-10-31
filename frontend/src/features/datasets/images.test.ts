@@ -154,7 +154,7 @@ describe("loadMoreImages", () => {
     })
     const observer = new InfiniteQueryObserver(
       client,
-      imagesQuery(1, { status: "all", label: "", q: "", sort: "path" })
+      imagesQuery(1, { status: "all", label: "", q: "" })
     )
     const unsubscribe = observer.subscribe(() => {})
     try {

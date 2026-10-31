@@ -40,7 +40,6 @@ import {
   type Dataset,
   type DatasetImage,
   type ImageFilters,
-  type ImageSort,
   type ImageStatusFilter,
 } from "@/features/datasets/api"
 import { DatasetThumbnail } from "@/features/datasets/dataset-thumbnail"
@@ -61,14 +60,7 @@ export const DEFAULT_IMAGE_FILTERS: ImageFilters = {
   status: "all",
   label: "",
   q: "",
-  sort: "path",
 }
-
-const sortOptions: { value: ImageSort; label: string }[] = [
-  { value: "path", label: "按路径" },
-  { value: "-mod_time", label: "最近修改" },
-  { value: "-objects", label: "目标最多" },
-]
 
 // Radix Select 的值不能为空字符串；标签名加前缀，避免与“全部”冲突。
 const ALL_LABELS = "all"
@@ -204,26 +196,6 @@ export function DatasetImages({
                   <span className="text-muted-foreground tabular-nums">
                     {formatNumber(label.image_count)}
                   </span>
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Select
-            value={filters.sort}
-            onValueChange={(value) =>
-              onFiltersChange({ sort: value as ImageSort })
-            }
-          >
-            <SelectTrigger
-              className="w-[calc(50%-0.25rem)] sm:w-32"
-              aria-label="排序方式"
-            >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {sortOptions.map((option) => (
-                <SelectItem key={option.value} value={option.value}>
-                  {option.label}
                 </SelectItem>
               ))}
             </SelectContent>

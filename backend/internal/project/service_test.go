@@ -70,8 +70,9 @@ func (e *testEnv) addDataset(t *testing.T, name string, images ...image) int64 {
 			img.labels = map[string]int{}
 		}
 		if _, err := e.db.Exec(ctx, `INSERT INTO dataset_images (dataset_id, rel_path, size_bytes, mod_time,
-				annotation_state, object_count, label_counts) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			id, img.path, 1000+i, time.Unix(1_700_000_000+int64(i), 0), state, objects, img.labels); err != nil {
+				annotation_state, object_count, label_counts, sort_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			id, img.path, 1000+i, time.Unix(1_700_000_000+int64(i), 0), state, objects, img.labels,
+			dataset.ImageSortKey(img.path)); err != nil {
 			t.Fatal(err)
 		}
 	}

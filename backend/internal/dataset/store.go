@@ -156,13 +156,13 @@ func recomputeAggregates(ctx context.Context, q querier, datasetID int64, markSc
 	return err
 }
 
-// queryCovers returns up to 4 images per dataset (first by path).
+// queryCovers returns the first 4 images of each dataset (in image order).
 func queryCovers(ctx context.Context, q querier, ids []int64) (map[int64][]ImageRef, error) {
 	rows, err := q.Query(ctx, `SELECT c.dataset_id, c.id, c.size_bytes, c.mod_time
 		FROM unnest($1::bigint[]) AS ds (id)
-		CROSS JOIN LATERAL (SELECT dataset_id, id, size_bytes, mod_time, rel_path FROM dataset_images
-			WHERE dataset_id = ds.id ORDER BY rel_path LIMIT 4) c
-		ORDER BY c.dataset_id, c.rel_path`, ids)
+		CROSS JOIN LATERAL (SELECT dataset_id, id, size_bytes, mod_time, sort_key FROM dataset_images
+			WHERE dataset_id = ds.id ORDER BY `+ImageOrder+` LIMIT 4) c
+		ORDER BY c.dataset_id, c.sort_key, c.id`, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -315,23 +315,22 @@ const (
 	FilterUnannotated = "unannotated" // no VOC file
 )
 
-// Image list orders.
-const (
-	SortPath     = "path"
-	SortModTime  = "-mod_time"
-	SortObjects  = "-objects"
-	imageColumns = `id, dataset_id, rel_path, size_bytes, mod_time, width, height,
+const imageColumns = `id, dataset_id, rel_path, size_bytes, mod_time, width, height,
 	annotation_path, annotation_state, object_count, label_counts`
-)
 
-// ImageQuery selects a page of a dataset's images.
+// ImageOrder is the ORDER BY clause that sorts the rows of dataset_images
+// in image order (see imageSortKey). Everything that lists a dataset's
+// images uses it, so they all agree; id only breaks ties between keys cut
+// at maxSortKeyLen.
+const ImageOrder = "sort_key, id"
+
+// ImageQuery selects a page of a dataset's images, in image order.
 type ImageQuery struct {
 	Offset int
 	Limit  int
 	Status string // Filter*
 	Label  string // exact label name, "" for any
 	Search string // case-insensitive substring of the path
-	Sort   string // Sort*
 }
 
 func scanImage(row pgx.Row) (Image, error) {
@@ -397,15 +396,8 @@ func queryImages(ctx context.Context, q querier, datasetID int64, f ImageQuery) 
 	if err := q.QueryRow(ctx, "SELECT count(*) FROM dataset_images WHERE "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	order := "rel_path, id"
-	switch f.Sort {
-	case SortModTime:
-		order = "mod_time DESC, id DESC"
-	case SortObjects:
-		order = "object_count DESC, rel_path, id"
-	}
 	sql := "SELECT " + imageColumns + " FROM dataset_images WHERE " + where +
-		" ORDER BY " + order + " LIMIT " + arg(f.Limit) + " OFFSET " + arg(f.Offset)
+		" ORDER BY " + ImageOrder + " LIMIT " + arg(f.Limit) + " OFFSET " + arg(f.Offset)
 	rows, err := q.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, 0, err
@@ -502,16 +494,18 @@ func upsertImages(ctx context.Context, db interface {
 			labels = map[string]int{}
 		}
 		b.Queue(`INSERT INTO dataset_images (dataset_id, rel_path, size_bytes, mod_time, width, height,
-				annotation_path, annotation_mod_time, annotation_size, annotation_state, object_count, label_counts)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				annotation_path, annotation_mod_time, annotation_size, annotation_state, object_count, label_counts,
+				sort_key)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 			ON CONFLICT (dataset_id, rel_path) DO UPDATE SET
 				size_bytes = EXCLUDED.size_bytes, mod_time = EXCLUDED.mod_time,
 				width = EXCLUDED.width, height = EXCLUDED.height,
 				annotation_path = EXCLUDED.annotation_path, annotation_mod_time = EXCLUDED.annotation_mod_time,
 				annotation_size = EXCLUDED.annotation_size, annotation_state = EXCLUDED.annotation_state,
-				object_count = EXCLUDED.object_count, label_counts = EXCLUDED.label_counts, updated_at = now()`,
+				object_count = EXCLUDED.object_count, label_counts = EXCLUDED.label_counts,
+				sort_key = EXCLUDED.sort_key, updated_at = now()`,
 			datasetID, r.RelPath, r.Size, r.ModTime, r.Width, r.Height,
-			r.AnnPath, r.AnnModTime, r.AnnSize, r.State, r.ObjectCount, labels)
+			r.AnnPath, r.AnnModTime, r.AnnSize, r.State, r.ObjectCount, labels, ImageSortKey(r.RelPath))
 	}
 	if err := tx.SendBatch(ctx, b).Close(); err != nil {
 		return fmt.Errorf("upsert images: %w", err)
