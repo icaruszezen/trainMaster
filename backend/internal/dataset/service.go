@@ -716,10 +716,11 @@ func (s *Service) ImageNeighbors(ctx context.Context, datasetID, imageID int64, 
 }
 
 // GetImage returns an image with the objects parsed from its VOC file as it
-// is on disk now. The VOC file is the one the index paired with the image;
-// without one, it is the file a scan would pair with it now, if there is
-// one (see resolveAnnotationTarget). Other files added or removed since the
-// last scan are noticed only by a scan.
+// is on disk now. The VOC file is the one the index paired with the image,
+// unless a file next to the image now takes over from a paired file
+// elsewhere; without one, it is the file a scan would pair with it now, if
+// there is one (see resolveAnnotationTarget). Other files added or removed
+// since the last scan are noticed only by a scan.
 func (s *Service) GetImage(ctx context.Context, datasetID, imageID int64) (ImageDetail, error) {
 	d, err := queryDataset(ctx, s.db, datasetID, false)
 	if err != nil {

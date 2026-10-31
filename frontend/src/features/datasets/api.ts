@@ -634,6 +634,11 @@ export type SaveAnnotationInput = {
   base_version: string
   /** 不检查版本，直接覆盖（冲突时用户选择“覆盖”）。 */
   force?: boolean
+  /**
+   * 文件无法在保留其它内容的情况下修改（`annotation_unpatchable`）时，按平台的
+   * 格式重新生成整个文件（用户选择“仍然保存”）。不带 force 时仍然检查版本。
+   */
+  regenerate?: boolean
 }
 
 /**
