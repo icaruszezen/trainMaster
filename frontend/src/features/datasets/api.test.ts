@@ -63,7 +63,6 @@ describe("imagesQuery", () => {
       status: "invalid",
       label: "",
       q: "",
-      sort: "path",
     })
     await (queryFn as (context: unknown) => Promise<unknown>)({
       pageParam: 0,

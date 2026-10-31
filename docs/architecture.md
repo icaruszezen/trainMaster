@@ -53,7 +53,7 @@ flowchart LR
 2. 初始化存储目录：创建根目录和 6 个子目录（见第 5 节）并做可写探测，失败则退出并提示检查挂载目录权限 / PUID、PGID。
 3. 连接数据库：指数退避重试，最长约 60 秒（数据库容器还在启动时会等待），仍失败则以非 0 退出。
 4. `TM_DB_AUTO_MIGRATE=true`（默认）时执行待执行的迁移。
-5. 启动数据集导入任务执行器，并恢复上次关闭时未完成的任务（见第 6 节）。
+5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），然后启动任务执行器（见第 6 节）。
 6. 启动 HTTP 服务；收到 SIGINT / SIGTERM 后停止接收新请求，等待进行中的请求完成（最长 15 秒）；超时后强制关闭剩余连接（取消其请求的 context），最后关闭数据库连接池。还在等待数据库或迁移锁时收到信号，则直接正常退出。收到信号时会立即取消正在执行的导入 / 扫描任务并记为失败（“服务重启，导入被中断”），排队中的任务保留到下次启动执行；HTTP 服务关闭后再等待任务执行器的 worker 退出。进程在写入结果前异常退出时，下次启动由恢复逻辑把任务标记为中断，并重新计算受影响数据集的统计数据。以后的长连接 handler（如 SSE 推送训练日志）应通过 `http.Server.RegisterOnShutdown` 在关闭开始时主动结束。
 
 ## 3. API 约定
@@ -154,7 +154,7 @@ flowchart LR
 | `PATCH /api/v1/datasets/{id}` | 修改名称（只改显示名称，文件夹不变）和描述 |
 | `PUT /api/v1/datasets/{id}/projects` | `{project_ids: [...]}` 设置数据集所属的项目（整体替换，`[]` 表示移出所有项目，缺少该字段时返回 422），返回更新后的数据集；所选项目不存在时返回 422，不做任何修改 |
 | `DELETE /api/v1/datasets/{id}` | 删除数据集记录（同时移出所属的项目）；`?delete_files=true` 同时删除磁盘上的**整个**文件夹与缩略图缓存。成功返回 204；记录已删除但文件夹没能完全删除（如权限不足）时返回 200 `{"files_removed": false, "message": "…"}`，剩余文件恢复为原来的文件夹名，可以重新添加或手动清理。导入 / 扫描正在执行时返回 409 |
-| `GET /api/v1/datasets/{id}/images` | 图片列表：`offset`、`limit`（≤ 200）、`status`（`all` / `annotated` 有目标 / `empty` 空标注 / `invalid` 标注无效 / `unannotated` 无标注文件）、`label`、`q`（路径包含）、`sort`（`path` / `-mod_time` / `-objects`） |
+| `GET /api/v1/datasets/{id}/images` | 图片列表，固定按图片顺序排列（见“图片顺序”）：`offset`、`limit`（≤ 200）、`status`（`all` / `annotated` 有目标 / `empty` 空标注 / `invalid` 标注无效 / `unannotated` 无标注文件）、`label`、`q`（路径包含） |
 | `GET /api/v1/datasets/{id}/images/{imageId}` | 单张图片详情：`objects` 等标注信息实时从 VOC 文件解析；文件无法解析或已不存在时 `annotation_error` 给出原因 |
 | `GET /api/v1/datasets/{id}/images/{imageId}/file` | 原图（支持 Range 与条件请求） |
 | `GET /api/v1/datasets/{id}/images/{imageId}/thumbnail` | JPEG 缩略图，`size=sm`（320px）/ `lg`（1600px），生成后缓存在 `cache/` 下 |
@@ -304,7 +304,22 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 下载为 YOLO 时，页面上的类别顺序默认沿用该数据集最近一次成功的 YOLO 导入所用的顺序（类别编号与导入时一致），数据集中其余的标签按名称排在后面；没有 YOLO 导入时按标签名称排序。
 
-未标注或标注无法解析的图片只包含图片本身；扫描之后已被删除的图片会被跳过。两个文件在压缩包中的名称相同时（如 `a.jpg` 与 `a.png` 的 `a.json`），只保留第一个。打包中途出错时连接被中断，浏览器会显示下载失败，而不会留下不完整的压缩包。
+压缩包中的文件按图片顺序排列。未标注或标注无法解析的图片只包含图片本身；扫描之后已被删除的图片会被跳过。两个文件在压缩包中的名称相同时（如 `a.jpg` 与 `a.png` 的 `a.json`），只保留按图片顺序在前的那个。打包中途出错时连接被中断，浏览器会显示下载失败，而不会留下不完整的压缩包。
+
+### 图片顺序
+
+数据集中的图片只有一种顺序，图片网格（含筛选、分页）、查看大图时的上一张 / 下一张、数据集与项目卡片的封面、下载的压缩包都按它排列。规则与 Windows 资源管理器默认的“按名称”升序一致（中文 Windows；资源管理器用 `StrCmpLogicalW` 比较名称，Windows 7 起相当于 `CompareStringEx` 加 `NORM_IGNORECASE | SORT_DIGITSASNUMBERS`）：
+
+- **像文件夹树一样逐层排列**：每一层文件夹在前（连同其中的全部内容），文件在后。例如 `NG/…`、`OK/…` 排在根目录下的图片前面。
+- **整个名称一起比较，包括扩展名**，不区分大小写和全角 / 半角（`Ａ`、`１` 等同于 `A`、`1`）。
+- **连续的数字按数值比较**：`img2` < `img10`；数值相同时前导零多的在前（`img001` < `img01` < `img1`）。与 Windows 相同，最多 19 位数字作为一个数，全角数字与半角数字相邻时分成两个数。
+- **符号 < 数字 < 其他数字字符 < 字母 < 汉字**：符号按 Windows 排序表的顺序（空格 `! # $ % & ( ) , . ; @ [ ] ^ _` `` ` `` `{ } ~ + =`，所以 `a (1).jpg` < `a.jpg` < `a_1.jpg`；中文标点和 GB 2312 中的符号如 `、。《》【】“”·※△` 也按该表）；`①②…⑳`、`⑴`、`⒈`、上标、分数、罗马数字 `Ⅰ Ⅱ Ⅲ` 等按数值排列（`½` < `①` < `⑩` < `Ⅰ` < `Ⅳ`），排在所有数字之后、字母之前；字母按字母表，忽略重音；汉字按拼音。零宽空格等不可见字符也按 Windows 处理（零宽空格算作空白，`U+FFFD` 等被忽略）。
+- **连字符和撇号先忽略**（Windows 的“word sort”）：`a-b` 紧挨着 `ab`；除此之外完全相同时，不带的在前。
+- 仍然相同的名称（如 Linux 上同时存在的 `A.jpg` 与 `a.jpg`）按字符编码排列，因此顺序不会因导入先后而变化。
+
+汉字的拼音顺序来自 Unicode CLDR（`golang.org/x/text/collate`），与 Windows 自带的拼音表绝大多数一致，个别多音字（如“谁”“地”）和同音字的先后可能不同。其余已知差异都只涉及文件名中很少见的字符：`㈠…㈩`、`㊀…㊉` 按数值排在其他数字字符之后（Windows 排在汉字之后）；`℃ ㎜ ™` 等字母式符号、表情符号、韩文和日文假名、不在上述符号表中的少见符号的位置与 Windows 不同。
+
+实现：`internal/dataset/order.go` 中的 `ImageSortKey` 把相对路径编码为字节串，按字节比较两个键即得到两张图片的先后；建立索引时写入 `dataset_images.sort_key`（`0005_image_sort_key.sql`，索引 `(dataset_id, sort_key, id)`），所有查询统一使用 `ORDER BY sort_key, id`（`dataset.ImageOrder`），分页由数据库完成。规则的版本（`imageOrderRevision` 加上所用 Unicode 数据的版本：`golang.org/x/text` 的排序、全角半角和规范化表，以及 Go 的 `unicode` 包）记录在 `app_settings` 的 `dataset.image_order` 中：服务启动时为还没有排序键的图片补上键；版本变化时（修改规则，或升级 Go / `golang.org/x/text` 带来新的 Unicode 数据后）重新计算全部键。修改规则时必须增加 `imageOrderRevision`，`TestImageSortKeyStable` 会在键变化时提醒。
 
 ### 缩略图
 
@@ -318,7 +333,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 因此迁移文件中**不要写 `BEGIN` / `COMMIT`**，也不能包含无法在事务中执行的语句（如 `CREATE INDEX CONCURRENTLY`）。
 - 迁移只向前：**已发布的迁移文件不要修改，也不要改名**，需要变更就新增一个文件。
 - 同一个版本号只能对应一个文件。执行器会比对 `schema_migrations` 中记录的文件名：数据库里已执行过的版本号在当前代码中对应另一个文件名时（典型情况是两个分支各自新增了 `0002_*.sql`，又共用一个开发数据库），启动直接失败并给出两个文件名，而不是悄悄跳过。此时给后合入的那个文件换一个新编号；开发数据库可以删掉 `data/postgres` 重建。
-- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
+- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
 
 ## 8. 日志
 

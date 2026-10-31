@@ -78,11 +78,15 @@ func NewService(o Options) *Service {
 	return s
 }
 
-// Start recovers jobs interrupted by a previous shutdown, then starts the
-// job workers and the janitor. They run until ctx ends or Stop is called.
+// Start recovers jobs interrupted by a previous shutdown and brings the
+// image sort keys up to date, then starts the job workers and the janitor.
+// They run until ctx ends or Stop is called.
 func (s *Service) Start(ctx context.Context) error {
 	if err := s.recoverJobs(ctx); err != nil {
 		return fmt.Errorf("recover dataset jobs: %w", err)
+	}
+	if err := s.refreshSortKeys(ctx); err != nil {
+		return fmt.Errorf("update image sort keys: %w", err)
 	}
 	s.base, s.stop = context.WithCancel(ctx)
 	s.runner.start(s.base)

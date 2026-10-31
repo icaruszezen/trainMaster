@@ -268,9 +268,6 @@ func TestIntegrationRegisterAndScan(t *testing.T) {
 	if got := paths(list(ImageQuery{Search: "ok/"})); got != "OK/a.jpg" {
 		t.Errorf("search = %s", got)
 	}
-	if got := paths(list(ImageQuery{Sort: SortObjects, Limit: 1})); got != "OK/a.jpg" {
-		t.Errorf("sort -objects = %s", got)
-	}
 	if items, total, _ := e.svc.ListImages(ctx, d.ID, ImageQuery{Offset: 3, Limit: 2}); total != 4 || len(items) != 1 {
 		t.Errorf("paging: %d items, total %d", len(items), total)
 	}

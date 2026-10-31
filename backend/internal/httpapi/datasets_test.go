@@ -325,10 +325,11 @@ func TestDatasetAPIArchiveImport(t *testing.T) {
 	}
 	wantKeys(t, "image", items[0].(map[string]any), imageKeys...)
 	images := want[List[dataset.Image]](t, e.do("GET", base+"/images", nil), 200).Items
-	if paths := []string{images[0].Path, images[1].Path, images[2].Path}; !slices.Equal(paths, []string{"a.jpg", "c.jpg", "sub/b.png"}) {
+	// Folders first, like Windows Explorer.
+	if paths := []string{images[0].Path, images[1].Path, images[2].Path}; !slices.Equal(paths, []string{"sub/b.png", "a.jpg", "c.jpg"}) {
 		t.Errorf("image order = %v", paths)
 	}
-	a := images[0]
+	a, c := images[1], images[2]
 	if a.Width == nil || *a.Width != 64 || *a.Height != 48 || a.Annotation == nil || a.Annotation.Path != "a.xml" ||
 		a.Annotation.ObjectCount != 2 || len(a.Annotation.Labels) != 2 || a.Annotation.Labels[0].Name != "dent" {
 		t.Errorf("a.jpg = %+v / %+v", a, a.Annotation)
@@ -336,24 +337,23 @@ func TestDatasetAPIArchiveImport(t *testing.T) {
 	if a.AnnotationState != "annotated" || a.AnnotationPath == nil || *a.AnnotationPath != "a.xml" {
 		t.Errorf("a.jpg annotation state = %q, path %v", a.AnnotationState, a.AnnotationPath)
 	}
-	if c := images[1]; c.Width != nil || c.Annotation != nil || c.AnnotationState != "none" || c.AnnotationPath != nil {
+	if c.Width != nil || c.Annotation != nil || c.AnnotationState != "none" || c.AnnotationPath != nil {
 		t.Errorf("c.jpg = %+v", c)
 	}
-	if raw := items[1].(map[string]any); raw["annotation_path"] != nil || raw["annotation_state"] != "none" {
+	if raw := items[2].(map[string]any); raw["annotation_path"] != nil || raw["annotation_state"] != "none" {
 		t.Errorf("c.jpg JSON = %v", raw)
 	}
 	for query, wantPaths := range map[string][]string{
-		"status=annotated":            {"a.jpg"},
-		"status=empty":                {"sub/b.png"},
-		"status=unannotated":          {"c.jpg"},
-		"status=invalid":              {},
-		"label=scratch":               {"a.jpg"},
-		"label=Scratch":               {},
-		"q=SUB":                       {"sub/b.png"},
-		"q=" + url.QueryEscape("%"):   {},
-		"sort=-objects&limit=1":       {"a.jpg"},
-		"limit=2&offset=2":            {"sub/b.png"},
-		"status=all&sort=-mod_time&v": {"a.jpg", "c.jpg", "sub/b.png"},
+		"status=annotated":          {"a.jpg"},
+		"status=empty":              {"sub/b.png"},
+		"status=unannotated":        {"c.jpg"},
+		"status=invalid":            {},
+		"label=scratch":             {"a.jpg"},
+		"label=Scratch":             {},
+		"q=SUB":                     {"sub/b.png"},
+		"q=" + url.QueryEscape("%"): {},
+		"limit=2&offset=2":          {"c.jpg"},
+		"status=all&v":              {"a.jpg", "c.jpg", "sub/b.png"},
 	} {
 		got := want[List[dataset.Image]](t, e.do("GET", base+"/images?"+query, nil), 200)
 		var paths []string
@@ -361,7 +361,7 @@ func TestDatasetAPIArchiveImport(t *testing.T) {
 			paths = append(paths, img.Path)
 		}
 		slices.Sort(paths)
-		if query == "sort=-objects&limit=1" || query == "limit=2&offset=2" {
+		if query == "limit=2&offset=2" {
 			if got.Total != 3 {
 				t.Errorf("%s: total = %d, want 3", query, got.Total)
 			}
@@ -370,7 +370,7 @@ func TestDatasetAPIArchiveImport(t *testing.T) {
 			t.Errorf("%s: images %v, want %v", query, paths, wantPaths)
 		}
 	}
-	for _, query := range []string{"limit=0", "limit=201", "offset=-1", "limit=x", "status=bogus", "sort=mod_time"} {
+	for _, query := range []string{"limit=0", "limit=201", "offset=-1", "limit=x", "status=bogus"} {
 		wantError(t, e.do("GET", base+"/images?"+query, nil), 400, codeBadRequest, "参数")
 	}
 
@@ -382,7 +382,7 @@ func TestDatasetAPIArchiveImport(t *testing.T) {
 		detail.Objects[0].Xmin != 1 || detail.Objects[0].Ymax != 40 {
 		t.Errorf("detail = %+v", detail)
 	}
-	if d := want[map[string]any](t, e.do("GET", fmt.Sprintf("%s/images/%d", base, images[1].ID), nil), 200); d["annotation_error"] != "" {
+	if d := want[map[string]any](t, e.do("GET", fmt.Sprintf("%s/images/%d", base, c.ID), nil), 200); d["annotation_error"] != "" {
 		t.Errorf("c.jpg detail = %v", d)
 	} else if objs, ok := d["objects"].([]any); !ok || len(objs) != 0 {
 		t.Errorf("objects = %#v, want []", d["objects"])
@@ -436,7 +436,7 @@ func TestDatasetAPIArchiveImport(t *testing.T) {
 		}
 	}
 	wantError(t, e.do("GET", imgURL+"/thumbnail?size=xl", nil), 400, codeBadRequest, "size")
-	wantError(t, e.do("GET", fmt.Sprintf("%s/images/%d/thumbnail", base, images[1].ID), nil), 422, codeUnsupportedImage, "")
+	wantError(t, e.do("GET", fmt.Sprintf("%s/images/%d/thumbnail", base, c.ID), nil), 422, codeUnsupportedImage, "")
 
 	// Labels and jobs.
 	labels := want[List[dataset.Label]](t, e.do("GET", base+"/labels", nil), 200)

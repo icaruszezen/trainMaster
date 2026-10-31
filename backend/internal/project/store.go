@@ -120,8 +120,9 @@ func uniqueViolation(err error) error {
 }
 
 // queryCovers returns up to 4 images per project for the card mosaic: the
-// first images (by path) of its first datasets with images (in the order
-// they were added), taken in turns so the mosaic shows several datasets.
+// first images (in image order) of its first datasets with images (in the
+// order they were added), taken in turns so the mosaic shows several
+// datasets.
 func queryCovers(ctx context.Context, q querier, ids []int64) (map[int64][]Cover, error) {
 	rows, err := q.Query(ctx, `SELECT ps.id, c.dataset_id, c.id, c.size_bytes, c.mod_time
 		FROM unnest($1::bigint[]) AS ps (id)
@@ -129,9 +130,9 @@ func queryCovers(ctx context.Context, q querier, ids []int64) (map[int64][]Cover
 			JOIN datasets d ON d.id = pd.dataset_id
 			WHERE pd.project_id = ps.id AND d.image_count > 0
 			ORDER BY pd.created_at, pd.dataset_id LIMIT 4) ds
-		CROSS JOIN LATERAL (SELECT dataset_id, id, size_bytes, mod_time, rel_path FROM dataset_images
-			WHERE dataset_id = ds.dataset_id ORDER BY rel_path LIMIT 4) c
-		ORDER BY ps.id, ds.created_at, ds.dataset_id, c.rel_path`, ids)
+		CROSS JOIN LATERAL (SELECT dataset_id, id, size_bytes, mod_time, sort_key FROM dataset_images
+			WHERE dataset_id = ds.dataset_id ORDER BY `+dataset.ImageOrder+` LIMIT 4) c
+		ORDER BY ps.id, ds.created_at, ds.dataset_id, c.sort_key, c.id`, ids)
 	if err != nil {
 		return nil, err
 	}

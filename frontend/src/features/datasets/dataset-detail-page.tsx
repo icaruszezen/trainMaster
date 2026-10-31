@@ -43,7 +43,6 @@ import {
   datasetQuery,
   type Dataset,
   type ImageFilters,
-  type ImageSort,
   type ImageStatusFilter,
 } from "@/features/datasets/api"
 import {
@@ -135,7 +134,6 @@ const STATUS_VALUES: ImageStatusFilter[] = [
   "unannotated",
   "invalid",
 ]
-const SORT_VALUES: ImageSort[] = ["path", "-mod_time", "-objects"]
 
 /** 标签页与图片筛选条件保存在地址栏中，刷新、分享链接、前进后退都能保留。 */
 function useDetailSearchParams() {
@@ -145,12 +143,10 @@ function useDetailSearchParams() {
   const tab: DetailTab =
     tabParam === "labels" || tabParam === "imports" ? tabParam : "images"
   const status = params.get("status") as ImageStatusFilter | null
-  const sort = params.get("sort") as ImageSort | null
   const filters: ImageFilters = {
     status: status && STATUS_VALUES.includes(status) ? status : "all",
     label: params.get("label") ?? "",
     q: params.get("q") ?? "",
-    sort: sort && SORT_VALUES.includes(sort) ? sort : "path",
   }
 
   const update = (changes: Record<string, string>) => {
