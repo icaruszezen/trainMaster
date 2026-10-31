@@ -74,13 +74,16 @@ func TestImageSortKeyWindowsOrder(t *testing.T) {
 		"a b < a\u00a0b < a\u2009b < a\u200bb < a!b",
 		"a z.jpg < a\u200bz.jpg < ab.jpg",
 		"a~ < a¨ < a‖ < a′ < a¢ < a》 < a【 < a+ < a∈ < a≡ < a⊥ < a⌒ < a■ < a○ < a↑ < a§ < a・ < a♂ < a† < a‰ < a※ < a1",
+		"a↔ < a─ < a│ < a┌ < a├ < a╋ < a╳ < a§",
 		"a《b < a¢z", // the same weight
 		"a≠b < a=z",
+		"a═b < a─z",
 		// Characters without weight.
 		"aa.jpg < a\ufffdb.jpg < b.jpg",
 		"测试\ufffd.jpg < 测试_1.jpg < 测试1.jpg",
 		"a\u200db.jpg < ab1.jpg < abc.jpg",
 		"a\u00adb.jpg < ab1.jpg < abc.jpg",
+		"a\u2066b.jpg < ab1.jpg < abc.jpg",
 	} {
 		wantOrder(t, strings.Split(order, " < ")...)
 	}
@@ -167,14 +170,14 @@ func TestImageSortKeyStable(t *testing.T) {
 	paths := []string{
 		"IMG_0001.JPG", "img_2.jpg", "NG/划痕/0001.png", "OK/正常 (3).jpg", "a-b_c d.bmp", "ｆｕｌｌ１２.jpg", "é́x.tif",
 		"【标注】《说明》、。.png", "2023-01-05 08.30.11.jpg", "12345678901234567890123.jpg", "a\u200bb²①…×→☆.jpg",
-		"Ⅲ类/⑩½㈠ ・‰≠\ufffd.jpg",
+		"Ⅲ类/⑩½㈠ ・‰≠\ufffd.jpg", "表─│┌a\u2066b.jpg",
 	}
 	h := sha256.New()
 	for _, p := range paths {
 		h.Write(ImageSortKey(p))
 		h.Write([]byte{0xFF})
 	}
-	const want = "0a413a44c8be38a282cfda564a5a2bfe1e3586e350793294f91801f7b2bd35a4"
+	const want = "7f99630f3bbb6de9bf6ab03bb81846184281046084762d6ca494afa69a836462"
 	if got := hex.EncodeToString(h.Sum(nil)); got != want {
 		t.Errorf("sort keys changed (hash %s, want %s): increase imageOrderRevision", got, want)
 	}

@@ -119,6 +119,14 @@ var symbolTwins = map[rune]rune{
 	'□': '■', '△': '▲', '◇': '◆', '◎': '○', '●': '○', '⇒': '→',
 }
 
+// windowsBoxDrawing lists the box-drawing characters, which follow the
+// arrows of group 9 in Windows' table. Each string holds characters the
+// table weighs the same.
+var windowsBoxDrawing = [...]string{
+	"─━┄┅┈┉╌╍═╼╾", "╴╸", "╶╺", "│┃┆┇┊┋╎╏║╽╿", "╵╹", "╷╻", "┌┍┎┏╒╓╔╭", "┐┑┒┓╕╖╗╮", "└┕┖┗╘╙╚╰", "┘┙┚┛╛╜╝╯",
+	"├┝┞┟┠┡┢┣╞╟╠", "┤┥┦┧┨┩┪┫╡╢╣", "┬┭┮┯┰┱┲┳╤╥╦", "┴┵┶┷┸┹┺┻╧╨╩", "┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋╪╫╬", "╱", "╲", "╳",
+}
+
 // windowsNumerals lists the number characters other than decimal digits
 // that file names commonly contain (superscripts, fractions, circled and
 // parenthesized numbers, Roman numerals, ...), in the order of Windows'
@@ -172,8 +180,9 @@ var windowsDigitZeros = [...]rune{0x30, 0x660, 0x6f0, 0x966, 0x9e6, 0xa66, 0xae6
 // other than white space are set aside too, before these.
 const windowsSpecials = "'ߴߵ-﹣⁻₋−‐֊‑‧⁃‒–︲—︱﹘―〜〰"
 
-// symbolRanks maps the characters of windowsSymbols to their group and
-// rank, and those of windowsSpecials to their rank (group 0).
+// symbolRanks maps the characters of windowsSymbols, symbolTwins and
+// windowsBoxDrawing to their group and rank, and those of windowsSpecials
+// to their rank (group 0).
 var symbolRanks = func() map[rune][2]byte {
 	m := map[rune][2]byte{}
 	for group, chars := range windowsSymbols {
@@ -181,6 +190,14 @@ var symbolRanks = func() map[rune][2]byte {
 		for _, r := range chars {
 			m[r] = [2]byte{byte(group), rank}
 			rank++
+		}
+		if group == 9 {
+			for _, chars := range windowsBoxDrawing {
+				for _, r := range chars {
+					m[r] = [2]byte{byte(group), rank}
+				}
+				rank++
+			}
 		}
 	}
 	rank := byte(0x40) // after the control characters, ranked by code point
@@ -210,7 +227,7 @@ func symbolGroup(r rune) byte {
 type charKind uint8
 
 const (
-	charIgnored     charKind = iota // format characters (zero-width joiner, BOM, ...)
+	charIgnored     charKind = iota // format characters (zero-width joiner, BOM, bidi controls, ...)
 	charMark                        // combining marks: part of the letters before them
 	charSpecial                     // set aside (windowsSpecials, control characters)
 	charSymbol                      // spaces, punctuation, symbols
@@ -344,10 +361,11 @@ func (k *nameKeyer) appendChars(s string) {
 		case charText:
 			k.run = append(k.run, s[i:i+size]...)
 			k.chars++
-		case charMark, charIgnored:
+		case charMark:
 			if len(k.run) > 0 { // a combining mark changes the letter before it; elsewhere it is ignored
 				k.run = append(k.run, s[i:i+size]...)
 			}
+		case charIgnored: // no weight, as in Windows
 		case charSpecial:
 			// Set aside without ending a run of letters: "co-op" compares like "coop".
 			k.spec = appendSpecial(k.spec, r, k.chars)
