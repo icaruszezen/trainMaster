@@ -217,20 +217,24 @@ func queryDatasetProjects(ctx context.Context, q querier, ids []int64) (map[int6
 
 // ---- imports ----
 
-const importColumns = `id, dataset_id, source, status, on_conflict, file_name, file_size, file_count,
-	received_bytes, received_files, stage, progress_done, progress_total, progress_unit, summary, error,
-	created_at, updated_at, started_at, finished_at`
+const importColumns = `id, dataset_id, source, status, on_conflict, annotation_format, classes, file_name,
+	file_size, file_count, received_bytes, received_files, stage, progress_done, progress_total, progress_unit,
+	summary, error, created_at, updated_at, started_at, finished_at`
 
 func scanImport(row pgx.Row) (Import, error) {
 	var j Import
-	err := row.Scan(&j.ID, &j.DatasetID, &j.Source, &j.Status, &j.OnConflict, &j.FileName, &j.FileSize,
-		&j.FileCount, &j.ReceivedBytes, &j.ReceivedFiles, &j.Stage, &j.Progress.Done, &j.Progress.Total,
-		&j.Progress.Unit, &j.Summary, &j.Error, &j.CreatedAt, &j.UpdatedAt, &j.StartedAt, &j.FinishedAt)
+	err := row.Scan(&j.ID, &j.DatasetID, &j.Source, &j.Status, &j.OnConflict, &j.AnnotationFormat, &j.Classes,
+		&j.FileName, &j.FileSize, &j.FileCount, &j.ReceivedBytes, &j.ReceivedFiles, &j.Stage, &j.Progress.Done,
+		&j.Progress.Total, &j.Progress.Unit, &j.Summary, &j.Error, &j.CreatedAt, &j.UpdatedAt, &j.StartedAt,
+		&j.FinishedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return j, errImportNotFound
 	}
 	if j.Summary == nil {
 		j.Summary = map[string]int64{}
+	}
+	if j.Classes == nil {
+		j.Classes = []string{}
 	}
 	j.CreatedAt, j.UpdatedAt = j.CreatedAt.UTC(), j.UpdatedAt.UTC()
 	j.StartedAt, j.FinishedAt = utcPtr(j.StartedAt), utcPtr(j.FinishedAt)
@@ -282,16 +286,22 @@ type newImport struct {
 	Source     string
 	Status     string
 	OnConflict string
+	Format     string   // "" means FormatVOC
+	Classes    []string // nil means none
 	FileName   string
 	FileSize   int64
 	FileCount  int
 }
 
 func insertImport(ctx context.Context, q querier, n newImport) (Import, error) {
+	format, classes := cmp.Or(n.Format, FormatVOC), n.Classes
+	if classes == nil {
+		classes = []string{}
+	}
 	return scanImport(q.QueryRow(ctx, `INSERT INTO dataset_imports
-		(dataset_id, source, status, on_conflict, file_name, file_size, file_count)
-		VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING `+importColumns,
-		n.DatasetID, n.Source, n.Status, n.OnConflict, n.FileName, n.FileSize, n.FileCount))
+		(dataset_id, source, status, on_conflict, annotation_format, classes, file_name, file_size, file_count)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING `+importColumns,
+		n.DatasetID, n.Source, n.Status, n.OnConflict, format, classes, n.FileName, n.FileSize, n.FileCount))
 }
 
 // ---- images ----

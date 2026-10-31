@@ -68,8 +68,8 @@ export function DatasetLabels({ dataset, onSelectLabel }: DatasetLabelsProps) {
           </EmptyMedia>
           <EmptyTitle className="text-base">还没有标签</EmptyTitle>
           <EmptyDescription>
-            导入带 VOC 标注（与图片同目录、同名的
-            .xml）的图片后，这里会按标签统计目标数量与图片数量。
+            导入带标注（VOC、X-AnyLabeling 或
+            YOLO）的图片后，这里会按标签统计目标数量与图片数量。
           </EmptyDescription>
         </EmptyHeader>
       </Empty>

@@ -38,6 +38,7 @@ import {
   type ImportSource,
 } from "@/features/datasets/api"
 import {
+  importFormatLabel,
   jobDurationSeconds,
   sourceLabels,
   statusLabels,
@@ -50,6 +51,14 @@ const sourceIcons: Record<ImportSource, LucideIcon> = {
   archive: FileArchive,
   folder: Folder,
   scan: ScanSearch,
+}
+
+/** YOLO 导入时使用的类别顺序，悬停在类型上时显示。 */
+function classesTitle(job: DatasetImport) {
+  if (job.annotation_format !== "yolo" || !job.classes?.length) {
+    return undefined
+  }
+  return `类别顺序：${job.classes.map((name, index) => `${index} ${name}`).join("，")}`
 }
 
 function StatusBadge({ job }: { job: DatasetImport }) {
@@ -142,12 +151,24 @@ export function DatasetImports({ dataset }: { dataset: Dataset }) {
               const Icon = sourceIcons[job.source]
               const duration = jobDurationSeconds(job)
               const summary = summaryText(job)
+              const formatLabel = importFormatLabel(job)
               return (
                 <TableRow key={job.id}>
                   <TableCell className="pl-4">
-                    <span className="inline-flex items-center gap-2">
+                    <span
+                      className="inline-flex items-center gap-2"
+                      title={classesTitle(job)}
+                    >
                       <Icon className="size-4 text-muted-foreground" />
-                      {sourceLabels[job.source]}
+                      <span>
+                        {sourceLabels[job.source]}
+                        {formatLabel && (
+                          <span className="text-muted-foreground">
+                            {" · "}
+                            {formatLabel}
+                          </span>
+                        )}
+                      </span>
                     </span>
                   </TableCell>
                   <TableCell

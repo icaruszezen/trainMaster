@@ -122,7 +122,7 @@ var (
 	datasetKeys = []string{"id", "name", "description", "dir_name", "path", "origin", "directory_missing",
 		"image_count", "annotated_count", "empty_count", "invalid_count", "object_count", "label_count", "total_bytes",
 		"covers", "projects", "active_import", "scanned_at", "created_at", "updated_at"}
-	importKeys = []string{"id", "dataset_id", "source", "status", "on_conflict", "file_name", "file_size",
+	importKeys = []string{"id", "dataset_id", "source", "status", "on_conflict", "annotation_format", "classes", "file_name", "file_size",
 		"file_count", "received_bytes", "received_files", "stage", "progress", "summary", "error",
 		"created_at", "updated_at", "started_at", "finished_at"}
 	imageKeys = []string{"id", "dataset_id", "path", "file_name", "size_bytes", "width", "height",
@@ -675,6 +675,87 @@ func TestDatasetAPIRouting(t *testing.T) {
 	if rec := e.do("GET", "/api/v1/datasets", nil); rec.Header().Get("Cache-Control") != "no-store" {
 		t.Errorf("JSON responses must not be cached")
 	}
+}
+
+func TestDatasetAPIAnnotationFormats(t *testing.T) {
+	e := newAPIEnv(t, true)
+	ds := want[dataset.Dataset](t, e.do("POST", "/api/v1/datasets", map[string]string{"name": "yolo"}), 201)
+	base := "/api/v1/datasets/" + strconv.FormatInt(ds.ID, 10)
+
+	// Import a YOLO archive.
+	pngData := testPNG(t, 40, 20)
+	archive := testZip(t, [][2]string{
+		{"images/a.png", string(pngData)}, {"labels/a.txt", "1 0.5 0.5 0.5 0.5\n"}, {"labels/classes.txt", "ok\nng\n"},
+	})
+	req := map[string]any{"source": "archive", "file_name": "a.zip", "file_size": len(archive), "annotation_format": "yolo"}
+	wantError(t, e.do("POST", base+"/imports", req), 422, codeValidationFailed, "YOLO 格式需要提供类别顺序")
+	req["classes"] = []string{"ok", "ok"}
+	wantError(t, e.do("POST", base+"/imports", req), 422, codeValidationFailed, "类别“ok”重复")
+	req["annotation_format"] = "coco"
+	wantError(t, e.do("POST", base+"/imports", req), 422, codeValidationFailed, "标注格式必须是")
+	req["annotation_format"], req["classes"] = "yolo", []string{"ok", "ng"}
+	raw := want[map[string]any](t, e.do("POST", base+"/imports", req), 201)
+	wantKeys(t, "import", raw, importKeys...)
+	if raw["annotation_format"] != "yolo" || fmt.Sprint(raw["classes"]) != "[ok ng]" {
+		t.Errorf("import = %v", raw)
+	}
+	importID := int64(raw["id"].(float64))
+	imp := fmt.Sprintf("%s/imports/%d", base, importID)
+	want[dataset.Import](t, e.do("PUT", imp+"/archive?offset=0", archive), 200)
+	want[dataset.Import](t, e.do("POST", imp+"/commit", nil), 202)
+	job := e.waitImport(t, ds.ID, importID)
+	if job.Status != dataset.StatusSucceeded || job.Summary["annotations_converted"] != 1 || job.Summary["annotations_matched"] != 1 {
+		t.Fatalf("job = %+v", job)
+	}
+	labels := want[List[dataset.Label]](t, e.do("GET", base+"/labels", nil), 200)
+	if len(labels.Items) != 1 || labels.Items[0].Name != "ng" {
+		t.Errorf("labels = %+v", labels)
+	}
+
+	// Download it as X-AnyLabeling.
+	wantError(t, e.do("POST", base+"/exports", map[string]any{"format": "yolo"}), 422, codeValidationFailed, "需要提供类别顺序")
+	wantError(t, e.do("POST", base+"/exports", map[string]any{"format": "coco"}), 422, codeValidationFailed, "导出格式必须是")
+	wantError(t, e.do("POST", "/api/v1/datasets/999/exports", map[string]any{"format": "voc"}), 404, codeNotFound, "数据集不存在")
+	raw = want[map[string]any](t, e.do("POST", base+"/exports", map[string]any{"format": "xanylabeling"}), 201)
+	wantKeys(t, "export", raw, "url", "file_name", "expires_at")
+	url, _ := raw["url"].(string)
+	if !strings.HasPrefix(url, base+"/exports/") || raw["file_name"] != "yolo-xanylabeling.zip" {
+		t.Errorf("export = %v", raw)
+	}
+	rec := e.do("GET", url, nil)
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "application/zip" ||
+		rec.Header().Get("Content-Disposition") != `attachment; filename="yolo-xanylabeling.zip"; filename*=UTF-8''yolo-xanylabeling.zip` ||
+		rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("download: %d %v", rec.Code, rec.Header())
+	}
+	zr, err := zip.NewReader(bytes.NewReader(rec.Body.Bytes()), int64(rec.Body.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, f := range zr.File {
+		names = append(names, f.Name)
+	}
+	if !slices.Equal(names, []string{"yolo/images/a.png", "yolo/images/a.json"}) {
+		t.Errorf("zip entries = %v", names)
+	}
+	// The link can be used again; HEAD sends only the headers.
+	if rec := e.do("HEAD", url, nil); rec.Code != 200 || rec.Body.Len() != 0 || rec.Header().Get("Content-Type") != "application/zip" {
+		t.Errorf("HEAD = %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+	if rec := e.do("GET", url, nil); rec.Code != 200 {
+		t.Errorf("second download = %d", rec.Code)
+	}
+	wantError(t, e.do("GET", base+"/exports/AAAA", nil), 404, codeNotFound, "下载链接已失效")
+	wantError(t, e.do("GET", base+"/exports/not-a-token", nil), 404, codeNotFound, "下载链接已失效")
+	wantError(t, e.do("GET", strings.Replace(url, base, "/api/v1/datasets/999", 1), nil), 404, codeNotFound, "下载链接已失效")
+
+	// A folder that disappeared after the link was made: JSON error, not a broken zip.
+	dir := filepath.Join(e.st.Dir(storage.Datasets), "yolo")
+	if err := os.Rename(dir, dir+"-moved"); err != nil {
+		t.Fatal(err)
+	}
+	wantError(t, e.do("GET", url, nil), 409, codeConflict, "数据集文件夹不存在")
 }
 
 func TestInlineDisposition(t *testing.T) {

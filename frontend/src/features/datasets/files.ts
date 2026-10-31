@@ -1,9 +1,10 @@
 /**
- * 文件识别与 VOC 标注配对，镜像后端 internal/dataset 的规则，用于上传前在
- * 浏览器里给出“将导入多少张图片、匹配多少个标注”的预估。真正的导入结果以
- * 服务端为准（例如多张图片共用一个 xml 时，服务端按 xml 的 `<filename>` 判断，
- * 这里按路径排序取第一张）。
+ * 文件识别与标注配对（VOC / X-AnyLabeling / YOLO），镜像后端 internal/dataset
+ * 的规则，用于上传前在浏览器里给出“将导入多少张图片、匹配多少个标注”的预估。
+ * 真正的导入结果以服务端为准（例如多张图片共用一个 xml / json 时，服务端按
+ * `<filename>` / `imagePath` 判断，这里按路径排序取第一张）。
  */
+import type { AnnotationFormat } from "@/features/datasets/api"
 
 export const IMAGE_EXTENSIONS: ReadonlySet<string> = new Set([
   ".jpg",
@@ -103,9 +104,48 @@ export function isJunkDirectoryName(name: string) {
   return name.startsWith(".") || name === "__MACOSX"
 }
 
+export const ANNOTATION_FORMATS: readonly AnnotationFormat[] = [
+  "voc",
+  "xanylabeling",
+  "yolo",
+]
+
+/** 标注格式的显示名称。 */
+export const annotationFormatLabels: Record<AnnotationFormat, string> = {
+  voc: "Pascal VOC（.xml）",
+  xanylabeling: "X-AnyLabeling（.json）",
+  yolo: "YOLO（.txt）",
+}
+
+/** 简短名称，用于导入记录、统计等空间有限的地方。 */
+export const annotationFormatNames: Record<AnnotationFormat, string> = {
+  voc: "VOC",
+  xanylabeling: "X-AnyLabeling",
+  yolo: "YOLO",
+}
+
+/** 各格式的标注文件扩展名。 */
+export const annotationExtensions: Record<AnnotationFormat, string> = {
+  voc: ".xml",
+  xanylabeling: ".json",
+  yolo: ".txt",
+}
+
+/** YOLO 的类别表 `classes.txt`（不区分大小写），它不是标注文件。 */
+export function isClassesFile(path: string) {
+  return baseName(path).toLowerCase() === "classes.txt"
+}
+
 export type FileKind = "image" | "annotation" | "ignored"
 
-export function classifyPath(path: string): FileKind {
+/**
+ * 按所选标注格式识别文件：图片、该格式的标注候选，其余（包括其它格式的标注
+ * 文件，如选了 YOLO 时的 .xml）都忽略。
+ */
+export function classifyPath(
+  path: string,
+  format: AnnotationFormat = "voc"
+): FileKind {
   if (isJunkPath(path)) {
     return "ignored"
   }
@@ -113,7 +153,10 @@ export function classifyPath(path: string): FileKind {
   if (IMAGE_EXTENSIONS.has(extension)) {
     return "image"
   }
-  return extension === ".xml" ? "annotation" : "ignored"
+  if (extension !== annotationExtensions[format]) {
+    return "ignored"
+  }
+  return format === "yolo" && isClassesFile(path) ? "ignored" : "annotation"
 }
 
 export function isBrowserNativeImage(path: string) {
@@ -122,7 +165,7 @@ export function isBrowserNativeImage(path: string) {
 
 const VOC_IMAGE_DIRS: ReadonlySet<string> = new Set(["jpegimages", "images"])
 
-type XmlDirectory = {
+type AnnotationDirectory = {
   exact: Map<string, string>
   /** 小写文件名 → 路径；同名（忽略大小写）时保留排序靠前的一个。 */
   folded: Map<string, string>
@@ -131,21 +174,43 @@ type XmlDirectory = {
 const byPath = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 
 /**
- * 把图片与 VOC 标注文件配对，返回 图片路径 → xml 路径。按顺序取第一个命中：
- *  1. 同目录、同名的 `.xml`（先精确匹配，再忽略大小写）；
- *  2. Pascal VOC 布局：图片位于 `JPEGImages`（或 `images`）目录时，
- *     找同级 `Annotations` 目录下的同名 `.xml`。
- * 一个 xml 只配给一张图片：按路径排序靠前的图片优先，其余视为未标注。
+ * Ultralytics 布局中图片目录对应的标注目录：把目录中最后一个名为 `images`
+ * （不区分大小写）的段换成 `labels`；没有这样的段时返回 null。
+ */
+function ultralyticsLabelsDir(dir: string): string | null {
+  const segments = dir === "" ? [] : dir.split("/")
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    if (segments[index].toLowerCase() === "images") {
+      segments[index] = "labels"
+      return segments.join("/")
+    }
+  }
+  return null
+}
+
+/**
+ * 把图片与所选格式的标注文件配对，返回 图片路径 → 标注路径。按顺序取第一个命中：
+ *  1. 同目录、同名的标注文件（先精确匹配，再忽略大小写）；
+ *  2. VOC：图片位于 `JPEGImages`（或 `images`）目录时，找同级 `Annotations`
+ *     目录下的同名 `.xml`；
+ *     YOLO：Ultralytics 布局，把图片目录中最后一个 `images` 段换成 `labels`，
+ *     在那里找同名 `.txt`（整条路径不区分大小写）；
+ *     X-AnyLabeling：只有规则 1（服务端还会参考 json 中的 `imagePath`）。
+ * 一个标注文件只配给一张图片：按路径排序靠前的图片优先，其余视为未标注。
  */
 export function pairAnnotations(
   imagePaths: readonly string[],
-  xmlPaths: readonly string[]
+  annotationPaths: readonly string[],
+  format: AnnotationFormat = "voc"
 ): Map<string, string> {
-  const directories = new Map<string, XmlDirectory>()
-  // 父目录 → 其下名为 Annotations（不区分大小写）的目录列表。
+  const extension = annotationExtensions[format]
+  const directories = new Map<string, AnnotationDirectory>()
+  // 父目录 → 其下名为 Annotations（不区分大小写）的目录列表（VOC）。
   const annotationDirs = new Map<string, string[]>()
+  // 小写的完整路径 → 路径（YOLO 的 labels/ 目录）。
+  const foldedPaths = new Map<string, string>()
 
-  for (const path of [...xmlPaths].sort(byPath)) {
+  for (const path of [...annotationPaths].sort(byPath)) {
     const dir = dirName(path)
     let entry = directories.get(dir)
     if (!entry) {
@@ -161,6 +226,9 @@ export function pairAnnotations(
     if (!entry.folded.has(name.toLowerCase())) {
       entry.folded.set(name.toLowerCase(), path)
     }
+    if (!foldedPaths.has(path.toLowerCase())) {
+      foldedPaths.set(path.toLowerCase(), path)
+    }
   }
 
   const lookup = (dir: string, fileName: string) => {
@@ -170,22 +238,35 @@ export function pairAnnotations(
     )
   }
 
-  const pairs = new Map<string, string>()
-  const claimed = new Set<string>()
-  for (const image of [...imagePaths].sort(byPath)) {
+  const candidateOf = (image: string): string | undefined => {
     const dir = dirName(image)
-    const xmlName = `${stemOf(baseName(image))}.xml`
-
-    let match = lookup(dir, xmlName)
-    if (!match && VOC_IMAGE_DIRS.has(baseName(dir).toLowerCase())) {
+    const fileName = `${stemOf(baseName(image))}${extension}`
+    const sameDir = lookup(dir, fileName)
+    if (sameDir) {
+      return sameDir
+    }
+    if (format === "voc" && VOC_IMAGE_DIRS.has(baseName(dir).toLowerCase())) {
       for (const annotationDir of annotationDirs.get(dirName(dir)) ?? []) {
-        match = lookup(annotationDir, xmlName)
+        const match = lookup(annotationDir, fileName)
         if (match) {
-          break
+          return match
         }
       }
     }
+    if (format === "yolo") {
+      const labelsDir = ultralyticsLabelsDir(dir)
+      if (labelsDir !== null) {
+        const path = labelsDir === "" ? fileName : `${labelsDir}/${fileName}`
+        return foldedPaths.get(path.toLowerCase())
+      }
+    }
+    return undefined
+  }
 
+  const pairs = new Map<string, string>()
+  const claimed = new Set<string>()
+  for (const image of [...imagePaths].sort(byPath)) {
+    const match = candidateOf(image)
     if (match && !claimed.has(match)) {
       claimed.add(match)
       pairs.set(image, match)
@@ -200,35 +281,41 @@ export const FOLDER_FILE_MAX_BYTES = 255 * 1024 * 1024
 export type FolderFile = { path: string; size: number }
 
 export type FolderSummary<T extends FolderFile> = {
+  /** 统计所依据的标注格式。 */
+  format: AnnotationFormat
   images: number
-  /** VOC 标注候选（`.xml`）的数量。 */
+  /** 所选格式的标注候选（`.xml` / `.json` / `.txt`）的数量。 */
   annotations: number
   /** 预计能配对上标注的图片数。 */
   matched: number
-  /** 没有配对到图片的 xml 数量（服务端不会导入）。 */
+  /** 没有配对到图片的标注文件数量（服务端不会导入）。 */
   orphaned: number
-  /** 既不是图片也不是 xml 的文件、系统垃圾文件：不上传。 */
+  /**
+   * 既不是图片也不是所选格式标注的文件（含 classes.txt、其它格式的标注）、
+   * 系统垃圾文件：不上传。
+   */
   ignored: number
-  /** 超过单文件上限、无法通过文件夹上传的图片 / xml。 */
+  /** 超过单文件上限、无法通过文件夹上传的图片 / 标注。 */
   oversized: number
-  /** 将上传的文件（图片与 xml），保持原有顺序。 */
+  /** 将上传的文件（图片与标注），保持原有顺序。 */
   uploads: T[]
   uploadBytes: number
 }
 
-/** 统计一次文件夹选择：识别图片与标注、预估配对、挑出要上传的文件。 */
+/** 按所选格式统计一次文件夹选择：识别图片与标注、预估配对、挑出要上传的文件。 */
 export function summarizeFolder<T extends FolderFile>(
-  files: readonly T[]
+  files: readonly T[],
+  format: AnnotationFormat = "voc"
 ): FolderSummary<T> {
   const uploads: T[] = []
   const imagePaths: string[] = []
-  const xmlPaths: string[] = []
+  const annotationPaths: string[] = []
   let ignored = 0
   let oversized = 0
   let uploadBytes = 0
 
   for (const file of files) {
-    const kind = classifyPath(file.path)
+    const kind = classifyPath(file.path, format)
     if (kind === "ignored") {
       ignored += 1
       continue
@@ -242,19 +329,69 @@ export function summarizeFolder<T extends FolderFile>(
     if (kind === "image") {
       imagePaths.push(file.path)
     } else {
-      xmlPaths.push(file.path)
+      annotationPaths.push(file.path)
     }
   }
 
-  const matched = pairAnnotations(imagePaths, xmlPaths).size
+  const matched = pairAnnotations(imagePaths, annotationPaths, format).size
   return {
+    format,
     images: imagePaths.length,
-    annotations: xmlPaths.length,
+    annotations: annotationPaths.length,
     matched,
-    orphaned: xmlPaths.length - matched,
+    orphaned: annotationPaths.length - matched,
     ignored,
     oversized,
     uploads,
     uploadBytes,
   }
+}
+
+/**
+ * 按所选格式一个标注都没配对上、换一种格式却能配对时，建议改用那种格式
+ * （取配对最多的一种）；否则返回 null。
+ */
+export function suggestAnnotationFormat<T extends FolderFile>(
+  files: readonly T[],
+  summary: Pick<FolderSummary<T>, "format" | "images" | "matched">
+): { format: AnnotationFormat; matched: number } | null {
+  if (summary.images === 0 || summary.matched > 0) {
+    return null
+  }
+  let best: { format: AnnotationFormat; matched: number } | null = null
+  for (const format of ANNOTATION_FORMATS) {
+    if (format === summary.format) {
+      continue
+    }
+    const { matched } = summarizeFolder(files, format)
+    if (matched > (best?.matched ?? 0)) {
+      best = { format, matched }
+    }
+  }
+  return best
+}
+
+/**
+ * 文件夹中的类别表 `classes.txt`（不区分大小写）：有多个时取层级最浅的，
+ * 同一层取路径排序靠前的；没有时返回 null。
+ */
+export function findClassesFile<T extends FolderFile>(
+  files: readonly T[]
+): T | null {
+  let best: T | null = null
+  let bestDepth = Infinity
+  for (const file of files) {
+    if (!isClassesFile(file.path) || isJunkPath(file.path)) {
+      continue
+    }
+    const depth = file.path.split("/").length
+    if (
+      depth < bestDepth ||
+      (depth === bestDepth && best !== null && file.path < best.path)
+    ) {
+      best = file
+      bestDepth = depth
+    }
+  }
+  return best
 }

@@ -64,6 +64,7 @@ import {
 import { DatasetCard } from "@/features/datasets/dataset-card"
 import { DatasetTable } from "@/features/datasets/dataset-table"
 import { DatasetsRootHint } from "@/features/datasets/directory-picker"
+import { ExportDialog } from "@/features/datasets/export-dialog"
 import { LoadError } from "@/features/datasets/load-error"
 import { useDatasetsRoot } from "@/features/datasets/use-datasets-root"
 import { projectsQuery, type Project } from "@/features/projects/api"
@@ -152,6 +153,7 @@ export function DatasetsPage() {
   const [editing, setEditing] = useState<Dataset | null>(null)
   const [deleting, setDeleting] = useState<Dataset | null>(null)
   const [assigning, setAssigning] = useState<Dataset | null>(null)
+  const [exporting, setExporting] = useState<Dataset | null>(null)
   const scan = useScanDataset()
 
   const projects = useQuery(projectsQuery())
@@ -189,7 +191,7 @@ export function DatasetsPage() {
     <>
       <PageHeader
         title="数据集"
-        description="上传图片压缩包或文件夹，或把服务器上已有的文件夹添加为数据集；同目录下的 VOC 标注会被自动识别。"
+        description="上传图片压缩包或文件夹（VOC、X-AnyLabeling、YOLO 标注统一转换为 VOC 保存），或把服务器上已有的文件夹添加为数据集。"
         actions={
           <>
             <Button variant="outline" onClick={() => openCreate("directory")}>
@@ -325,6 +327,7 @@ export function DatasetsPage() {
                   key={dataset.id}
                   dataset={dataset}
                   onScan={() => scan.mutate(dataset)}
+                  onDownload={() => setExporting(dataset)}
                   onEdit={() => setEditing(dataset)}
                   onDelete={() => setDeleting(dataset)}
                   onManageProjects={() => setAssigning(dataset)}
@@ -335,6 +338,7 @@ export function DatasetsPage() {
             <DatasetTable
               datasets={items}
               onScan={(dataset) => scan.mutate(dataset)}
+              onDownload={setExporting}
               onEdit={setEditing}
               onDelete={setDeleting}
               onManageProjects={setAssigning}
@@ -360,6 +364,10 @@ export function DatasetsPage() {
       <DatasetProjectsDialog
         dataset={assigning}
         onOpenChange={(open) => !open && setAssigning(null)}
+      />
+      <ExportDialog
+        dataset={exporting}
+        onOpenChange={(open) => !open && setExporting(null)}
       />
     </>
   )
@@ -544,7 +552,8 @@ function DatasetsEmptyState({
             </div>
             <p className="flex-1 text-sm text-muted-foreground">
               上传 zip、tar、7z、rar
-              等压缩包，或直接选择整个文件夹。平台会在数据目录下按数据集名称新建文件夹。
+              等压缩包，或直接选择整个文件夹；X-AnyLabeling 与 YOLO
+              标注会自动转换为 VOC。平台会在数据目录下按数据集名称新建文件夹。
             </p>
             <Button onClick={onUpload} className="self-start">
               <Plus />

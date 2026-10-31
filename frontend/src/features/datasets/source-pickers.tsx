@@ -1,5 +1,11 @@
 /** 选择导入来源：压缩包、文件夹（点击选择或拖放），以及文件夹的预检摘要。 */
-import { useRef, useState, type DragEvent, type ReactNode } from "react"
+import {
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+  type ReactNode,
+} from "react"
 import {
   CircleAlert,
   FileArchive,
@@ -13,9 +19,13 @@ import {
 
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
+import type { AnnotationFormat } from "@/features/datasets/api"
 import {
+  annotationExtensions,
+  annotationFormatNames,
   ARCHIVE_ACCEPT,
   archiveFormatLabel,
+  suggestAnnotationFormat,
   summarizeFolder,
   type FolderSummary,
 } from "@/features/datasets/files"
@@ -197,15 +207,34 @@ function SelectedSource({
   )
 }
 
+/** 压缩包中会导入哪些文件（随所选标注格式变化）。 */
+const archiveNotes: Record<AnnotationFormat, string> = {
+  voc: "上传后在服务器上解压，只导入图片与 VOC 标注（.xml）",
+  xanylabeling:
+    "上传后在服务器上解压，只导入图片与 X-AnyLabeling 标注（.json），标注转换为 VOC（.xml）保存",
+  yolo: "上传后在服务器上解压，只导入图片与 YOLO 标注（.txt），按类别顺序转换为 VOC（.xml）保存",
+}
+
+/** 文件夹中的哪些文件会被识别为标注（随所选标注格式变化）。 */
+const folderHints: Record<AnnotationFormat, string> = {
+  voc: "包含所有子文件夹；与图片同目录、同名的 .xml 会被识别为 VOC 标注",
+  xanylabeling:
+    "包含所有子文件夹；与图片同目录、同名的 .json 会被识别为 X-AnyLabeling 标注",
+  yolo: "包含所有子文件夹；与图片同目录或对应 labels/ 目录下同名的 .txt 会被识别为 YOLO 标注",
+}
+
 type ArchivePickerProps = {
   file: File | null
   onChange: (file: File | null) => void
+  /** 压缩包中标注文件的格式。 */
+  format: AnnotationFormat
   disabled?: boolean
 }
 
 export function ArchivePicker({
   file,
   onChange,
+  format,
   disabled,
 }: ArchivePickerProps) {
   const inputRef = useRef<HTMLInputElement>(null)
@@ -252,8 +281,7 @@ export function ArchivePicker({
       >
         <p className="flex items-start gap-1.5 text-xs text-pretty text-muted-foreground">
           <Info className="mt-px size-3.5 shrink-0" />
-          上传后在服务器上解压，只导入图片与 VOC
-          标注（.xml）；若压缩包内只有一个顶层文件夹，会去掉这一层。
+          {archiveNotes[format]}；若压缩包内只有一个顶层文件夹，会去掉这一层。
         </p>
       </SelectedSource>
     )
@@ -290,29 +318,55 @@ export function ArchivePicker({
   )
 }
 
-/** 选中的文件夹及其预检摘要。 */
+/** 选中的文件夹。预检摘要随所选标注格式变化，见 {@link useFolderSummary}。 */
 export type FolderSelection = {
   /** 文件夹名；拖入多个条目时为 `""`。 */
   name: string
-  /** 选中的全部文件数（含忽略的）。 */
-  fileCount: number
-  summary: FolderSummary<PickedFile>
+  /** 选中的全部文件（含会被忽略的），按路径排序。 */
+  files: PickedFile[]
+}
+
+/** 按所选标注格式统计文件夹：要上传哪些文件、预计配对多少标注。 */
+export function useFolderSummary(
+  selection: FolderSelection | null,
+  format: AnnotationFormat
+) {
+  return useMemo(
+    () => (selection ? summarizeFolder(selection.files, format) : null),
+    [selection, format]
+  )
 }
 
 type FolderPickerProps = {
   selection: FolderSelection | null
+  /** `useFolderSummary(selection, format)` 的结果。 */
+  summary: FolderSummary<PickedFile> | null
   onChange: (selection: FolderSelection | null) => void
+  /** 文件夹中标注文件的格式。 */
+  format: AnnotationFormat
+  /** 传入时，所选格式配对不上而其它格式可以时提示改用。 */
+  onFormatChange?: (format: AnnotationFormat) => void
   disabled?: boolean
 }
 
 export function FolderPicker({
   selection,
+  summary,
   onChange,
+  format,
+  onFormatChange,
   disabled,
 }: FolderPickerProps) {
   const inputRef = useRef<HTMLInputElement | null>(null)
   const [reading, setReading] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const suggestion = useMemo(
+    () =>
+      selection && summary && onFormatChange
+        ? suggestAnnotationFormat(selection.files, summary)
+        : null,
+    [selection, summary, onFormatChange]
+  )
 
   const select = (name: string, files: PickedFile[]) => {
     if (files.length === 0) {
@@ -320,7 +374,7 @@ export function FolderPicker({
       return
     }
     setError(null)
-    onChange({ name, fileCount: files.length, summary: summarizeFolder(files) })
+    onChange({ name, files })
   }
 
   const onDropData = (dataTransfer: DataTransfer) => {
@@ -342,17 +396,35 @@ export function FolderPicker({
       .finally(() => setReading(null))
   }
 
-  if (selection) {
+  if (selection && summary) {
     return (
       <SelectedSource
         icon={Folder}
         title={selection.name || "拖入的文件"}
-        meta={`共 ${formatNumber(selection.fileCount)} 个文件 · 将上传 ${formatBytes(selection.summary.uploadBytes)}`}
+        meta={`共 ${formatNumber(selection.files.length)} 个文件 · 将上传 ${formatBytes(summary.uploadBytes)}`}
         onRemove={() => onChange(null)}
         removeLabel="重新选择文件夹"
         disabled={disabled}
       >
-        <FolderSummaryView summary={selection.summary} />
+        <FolderSummaryView summary={summary} />
+        {suggestion && onFormatChange && (
+          <p className="flex flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
+            <Info className="size-3.5 shrink-0" />按{" "}
+            {annotationFormatNames[summary.format]} 格式没有配对到标注；按{" "}
+            {annotationFormatNames[suggestion.format]} 格式可配对{" "}
+            {formatNumber(suggestion.matched)} 张图片。
+            <Button
+              type="button"
+              variant="link"
+              size="sm"
+              className="h-auto px-0 py-0 text-xs underline"
+              onClick={() => onFormatChange(suggestion.format)}
+              disabled={disabled}
+            >
+              改用 {annotationFormatNames[suggestion.format]}
+            </Button>
+          </p>
+        )}
       </SelectedSource>
     )
   }
@@ -362,7 +434,7 @@ export function FolderPicker({
       <Dropzone
         icon={FolderUp}
         title="拖放文件夹到这里，或点击选择"
-        hint="包含所有子文件夹；与图片同目录、同名的 .xml 会被识别为 VOC 标注"
+        hint={folderHints[format]}
         buttonLabel="选择文件夹"
         onBrowse={() => inputRef.current?.click()}
         onDropData={onDropData}
@@ -431,6 +503,7 @@ export function FolderSummaryView({
 }: {
   summary: FolderSummary<PickedFile>
 }) {
+  const extension = annotationExtensions[summary.format]
   const notes: { tone: "warning" | "info"; text: string }[] = []
   if (summary.oversized > 0) {
     notes.push({
@@ -447,7 +520,7 @@ export function FolderSummaryView({
   if (summary.ignored > 0) {
     notes.push({
       tone: "info",
-      text: `${formatNumber(summary.ignored)} 个其他文件（非图片、非 xml 或系统文件）不会上传`,
+      text: `${formatNumber(summary.ignored)} 个其他文件（非图片、非 ${extension} 标注或系统文件）不会上传`,
     })
   }
 
@@ -455,7 +528,10 @@ export function FolderSummaryView({
     <div className="grid gap-3">
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         <SummaryTile label="图片" value={summary.images} />
-        <SummaryTile label="VOC 标注" value={summary.annotations} />
+        <SummaryTile
+          label={`${annotationFormatNames[summary.format]} 标注`}
+          value={summary.annotations}
+        />
         <SummaryTile
           label="已配对"
           value={summary.matched}

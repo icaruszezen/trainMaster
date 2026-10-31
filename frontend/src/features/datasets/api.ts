@@ -119,9 +119,17 @@ export type DatasetLabel = {
 export type ImportSource = "archive" | "folder" | "scan"
 export type ImportStatus =
   "uploading" | "queued" | "running" | "succeeded" | "failed" | "canceled"
-export type ImportStage = "" | "extracting" | "importing" | "scanning"
+/** `converting`：把 X-AnyLabeling / YOLO 标注转换为 VOC（位于解压之后、导入之前）。 */
+export type ImportStage =
+  "" | "extracting" | "converting" | "importing" | "scanning"
 export type ProgressUnit = "" | "bytes" | "files" | "entries"
 export type ConflictPolicy = "skip" | "overwrite"
+
+/**
+ * 导入 / 导出的标注格式。数据集在服务器上始终以 VOC（图片 + 同名 .xml）保存，
+ * 其它格式只在导入时转换为 VOC、在下载时生成。
+ */
+export type AnnotationFormat = "voc" | "xanylabeling" | "yolo"
 
 export type ImportSummaryKey =
   | "images_added"
@@ -134,6 +142,9 @@ export type ImportSummaryKey =
   | "annotations_matched"
   | "annotations_invalid"
   | "annotations_orphaned"
+  | "annotations_converted"
+  | "annotations_failed"
+  | "objects_skipped"
   | "files_ignored"
   | "entries_unsafe"
   | "names_invalid"
@@ -144,6 +155,10 @@ export type DatasetImport = {
   source: ImportSource
   status: ImportStatus
   on_conflict: ConflictPolicy
+  /** 上传内容中的标注格式；扫描任务为 `voc`。 */
+  annotation_format: AnnotationFormat
+  /** YOLO 的类别顺序（下标即类别编号）；其它格式为 `[]`。 */
+  classes: string[]
   /** 压缩包文件名 / 上传的文件夹名。 */
   file_name: string
   /** 声明的上传总字节数。 */
@@ -442,6 +457,10 @@ export type CreateImportInput = {
   file_size: number
   file_count?: number
   on_conflict?: ConflictPolicy
+  /** 省略时为 `voc`。 */
+  annotation_format?: AnnotationFormat
+  /** `annotation_format` 为 `yolo` 时必填。 */
+  classes?: string[]
 }
 
 export function createImport(datasetId: number, input: CreateImportInput) {
@@ -463,5 +482,29 @@ export function cancelImport(datasetId: number, importId: number) {
   return apiSend<DatasetImport>(
     "POST",
     `${importPath(datasetId, importId)}/cancel`
+  )
+}
+
+export type CreateExportInput = {
+  format: AnnotationFormat
+  /** `format` 为 `yolo` 时必填。 */
+  classes?: string[]
+}
+
+/**
+ * 下载链接：`url` 同源、1 小时内有效，压缩包在下载时流式生成（没有
+ * Content-Length），用浏览器原生下载，不要读进内存。
+ */
+export type DatasetExport = {
+  url: string
+  file_name: string
+  expires_at: string
+}
+
+export function createExport(datasetId: number, input: CreateExportInput) {
+  return apiSend<DatasetExport>(
+    "POST",
+    `${datasetPath(datasetId)}/exports`,
+    input
   )
 }

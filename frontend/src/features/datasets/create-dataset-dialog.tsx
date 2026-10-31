@@ -39,6 +39,10 @@ import {
   DirectoryPicker,
   type DirectoryRowState,
 } from "@/features/datasets/directory-picker"
+import {
+  ImportFormatFields,
+  useImportFormat,
+} from "@/features/datasets/import-format-fields"
 import { watchImport } from "@/features/datasets/import-watch"
 import {
   archiveBaseName,
@@ -50,6 +54,7 @@ import {
 import {
   ArchivePicker,
   FolderPicker,
+  useFolderSummary,
   type FolderSelection,
 } from "@/features/datasets/source-pickers"
 import {
@@ -82,6 +87,7 @@ export function CreateDatasetDialog({
   const nameId = useId()
   const descriptionId = useId()
   const nameInputRef = useRef<HTMLInputElement>(null)
+  const classFieldRef = useRef<HTMLTextAreaElement>(null)
 
   const [tab, setTab] = useState<CreateTab>(initialTab)
   const [archive, setArchive] = useState<File | null>(null)
@@ -103,6 +109,9 @@ export function CreateDatasetDialog({
   const [rowStates, setRowStates] = useState<
     ReadonlyMap<string, DirectoryRowState>
   >(new Map())
+  // 上传内容的标注格式；“已有目录”原地登记文件夹，始终按 VOC 扫描。
+  const annotation = useImportFormat()
+  const folderSummary = useFolderSummary(folder, annotation.format)
 
   const datasets = useQuery(datasetsQuery())
   const directories = useQuery({ ...directoriesQuery(), enabled: open })
@@ -193,9 +202,18 @@ export function CreateDatasetDialog({
     tab === "archive"
       ? archive !== null
       : tab === "folder"
-        ? folder !== null && folder.summary.images > 0
+        ? folderSummary !== null && folderSummary.images > 0
         : selectedDirectories.length > 0
-  const dirty = archive !== null || folder !== null || selectedNames.length > 0
+  const dirty =
+    archive !== null ||
+    folder !== null ||
+    selectedNames.length > 0 ||
+    annotation.dirty
+
+  const selectFolder = (selection: FolderSelection | null) => {
+    setFolder(selection)
+    annotation.prefillFromFolder(selection)
+  }
 
   const setName = (value: string) => {
     setNameDrafts((drafts) => ({ ...drafts, [tab]: value }))
@@ -254,15 +272,17 @@ export function CreateDatasetDialog({
           source: "archive",
           file_name: archive.name,
           file_size: archive.size,
+          ...annotation.importFields,
         })
         startArchiveUpload({ dataset, job, file: archive })
-      } else if (folder) {
-        const { uploads, uploadBytes } = folder.summary
+      } else if (folder && folderSummary) {
+        const { uploads, uploadBytes } = folderSummary
         const job = await createImport(dataset.id, {
           source: "folder",
           file_name: folder.name || trimmed,
           file_size: uploadBytes,
           file_count: uploads.length,
+          ...annotation.importFields,
         })
         startFolderUpload({ dataset, job, files: uploads })
       }
@@ -371,6 +391,10 @@ export function CreateDatasetDialog({
       nameInputRef.current?.focus()
       return
     }
+    if (isUpload && annotation.invalid) {
+      classFieldRef.current?.focus()
+      return
+    }
     if (!showNameFields && directoryProblems.size > 0) {
       return
     }
@@ -423,8 +447,9 @@ export function CreateDatasetDialog({
           <DialogHeader>
             <DialogTitle>新建数据集</DialogTitle>
             <DialogDescription>
-              上传图片压缩包或整个文件夹，也可以把服务器上已有的文件夹直接添加为数据集。与图片同目录、同名的
-              VOC 标注（.xml）会被自动识别。
+              上传图片压缩包或整个文件夹（标注可以是 VOC、X-AnyLabeling 或 YOLO
+              格式，统一转换为 VOC 保存），也可以把服务器上已有的 VOC
+              数据集文件夹直接添加为数据集。
             </DialogDescription>
           </DialogHeader>
 
@@ -455,13 +480,17 @@ export function CreateDatasetDialog({
               <ArchivePicker
                 file={archive}
                 onChange={setArchive}
+                format={annotation.format}
                 disabled={submitting}
               />
             </TabsContent>
             <TabsContent value="folder">
               <FolderPicker
                 selection={folder}
-                onChange={setFolder}
+                summary={folderSummary}
+                onChange={selectFolder}
+                format={annotation.format}
+                onFormatChange={annotation.setFormat}
                 disabled={submitting}
               />
             </TabsContent>
@@ -476,6 +505,15 @@ export function CreateDatasetDialog({
               />
             </TabsContent>
           </Tabs>
+
+          {isUpload && (
+            <ImportFormatFields
+              state={annotation}
+              showErrors={submitted}
+              disabled={submitting}
+              classFieldRef={classFieldRef}
+            />
+          )}
 
           {showNameFields && (
             <FieldGroup className="gap-5">

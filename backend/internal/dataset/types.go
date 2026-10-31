@@ -39,9 +39,19 @@ const (
 	ConflictOverwrite = "overwrite" // replace the image (and its annotation if the import has one)
 )
 
+// Annotation formats of an upload or a download. Datasets always store
+// Pascal VOC; the other formats are converted when importing and generated
+// when exporting (convert.go, export.go).
+const (
+	FormatVOC          = "voc"          // <stem>.xml next to the image
+	FormatXAnyLabeling = "xanylabeling" // X-AnyLabeling / LabelMe <stem>.json
+	FormatYOLO         = "yolo"         // <stem>.txt with class ids; needs the class names in order
+)
+
 // Processing stages and progress units of a running job.
 const (
 	stageExtracting = "extracting"
+	stageConverting = "converting"
 	stageImporting  = "importing"
 	stageScanning   = "scanning"
 
@@ -139,24 +149,26 @@ type Label struct {
 
 // Import is an import or scan job.
 type Import struct {
-	ID            int64            `json:"id"`
-	DatasetID     int64            `json:"dataset_id"`
-	Source        string           `json:"source"`
-	Status        string           `json:"status"`
-	OnConflict    string           `json:"on_conflict"`
-	FileName      string           `json:"file_name"`
-	FileSize      int64            `json:"file_size"`
-	FileCount     int              `json:"file_count"`
-	ReceivedBytes int64            `json:"received_bytes"`
-	ReceivedFiles int              `json:"received_files"`
-	Stage         string           `json:"stage"`
-	Progress      Progress         `json:"progress"`
-	Summary       map[string]int64 `json:"summary"`
-	Error         string           `json:"error"`
-	CreatedAt     time.Time        `json:"created_at"`
-	UpdatedAt     time.Time        `json:"updated_at"`
-	StartedAt     *time.Time       `json:"started_at"`
-	FinishedAt    *time.Time       `json:"finished_at"`
+	ID               int64            `json:"id"`
+	DatasetID        int64            `json:"dataset_id"`
+	Source           string           `json:"source"`
+	Status           string           `json:"status"`
+	OnConflict       string           `json:"on_conflict"`
+	AnnotationFormat string           `json:"annotation_format"` // of the uploaded annotations (Format*); scans: voc
+	Classes          []string         `json:"classes"`           // YOLO class names by id, [] otherwise
+	FileName         string           `json:"file_name"`
+	FileSize         int64            `json:"file_size"`
+	FileCount        int              `json:"file_count"`
+	ReceivedBytes    int64            `json:"received_bytes"`
+	ReceivedFiles    int              `json:"received_files"`
+	Stage            string           `json:"stage"`
+	Progress         Progress         `json:"progress"`
+	Summary          map[string]int64 `json:"summary"`
+	Error            string           `json:"error"`
+	CreatedAt        time.Time        `json:"created_at"`
+	UpdatedAt        time.Time        `json:"updated_at"`
+	StartedAt        *time.Time       `json:"started_at"`
+	FinishedAt       *time.Time       `json:"finished_at"`
 }
 
 // Progress of the current stage of a running job.
@@ -194,6 +206,11 @@ const (
 	sumFilesIgnored       = "files_ignored"
 	sumEntriesUnsafe      = "entries_unsafe"
 	sumNamesInvalid       = "names_invalid" // files and folders skipped: name not valid UTF-8
+
+	// Conversion of X-AnyLabeling / YOLO uploads to VOC.
+	sumAnnotationsConverted = "annotations_converted" // source files written as VOC
+	sumAnnotationsFailed    = "annotations_failed"    // paired source files that could not be converted
+	sumObjectsSkipped       = "objects_skipped"       // shapes that are not a box (points, lines, ...)
 )
 
 // fileVersion identifies the content of a file by its modification time

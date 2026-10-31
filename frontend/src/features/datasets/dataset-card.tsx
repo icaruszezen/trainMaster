@@ -112,11 +112,13 @@ type DatasetCardProps = {
   onEdit: () => void
   onDelete: () => void
   onManageProjects: () => void
+  onDownload: () => void
 }
 
 export function DatasetCard({
   dataset,
   onScan,
+  onDownload,
   onEdit,
   onDelete,
   onManageProjects,
@@ -135,6 +137,7 @@ export function DatasetCard({
       <DatasetActionsMenu
         dataset={dataset}
         onScan={onScan}
+        onDownload={onDownload}
         onEdit={onEdit}
         onDelete={onDelete}
         onManageProjects={onManageProjects}

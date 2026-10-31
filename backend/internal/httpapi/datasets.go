@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -40,6 +41,8 @@ func (s *server) datasetRoutes(r chi.Router) {
 		r.Post("/imports/{importID}/files", s.uploadImportFiles)
 		r.Post("/imports/{importID}/commit", s.commitDatasetImport)
 		r.Post("/imports/{importID}/cancel", s.cancelDatasetImport)
+		r.Post("/exports", s.createDatasetExport)
+		r.Get("/exports/{token}", s.downloadDatasetExport)
 		if s.projects != nil {
 			r.Put("/projects", s.setDatasetProjects)
 		}
@@ -391,7 +394,12 @@ func serveImageFile(w http.ResponseWriter, r *http.Request, f *dataset.ImageFile
 // inlineDisposition builds a Content-Disposition header that keeps
 // non-ASCII file names (RFC 6266 / RFC 5987), with an ASCII fallback for
 // old clients.
-func inlineDisposition(name string) string {
+func inlineDisposition(name string) string { return contentDisposition("inline", name) }
+
+// attachmentDisposition is inlineDisposition for a file to save.
+func attachmentDisposition(name string) string { return contentDisposition("attachment", name) }
+
+func contentDisposition(kind, name string) string {
 	var fallback, encoded strings.Builder
 	for _, r := range name {
 		if r < 0x80 && r >= 0x20 && r != '"' && r != '\\' && r != 0x7f {
@@ -407,7 +415,7 @@ func inlineDisposition(name string) string {
 			fmt.Fprintf(&encoded, "%%%02X", b)
 		}
 	}
-	return `inline; filename="` + fallback.String() + `"; filename*=UTF-8''` + encoded.String()
+	return kind + `; filename="` + fallback.String() + `"; filename*=UTF-8''` + encoded.String()
 }
 
 // isAttrChar reports whether b may appear unescaped in an RFC 5987 value.
@@ -465,11 +473,13 @@ func (s *server) listDatasetImports(w http.ResponseWriter, r *http.Request) {
 }
 
 type createImportRequest struct {
-	Source     string `json:"source"`
-	FileName   string `json:"file_name"`
-	FileSize   int64  `json:"file_size"`
-	FileCount  int    `json:"file_count"`
-	OnConflict string `json:"on_conflict"`
+	Source           string   `json:"source"`
+	FileName         string   `json:"file_name"`
+	FileSize         int64    `json:"file_size"`
+	FileCount        int      `json:"file_count"`
+	OnConflict       string   `json:"on_conflict"`
+	AnnotationFormat string   `json:"annotation_format"`
+	Classes          []string `json:"classes"`
 }
 
 func (s *server) createDatasetImport(w http.ResponseWriter, r *http.Request) {
@@ -483,6 +493,7 @@ func (s *server) createDatasetImport(w http.ResponseWriter, r *http.Request) {
 	}
 	job, err := s.datasets.CreateImport(r.Context(), id, dataset.CreateImportInput{
 		Source: req.Source, FileName: req.FileName, FileSize: req.FileSize, FileCount: req.FileCount, OnConflict: req.OnConflict,
+		AnnotationFormat: req.AnnotationFormat, Classes: req.Classes,
 	})
 	if err != nil {
 		s.datasetError(w, r, err)
@@ -654,4 +665,73 @@ func (s *server) cancelDatasetImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// ---- downloads ----
+
+type createExportRequest struct {
+	Format  string   `json:"format"`
+	Classes []string `json:"classes"`
+}
+
+type exportResponse struct {
+	URL       string    `json:"url"`
+	FileName  string    `json:"file_name"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func (s *server) createDatasetExport(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := datasetIDs(w, r, "")
+	if !ok {
+		return
+	}
+	var req createExportRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	t, err := s.datasets.CreateExport(r.Context(), id, dataset.ExportInput{Format: req.Format, Classes: req.Classes})
+	if err != nil {
+		s.datasetError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, exportResponse{
+		URL:      fmt.Sprintf("/api/v1/datasets/%d/exports/%s", id, t.Token),
+		FileName: t.FileName, ExpiresAt: t.ExpiresAt,
+	})
+}
+
+// downloadDatasetExport streams a prepared download. The archive is
+// generated on the fly, so there is no Content-Length; when it fails
+// midway the connection is aborted, so that the browser reports the
+// download as failed instead of saving a truncated zip.
+func (s *server) downloadDatasetExport(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := datasetIDs(w, r, "")
+	if !ok {
+		return
+	}
+	token := chi.URLParam(r, "token")
+	if token == "" || len(token) > 64 || strings.Trim(token, "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567") != "" {
+		notFoundMessage(w, "下载链接已失效，请重新下载")
+		return
+	}
+	e, err := s.datasets.OpenExport(r.Context(), id, token)
+	if err != nil {
+		s.datasetError(w, r, err)
+		return
+	}
+	defer e.Close()
+	h := w.Header()
+	h.Set("Content-Type", "application/zip")
+	h.Set("Content-Disposition", attachmentDisposition(e.FileName))
+	h.Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	if err := e.Write(r.Context(), w); err != nil {
+		if r.Context().Err() == nil {
+			s.log.Error("dataset download failed", "dataset_id", id, "request_id", RequestID(r.Context()), "err", err)
+		}
+		panic(http.ErrAbortHandler)
+	}
 }

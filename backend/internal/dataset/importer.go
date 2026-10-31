@@ -59,6 +59,10 @@ type importSummary struct {
 	Unsafe                   int
 	NamesInvalid             int // found while indexing the dataset folder afterwards
 	archive                  bool
+	// Conversion of X-AnyLabeling / YOLO annotations (convert.go).
+	converted                bool
+	Converted, ConvertFailed int
+	ObjectsSkipped           int
 }
 
 func (r *importSummary) summary() map[string]int64 {
@@ -76,13 +80,18 @@ func (r *importSummary) summary() map[string]int64 {
 		m[sumFilesIgnored] = int64(r.Ignored)
 		m[sumEntriesUnsafe] = int64(r.Unsafe)
 	}
+	if r.converted {
+		m[sumAnnotationsConverted] = int64(r.Converted)
+		m[sumAnnotationsFailed] = int64(r.ConvertFailed)
+		m[sumObjectsSkipped] = int64(r.ObjectsSkipped)
+	}
 	return m
 }
 
 // runImport extracts (archives) and moves the staged files into the
 // dataset folder, then indexes the folder (spec §5.1 / §5.2).
 func (s *Service) runImport(ctx context.Context, d Dataset, job Import, p *progressTracker) (map[string]int64, error) {
-	sum := &importSummary{archive: job.Source == SourceArchive}
+	sum := &importSummary{archive: job.Source == SourceArchive, converted: job.AnnotationFormat != FormatVOC}
 	// Fail early, before extracting a large archive for nothing.
 	root, err := s.openDatasetRoot(d)
 	if err != nil {
@@ -96,6 +105,11 @@ func (s *Service) runImport(ctx context.Context, d Dataset, job Import, p *progr
 			return sum.summary(), err
 		}
 		staged = singleTopDir(staged)
+	}
+	if job.AnnotationFormat != FormatVOC {
+		if err := s.convertStaged(ctx, staged, job, sum, p); err != nil {
+			return sum.summary(), err
+		}
 	}
 
 	moved, err := s.moveStaged(ctx, root, staged, job.OnConflict, sum, p)
@@ -132,8 +146,8 @@ func diskFull(err error) error {
 const freeSpaceRecheck = 64 << 20
 
 // extract unpacks the uploaded archive into dir, keeping only images and
-// XML files with safe names (spec §5.1 step 5). The archive is deleted
-// afterwards.
+// annotation files of the job's format with safe names (spec §5.1 step 5).
+// The archive is deleted afterwards.
 func (s *Service) extract(ctx context.Context, job Import, dir string, sum *importSummary, p *progressTracker) error {
 	archivePath := filepath.Join(s.stagingDir(job.ID), uploadFileName)
 	f, err := os.Open(archivePath)
@@ -164,7 +178,7 @@ func (s *Service) extract(ctx context.Context, job Import, dir string, sum *impo
 			sum.Unsafe++
 			return nil
 		}
-		if classify(rel) == kindIgnored {
+		if classifyFor(rel, job.AnnotationFormat) == kindIgnored {
 			sum.Ignored++
 			return nil
 		}
@@ -291,7 +305,7 @@ func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConfli
 	cache := newAnnotationCache(src)
 	images := set.imagePaths()
 	pairs := pairAnnotations(images, set.xmlPaths(), cache.filename)
-	sum.Orphaned = len(set.XMLs) - len(pairs)
+	sum.Orphaned += len(set.XMLs) - len(pairs)
 	sum.Ignored += set.Ignored
 
 	p.setStage(ctx, stageImporting, unitFiles, int64(len(images)))

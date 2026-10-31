@@ -6,6 +6,7 @@ import {
   Clock,
   Copy,
   DatabaseZap,
+  Download,
   FolderKanban,
   FolderX,
   ImagePlus,
@@ -58,6 +59,10 @@ import {
 } from "@/features/datasets/dataset-images"
 import { DatasetImports } from "@/features/datasets/dataset-imports"
 import { DatasetLabels } from "@/features/datasets/dataset-labels"
+import {
+  canExportDataset,
+  ExportDialog,
+} from "@/features/datasets/export-dialog"
 import { ImportDialog } from "@/features/datasets/import-dialog"
 import { ImportProgressCard } from "@/features/datasets/import-progress-card"
 import { LoadError } from "@/features/datasets/load-error"
@@ -192,6 +197,7 @@ function DatasetDetail({ id }: { id: number }) {
   const [editing, setEditing] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [assigning, setAssigning] = useState(false)
+  const [exporting, setExporting] = useState(false)
 
   usePageTitle(query.data?.name)
 
@@ -236,6 +242,14 @@ function DatasetDetail({ id }: { id: number }) {
               >
                 <RefreshCw className={scan.isPending ? "animate-spin" : ""} />
                 重新扫描
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => setExporting(true)}
+                disabled={!canExportDataset(dataset)}
+              >
+                <Download />
+                下载
               </Button>
               <Button onClick={openImport} disabled={dataset.directory_missing}>
                 <ImagePlus />
@@ -331,6 +345,10 @@ function DatasetDetail({ id }: { id: number }) {
       <DatasetProjectsDialog
         dataset={assigning ? dataset : null}
         onOpenChange={setAssigning}
+      />
+      <ExportDialog
+        dataset={exporting ? dataset : null}
+        onOpenChange={setExporting}
       />
     </>
   )

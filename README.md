@@ -4,7 +4,7 @@
 
 它是桌面工具 [ez_training](https://github.com/icaruszezen/ez_training)（PyQt 版，覆盖数据集、预标注、标注、数据准备、训练、验证等）的团队 Web 版。
 
-> **当前进度：** 平台框架（Go + React 工程骨架、shadcn/ui 界面框架、Docker 部署与数据持久化）已完成；**数据集管理**已上线：压缩包 / 文件夹导入、VOC 标注自动识别、服务器上已有文件夹直接添加为数据集、缩略图浏览与标注预览；**项目管理**已上线：按检测任务把数据集组织成项目（一个数据集可以属于多个项目），项目页汇总其中的数据、标注与模型情况。其余模块已有占位页，将在后续迭代中逐个实现。
+> **当前进度：** 平台框架（Go + React 工程骨架、shadcn/ui 界面框架、Docker 部署与数据持久化）已完成；**数据集管理**已上线：压缩包 / 文件夹导入（VOC、X-AnyLabeling、YOLO 标注，统一转换为 VOC 保存）、服务器上已有文件夹直接添加为数据集、缩略图浏览与标注预览、按 VOC / X-AnyLabeling / YOLO 格式下载；**项目管理**已上线：按检测任务把数据集组织成项目（一个数据集可以属于多个项目），项目页汇总其中的数据、标注与模型情况。其余模块已有占位页，将在后续迭代中逐个实现。
 
 ## 功能模块
 
@@ -12,7 +12,7 @@
 |---|---|---|---|---|
 | 概览 | 工作台（系统状态、平台流程入口） | `/` | `GET /api/v1/system/info` | 已完成 |
 | 项目管理 | 项目：新建 / 编辑 / 删除、纳入数据集、项目详情（数据集、标签分布、模型占位） | `/projects` | `/api/v1/projects` | 已完成 |
-| 数据管理 | 数据集：压缩包 / 文件夹导入、VOC 标注识别、添加已有目录、缩略图浏览与标注预览 | `/datasets` | `/api/v1/datasets` | 已完成 |
+| 数据管理 | 数据集：压缩包 / 文件夹导入（VOC / X-AnyLabeling / YOLO 标注）、添加已有目录、缩略图浏览与标注预览、按格式下载 | `/datasets` | `/api/v1/datasets` | 已完成 |
 | 数据管理 | 数据版本：划分、快照、导出 YOLO/VOC/COCO、增强 | `/datasets/versions` | `/api/v1/datasets` | 规划中 |
 | 标注 | 标注任务：分配、进度、审核返修、抽检 | `/annotation/tasks` | `/api/v1/annotation/tasks` | 规划中 |
 | 标注 | 标注工作台：矩形框/多边形/关键点、快捷键、撤销 | `/annotation/workspace` | `/api/v1/annotation/tasks` | 规划中 |
@@ -41,6 +41,8 @@
 
 - 新建数据集时自动在 `datasets/` 下创建与数据集**同名的文件夹**。
 - **VOC 标注自动识别**：与图片同目录、同名的 `.xml`（如 `NG/0001.jpg` ↔ `NG/0001.xml`），以及标准 VOC 结构 `JPEGImages/` ↔ `Annotations/`。页面上可以按已标注 / 空标注 / 标注无效 / 未标注、按标签筛选，查看图片时叠加显示标注框。
+- **上传时选择标注格式**：Pascal VOC（`.xml`）、[X-AnyLabeling](https://github.com/CVHub520/X-AnyLabeling)（`.json`，兼容 LabelMe）或 YOLO（`.txt`，同目录同名或 Ultralytics 的 `images/` ↔ `labels/` 结构）。X-AnyLabeling 与 YOLO 标注在导入时**自动转换为 VOC** 保存（多边形、旋转框等取外接矩形）；选择 YOLO 时需同时提供类别顺序（每行一个类别，可直接输入或读取 `classes.txt`，上传文件夹时自动读取其中的 `classes.txt`）。
+- **下载数据集**：在数据集详情页或卡片菜单中选择 VOC、X-AnyLabeling 或 YOLO 格式（YOLO 同样需要类别顺序，默认按数据集标签名称排列），服务器边打包边下载 zip，YOLO 包含 `images/`、`labels/`、`classes.txt` 与 `data.yaml`。
 - 导入到已有数据集时，同名文件可选择跳过或覆盖；在服务器上直接增删文件后，点“重新扫描”即可同步。
 
 识别规则、导入流程和接口详见 [架构说明 · 数据集与导入](docs/architecture.md#6-数据集与导入)。

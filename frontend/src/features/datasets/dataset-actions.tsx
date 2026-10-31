@@ -1,6 +1,13 @@
 import { useId, useState, type FormEvent } from "react"
 import { useMutation } from "@tanstack/react-query"
-import { Ellipsis, FolderKanban, Pencil, RefreshCw, Trash2 } from "lucide-react"
+import {
+  Download,
+  Ellipsis,
+  FolderKanban,
+  Pencil,
+  RefreshCw,
+  Trash2,
+} from "lucide-react"
 import { toast } from "sonner"
 
 import {
@@ -46,6 +53,7 @@ import {
   updateDataset,
   type Dataset,
 } from "@/features/datasets/api"
+import { canExportDataset } from "@/features/datasets/export-dialog"
 import {
   refreshStartedImport,
   watchImport,
@@ -91,6 +99,8 @@ type DatasetActionsMenuProps = {
   onManageProjects: () => void
   /** 不传时菜单中不显示“重新扫描”（详情页把它放在了工具栏上）。 */
   onScan?: () => void
+  /** 打开“下载数据集”对话框；不传时不显示（详情页把它放在了工具栏上）。 */
+  onDownload?: () => void
   className?: string
 }
 
@@ -100,6 +110,7 @@ export function DatasetActionsMenu({
   onDelete,
   onManageProjects,
   onScan,
+  onDownload,
   className,
 }: DatasetActionsMenuProps) {
   return (
@@ -123,6 +134,15 @@ export function DatasetActionsMenu({
           >
             <RefreshCw />
             重新扫描
+          </DropdownMenuItem>
+        )}
+        {onDownload && (
+          <DropdownMenuItem
+            onSelect={onDownload}
+            disabled={!canExportDataset(dataset)}
+          >
+            <Download />
+            下载数据集
           </DropdownMenuItem>
         )}
         <DropdownMenuItem onSelect={onEdit}>
