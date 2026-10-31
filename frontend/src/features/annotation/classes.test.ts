@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import {
   addClass,
+  appendClass,
   classColor,
   classNameError,
   colorResolver,
@@ -129,5 +130,25 @@ describe("filterClasses", () => {
     ])
     expect(filterClasses(items, "")).toEqual(items)
     expect(filterClasses(items, "x")).toEqual([])
+  })
+})
+
+describe("appendClass", () => {
+  it("adds a class at the end, keeping the other fields", () => {
+    const list = { items: classes, total: classes.length, version: "v1" }
+    const next = appendClass(list, "crack")
+    expect(next.items.map((cls) => cls.name)).toEqual([
+      ...classes.map((cls) => cls.name),
+      "crack",
+    ])
+    expect(next.items.at(-1)).toEqual({ name: "crack", color: "" })
+    expect(next.total).toBe(classes.length + 1)
+    expect(next.version).toBe("v1")
+    expect(list.items).toBe(classes) // not changed in place
+  })
+
+  it("returns the same list when the class exists", () => {
+    const list = { items: classes, total: classes.length, version: "v1" }
+    expect(appendClass(list, "dent")).toBe(list)
   })
 })

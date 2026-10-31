@@ -142,6 +142,12 @@ export type ImageNeighbors = {
 /** 数据集的类别列表（标注时可选的类别）。`color` 为 `#rrggbb`，`""` 表示按名称自动配色。 */
 export type DatasetClass = { name: string; color: string }
 
+/**
+ * 类别列表接口的响应。`version` 标识列表的内容（不透明的字符串，空列表也有），
+ * 整体替换时作为 `base_version` 带上，列表已被别人修改时返回 409 `conflict`。
+ */
+export type DatasetClassList = ListResponse<DatasetClass> & { version: string }
+
 export type DatasetLabel = {
   name: string
   object_count: number
@@ -443,9 +449,7 @@ export function classesQuery(id: number) {
   return queryOptions({
     queryKey: datasetKeys.classes(id),
     queryFn: ({ signal }) =>
-      apiGet<ListResponse<DatasetClass>>(`${datasetPath(id)}/classes`, {
-        signal,
-      }),
+      apiGet<DatasetClassList>(`${datasetPath(id)}/classes`, { signal }),
   })
 }
 
@@ -597,13 +601,31 @@ export function createExport(datasetId: number, input: CreateExportInput) {
   )
 }
 
-/** 设置数据集的类别列表（整体替换），返回保存后的列表。 */
-export function setDatasetClasses(id: number, classes: DatasetClass[]) {
-  return apiSend<ListResponse<DatasetClass>>(
-    "PUT",
-    `${datasetPath(id)}/classes`,
-    { classes }
-  )
+/**
+ * 设置数据集的类别列表（整体替换），返回保存后的列表。`baseVersion` 是编辑
+ * 开始时列表的 `version`：列表在此之后被修改过时返回 409 `conflict`，不做任何
+ * 改动。
+ */
+export function setDatasetClasses(
+  id: number,
+  classes: DatasetClass[],
+  baseVersion: string
+) {
+  return apiSend<DatasetClassList>("PUT", `${datasetPath(id)}/classes`, {
+    classes,
+    base_version: baseVersion,
+  })
+}
+
+/**
+ * 在类别列表末尾加入一个类别（已有同名类别时列表不变），返回加入后的列表。
+ * 只追加，不会覆盖别人同时做的修改。
+ */
+export function addDatasetClass(id: number, name: string, color = "") {
+  return apiSend<DatasetClassList>("POST", `${datasetPath(id)}/classes`, {
+    name,
+    color,
+  })
 }
 
 export type SaveAnnotationInput = {
@@ -632,12 +654,16 @@ export function saveAnnotation(
   )
 }
 
-/** 删除图片的标注文件（图片变为“未标注”），返回删除后的图片详情。 */
+/**
+ * 删除图片的标注文件（图片变为“未标注”），返回删除后的图片详情。`init` 用于
+ * 关闭页面时的 `keepalive` 请求。
+ */
 export function deleteAnnotation(
   datasetId: number,
   imageId: number,
   baseVersion: string,
-  force = false
+  force = false,
+  init?: RequestInit
 ) {
   // base_version 为空（没有文件）也要带上：它表示“我看到的是没有文件”。
   const search = new URLSearchParams({ base_version: baseVersion })
@@ -646,6 +672,8 @@ export function deleteAnnotation(
   }
   return apiSend<DatasetImageDetail>(
     "DELETE",
-    `${datasetPath(datasetId)}/images/${imageId}/annotation?${search}`
+    `${datasetPath(datasetId)}/images/${imageId}/annotation?${search}`,
+    undefined,
+    init
   )
 }

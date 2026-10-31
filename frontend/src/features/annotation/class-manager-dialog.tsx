@@ -34,17 +34,21 @@ import {
 } from "@/features/annotation/classes"
 import { classHotkey } from "@/features/annotation/shortcuts"
 import {
+  classesQuery,
   datasetKeys,
   labelsQuery,
   lastYoloImportQuery,
   setDatasetClasses,
   type DatasetClass,
+  type DatasetClassList,
 } from "@/features/datasets/api"
+import { ApiError } from "@/lib/api"
 import { formatNumber } from "@/lib/format"
 
 type ClassManagerDialogProps = {
   datasetId: number
-  classes: DatasetClass[]
+  /** 已读取的类别列表；还没有读取到时不能打开（不能把它当作空列表保存）。 */
+  classes: DatasetClassList | undefined
   open: boolean
   onOpenChange: (open: boolean) => void
 }
@@ -57,9 +61,9 @@ export function ClassManagerDialog({
   onOpenChange,
 }: ClassManagerDialogProps) {
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open && classes !== undefined} onOpenChange={onOpenChange}>
       <DialogContent className="flex max-h-[min(90dvh,760px)] flex-col gap-4 sm:max-w-lg">
-        {open && (
+        {open && classes && (
           <ClassManagerForm
             datasetId={datasetId}
             initial={classes}
@@ -70,6 +74,18 @@ export function ClassManagerDialog({
     </Dialog>
   )
 }
+
+/** 保存时类别列表已被别人修改（`base_version` 不是最新的）。 */
+function isListConflict(error: unknown) {
+  return (
+    error instanceof ApiError &&
+    error.status === 409 &&
+    error.code === "conflict"
+  )
+}
+
+const toRows = (classes: readonly DatasetClass[]): Row[] =>
+  classes.map((cls, index) => ({ ...cls, original: cls.name, key: index }))
 
 type Row = DatasetClass & {
   /** 打开对话框时的名称（新增的为 null），用于提示改名。 */
@@ -83,27 +99,40 @@ function ClassManagerForm({
   onDone,
 }: {
   datasetId: number
-  initial: DatasetClass[]
+  initial: DatasetClassList
   onDone: () => void
 }) {
   const queryClient = useQueryClient()
   const labels = useQuery(labelsQuery(datasetId))
   // 由 YOLO 导入的数据集：按导入时的类别顺序加入，导出时类别编号不变。
   const lastYolo = useQuery(lastYoloImportQuery(datasetId))
-  const [rows, setRows] = useState<Row[]>(() =>
-    initial.map((cls, index) => ({ ...cls, original: cls.name, key: index }))
-  )
-  const [nextKey, setNextKey] = useState(initial.length)
+  // 打开对话框（或载入最新列表）时的列表：保存时带上它的版本，期间列表被
+  // 别人修改过时服务端拒绝保存，不会悄悄覆盖。
+  const [base, setBase] = useState(initial)
+  const [rows, setRows] = useState<Row[]>(() => toRows(initial.items))
+  const [nextKey, setNextKey] = useState(initial.items.length)
   const [newName, setNewName] = useState("")
   const [addError, setAddError] = useState<string | null>(null)
 
   const save = useMutation({
     mutationFn: (classes: DatasetClass[]) =>
-      setDatasetClasses(datasetId, classes),
+      setDatasetClasses(datasetId, classes, base.version),
     onSuccess: (list) => {
       queryClient.setQueryData(datasetKeys.classes(datasetId), list)
       toast.success("类别列表已保存")
       onDone()
+    },
+  })
+  const conflict = isListConflict(save.error)
+
+  const reloadLatest = useMutation({
+    mutationFn: () =>
+      queryClient.fetchQuery({ ...classesQuery(datasetId), staleTime: 0 }),
+    onSuccess: (list) => {
+      setBase(list)
+      setRows(toRows(list.items))
+      setNextKey(list.items.length)
+      save.reset()
     },
   })
 
@@ -120,7 +149,7 @@ function ClassManagerForm({
   const counts = new Map(
     (labels.data?.items ?? []).map((label) => [label.name, label.object_count])
   )
-  const removedInUse = initial.filter(
+  const removedInUse = base.items.filter(
     (cls) =>
       !rows.some((row) => row.original === cls.name) &&
       (counts.get(cls.name) ?? 0) > 0
@@ -189,7 +218,8 @@ function ClassManagerForm({
         <DialogTitle>管理类别</DialogTitle>
         <DialogDescription>
           标注时可选的类别。前 10 个类别可以用数字键 1–9、0 快速切换；下载为
-          YOLO 时默认按这个顺序编号。
+          YOLO 时默认按这个顺序编号（由 YOLO
+          导入的数据集先沿用导入时的类别顺序）。
         </DialogDescription>
       </DialogHeader>
 
@@ -375,7 +405,29 @@ function ClassManagerForm({
         )}
 
         {save.error && (
-          <p className="text-sm text-destructive">{save.error.message}</p>
+          <div role="alert" className="grid gap-2 text-sm text-destructive">
+            <p>{save.error.message}</p>
+            {conflict && (
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => reloadLatest.mutate()}
+                  disabled={reloadLatest.isPending}
+                >
+                  {reloadLatest.isPending ? <Spinner /> : <RotateCcw />}
+                  载入最新列表
+                </Button>
+                <span className="text-xs text-muted-foreground">
+                  这里还没保存的修改会被放弃
+                </span>
+              </div>
+            )}
+            {reloadLatest.error && (
+              <p>无法读取最新的类别列表：{reloadLatest.error.message}</p>
+            )}
+          </div>
         )}
       </div>
 
@@ -385,7 +437,12 @@ function ClassManagerForm({
         </Button>
         <Button
           type="submit"
-          disabled={save.isPending || rowErrors.some((e) => e !== null)}
+          disabled={
+            save.isPending ||
+            conflict ||
+            reloadLatest.isPending ||
+            rowErrors.some((e) => e !== null)
+          }
         >
           {save.isPending && <Spinner />}
           保存

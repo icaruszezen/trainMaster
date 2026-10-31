@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react"
+import { useId, useRef, useState, type ReactNode } from "react"
 import {
   CircleAlert,
   Eye,
@@ -23,6 +23,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Skeleton } from "@/components/ui/skeleton"
+import { Spinner } from "@/components/ui/spinner"
 import type { EditorObject } from "@/features/annotation/document"
 import { countLabels } from "@/features/annotation/document"
 import {
@@ -62,8 +64,16 @@ function Section({
   )
 }
 
+/** 类别列表的读取状态：读取完成前不能修改类别列表（避免当作空列表覆盖）。 */
+export type ClassListStatus =
+  | { state: "ready" }
+  | { state: "pending" }
+  | { state: "error"; message: string; retrying: boolean }
+
 type ClassPanelProps = {
   classes: DatasetClass[]
+  listStatus: ClassListStatus
+  onRetry: () => void
   objects: EditorObject[]
   activeClass: string | null
   colorFor: (name: string) => string
@@ -82,6 +92,8 @@ type ClassPanelProps = {
  */
 export function ClassPanel({
   classes,
+  listStatus,
+  onRetry,
   objects,
   activeClass,
   colorFor,
@@ -93,10 +105,6 @@ export function ClassPanel({
   onAddToList,
   onManage,
 }: ClassPanelProps) {
-  const counts = countLabels(objects)
-  const known = new Set(classes.map((cls) => cls.name))
-  const unknown = [...counts.keys()].filter((name) => !known.has(name)).sort()
-
   return (
     <Section
       title={
@@ -108,12 +116,78 @@ export function ClassPanel({
         </>
       }
       action={
-        <Button variant="ghost" size="xs" onClick={onManage}>
+        <Button
+          variant="ghost"
+          size="xs"
+          onClick={onManage}
+          disabled={listStatus.state !== "ready"}
+        >
           <Settings2 />
           管理
         </Button>
       }
     >
+      {listStatus.state === "pending" && (
+        <div className="grid gap-1" role="status">
+          <span className="sr-only">正在读取类别列表…</span>
+          <Skeleton className="h-7" />
+          <Skeleton className="h-7" />
+          <Skeleton className="h-7" />
+        </div>
+      )}
+      {listStatus.state === "error" && (
+        <div
+          role="alert"
+          className="grid gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"
+        >
+          <p className="break-words">无法读取类别列表：{listStatus.message}</p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onRetry}
+            disabled={listStatus.retrying}
+          >
+            {listStatus.retrying && <Spinner />}
+            重试
+          </Button>
+        </div>
+      )}
+      {listStatus.state === "ready" && (
+        <ClassRows
+          classes={classes}
+          objects={objects}
+          activeClass={activeClass}
+          colorFor={colorFor}
+          hiddenClasses={hiddenClasses}
+          onPick={onPick}
+          onToggleHidden={onToggleHidden}
+          onAddToList={onAddToList}
+          onManage={onManage}
+        />
+      )}
+    </Section>
+  )
+}
+
+function ClassRows({
+  classes,
+  objects,
+  activeClass,
+  colorFor,
+  hiddenClasses,
+  onPick,
+  onToggleHidden,
+  onAddToList,
+  onManage,
+}: Omit<
+  ClassPanelProps,
+  "listStatus" | "onRetry" | "hasSelection" | "readOnly"
+>) {
+  const counts = countLabels(objects)
+  const known = new Set(classes.map((cls) => cls.name))
+  const unknown = [...counts.keys()].filter((name) => !known.has(name)).sort()
+  return (
+    <>
       {classes.length === 0 && (
         <div className="grid gap-2 rounded-md border border-dashed p-3 text-sm text-muted-foreground">
           <p>
@@ -155,7 +229,7 @@ export function ClassPanel({
           />
         ))}
       </ul>
-    </Section>
+    </>
   )
 }
 
@@ -371,23 +445,53 @@ function ObjectDetails({
   onChange: (patch: Partial<AnnotationObject>) => void
   onDelete: () => void
 }) {
+  // id 不写死：页面上有多份面板（如切换布局时）也不会重复，标签对应各自的控件。
+  const id = useId()
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const pickedRef = useRef(false)
   const names = classes.map((cls) => cls.name)
   const options = names.includes(object.name) ? names : [...names, object.name]
   return (
     <div className="grid gap-3 rounded-md border bg-muted/30 p-3">
       <div className="grid gap-1.5">
-        <Label htmlFor="object-class" className="text-xs text-muted-foreground">
+        <Label
+          htmlFor={`${id}-class`}
+          className="text-xs text-muted-foreground"
+        >
           类别
         </Label>
         <Select
           value={object.name}
-          onValueChange={(name) => onChange({ name })}
+          onOpenChange={(open) => {
+            if (open) {
+              pickedRef.current = false
+            }
+          }}
+          onValueChange={(name) => {
+            pickedRef.current = true
+            onChange({ name })
+          }}
           disabled={readOnly}
         >
-          <SelectTrigger id="object-class" size="sm" className="w-full">
+          <SelectTrigger
+            ref={triggerRef}
+            id={`${id}-class`}
+            size="sm"
+            className="w-full"
+          >
             <SelectValue />
           </SelectTrigger>
-          <SelectContent>
+          <SelectContent
+            onCloseAutoFocus={(event) => {
+              // 选好类别后把焦点还给画布：焦点留在下拉框上时，字母键会被它
+              // 用来按首字母选择类别，快捷键也就不能用了。
+              const picked = pickedRef.current
+              pickedRef.current = false
+              if (picked && focusCanvas(triggerRef.current)) {
+                event.preventDefault()
+              }
+            }}
+          >
             {options.map((name) => (
               <SelectItem key={name} value={name}>
                 <span
@@ -409,7 +513,7 @@ function ObjectDetails({
       />
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <FlagField
-          id="object-difficult"
+          id={`${id}-difficult`}
           label="难例（difficult）"
           shortcut="Q"
           checked={object.difficult}
@@ -417,7 +521,7 @@ function ObjectDetails({
           onChange={(difficult) => onChange({ difficult })}
         />
         <FlagField
-          id="object-truncated"
+          id={`${id}-truncated`}
           label="截断（truncated）"
           shortcut="E"
           checked={object.truncated}
@@ -439,6 +543,24 @@ function ObjectDetails({
       )}
     </div>
   )
+}
+
+/**
+ * 把焦点移到标注画布上，返回是否移动了。`from` 在弹出的面板（对话框）中时
+ * 不移动：面板会把焦点留在自己里面。
+ */
+function focusCanvas(from: Element | null) {
+  if (!from || from.closest('[role="dialog"]')) {
+    return false
+  }
+  const canvas = from.ownerDocument.querySelector<HTMLElement>(
+    '[role="application"]'
+  )
+  if (!canvas) {
+    return false
+  }
+  canvas.focus({ preventScroll: true })
+  return true
 }
 
 function FlagField({
@@ -487,6 +609,14 @@ function CoordinateFields({
   onChange: (patch: Partial<AnnotationObject>) => void
 }) {
   const [drafts, setDrafts] = useState<Partial<Record<Coordinate, string>>>({})
+  // Esc 取消输入时失去焦点，这次失去焦点不应用输入的值。
+  const cancelling = useRef(false)
+  const cancel = (field: Coordinate) =>
+    setDrafts((current) => {
+      const next = { ...current }
+      delete next[field]
+      return next
+    })
   const commit = (field: Coordinate) => {
     const text = drafts[field]
     setDrafts((current) => {
@@ -526,13 +656,20 @@ function CoordinateFields({
             onChange={(event) =>
               setDrafts({ ...drafts, [field]: event.target.value })
             }
-            onBlur={() => commit(field)}
+            onBlur={() => {
+              if (!cancelling.current) {
+                commit(field)
+              }
+            }}
             onKeyDown={(event) => {
               if (event.key === "Enter") {
                 commit(field)
               } else if (event.key === "Escape") {
-                setDrafts({})
-                event.currentTarget.blur()
+                // 恢复原来的值，不应用输入的内容。
+                cancel(field)
+                cancelling.current = true
+                event.currentTarget.blur() // 同步触发 onBlur
+                cancelling.current = false
               }
             }}
             className="h-7 px-1.5 text-xs tabular-nums md:text-xs"

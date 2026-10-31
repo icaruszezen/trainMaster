@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import {
   hasFilters,
+  leavesImage,
   NO_FILTERS,
   parseFilters,
   parseId,
@@ -55,5 +56,30 @@ describe("hasFilters and workspacePath", () => {
     expect(hasFilters({ ...NO_FILTERS, label: "a" })).toBe(true)
     expect(workspacePath(5)).toBe("/annotation/workspace/5")
     expect(workspacePath(5, 7)).toBe("/annotation/workspace/5?image=7")
+  })
+})
+
+describe("leavesImage", () => {
+  const at = (search: string, pathname = "/annotation/workspace/1") => ({
+    pathname,
+    search,
+  })
+
+  it("is true for another image or another page", () => {
+    expect(leavesImage(at("?image=1"), at("?image=2"))).toBe(true)
+    expect(leavesImage(at("?image=1&status=unannotated"), at("?image=2"))).toBe(
+      true
+    )
+    expect(leavesImage(at("?image=1"), at("", "/datasets/1"))).toBe(true)
+    expect(
+      leavesImage(at("?image=1"), at("?image=1", "/annotation/workspace/2"))
+    ).toBe(true)
+  })
+
+  it("is false when only the filters change", () => {
+    expect(
+      leavesImage(at("?image=1"), at("?image=1&status=unannotated&q=a"))
+    ).toBe(false)
+    expect(leavesImage(at("?image=1&q=a"), at("?q=b&image=1"))).toBe(false)
   })
 })

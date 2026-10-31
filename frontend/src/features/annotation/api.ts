@@ -112,25 +112,28 @@ export type SaveContext = {
  * 保存编辑器中的框。没有框时：图片原本有标注文件，或用户标为了无目标，则
  * 写入空标注（负样本）；否则删除本次编辑中创建的文件，图片恢复为“未标注”，
  * 画了又删掉的框不会把图片误标为负样本。返回保存后的详情；没有任何写入时为 null。
+ * `init` 用于关闭页面时补发的 `keepalive` 请求（与平时的保存走同一套规则）。
  */
 export async function persistAnnotation(
   objects: AnnotationObject[],
   baseVersion: string,
   force: boolean,
-  context: SaveContext
+  context: SaveContext,
+  init?: RequestInit
 ): Promise<DatasetImageDetail | null> {
   const { datasetId, imageId } = context
   if (objects.length === 0 && !context.hadFile && !context.negative) {
     if (baseVersion === "" && !force) {
       return null // 磁盘上没有文件，也不需要有
     }
-    return deleteAnnotation(datasetId, imageId, baseVersion, force)
+    return deleteAnnotation(datasetId, imageId, baseVersion, force, init)
   }
-  return saveAnnotation(datasetId, imageId, {
-    objects,
-    base_version: baseVersion,
-    force,
-  })
+  return saveAnnotation(
+    datasetId,
+    imageId,
+    { objects, base_version: baseVersion, force },
+    init
+  )
 }
 
 function labelKey(detail: DatasetImageDetail | undefined) {

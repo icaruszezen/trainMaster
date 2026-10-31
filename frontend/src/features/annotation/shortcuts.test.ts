@@ -1,14 +1,51 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
   allowsRepeat,
   classHotkey,
   commandForKey,
+  copiesSelectedText,
   shortcutHelp,
   shouldIgnoreKey,
   type KeyInput,
   type ShortcutContext,
 } from "@/features/annotation/shortcuts"
+
+/**
+ * A stand-in for a DOM element (the tests run without a DOM): `closest()`
+ * matches when one of the selectors in the list is one the element is in.
+ */
+class FakeElement {
+  readonly isContentEditable = false
+  readonly parentElement = null
+  private readonly within: string[]
+  constructor(within: string[]) {
+    this.within = within
+  }
+  closest(selectors: string) {
+    const list = selectors.split(",").map((part) => part.trim())
+    return this.within.some((selector) => list.includes(selector)) ? this : null
+  }
+}
+
+/** Runs `test` with `Element` / `HTMLElement` / `Node` set to {@link FakeElement}. */
+function withDom(test: () => void) {
+  vi.stubGlobal("Element", FakeElement)
+  vi.stubGlobal("HTMLElement", FakeElement)
+  vi.stubGlobal("Node", FakeElement)
+  test()
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+/** An element inside the given selectors, typed as the event target it stands for. */
+const element = (...within: string[]) =>
+  new FakeElement(within) as unknown as EventTarget
+const canvas = () => element('[role="application"]')
+const body = () => element()
+const combobox = () => element('[role="combobox"]')
 
 const pc: ShortcutContext = { mac: false, hasSelection: false }
 const mac: ShortcutContext = { mac: true, hasSelection: false }
@@ -199,6 +236,94 @@ describe("shouldIgnoreKey", () => {
       false
     )
     expect(shouldIgnoreKey(event("KeyS"), { type: "save" })).toBe(false)
+  })
+
+  it("lets Tab move the focus unless the canvas has it", () => {
+    const cycle = { type: "cycle", direction: 1 } as const
+    expect(shouldIgnoreKey(event("Tab"), cycle)).toBe(true) // no element
+    withDom(() => {
+      expect(shouldIgnoreKey(event("Tab", { target: body() }), cycle)).toBe(
+        true
+      )
+      expect(
+        shouldIgnoreKey(event("Tab", { target: element("button") }), cycle)
+      ).toBe(true)
+      expect(shouldIgnoreKey(event("Tab", { target: canvas() }), cycle)).toBe(
+        false
+      )
+    })
+  })
+
+  it("leaves typed characters to a focused drop-down (type-ahead)", () => {
+    withDom(() => {
+      const next = { type: "image", direction: 1, unannotated: false } as const
+      expect(shouldIgnoreKey(event("KeyD", { target: combobox() }), next)).toBe(
+        true
+      )
+      expect(
+        shouldIgnoreKey(event("Digit1", { key: "1", target: combobox() }), {
+          type: "class",
+          index: 0,
+        })
+      ).toBe(true)
+      // Ctrl+S still saves; keys that type nothing still work.
+      expect(
+        shouldIgnoreKey(event("KeyS", { ctrlKey: true, target: combobox() }), {
+          type: "save",
+        })
+      ).toBe(false)
+      expect(
+        shouldIgnoreKey(event("KeyZ", { ctrlKey: true, target: combobox() }), {
+          type: "undo",
+        })
+      ).toBe(false)
+      expect(
+        shouldIgnoreKey(event("F1", { target: combobox() }), { type: "help" })
+      ).toBe(false)
+      expect(shouldIgnoreKey(event("KeyD", { target: body() }), next)).toBe(
+        false
+      )
+    })
+  })
+
+  it("ignores keys in inputs and dialogs", () => {
+    withDom(() => {
+      expect(
+        shouldIgnoreKey(event("KeyW", { target: element("input") }), {
+          type: "tool",
+          tool: "rect",
+        })
+      ).toBe(true)
+      expect(
+        shouldIgnoreKey(event("KeyW", { target: element('[role="dialog"]') }), {
+          type: "tool",
+          tool: "rect",
+        })
+      ).toBe(true)
+    })
+  })
+})
+
+describe("copiesSelectedText", () => {
+  const selection = (anchorNode: unknown, isCollapsed = false) =>
+    ({ isCollapsed, rangeCount: 1, anchorNode }) as unknown as Parameters<
+      typeof copiesSelectedText
+    >[1]
+
+  it("leaves Ctrl+C to the browser when text outside the canvas is selected", () => {
+    withDom(() => {
+      expect(copiesSelectedText(body(), selection(body()))).toBe(true)
+    })
+  })
+
+  it("copies boxes otherwise", () => {
+    withDom(() => {
+      expect(copiesSelectedText(body(), null)).toBe(false)
+      expect(copiesSelectedText(body(), selection(body(), true))).toBe(false)
+      // The canvas has the focus: the user means the boxes.
+      expect(copiesSelectedText(canvas(), selection(body()))).toBe(false)
+      expect(copiesSelectedText(body(), selection(canvas()))).toBe(false)
+    })
   })
 })
 

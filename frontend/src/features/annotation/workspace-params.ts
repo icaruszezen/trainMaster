@@ -55,3 +55,17 @@ export function workspacePath(datasetId: number, imageId?: number) {
   const base = `/annotation/workspace/${datasetId}`
   return imageId === undefined ? base : `${base}?image=${imageId}`
 }
+
+type LocationLike = { pathname: string; search: string }
+
+/**
+ * 地址的变化是否离开当前图片：去了别的页面，或 `?image=` 变了（浏览器的后退 /
+ * 前进也是）。只改筛选条件时仍在同一张图片上，不算离开。
+ */
+export function leavesImage(from: LocationLike, to: LocationLike) {
+  return (
+    from.pathname !== to.pathname ||
+    new URLSearchParams(from.search).get("image") !==
+      new URLSearchParams(to.search).get("image")
+  )
+}

@@ -131,6 +131,22 @@ describe("defaultClassOrder", () => {
       )
     ).toEqual(["划痕", "hole", "dent", "Crack"])
   })
+
+  it("keeps the imported order first, then the class list, then the labels", () => {
+    expect(
+      defaultClassOrder(
+        [{ name: "dog" }, { name: "car" }, { name: "bird" }, { name: "ant" }],
+        ["person", "car", "dog"], // YOLO import: ids 0, 1, 2 stay
+        ["car", "cat", "person", "bird"] // class list in the workspace
+      )
+    ).toEqual(["person", "car", "dog", "cat", "bird", "ant"])
+  })
+
+  it("skips missing bases", () => {
+    expect(
+      defaultClassOrder([{ name: "b" }, { name: "a" }], undefined, ["b"])
+    ).toEqual(["b", "a"])
+  })
 })
 
 describe("compareClassesWithLabels", () => {
