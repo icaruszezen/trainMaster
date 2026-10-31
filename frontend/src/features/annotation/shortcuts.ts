@@ -25,7 +25,10 @@ export type Command =
   | { type: "paste" }
   | { type: "duplicate" }
   | { type: "delete" }
-  /** Tab / Shift+Tab：依次选中下一个 / 上一个框。 */
+  /**
+   * Tab / Shift+Tab（焦点在画布上时）：依次选中下一个 / 上一个框；到头后取消
+   * 选中，焦点照常移出画布。
+   */
   | { type: "cycle"; direction: 1 | -1 }
   | { type: "escape" }
   /**
@@ -64,7 +67,10 @@ export type KeyInput = {
 export type ShortcutContext = {
   /** macOS 上用 ⌘ 代替 Ctrl。 */
   mac: boolean
-  /** 有选中的框：方向键移动它；没有时 ← / → 切换图片。 */
+  /**
+   * 有选中（且显示着）的框：方向键移动它；没有时 ← / → 切换图片。隐藏的框
+   * （H 隐藏所有框，或隐藏了它的类别）不算选中。
+   */
   hasSelection: boolean
 }
 
@@ -260,6 +266,29 @@ export function isTypingTarget(target: EventTarget | null) {
   )
 }
 
+/** 标注画布（`role="application"`）。 */
+const CANVAS = '[role="application"]'
+
+function asElement(target: EventTarget | Node | null): Element | null {
+  if (typeof Element === "undefined" || target === null) {
+    return null
+  }
+  if (target instanceof Element) {
+    return target
+  }
+  // 文字节点：取它所在的元素。
+  return typeof Node !== "undefined" && target instanceof Node
+    ? target.parentElement
+    : null
+}
+
+/** 输入一个字符的按键（字母、数字、标点、空格），没有按 Ctrl / ⌘ / Alt。 */
+function isPrintableKey(event: KeyInput) {
+  return (
+    event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey
+  )
+}
+
 // 自己用方向键的控件（单选组、标签页、滑块、菜单、列表等）。
 const ARROW_CONTROLS =
   '[role="radio"], [role="tab"], [role="slider"], [role="menuitem"], [role="option"], [role="combobox"], [role="spinbutton"], [role="switch"], [role="checkbox"]'
@@ -269,7 +298,10 @@ const ARROW_CONTROLS =
  * - 输入法正在组字；
  * - 焦点在输入控件 / 浮层中（Ctrl+S 例外，在输入框里也保存，并且不弹出浏览器
  *   的“保存网页”）；
- * - 焦点在按钮等控件上时的 Tab（照常移动焦点），以及自己用方向键的控件上的方向键。
+ * - 焦点在关闭的下拉框（如类别下拉框）上时输入字符的按键：下拉框会按首字母
+ *   直接选中匹配的选项，快捷键再执行一次就会同时改掉框的类别；
+ * - 焦点不在画布上时的 Tab（页面本身、按钮等控件上照常移动焦点），以及自己
+ *   用方向键的控件上的方向键。
  */
 export function shouldIgnoreKey(
   event: KeyInput & {
@@ -289,19 +321,43 @@ export function shouldIgnoreKey(
   if (isTypingTarget(target)) {
     return true
   }
-  if (typeof Element === "undefined" || !(target instanceof Element)) {
+  const element = asElement(target)
+  if (event.code === "Tab") {
+    // 只在焦点位于画布上时用 Tab 切换框。
+    return element?.closest(CANVAS) == null
+  }
+  if (element === null) {
     return false
   }
-  if (event.code === "Tab") {
-    // 只在焦点位于画布（或页面本身）时用 Tab 切换框。
-    return (
-      target !== target.ownerDocument.body &&
-      target.closest('[role="application"]') === null
-    )
+  if (isPrintableKey(event) && element.closest('[role="combobox"]') !== null) {
+    return true
   }
   return (
-    event.code.startsWith("Arrow") && target.closest(ARROW_CONTROLS) !== null
+    event.code.startsWith("Arrow") && element.closest(ARROW_CONTROLS) !== null
   )
+}
+
+/** 与 `Selection` 中用到的字段一致，便于测试。 */
+export type SelectionInput = Pick<
+  Selection,
+  "isCollapsed" | "rangeCount" | "anchorNode"
+>
+
+/**
+ * Ctrl / ⌘+C 是否交给浏览器复制文字：焦点不在画布上，并且页面上（画布以外）
+ * 选中了文字，如工具栏中的路径、提示中的错误信息。
+ */
+export function copiesSelectedText(
+  target: EventTarget | null,
+  selection: SelectionInput | null
+) {
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+    return false
+  }
+  if (asElement(target)?.closest(CANVAS) != null) {
+    return false
+  }
+  return asElement(selection.anchorNode)?.closest(CANVAS) == null
 }
 
 export type ShortcutHelp = {
@@ -320,7 +376,10 @@ export function shortcutHelp(mac: boolean): ShortcutHelp[] {
         { keys: ["Shift"], label: "画框时按住：画正方形" },
         { keys: ["V"], label: "选择 / 编辑框（拖动空白处平移画面）" },
         { keys: ["Esc"], label: "取消正在画的框 → 取消选中 → 回到选择工具" },
-        { keys: ["Tab", "Shift+Tab"], label: "选中下一个 / 上一个框" },
+        {
+          keys: ["Tab", "Shift+Tab"],
+          label: "画布有焦点时选中下一个 / 上一个框（到头后焦点移出画布）",
+        },
         { keys: ["单击重叠处"], label: "再次单击依次选中下面的框" },
       ],
     },
@@ -347,7 +406,8 @@ export function shortcutHelp(mac: boolean): ShortcutHelp[] {
         { keys: ["Delete", "Backspace"], label: "删除选中的框" },
         {
           keys: [`${mod}+C`, `${mod}+V`],
-          label: "复制 / 粘贴框，可粘贴到别的图片（没有选中时复制全部）",
+          label:
+            "复制 / 粘贴框，可粘贴到别的图片（没有选中时复制全部；选中了页面上的文字时复制文字）",
         },
         { keys: [`${mod}+D`], label: "原地复制一份选中的框" },
         { keys: [`${mod}+Z`], label: "撤销" },
@@ -362,7 +422,10 @@ export function shortcutHelp(mac: boolean): ShortcutHelp[] {
       items: [
         { keys: ["D", "A"], label: "下一张 / 上一张（自动保存）" },
         { keys: ["Shift+D", "Shift+A"], label: "下一张 / 上一张未标注的图片" },
-        { keys: ["← / →"], label: "没有选中框时切换图片" },
+        {
+          keys: ["← / →"],
+          label: "没有选中框（或选中的框已隐藏）时切换图片",
+        },
         { keys: ["G"], label: "跳到第 N 张" },
         { keys: ["N"], label: "标为空标注（图片上没有目标，负样本）" },
         { keys: [`${mod}+S`], label: "立即保存（停止编辑后也会自动保存）" },

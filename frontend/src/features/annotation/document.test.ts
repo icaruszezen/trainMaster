@@ -102,6 +102,48 @@ describe("documentReducer", () => {
     expect(state.past).toHaveLength(HISTORY_LIMIT)
   })
 
+  it("appends to the current objects, only for the same document", () => {
+    const start = loaded(box("a"))
+    // An edit made while the async operation was running is kept.
+    const edited = documentReducer(start, {
+      type: "change",
+      objects: [...start.objects, { ...box("b"), uid: "b" }],
+    })
+    const pasted = { ...box("p"), uid: "p" }
+    const appended = documentReducer(edited, {
+      type: "append",
+      key: "img",
+      objects: [pasted],
+      select: "p",
+    })
+    expect(appended.objects.map((o) => o.uid)).toEqual(["img:0", "b", "p"])
+    expect(appended.selected).toBe("p")
+    expect(appended.past.at(-1)).toBe(edited.objects)
+
+    // Another image (or a reload) was loaded meanwhile: ignored.
+    const other = documentReducer(edited, {
+      type: "load",
+      objects: [box("x")],
+      key: "other",
+    })
+    expect(
+      documentReducer(other, { type: "append", key: "img", objects: [pasted] })
+    ).toBe(other)
+    expect(
+      documentReducer(edited, { type: "append", key: "img", objects: [] })
+    ).toBe(edited)
+  })
+
+  it("keeps the key across edits, undo and redo", () => {
+    let state = loaded(box("a"))
+    state = documentReducer(state, { type: "change", objects: [] })
+    expect(state.key).toBe("img")
+    state = documentReducer(state, { type: "undo" })
+    expect(state.key).toBe("img")
+    state = documentReducer(state, { type: "redo" })
+    expect(state.key).toBe("img")
+  })
+
   it("selects only existing objects", () => {
     const state = loaded(box("dent"))
     expect(
@@ -169,12 +211,19 @@ describe("duplicateBox and pasteObjects", () => {
 describe("cycleSelection", () => {
   const objects = [{ uid: "a" }, { uid: "b" }, { uid: "c" }]
 
-  it("wraps around in both directions", () => {
+  it("starts at either end and moves in both directions", () => {
     expect(cycleSelection(objects, null, 1)).toBe("a")
     expect(cycleSelection(objects, null, -1)).toBe("c")
-    expect(cycleSelection(objects, "c", 1)).toBe("a")
-    expect(cycleSelection(objects, "a", -1)).toBe("c")
+    expect(cycleSelection(objects, "missing", 1)).toBe("a")
+    expect(cycleSelection(objects, "a", 1)).toBe("b")
+    expect(cycleSelection(objects, "c", -1)).toBe("b")
+  })
+
+  it("ends after the last / before the first box instead of wrapping", () => {
+    expect(cycleSelection(objects, "c", 1)).toBeNull()
+    expect(cycleSelection(objects, "a", -1)).toBeNull()
     expect(cycleSelection([], null, 1)).toBeNull()
+    expect(cycleSelection([], null, -1)).toBeNull()
   })
 })
 

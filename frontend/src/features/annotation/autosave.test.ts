@@ -186,21 +186,130 @@ describe("AnnotationSaver", () => {
     })
   })
 
-  it("rebase takes a version written elsewhere", async () => {
+  it("saveNow writes once even without edits, after the save in progress", async () => {
     const { saver, calls } = setup()
     saver.reset([box("a")], "v1", "image-1")
     saver.update([])
-    saver.rebase([], "v2") // e.g. "标为无目标" wrote an empty file
+    void saver.flush() // e.g. the last box was just deleted
+    const saved = saver.saveNow() // then "标为空标注"
+    expect(saver.isDirty()).toBe(true)
+    expect(calls).toHaveLength(1)
+    calls[0].resolve("v2")
+    await vi.advanceTimersByTimeAsync(0)
+    expect(calls).toHaveLength(2)
+    expect(calls[1].request).toEqual({
+      objects: [],
+      baseVersion: "v2",
+      force: false,
+      context: "image-1",
+    })
+    calls[1].resolve("v3")
+    await expect(saved).resolves.toBe(true)
+    expect(saver.getVersion()).toBe("v3")
     expect(saver.isDirty()).toBe(false)
     expect(saver.getState().status).toBe("saved")
     vi.advanceTimersByTime(AUTOSAVE_DELAY * 2)
-    expect(calls).toHaveLength(0)
+    expect(calls).toHaveLength(2)
+  })
 
-    saver.update([box("b")])
-    saver.rebase([], "v3")
-    expect(saver.getState().status).toBe("dirty")
-    await vi.advanceTimersByTimeAsync(AUTOSAVE_DELAY)
-    expect(calls[0].request.baseVersion).toBe("v3")
+  it("flush waits for saveNow, so switching images does not leave it behind", async () => {
+    const { saver, calls } = setup()
+    saver.reset([], "", "image-1")
+    void saver.saveNow()
+    const flushed = saver.flush()
+    expect(calls).toHaveLength(1)
+    calls[0].resolve("v1")
+    await expect(flushed).resolves.toBe(true)
+    expect(calls).toHaveLength(1)
+    expect(saver.getVersion()).toBe("v1")
+  })
+
+  it("does not apply a saveNow result to the next image", async () => {
+    const { saver, calls } = setup()
+    saver.reset([], "", "image-1")
+    const saved = saver.saveNow()
+    saver.reset([box("b")], "w1", "image-2")
+    calls[0].resolve("v1")
+    await expect(saved).resolves.toBe(false)
+    expect(saver.getVersion()).toBe("w1")
+    expect(saver.getContext()).toBe("image-2")
+    expect(saver.isDirty()).toBe(false)
+    vi.advanceTimersByTime(AUTOSAVE_DELAY * 2)
+    expect(calls).toHaveLength(1)
+  })
+
+  it("keeps a failed saveNow pending until it is written", async () => {
+    const { saver, calls } = setup()
+    saver.reset([], "", "image-1")
+    const saved = saver.saveNow()
+    calls[0].reject(new Error("网络错误"))
+    await expect(saved).resolves.toBe(false)
+    expect(saver.getState()).toEqual({ status: "error", error: "网络错误" })
+    expect(saver.pending()).toEqual({
+      objects: [],
+      baseVersion: "",
+      force: false,
+      context: "image-1",
+    })
+    const retry = saver.flush()
+    calls[1].resolve("v1")
+    await expect(retry).resolves.toBe(true)
+    expect(saver.isDirty()).toBe(false)
+  })
+
+  it("saveNow does not write over a conflict", async () => {
+    const { saver, calls } = setup()
+    saver.reset([], "v1", "image-1")
+    saver.update([box("a")])
+    const flushed = saver.flush()
+    calls[0].reject(conflict())
+    await flushed
+    await expect(saver.saveNow()).resolves.toBe(false)
+    expect(calls).toHaveLength(1)
+  })
+
+  it("discard drops the unsaved edits, also for a later flush", async () => {
+    const { saver, calls } = setup()
+    saver.reset([], "v1", "image-1")
+    saver.update([box("a")])
+    const flushed = saver.flush()
+    calls[0].reject(new Error("网络错误"))
+    await flushed
+    saver.discard()
+    expect(saver.isDirty()).toBe(false)
+    expect(saver.getState().status).toBe("clean")
+    expect(saver.pending()).toBeNull()
+    await expect(saver.flush()).resolves.toBe(true)
+    vi.advanceTimersByTime(AUTOSAVE_DELAY * 2)
+    expect(calls).toHaveLength(1)
+  })
+
+  it("discard ignores the result of a save in progress", async () => {
+    const { saver, calls } = setup()
+    saver.reset([], "v1", "image-1")
+    saver.update([box("a")])
+    const flushed = saver.flush()
+    saver.discard()
+    calls[0].reject(new Error("网络错误"))
+    await expect(flushed).resolves.toBe(false)
+    expect(saver.getState().status).toBe("clean")
+  })
+
+  it("hasPendingWork while dirty, saving or not resolved", async () => {
+    const { saver, calls } = setup()
+    saver.reset([], "v1", "image-1")
+    expect(saver.hasPendingWork()).toBe(false)
+    saver.update([box("a")])
+    expect(saver.hasPendingWork()).toBe(true)
+    const flushed = saver.flush()
+    saver.update([]) // undone while the save is running
+    expect(saver.getState().status).toBe("saving")
+    expect(saver.hasPendingWork()).toBe(true)
+    calls[0].resolve("v2")
+    await vi.advanceTimersByTimeAsync(0)
+    calls[1].resolve("v3") // writes the undo
+    await flushed
+    expect(saver.hasPendingWork()).toBe(false)
   })
 
   it("does nothing before reset", async () => {

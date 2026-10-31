@@ -1,13 +1,14 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useReducer,
   useRef,
   useState,
 } from "react"
-import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { useSearchParams } from "react-router"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useBlocker, useSearchParams, type BlockerFunction } from "react-router"
 import { toast } from "sonner"
 
 import {
@@ -46,7 +47,7 @@ import {
   type SaverState,
 } from "@/features/annotation/autosave"
 import { ClassManagerDialog } from "@/features/annotation/class-manager-dialog"
-import { colorResolver } from "@/features/annotation/classes"
+import { appendClass, colorResolver } from "@/features/annotation/classes"
 import {
   cycleSelection,
   documentReducer,
@@ -74,6 +75,7 @@ import { LabelPicker } from "@/features/annotation/label-picker"
 import {
   allowsRepeat,
   commandForKey,
+  copiesSelectedText,
   isMac,
   shouldIgnoreKey,
   type Command,
@@ -85,28 +87,31 @@ import {
   ImageInfo,
   NoticeBox,
   ObjectPanel,
+  type ClassListStatus,
   type Notice,
 } from "@/features/annotation/side-panel"
 import {
+  leavesImage,
   NO_FILTERS,
   parseFilters,
   updateParams,
 } from "@/features/annotation/workspace-params"
 import {
+  addDatasetClass,
   classesQuery,
   datasetKeys,
   deleteAnnotation,
   imageNeighborsQuery,
-  saveAnnotation,
-  setDatasetClasses,
   thumbnailUrl,
   type AnnotationObject,
   type Dataset,
   type DatasetClass,
+  type DatasetClassList,
   type DatasetImage,
   type DatasetImageDetail,
   type ImageFilters,
 } from "@/features/datasets/api"
+import { useMediaQuery } from "@/hooks/use-media-query"
 import { formatNumber } from "@/lib/format"
 import { readPreference, writePreference } from "@/lib/storage"
 
@@ -158,6 +163,13 @@ const EMPTY_CLASSES: DatasetClass[] = []
 /** 正在编辑的图片：载入时的详情；`token` 在重新读取时递增。 */
 type Loaded = { detail: DatasetImageDetail; token: number }
 
+/** 文档的 key：哪张图片、第几次载入（异步操作完成时据此判断是否还是同一份）。 */
+const docKey = (loaded: Loaded) => `${loaded.detail.id}:${loaded.token}`
+
+/** 与 Tailwind 的 `lg:`、`xl:` 一致：侧边面板、图片列表固定显示的宽度。 */
+const PANEL_QUERY = "(min-width: 64rem)"
+const IMAGES_QUERY = "(min-width: 80rem)"
+
 type Picker =
   /** 画了新框但还没有类别（类别列表为空）：选择后才加入。 */
   | { mode: "new"; box: Box }
@@ -190,8 +202,19 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   const [mac] = useState(isMac)
   const mod = mac ? "⌘" : "Ctrl"
 
+  // 类别列表读取完成前（或读取失败时）不能修改它：不能把它当作空列表。
   const classesQ = useQuery(classesQuery(datasetId))
-  const classes = classesQ.data?.items ?? EMPTY_CLASSES
+  const classList = classesQ.data
+  const classes = classList?.items ?? EMPTY_CLASSES
+  const listStatus: ClassListStatus = classList
+    ? { state: "ready" }
+    : classesQ.error
+      ? {
+          state: "error",
+          message: classesQ.error.message,
+          retrying: classesQ.isFetching,
+        }
+      : { state: "pending" }
   const detailQ = useQuery(editorImageQuery(datasetId, imageId))
   const neighborsQ = useQuery(imageNeighborsQuery(datasetId, imageId, filters))
 
@@ -230,6 +253,9 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   const [confirmClear, setConfirmClear] = useState(false)
   const [imagesOpen, setImagesOpen] = useState(false)
   const [panelOpen, setPanelOpen] = useState(false)
+  // 宽屏时面板固定在两侧，否则放在弹出的面板中；只渲染一份（元素 id 不重复）。
+  const panelDocked = useMediaQuery(PANEL_QUERY)
+  const imagesDocked = useMediaQuery(IMAGES_QUERY)
 
   const canvasRef = useRef<CanvasHandle>(null)
   const positionRef = useRef<HTMLInputElement>(null)
@@ -269,12 +295,26 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   // 换了图片：载入它的框（在渲染中调整状态，避免先渲染一次旧图片的框）。
   const detail = detailQ.data?.id === imageId ? detailQ.data : undefined
   if (detail && loaded?.detail.id !== detail.id) {
-    setLoaded({ detail, token: (loaded?.token ?? 0) + 1 })
-    dispatch({ type: "load", objects: detail.objects, key: String(detail.id) })
+    const next = { detail, token: (loaded?.token ?? 0) + 1 }
+    setLoaded(next)
+    dispatch({ type: "load", objects: detail.objects, key: docKey(next) })
     setHighlight(null)
     setPicker(null)
   }
   const current = loaded && loaded.detail.id === imageId ? loaded.detail : null
+
+  // 异步操作（读取上一张、重新读取等）完成时判断是否还在同一次编辑中：没有
+  // 切换图片、没有重新读取。在提交时同步更新，异步回调读到的总是最新的。
+  const loadedRef = useRef<Loaded | null>(null)
+  const imageIdRef = useRef(imageId)
+  useLayoutEffect(() => {
+    loadedRef.current = loaded
+    imageIdRef.current = imageId
+  })
+  const isCurrent = (start: Loaded | null): start is Loaded =>
+    start !== null &&
+    loadedRef.current === start &&
+    imageIdRef.current === start.detail.id
 
   useEffect(() => {
     if (!loaded) {
@@ -297,6 +337,38 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       saver.update(doc.objects)
     }
   }, [doc.objects, loaded, saver])
+
+  // 离开这张图片（浏览器后退 / 前进、站内链接、侧边栏等）前先保存；保存失败
+  // 或有冲突时不离开，提示可以留下处理或放弃修改。上一张 / 下一张等按钮自己
+  // 先保存（navigateTo），保存成功后这里不再拦截。
+  const shouldBlock = useCallback<BlockerFunction>(
+    ({ currentLocation, nextLocation }) =>
+      leavesImage(currentLocation, nextLocation) && saver.hasPendingWork(),
+    [saver]
+  )
+  const blocker = useBlocker(shouldBlock)
+  // 保存失败、拦下的是这一次离开：显示提示。
+  const [leaveFailed, setLeaveFailed] = useState<typeof blocker | null>(null)
+  useEffect(() => {
+    if (blocker.state !== "blocked") {
+      return
+    }
+    let active = true
+    void saver.flush().then((ok) => {
+      if (!active) {
+        return
+      }
+      if (ok) {
+        blocker.proceed()
+      } else {
+        setLeaveFailed(blocker)
+      }
+    })
+    return () => {
+      active = false
+    }
+  }, [blocker, saver])
+  const leavePromptOpen = blocker.state === "blocked" && leaveFailed === blocker
 
   // 离开工作台时保存未保存的修改。
   useEffect(
@@ -325,18 +397,12 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       if (!pending || saver.getState().status === "saving") {
         return
       }
-      const { context } = pending
-      if (
-        pending.objects.length === 0 &&
-        !context.hadFile &&
-        !context.negative
-      ) {
-        return
-      }
-      void saveAnnotation(
-        context.datasetId,
-        context.imageId,
-        { objects: pending.objects, base_version: pending.baseVersion },
+      // 与平时的保存规则相同（包括删除本次创建、框又全部删掉的文件）。
+      void persistAnnotation(
+        pending.objects,
+        pending.baseVersion,
+        false,
+        pending.context,
         { keepalive: true }
       ).catch(() => undefined)
     }
@@ -447,14 +513,41 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     uidCounter.current += 1
     return `n${uidCounter.current}`
   }
+  // 正在载入下一张图片时（current 为 null）框列表还是上一张的，不能修改。
+  const editable = current !== null && !readOnly
   const change = (objects: EditorObject[], select?: string | null) => {
-    if (readOnly) {
+    if (!editable) {
       return
     }
     dispatch({ type: "change", objects, select })
   }
   const select = (uid: string | null) => dispatch({ type: "select", uid })
   const selectedObject = doc.objects.find((o) => o.uid === doc.selected)
+  const isShown = (object: EditorObject) =>
+    view.showBoxes && !hiddenClasses.has(object.name)
+  // 键盘操作的对象：隐藏的框（H 隐藏所有框，或隐藏了它的类别）不算选中，
+  // 不会被看不见地移动、删除，← / → 照常切换图片。
+  const activeObject =
+    selectedObject && isShown(selectedObject) ? selectedObject : undefined
+
+  // 类别列表还没有读取到时，不能新建类别或打开类别管理。
+  const classListNotReady = () => {
+    if (classesQ.error) {
+      toast.error("无法读取类别列表", {
+        description: classesQ.error.message,
+        action: { label: "重试", onClick: () => void classesQ.refetch() },
+      })
+    } else {
+      toast.info("正在读取类别列表，请稍候")
+    }
+  }
+  const openClassManager = () => {
+    if (!classList) {
+      classListNotReady()
+      return
+    }
+    setClassDialogOpen(true)
+  }
 
   const addObject = (box: Box, name: string) => {
     const object: EditorObject = {
@@ -467,24 +560,47 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     change([...doc.objects, object], object.uid)
   }
 
-  const addClassToList = async (name: string) => {
-    if (classes.some((cls) => cls.name === name)) {
-      return true
-    }
-    try {
-      const list = await setDatasetClasses(datasetId, [
-        ...classes,
-        { name, color: "" },
-      ])
-      queryClient.setQueryData(datasetKeys.classes(datasetId), list)
+  // 在类别列表末尾加入一个类别（POST 只追加，不会覆盖别人同时做的修改）。
+  // 先更新页面上的列表，不等待请求：画好的框、改好的类别立即生效。
+  const addClassKey = ["annotation", "add-class", datasetId] as const
+  const addClass = useMutation({
+    mutationKey: addClassKey,
+    mutationFn: (name: string) => addDatasetClass(datasetId, name),
+    onMutate: async (name) => {
+      const queryKey = datasetKeys.classes(datasetId)
+      await queryClient.cancelQueries({ queryKey })
+      queryClient.setQueryData<DatasetClassList>(
+        queryKey,
+        (list) => list && appendClass(list, name)
+      )
+    },
+    onSuccess: (list, name) => {
+      // 同时加入几个类别时，以最后完成的结果为准（之前的结果不完整）。
+      if (queryClient.isMutating({ mutationKey: addClassKey }) === 1) {
+        queryClient.setQueryData(datasetKeys.classes(datasetId), list)
+      }
       toast.success(`已把“${name}”加入类别列表`)
-      return true
-    } catch (error) {
-      toast.error("无法保存类别列表", {
-        description: error instanceof Error ? error.message : undefined,
+    },
+    onError: (error, name) => {
+      toast.error(`无法把“${name}”加入类别列表`, {
+        description: error.message,
       })
+      void queryClient.invalidateQueries({
+        queryKey: datasetKeys.classes(datasetId),
+      })
+    },
+  })
+
+  /** 把类别加入列表（后台进行）；类别列表还没有读取到时不加入，返回 false。 */
+  const addClassToList = (name: string) => {
+    if (!classList) {
+      classListNotReady()
       return false
     }
+    if (!classes.some((cls) => cls.name === name)) {
+      addClass.mutate(name)
+    }
+    return true
   }
 
   const relabel = (uid: string, name: string) =>
@@ -492,20 +608,25 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
 
   const onCreate = (box: Box) => {
     if (effectiveClass === null) {
+      if (!classList) {
+        classListNotReady() // 不能把“还没读取到”当作“没有类别”，让用户新建
+        return
+      }
       setPicker({ mode: "new", box })
       return
     }
     addObject(box, effectiveClass)
   }
 
-  const onPick = async (name: string, created: boolean) => {
+  // 不等待网络请求：新建的类别在后台加入列表，框立即用新类别加上 / 改好。
+  const onPick = (name: string, created: boolean) => {
     const target = picker
     setPicker(null)
     if (!target) {
       return
     }
-    if (created && !(await addClassToList(name))) {
-      return
+    if (created) {
+      addClassToList(name)
     }
     if (target.mode === "new") {
       addObject(target.box, name)
@@ -519,30 +640,30 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   }
 
   const pickClass = (name: string) => {
-    if (selectedObject && !readOnly) {
-      relabel(selectedObject.uid, name)
+    if (activeObject && editable) {
+      relabel(activeObject.uid, name)
     } else {
       setActiveClass(name)
     }
   }
 
   const toggleFlag = (flag: "difficult" | "truncated") => {
-    if (!selectedObject) {
+    if (!activeObject) {
       toast.info("请先选中一个框")
       return
     }
-    if (readOnly) {
+    if (!editable) {
       return
     }
-    const value = !selectedObject[flag]
-    change(updateObject(doc.objects, selectedObject.uid, { [flag]: value }))
+    const value = !activeObject[flag]
+    change(updateObject(doc.objects, activeObject.uid, { [flag]: value }))
     const label =
       flag === "difficult" ? "难例（difficult）" : "截断（truncated）"
     toast(value ? `已标记为${label}` : `已取消${label}`, { duration: 1200 })
   }
 
   const copy = () => {
-    const objects = selectedObject ? [selectedObject] : doc.objects
+    const objects = activeObject ? [activeObject] : doc.objects
     if (objects.length === 0) {
       toast.info("这张图片上没有框可以复制")
       return
@@ -554,8 +675,9 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     toast(`已复制 ${formatNumber(objects.length)} 个框`, { duration: 1200 })
   }
 
-  const paste = (source = clipboard.current) => {
-    if (!size || readOnly) {
+  /** 粘贴到 `key` 对应的文档（异步操作开始时的文档；之后切换了图片则不粘贴）。 */
+  const paste = (source = clipboard.current, key = doc.key) => {
+    if (!size || !editable) {
       return
     }
     if (source.objects.length === 0) {
@@ -571,7 +693,13 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       : source.objects
     const { objects, dropped } = pasteObjects(shifted, size, newUid)
     if (objects.length > 0) {
-      change([...doc.objects, ...objects], objects.at(-1)?.uid ?? null)
+      // 加到此刻的框列表后面，而不是调用时的（异步操作期间可能又有修改）。
+      dispatch({
+        type: "append",
+        key,
+        objects,
+        select: objects.at(-1)?.uid ?? null,
+      })
     }
     if (dropped > 0) {
       toast.warning(
@@ -581,10 +709,18 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   }
 
   const copyPrevious = async () => {
+    const start = loaded
+    const key = doc.key
+    if (!editable) {
+      return
+    }
     try {
       const neighbors = await queryClient.fetchQuery(
         imageNeighborsQuery(datasetId, imageId, NO_FILTERS)
       )
+      if (!isCurrent(start)) {
+        return // 已切换到别的图片
+      }
       if (!neighbors.prev) {
         toast.info("这是第一张图片")
         return
@@ -592,36 +728,48 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       const previous = await queryClient.fetchQuery(
         editorImageQuery(datasetId, neighbors.prev.id)
       )
+      if (!isCurrent(start)) {
+        return
+      }
       if (previous.objects.length === 0) {
         toast.info(`上一张（${previous.file_name}）没有框`)
         return
       }
-      paste({ imageId: previous.id, objects: previous.objects })
+      paste({ imageId: previous.id, objects: previous.objects }, key)
       toast.success(
         `已沿用上一张的 ${formatNumber(previous.objects.length)} 个框`
       )
     } catch (error) {
-      toast.error("无法读取上一张图片的标注", {
-        description: error instanceof Error ? error.message : undefined,
-      })
+      if (isCurrent(start)) {
+        toast.error("无法读取上一张图片的标注", {
+          description: error instanceof Error ? error.message : undefined,
+        })
+      }
     }
   }
 
   // ---- 保存 ----
   const reload = async () => {
+    const start = loaded
     try {
       const fresh = await queryClient.fetchQuery({
         ...editorImageQuery(datasetId, imageId),
         staleTime: 0,
       })
-      setLoaded({ detail: fresh, token: (loaded?.token ?? 0) + 1 })
-      dispatch({ type: "load", objects: fresh.objects, key: String(fresh.id) })
+      if (!isCurrent(start)) {
+        return // 已切换到别的图片
+      }
+      const next = { detail: fresh, token: start.token + 1 }
+      setLoaded(next)
+      dispatch({ type: "load", objects: fresh.objects, key: docKey(next) })
       setUnlocked(null)
       toast.success("已重新读取标注文件")
     } catch (error) {
-      toast.error("无法读取标注文件", {
-        description: error instanceof Error ? error.message : undefined,
-      })
+      if (isCurrent(start)) {
+        toast.error("无法读取标注文件", {
+          description: error instanceof Error ? error.message : undefined,
+        })
+      }
     }
   }
 
@@ -633,46 +781,51 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
 
   const markNegative = async () => {
     const session = sessionRef.current
-    if (!session || readOnly) {
+    if (!session || !editable || saver.getContext() !== session) {
       return
     }
     if (doc.objects.length > 0) {
       toast.info("图片上还有框：删除所有框后才能标为空标注")
       return
     }
-    if (!(await saver.flush())) {
+    if (saver.getState().status === "conflict") {
+      toast.error("请先处理这张图片的保存冲突")
       return
     }
-    try {
-      session.negative = true
-      const saved = await saveAnnotation(datasetId, session.imageId, {
-        objects: [],
-        base_version: saver.getVersion(),
-      })
-      applySavedDetail(queryClient, datasetId, saved)
-      saver.rebase([], saved.annotation_version)
+    // 通过保存器写入没有目标的文件：切换图片、离开前会等它完成（失败时同样
+    // 不离开），结果只用于这张图片。
+    session.negative = true
+    const ok = await saver.saveNow()
+    if (saver.getContext() !== session) {
+      return // 已切换到别的图片
+    }
+    if (ok) {
       toast.success("已标为空标注（没有目标）")
-    } catch (error) {
-      session.negative = false
-      if (isConflictError(error)) {
-        toast.error("标注文件已被修改，请重新读取后再试")
-      } else {
-        toast.error("保存失败", {
-          description: error instanceof Error ? error.message : undefined,
-        })
-      }
+      return
+    }
+    const state = saver.getState()
+    if (state.status === "conflict") {
+      toast.error("标注文件已被修改，请重新读取后再试")
+    } else if (state.status === "error") {
+      toast.error("保存失败", { description: state.error ?? undefined })
     }
   }
 
   const clearFile = async () => {
     const session = sessionRef.current
+    const start = loaded
     setConfirmClear(false)
     if (!session) {
       return
     }
     if (!(await saver.flush())) {
-      toast.error("请先处理保存失败或冲突")
+      if (isCurrent(start)) {
+        toast.error("请先处理保存失败或冲突")
+      }
       return
+    }
+    if (!isCurrent(start) || saver.getContext() !== session) {
+      return // 已切换到别的图片
     }
     try {
       const saved = await deleteAnnotation(
@@ -681,8 +834,12 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         saver.getVersion()
       )
       applySavedDetail(queryClient, datasetId, saved)
-      setLoaded({ detail: saved, token: (loaded?.token ?? 0) + 1 })
-      dispatch({ type: "load", objects: [], key: String(saved.id) })
+      if (!isCurrent(start)) {
+        return
+      }
+      const next = { detail: saved, token: start.token + 1 }
+      setLoaded(next)
+      dispatch({ type: "load", objects: [], key: docKey(next) })
       toast.success("已删除标注文件，图片恢复为未标注")
     } catch (error) {
       toast.error(
@@ -703,7 +860,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     const session = sessionRef.current
     if (
       session &&
-      !readOnly &&
+      editable &&
       !saver.isDirty() &&
       doc.objects.length === 0 &&
       saver.getVersion() === ""
@@ -755,8 +912,23 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     setImagesOpen(false)
   }
 
+  // 用户选择放弃这张图片上没有保存成功的修改并切换（之后不再保存它们，离开时
+  // 也不再拦截）。
+  const discardAndOpen = (from: number, id: number) => {
+    if (imageIdRef.current !== from) {
+      return // 提示过期：已经在别的图片上了
+    }
+    saver.discard()
+    openImage(id)
+  }
+
   const navigateTo = async (target: number | null | undefined) => {
-    if (!target || target === imageId || navigating) {
+    if (
+      !target ||
+      target === imageId ||
+      navigating ||
+      blocker.state !== "unblocked" // 正在处理另一次离开
+    ) {
       return
     }
     setNavigating(true)
@@ -771,7 +943,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
             description: state.error ?? undefined,
             action: {
               label: "放弃修改并切换",
-              onClick: () => openImage(target),
+              onClick: () => discardAndOpen(imageId, target),
             },
           })
         }
@@ -830,7 +1002,8 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     setParams((previous) => updateParams(previous, changes), { replace: true })
 
   // ---- 快捷键 ----
-  const run = (command: Command) => {
+  /** 执行命令；返回 false 时这次按键交给浏览器（不阻止默认行为）。 */
+  const run = (command: Command): false | void => {
     switch (command.type) {
       case "tool":
         setTool(command.tool)
@@ -845,10 +1018,10 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         void save()
         return
       case "undo":
-        if (!readOnly) dispatch({ type: "undo" })
+        if (editable) dispatch({ type: "undo" })
         return
       case "redo":
-        if (!readOnly) dispatch({ type: "redo" })
+        if (editable) dispatch({ type: "redo" })
         return
       case "copy":
         copy()
@@ -857,33 +1030,32 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         paste()
         return
       case "duplicate":
-        if (selectedObject && size && !readOnly) {
+        if (activeObject && size && editable) {
           const object = {
-            ...selectedObject,
-            ...duplicateBox(selectedObject, size),
+            ...activeObject,
+            ...duplicateBox(activeObject, size),
             uid: newUid(),
           }
           change([...doc.objects, object], object.uid)
         }
         return
       case "delete":
-        if (selectedObject && !readOnly) {
-          change(removeObject(doc.objects, selectedObject.uid), null)
+        if (activeObject && editable) {
+          change(removeObject(doc.objects, activeObject.uid), null)
         }
         return
       case "cycle": {
         const uid = cycleSelection(
-          doc.objects.filter(
-            (o) => view.showBoxes && !hiddenClasses.has(o.name)
-          ),
+          doc.objects.filter(isShown),
           doc.selected,
           command.direction
         )
         select(uid)
         const object = doc.objects.find((o) => o.uid === uid)
-        if (object) {
-          canvasRef.current?.reveal(object)
+        if (!object) {
+          return false // 到头了：取消选中，Tab 照常把焦点移出画布
         }
+        canvasRef.current?.reveal(object)
         return
       }
       case "escape":
@@ -900,6 +1072,10 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       case "class": {
         const cls = classes[command.index]
         if (!cls) {
+          if (!classList) {
+            classListNotReady()
+            return
+          }
           toast.info(
             classes.length === 0
               ? "还没有类别，请先在右侧添加类别"
@@ -907,8 +1083,8 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
           )
           return
         }
-        if (selectedObject && !readOnly) {
-          relabel(selectedObject.uid, cls.name)
+        if (activeObject && editable) {
+          relabel(activeObject.uid, cls.name)
         } else {
           setActiveClass(cls.name)
           toast(`当前类别：${cls.name}`, { duration: 1200 })
@@ -916,9 +1092,13 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         return
       }
       case "pickClass":
+        if (!classList) {
+          classListNotReady() // 选择框中可以新建类别：要先读取到列表
+          return
+        }
         setPicker(
-          selectedObject && !readOnly
-            ? { mode: "relabel", uid: selectedObject.uid }
+          activeObject && editable
+            ? { mode: "relabel", uid: activeObject.uid }
             : { mode: "active" }
         )
         return
@@ -929,23 +1109,23 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         toggleFlag("truncated")
         return
       case "nudge":
-        if (selectedObject && size && !readOnly) {
+        if (activeObject && size && editable) {
           change(
             updateObject(
               doc.objects,
-              selectedObject.uid,
-              moveBox(selectedObject, command.dx, command.dy, size)
+              activeObject.uid,
+              moveBox(activeObject, command.dx, command.dy, size)
             )
           )
         }
         return
       case "resize":
-        if (selectedObject && size && !readOnly) {
+        if (activeObject && size && editable) {
           change(
             updateObject(
               doc.objects,
-              selectedObject.uid,
-              resizeEdges(selectedObject, command.dx, command.dy, size)
+              activeObject.uid,
+              resizeEdges(activeObject, command.dx, command.dy, size)
             )
           )
         }
@@ -960,8 +1140,8 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         canvasRef.current?.actualSize()
         return
       case "zoomToSelection":
-        if (selectedObject) {
-          canvasRef.current?.zoomToBox(selectedObject)
+        if (activeObject) {
+          canvasRef.current?.zoomToBox(activeObject)
         }
         return
       case "toggleLabels":
@@ -985,7 +1165,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   })
   const hasSelectionRef = useRef(false)
   useEffect(() => {
-    hasSelectionRef.current = doc.selected !== null
+    hasSelectionRef.current = activeObject !== undefined
   })
 
   useEffect(() => {
@@ -997,11 +1177,20 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       if (!command || shouldIgnoreKey(event, command)) {
         return
       }
-      event.preventDefault()
+      if (
+        command.type === "copy" &&
+        copiesSelectedText(event.target, window.getSelection())
+      ) {
+        return // 复制页面上选中的文字
+      }
       if (event.repeat && !allowsRepeat(command)) {
+        event.preventDefault()
         return
       }
-      runRef.current(command)
+      if (runRef.current(command) === false) {
+        return
+      }
+      event.preventDefault()
     }
     window.addEventListener("keydown", onKeyDown)
     return () => window.removeEventListener("keydown", onKeyDown)
@@ -1059,11 +1248,13 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       )}
       <ClassPanel
         classes={classes}
+        listStatus={listStatus}
+        onRetry={() => void classesQ.refetch()}
         objects={doc.objects}
         activeClass={effectiveClass}
         colorFor={colorFor}
         hiddenClasses={hiddenClasses}
-        hasSelection={selectedObject !== undefined}
+        hasSelection={activeObject !== undefined}
         readOnly={readOnly}
         onPick={pickClass}
         onToggleHidden={(name) => {
@@ -1076,7 +1267,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
           setHiddenClasses(nextHidden)
         }}
         onAddToList={(name) => void addClassToList(name)}
-        onManage={() => setClassDialogOpen(true)}
+        onManage={openClassManager}
       />
       <ObjectPanel
         objects={doc.objects}
@@ -1124,8 +1315,8 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         tool={tool}
         onToolChange={setTool}
         readOnly={readOnly}
-        canUndo={!readOnly && doc.past.length > 0}
-        canRedo={!readOnly && doc.future.length > 0}
+        canUndo={editable && doc.past.length > 0}
+        canRedo={editable && doc.future.length > 0}
         onUndo={() => dispatch({ type: "undo" })}
         onRedo={() => dispatch({ type: "redo" })}
         zoom={zoom}
@@ -1137,16 +1328,16 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         saveState={saveState}
         savedAt={savedAt}
         onRetrySave={() => void saver.flush()}
-        canCopyPrevious={!readOnly && size !== null}
+        canCopyPrevious={editable && size !== null}
         onCopyPrevious={() => void copyPrevious()}
-        canMarkNegative={!readOnly && doc.objects.length === 0}
+        canMarkNegative={editable && doc.objects.length === 0}
         onMarkNegative={() => void markNegative()}
         canClearFile={
           !readOnly && latest !== null && latest.annotation_version !== ""
         }
         onClearFile={() => setConfirmClear(true)}
         onReload={() => void reload()}
-        onManageClasses={() => setClassDialogOpen(true)}
+        onManageClasses={openClassManager}
         onHelp={() => setHelpOpen(true)}
         onOpenImages={() => setImagesOpen(true)}
         onOpenPanel={() => setPanelOpen(true)}
@@ -1154,9 +1345,11 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       />
 
       <div className="flex min-h-0 flex-1">
-        <aside className="hidden w-64 shrink-0 flex-col border-r xl:flex">
-          {imagesPanel}
-        </aside>
+        {imagesDocked && (
+          <aside className="flex w-64 shrink-0 flex-col border-r">
+            {imagesPanel}
+          </aside>
+        )}
 
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
           {urgentNotices.length > 0 && (
@@ -1258,12 +1451,14 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
           )}
         </div>
 
-        <aside className="hidden w-72 shrink-0 overflow-y-auto border-l lg:block">
-          {sidePanel}
-        </aside>
+        {panelDocked && (
+          <aside className="w-72 shrink-0 overflow-y-auto border-l">
+            {sidePanel}
+          </aside>
+        )}
       </div>
 
-      <Sheet open={imagesOpen} onOpenChange={setImagesOpen}>
+      <Sheet open={imagesOpen && !imagesDocked} onOpenChange={setImagesOpen}>
         <SheetContent side="left" className="flex w-80 flex-col gap-0 p-0">
           <SheetHeader className="border-b">
             <SheetTitle>图片列表</SheetTitle>
@@ -1274,7 +1469,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
           {imagesPanel}
         </SheetContent>
       </Sheet>
-      <Sheet open={panelOpen} onOpenChange={setPanelOpen}>
+      <Sheet open={panelOpen && !panelDocked} onOpenChange={setPanelOpen}>
         <SheetContent side="right" className="w-80 gap-0 overflow-y-auto p-0">
           <SheetHeader className="border-b">
             <SheetTitle>类别与目标</SheetTitle>
@@ -1289,10 +1484,45 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       <ShortcutsDialog open={helpOpen} onOpenChange={setHelpOpen} mac={mac} />
       <ClassManagerDialog
         datasetId={datasetId}
-        classes={classes}
+        classes={classList}
         open={classDialogOpen}
         onOpenChange={setClassDialogOpen}
       />
+      <AlertDialog
+        open={leavePromptOpen}
+        onOpenChange={(open) => {
+          if (!open) {
+            blocker.reset?.()
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>修改还没有保存</AlertDialogTitle>
+            <AlertDialogDescription>
+              {saveState.status === "conflict"
+                ? "这张图片的标注文件已被修改（可能有其他人同时在标注它），你的修改没有保存。留在这里可以载入最新版本或用你的版本覆盖；离开则放弃这些修改。"
+                : `最后的修改没有保存成功（${saveState.error ?? "未知错误"}）。留在这里可以重试保存；离开则放弃这些修改。`}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>留在这里</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={(event) => {
+                // 不经过 onOpenChange（那里会取消这次离开）：继续离开后提示随
+                // 拦截状态一起关闭。放弃后，卸载时的保存、自动保存都不再写入
+                // 这些修改。
+                event.preventDefault()
+                saver.discard()
+                blocker.proceed?.()
+              }}
+            >
+              放弃修改并离开
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <AlertDialog open={confirmClear} onOpenChange={setConfirmClear}>
         <AlertDialogContent>
           <AlertDialogHeader>

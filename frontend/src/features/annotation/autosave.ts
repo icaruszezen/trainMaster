@@ -65,6 +65,11 @@ export class AnnotationSaver<C> {
   private current: AnnotationObject[] = []
   private currentText = "[]"
   private context: C | null = null
+  /**
+   * 要求即使没有修改也写入一次文件（{@link saveNow}，如“标为空标注”），写入
+   * 成功前算作未保存的修改。
+   */
+  private forced = false
 
   private timer: ReturnType<typeof setTimeout> | null = null
   private inflight: Promise<boolean> | null = null
@@ -90,11 +95,25 @@ export class AnnotationSaver<C> {
 
   /** 有尚未写入文件的修改（包括正在保存的）。 */
   isDirty() {
-    return this.currentText !== this.baseline
+    return this.forced || this.currentText !== this.baseline
   }
 
   getContext() {
     return this.context
+  }
+
+  /**
+   * 离开这张图片前需要先 flush()：有未保存的修改、正在保存，或保存失败 /
+   * 冲突还没有处理。
+   */
+  hasPendingWork() {
+    const { status } = this.state
+    return (
+      this.isDirty() ||
+      status === "saving" ||
+      status === "error" ||
+      status === "conflict"
+    )
   }
 
   /**
@@ -105,6 +124,7 @@ export class AnnotationSaver<C> {
     this.generation += 1
     this.clearTimer()
     this.inflight = null
+    this.forced = false
     this.baseline = serializeObjects(objects)
     this.currentText = this.baseline
     this.current = [...objects]
@@ -114,22 +134,16 @@ export class AnnotationSaver<C> {
   }
 
   /**
-   * 文件已在别处写入（如“标为无目标”直接保存）：以 `objects` 与 `version` 为
-   * 新的基准，不改变上下文。编辑器中有其它修改时继续保存它们。
+   * 放弃未保存的修改（用户选择“放弃修改并离开”）：之后的 flush() 不再保存
+   * 它们；进行中的保存照常完成，但结果不再影响状态。
    */
-  rebase(objects: readonly AnnotationObject[], version: string) {
-    this.baseline = serializeObjects(objects)
-    this.version = version
-    if (this.state.status === "conflict" || this.state.status === "error") {
-      this.setState({ status: "saved", error: null })
-    }
-    if (this.isDirty()) {
-      this.setState({ status: "dirty", error: null })
-      this.schedule()
-    } else {
-      this.clearTimer()
-      this.setState({ status: "saved", error: null })
-    }
+  discard() {
+    this.generation += 1
+    this.clearTimer()
+    this.inflight = null
+    this.forced = false
+    this.baseline = this.currentText
+    this.setState({ status: "clean", error: null })
   }
 
   /** 尚未保存的修改（页面关闭时用 keepalive 请求补发），没有时为 null。 */
@@ -189,7 +203,8 @@ export class AnnotationSaver<C> {
     const generation = this.generation
     // 保存期间可能又有修改，最多再保存几轮。
     for (let round = 0; round < 5; round += 1) {
-      if (this.inflight) {
+      // 同时有多个 flush() 时，等待期间别的 flush() 可能已开始下一次保存。
+      while (this.inflight) {
         await this.inflight
       }
       if (generation !== this.generation) {
@@ -210,6 +225,23 @@ export class AnnotationSaver<C> {
       }
     }
     return !this.isDirty()
+  }
+
+  /**
+   * 即使没有修改也立即写入编辑器中的框（如“标为空标注”：调用前在上下文中
+   * 标明，再写入没有目标的文件）。先等待进行中的保存；与普通修改一样，写入
+   * 成功前算作未保存（flush() 会等待并重试它，关闭页面时补发）。存在冲突时
+   * 不写入，返回 false。
+   */
+  async saveNow(): Promise<boolean> {
+    if (this.context === null || this.state.status === "conflict") {
+      return false
+    }
+    this.forced = true
+    if (this.state.status !== "saving") {
+      this.setState({ status: "dirty", error: null })
+    }
+    return this.flush()
   }
 
   /** 冲突时选择“覆盖”：不再检查版本，用编辑器中的框覆盖文件。 */
@@ -233,7 +265,11 @@ export class AnnotationSaver<C> {
     }
     this.timer = setTimeout(() => {
       this.timer = null
-      if (this.inflight || this.state.status === "conflict") {
+      if (
+        this.inflight ||
+        this.state.status === "conflict" ||
+        !this.isDirty() // 已由 flush() 保存
+      ) {
         return // 正在保存：保存完成后会再检查一次
       }
       void this.run(false)
@@ -251,6 +287,7 @@ export class AnnotationSaver<C> {
     const generation = this.generation
     const objects = this.current
     const text = this.currentText
+    const forced = this.forced
     const context = this.context
     if (context === null) {
       return Promise.resolve(false) // 还没有 reset()
@@ -269,6 +306,9 @@ export class AnnotationSaver<C> {
         this.inflight = null
         this.version = version
         this.baseline = text
+        if (forced) {
+          this.forced = false
+        }
         if (this.isDirty()) {
           // 保存期间又有修改：继续保存。
           this.setState({ status: "dirty", error: null })

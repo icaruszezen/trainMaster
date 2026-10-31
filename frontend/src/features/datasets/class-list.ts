@@ -114,20 +114,32 @@ export async function readClassFile(file: Blob): Promise<string> {
 const byCodePoint = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 
 /**
- * 下载为 YOLO 时的默认类别顺序：数据集中的标签按名称（码点）排序。给出
- * `base`（最近一次 YOLO 导入的类别顺序）时先沿用它，类别编号与导入时一致，
- * 其余标签按名称排在后面。
+ * 下载为 YOLO 时的默认类别顺序：先依次沿用 `bases` 中的顺序（如最近一次
+ * YOLO 导入的类别顺序，类别编号与导入时一致；再是标注工作台类别列表中的
+ * 其它类别），重复的只取第一次出现的位置；数据集中其余的标签按名称（码点）
+ * 排在后面。
  */
 export function defaultClassOrder(
   labels: readonly Pick<DatasetLabel, "name">[],
-  base: readonly string[] = []
+  ...bases: (readonly string[] | undefined)[]
 ) {
-  const known = new Set(base)
-  const rest = labels
+  const order: string[] = []
+  const known = new Set<string>()
+  const add = (name: string) => {
+    if (!known.has(name)) {
+      known.add(name)
+      order.push(name)
+    }
+  }
+  for (const base of bases) {
+    base?.forEach(add)
+  }
+  labels
     .map((label) => label.name)
     .filter((name) => !known.has(name))
     .sort(byCodePoint)
-  return [...base, ...rest]
+    .forEach(add)
+  return order
 }
 
 /**

@@ -46,11 +46,12 @@ beforeEach(() => {
 describe("persistAnnotation", () => {
   it("writes the boxes", async () => {
     await persistAnnotation([box], "v1", false, context())
-    expect(saveAnnotation).toHaveBeenCalledWith(1, 2, {
-      objects: [box],
-      base_version: "v1",
-      force: false,
-    })
+    expect(saveAnnotation).toHaveBeenCalledWith(
+      1,
+      2,
+      { objects: [box], base_version: "v1", force: false },
+      undefined
+    )
   })
 
   it("writes nothing for an image that had no file and still has no box", async () => {
@@ -63,8 +64,25 @@ describe("persistAnnotation", () => {
 
   it("removes the file created in this session when all boxes are deleted", async () => {
     await persistAnnotation([], "v2", false, context())
-    expect(deleteAnnotation).toHaveBeenCalledWith(1, 2, "v2", false)
+    expect(deleteAnnotation).toHaveBeenCalledWith(1, 2, "v2", false, undefined)
     expect(saveAnnotation).not.toHaveBeenCalled()
+  })
+
+  it("passes the request options through, also when deleting (keepalive)", async () => {
+    const init = { keepalive: true }
+    await persistAnnotation([], "v2", false, context(), init)
+    expect(deleteAnnotation).toHaveBeenCalledWith(1, 2, "v2", false, init)
+    await persistAnnotation([box], "v2", false, context(), init)
+    expect(saveAnnotation).toHaveBeenCalledWith(
+      1,
+      2,
+      { objects: [box], base_version: "v2", force: false },
+      init
+    )
+    await expect(
+      persistAnnotation([], "", false, context(), init)
+    ).resolves.toBeNull()
+    expect(deleteAnnotation).toHaveBeenCalledTimes(1)
   })
 
   it("writes an empty annotation when the image had a file or is marked negative", async () => {

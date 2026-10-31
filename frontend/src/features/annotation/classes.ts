@@ -161,6 +161,22 @@ export function mergeLabels(
   return { classes: [...classes, ...extra], added: extra.length }
 }
 
+/**
+ * 在类别列表末尾加入一个类别，已有同名类别时原样返回。用于加入类别时先更新
+ * 页面（与服务端 `POST /classes` 的结果一致），之后以服务端返回的列表为准。
+ */
+export function appendClass<T extends { items: DatasetClass[]; total: number }>(
+  list: T,
+  name: string,
+  color = ""
+): T {
+  if (list.items.some((cls) => cls.name === name)) {
+    return list
+  }
+  const items = [...list.items, { name, color }]
+  return { ...list, items, total: items.length }
+}
+
 /** 按输入筛选类别（不区分大小写的包含匹配），完全相同的排在最前。 */
 export function filterClasses<T extends { name: string }>(
   classes: readonly T[],
