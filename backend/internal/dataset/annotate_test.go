@@ -96,7 +96,8 @@ func openTestRoot(t *testing.T, files map[string][]byte, dirs ...string) *os.Roo
 }
 
 func TestDefaultAnnotationPath(t *testing.T) {
-	root := openTestRoot(t, map[string][]byte{"voc/annotations.txt": nil, "voc2/Annotations": []byte("a file, not a folder")},
+	root := openTestRoot(t, map[string][]byte{"voc/annotations.txt": nil, "voc2/Annotations": []byte("a file, not a folder"),
+		"VOC2007/JPEGImages/twin.jpg": nil, "VOC2007/images/twin.jpg": nil, "VOC2007/images/k.png": nil, "VOC2007/images/dir.jpg/x": nil},
 		"VOC2007/JPEGImages", "VOC2007/Annotations", "lower/images", "lower/annotations", "voc/JPEGImages", "voc2/JPEGImages",
 		"JPEGImages", "Annotations", "NG")
 	for rel, want := range map[string]string{
@@ -111,6 +112,12 @@ func TestDefaultAnnotationPath(t *testing.T) {
 		"missing/JPEGImages/a.jpg":    "missing/JPEGImages/a.xml", // the parent does not exist
 		"NG/JPEGImagesX/a.jpg":        "NG/JPEGImagesX/a.xml",     // not a VOC image folder
 		"VOC2007/Annotations/odd.jpg": "VOC2007/Annotations/odd.xml",
+		// An image of the same name in the other VOC image folder would take
+		// Annotations/twin.xml too: each gets a file next to it.
+		"VOC2007/JPEGImages/twin.jpg": "VOC2007/JPEGImages/twin.xml",
+		"VOC2007/images/twin.jpg":     "VOC2007/images/twin.xml",
+		"VOC2007/JPEGImages/k.jpg":    "VOC2007/Annotations/k.xml",   // only the stem is the same
+		"VOC2007/JPEGImages/dir.jpg":  "VOC2007/Annotations/dir.xml", // a folder is no image
 	} {
 		if got := defaultAnnotationPath(root, rel); got != want {
 			t.Errorf("defaultAnnotationPath(%q) = %q, want %q", rel, got, want)
@@ -889,37 +896,53 @@ func TestIntegrationPairedAnnotationSuperseded(t *testing.T) {
 	}
 }
 
-// A new annotation file is created only for the image a scan gives it to.
+// A new annotation file is created where a scan gives it to the image that
+// created it, whatever happens to the other files later.
 func TestIntegrationNewAnnotationFileOwner(t *testing.T) {
 	e := newAnnotationEnv(t, map[string][]byte{
 		"VOC/JPEGImages/a.jpg":  pngFile(t, 16, 16),
 		"VOC/images/a.jpg":      pngFile(t, 16, 16),
+		"VOC/JPEGImages/k.jpg":  pngFile(t, 16, 16),
+		"VOC/images/k.png":      pngFile(t, 16, 16),
 		"VOC/Annotations/.keep": nil,
 		"same/a.jpg":            pngFile(t, 16, 16),
 		"same/a.png":            pngFile(t, 16, 16),
 	})
 	ctx := context.Background()
+	save := func(rel, label string) ImageDetail {
+		t.Helper()
+		saved, err := e.svc.SaveAnnotation(ctx, e.d.ID, e.image(t, rel).ID, SaveAnnotationInput{Objects: boxNamed(label)})
+		if err != nil {
+			t.Fatalf("save %s: %v", rel, err)
+		}
+		return saved
+	}
 
-	// Both images take Annotations/a.xml, and the <filename> a.jpg of a new
-	// file names both: a scan gives it to the first in sorted order.
-	img := e.image(t, "VOC/images/a.jpg")
-	got := e.detail(t, img)
-	if !strings.Contains(got.AnnotationBlocked, "标注文件 VOC/Annotations/a.xml 属于另一张图片 VOC/JPEGImages/a.jpg（VOC 按文件名配对）") ||
-		strings.Contains(got.AnnotationBlocked, "同一文件夹") {
-		t.Errorf("images/a.jpg detail = %+v", got)
+	// JPEGImages/a.jpg and images/a.jpg would both take Annotations/a.xml,
+	// and its <filename> could not tell them apart: each image gets a file
+	// next to it instead.
+	for _, rel := range []string{"VOC/images/a.jpg", "VOC/JPEGImages/a.jpg"} {
+		if got := e.detail(t, e.image(t, rel)); got.AnnotationBlocked != "" {
+			t.Errorf("%s detail = %+v", rel, got)
+		}
 	}
-	_, err := e.svc.SaveAnnotation(ctx, e.d.ID, img.ID, SaveAnnotationInput{Objects: boxNamed("for-images")})
-	wantKind(t, err, ErrConflict, "属于另一张图片 VOC/JPEGImages/a.jpg")
+	if saved := save("VOC/images/a.jpg", "for-images"); *saved.AnnotationPath != "VOC/images/a.xml" {
+		t.Errorf("images/a.jpg saved = %+v", saved)
+	}
+	if saved := save("VOC/JPEGImages/a.jpg", "for-jpeg"); *saved.AnnotationPath != "VOC/JPEGImages/a.xml" {
+		t.Errorf("JPEGImages/a.jpg saved = %+v", saved)
+	}
 	if _, err := os.Stat(filepath.Join(e.dir, "VOC", "Annotations", "a.xml")); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("created a file for images/a.jpg: %v", err)
+		t.Errorf("created a shared file: %v", err)
 	}
-	jpeg := e.image(t, "VOC/JPEGImages/a.jpg")
-	if got := e.detail(t, jpeg); got.AnnotationBlocked != "" {
-		t.Errorf("JPEGImages/a.jpg detail = %+v", got)
+	// Images of other names share Annotations/: the <filename> of the new
+	// file decides.
+	if saved := save("VOC/JPEGImages/k.jpg", "for-k"); *saved.AnnotationPath != "VOC/Annotations/k.xml" {
+		t.Errorf("JPEGImages/k.jpg saved = %+v", saved)
 	}
-	saved, err := e.svc.SaveAnnotation(ctx, e.d.ID, jpeg.ID, SaveAnnotationInput{Objects: boxNamed("for-jpeg")})
-	if err != nil || *saved.AnnotationPath != "VOC/Annotations/a.xml" {
-		t.Fatalf("JPEGImages/a.jpg save = %+v, %v", saved, err)
+	if got := e.detail(t, e.image(t, "VOC/images/k.png")); !strings.Contains(got.AnnotationBlocked, "属于另一张图片 VOC/JPEGImages/k.jpg（VOC 按文件名配对）") ||
+		strings.Contains(got.AnnotationBlocked, "同一文件夹") {
+		t.Errorf("images/k.png detail = %+v", got)
 	}
 
 	// In one folder the <filename> of the new file decides: a.png may create
@@ -928,23 +951,301 @@ func TestIntegrationNewAnnotationFileOwner(t *testing.T) {
 	if got := e.detail(t, png); got.AnnotationBlocked != "" {
 		t.Errorf("same/a.png detail = %+v", got)
 	}
-	if _, err := e.svc.SaveAnnotation(ctx, e.d.ID, png.ID, SaveAnnotationInput{Objects: boxNamed("for-png")}); err != nil {
-		t.Fatal(err)
-	}
+	save("same/a.png", "for-png")
 
 	e.rescan(t)
-	if got := e.detail(t, e.image(t, "VOC/JPEGImages/a.jpg")); !reflect.DeepEqual(objectNames(got.Objects), []string{"for-jpeg"}) {
-		t.Errorf("JPEGImages/a.jpg after a rescan = %+v", got)
+	for rel, want := range map[string]string{
+		"VOC/JPEGImages/a.jpg": "for-jpeg", "VOC/images/a.jpg": "for-images", "VOC/JPEGImages/k.jpg": "for-k", "same/a.png": "for-png",
+	} {
+		if got := e.detail(t, e.image(t, rel)); !reflect.DeepEqual(objectNames(got.Objects), []string{want}) || got.AnnotationBlocked != "" {
+			t.Errorf("%s after a rescan = %+v", rel, got)
+		}
 	}
-	if got := e.detail(t, e.image(t, "VOC/images/a.jpg")); len(got.Objects) != 0 ||
-		!strings.Contains(got.AnnotationBlocked, "属于另一张图片 VOC/JPEGImages/a.jpg") {
-		t.Errorf("images/a.jpg after a rescan = %+v", got)
-	}
-	if got := e.detail(t, e.image(t, "same/a.png")); !reflect.DeepEqual(objectNames(got.Objects), []string{"for-png"}) {
-		t.Errorf("same/a.png after a rescan = %+v", got)
+	if got := e.detail(t, e.image(t, "VOC/images/k.png")); !strings.Contains(got.AnnotationBlocked, "属于另一张图片 VOC/JPEGImages/k.jpg") {
+		t.Errorf("images/k.png after a rescan = %+v", got)
 	}
 	if got := e.detail(t, e.image(t, "same/a.jpg")); !strings.Contains(got.AnnotationBlocked, "属于同一文件夹中的另一张图片 same/a.png") {
 		t.Errorf("same/a.jpg after a rescan = %+v", got)
+	}
+}
+
+// The boxes saved for an image stay with it: viewing and saving use the file
+// the next scan pairs with the image, also after the platform deletes the
+// file of another image or another tool rewrites a file.
+func TestIntegrationAnnotationOwnershipKept(t *testing.T) {
+	e := newAnnotationEnv(t, map[string][]byte{
+		// JPEGImages/b.jpg has a file of its own (LabelImg's).
+		"VOC/JPEGImages/b.jpg":  pngFile(t, 16, 16),
+		"VOC/JPEGImages/b.xml":  vocFile("b.jpg", "theirs"),
+		"VOC/images/b.jpg":      pngFile(t, 16, 16),
+		"VOC/Annotations/.keep": nil,
+		// The scan pairs images/c.jpg with Annotations/c.xml: JPEGImages/c.jpg
+		// has a file of its own.
+		"VOC2/JPEGImages/c.jpg":  pngFile(t, 16, 16),
+		"VOC2/JPEGImages/c.xml":  vocFile("c.jpg", "labelimg"),
+		"VOC2/images/c.jpg":      pngFile(t, 16, 16),
+		"VOC2/Annotations/c.xml": vocFile("c.jpg", "shared"),
+		"f/a.jpg":                pngFile(t, 16, 16),
+		"f/a.png":                pngFile(t, 16, 16),
+	})
+	ctx := context.Background()
+	save := func(rel, base, label string) (ImageDetail, error) {
+		return e.svc.SaveAnnotation(ctx, e.d.ID, e.image(t, rel).ID, SaveAnnotationInput{Objects: boxNamed(label), BaseVersion: base})
+	}
+	remove := func(rel string, force bool) (ImageDetail, error) {
+		img := e.image(t, rel)
+		return e.svc.DeleteAnnotation(ctx, e.d.ID, img.ID, e.detail(t, img).AnnotationVersion, force)
+	}
+
+	// images/b.jpg creates its file; deleting the file of JPEGImages/b.jpg
+	// then makes that image look for Annotations/b.xml.
+	mine, err := save("VOC/images/b.jpg", "", "mine")
+	if err != nil || *mine.AnnotationPath != "VOC/images/b.xml" {
+		t.Fatalf("images/b.jpg save = %+v, %v", mine, err)
+	}
+	if _, err := remove("VOC/JPEGImages/b.jpg", false); err != nil {
+		t.Fatalf("delete JPEGImages/b.jpg: %v", err)
+	}
+	got := e.detail(t, e.image(t, "VOC/images/b.jpg"))
+	if !reflect.DeepEqual(objectNames(got.Objects), []string{"mine"}) || got.AnnotationBlocked != "" {
+		t.Fatalf("images/b.jpg detail = %+v", got)
+	}
+	if _, err := save("VOC/images/b.jpg", got.AnnotationVersion, "mine-2"); err != nil {
+		t.Fatalf("images/b.jpg second save: %v", err)
+	}
+
+	// Deleting the file of JPEGImages/c.jpg would make it take
+	// Annotations/c.xml from images/c.jpg at the next scan: refused, even
+	// forced. Saving it empty keeps it off that file.
+	for _, force := range []bool{false, true} {
+		_, err := remove("VOC2/JPEGImages/c.jpg", force)
+		wantKind(t, err, ErrConflict, "重新扫描会把另一张图片 VOC2/images/c.jpg 的标注文件 VOC2/Annotations/c.xml 配对给这张图片")
+	}
+	if data := e.readFile(t, "VOC2/JPEGImages/c.xml"); !bytes.Equal(data, vocFile("c.jpg", "labelimg")) {
+		t.Errorf("refused delete changed the file:\n%s", data)
+	}
+	c := e.image(t, "VOC2/JPEGImages/c.jpg")
+	empty, err := e.svc.SaveAnnotation(ctx, e.d.ID, c.ID, SaveAnnotationInput{Objects: []AnnotationObject{}, BaseVersion: e.detail(t, c).AnnotationVersion})
+	if err != nil || empty.AnnotationState != annotationEmpty {
+		t.Errorf("empty save = %+v, %v", empty, err)
+	}
+
+	// Another tool rewrites a.xml for a.png: a scan gives it to a.png now,
+	// so a.jpg can no longer save into it or delete it.
+	if _, err := save("f/a.jpg", "", "jpgbox"); err != nil {
+		t.Fatal(err)
+	}
+	pngXML := vocFile("a.png", "pngbox")
+	writeFiles(t, e.dir, map[string][]byte{"f/a.xml": pngXML})
+	jpg := e.image(t, "f/a.jpg")
+	_, err = save("f/a.jpg", annotationVersion(pngXML), "jpgbox2")
+	wantKind(t, err, ErrConflict, "标注文件 f/a.xml 按 VOC 的配对规则现在属于同一文件夹中的另一张图片 f/a.png")
+	_, err = e.svc.DeleteAnnotation(ctx, e.d.ID, jpg.ID, annotationVersion(pngXML), true)
+	wantKind(t, err, ErrConflict, "请先重新扫描数据集")
+	if data := e.readFile(t, "f/a.xml"); !bytes.Equal(data, pngXML) {
+		t.Errorf("a.jpg changed a.png's file:\n%s", data)
+	}
+
+	e.rescan(t)
+	for rel, want := range map[string][]string{
+		"VOC/images/b.jpg": {"mine-2"}, "VOC/JPEGImages/b.jpg": {},
+		"VOC2/images/c.jpg": {"shared"}, "VOC2/JPEGImages/c.jpg": {},
+		"f/a.png": {"pngbox"},
+	} {
+		if got := e.detail(t, e.image(t, rel)); !reflect.DeepEqual(objectNames(got.Objects), want) || got.AnnotationBlocked != "" {
+			t.Errorf("%s after a rescan = %+v", rel, got)
+		}
+	}
+	if img := e.image(t, "VOC2/JPEGImages/c.jpg"); img.AnnotationState != annotationEmpty {
+		t.Errorf("JPEGImages/c.jpg after a rescan = %+v", img)
+	}
+	if got := e.detail(t, e.image(t, "f/a.jpg")); !strings.Contains(got.AnnotationBlocked, "属于同一文件夹中的另一张图片 f/a.png") {
+		t.Errorf("a.jpg after a rescan = %+v", got)
+	}
+}
+
+// A paired image whose file is gone gets a new file where an image without
+// one would, so its owner does not depend on the files of other images.
+func TestIntegrationPairedAnnotationGone(t *testing.T) {
+	e := newAnnotationEnv(t, map[string][]byte{
+		"VOC/JPEGImages/b.jpg":  pngFile(t, 16, 16),
+		"VOC/JPEGImages/b.xml":  vocFile("b.jpg", "theirs"),
+		"VOC/images/b.jpg":      pngFile(t, 16, 16),
+		"VOC/Annotations/b.xml": vocFile("b.jpg", "shared"),
+		"flat/e.png":            pngFile(t, 16, 16),
+		"flat/e.xml":            vocFile("e.png", "dent"),
+	})
+	ctx := context.Background()
+	for _, rel := range []string{"VOC/Annotations/b.xml", "flat/e.xml"} {
+		if err := os.Remove(filepath.Join(e.dir, filepath.FromSlash(rel))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	saved, err := e.svc.SaveAnnotation(ctx, e.d.ID, e.image(t, "VOC/images/b.jpg").ID, SaveAnnotationInput{Objects: boxNamed("mine")})
+	if err != nil || *saved.AnnotationPath != "VOC/images/b.xml" {
+		t.Fatalf("images/b.jpg save = %+v, %v", saved, err)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, "VOC", "Annotations", "b.xml")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("wrote the shared file again: %v", err)
+	}
+	saved, err = e.svc.SaveAnnotation(ctx, e.d.ID, e.image(t, "flat/e.png").ID, SaveAnnotationInput{Objects: boxNamed("again")})
+	if err != nil || *saved.AnnotationPath != "flat/e.xml" {
+		t.Fatalf("e.png save = %+v, %v", saved, err)
+	}
+	jpeg := e.image(t, "VOC/JPEGImages/b.jpg")
+	if _, err := e.svc.DeleteAnnotation(ctx, e.d.ID, jpeg.ID, e.detail(t, jpeg).AnnotationVersion, false); err != nil {
+		t.Fatalf("delete JPEGImages/b.jpg: %v", err)
+	}
+	e.rescan(t)
+	if got := e.detail(t, e.image(t, "VOC/images/b.jpg")); !reflect.DeepEqual(objectNames(got.Objects), []string{"mine"}) {
+		t.Errorf("images/b.jpg after a rescan = %+v", got)
+	}
+	if got := e.detail(t, e.image(t, "VOC/JPEGImages/b.jpg")); got.AnnotationState != annotationNone || got.AnnotationBlocked != "" {
+		t.Errorf("JPEGImages/b.jpg after a rescan = %+v", got)
+	}
+}
+
+// Deleting the file of an image that has another candidate pairs the image
+// with that file, as a scan would.
+func TestIntegrationDeleteAnnotationFallsBack(t *testing.T) {
+	e := newAnnotationEnv(t, map[string][]byte{
+		"VOC/JPEGImages/a.jpg":  pngFile(t, 16, 16),
+		"VOC/Annotations/.keep": nil,
+		"VOC/JPEGImages/h.jpg":  pngFile(t, 16, 16),
+		"VOC/JPEGImages/h.xml":  vocFile("h.jpg", "own"),
+		"VOC/images/h.png":      pngFile(t, 16, 16),
+	})
+	ctx := context.Background()
+	a := e.image(t, "VOC/JPEGImages/a.jpg")
+	first, err := e.svc.SaveAnnotation(ctx, e.d.ID, a.ID, SaveAnnotationInput{Objects: boxNamed("platform")})
+	if err != nil || *first.AnnotationPath != "VOC/Annotations/a.xml" {
+		t.Fatalf("first save = %+v, %v", first, err)
+	}
+	writeFiles(t, e.dir, map[string][]byte{"VOC/JPEGImages/a.xml": vocFile("a.jpg", "labelimg")})
+	got := e.detail(t, a)
+	if *got.AnnotationPath != "VOC/JPEGImages/a.xml" {
+		t.Fatalf("detail = %+v", got)
+	}
+	gone, err := e.svc.DeleteAnnotation(ctx, e.d.ID, a.ID, got.AnnotationVersion, false)
+	if err != nil || gone.AnnotationState != annotationAnnotated || gone.AnnotationPath == nil || *gone.AnnotationPath != "VOC/Annotations/a.xml" ||
+		gone.AnnotationVersion != first.AnnotationVersion || !reflect.DeepEqual(objectNames(gone.Objects), []string{"platform"}) ||
+		gone.Annotation == nil || gone.Annotation.ObjectCount != 1 || gone.AnnotationError != "" {
+		t.Fatalf("deleted = %+v, %v", gone, err)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, "VOC", "JPEGImages", "a.xml")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a.xml still there: %v", err)
+	}
+	if img := e.image(t, "VOC/JPEGImages/a.jpg"); img.AnnotationPath == nil || *img.AnnotationPath != "VOC/Annotations/a.xml" ||
+		img.AnnotationState != annotationAnnotated {
+		t.Errorf("indexed image = %+v", img)
+	}
+	if d := e.dataset(t); d.AnnotatedCount != 2 {
+		t.Errorf("counters after delete = %+v", d)
+	}
+	if after := e.detail(t, a); after.AnnotationVersion != gone.AnnotationVersion || !reflect.DeepEqual(after.Objects, gone.Objects) {
+		t.Errorf("detail after delete = %+v", after)
+	}
+	// The index is what a scan writes.
+	job, err := e.svc.StartScan(ctx, e.d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job = e.waitJob(t, e.d.ID, job.ID); job.Summary[sumImagesUpdated] != 0 {
+		t.Errorf("rescan after delete = %+v", job.Summary)
+	}
+	// The next edit starts from that file.
+	saved, err := e.svc.SaveAnnotation(ctx, e.d.ID, a.ID, SaveAnnotationInput{Objects: boxNamed("again"), BaseVersion: gone.AnnotationVersion})
+	if err != nil || *saved.AnnotationPath != "VOC/Annotations/a.xml" {
+		t.Errorf("save after delete = %+v, %v", saved, err)
+	}
+
+	// A remaining file that a scan gives to another image: the image is
+	// unannotated, and the result says why it cannot be edited.
+	writeFiles(t, e.dir, map[string][]byte{"VOC/Annotations/h.xml": vocFile("h.png", "for-png")})
+	h := e.image(t, "VOC/JPEGImages/h.jpg")
+	gone, err = e.svc.DeleteAnnotation(ctx, e.d.ID, h.ID, e.detail(t, h).AnnotationVersion, false)
+	if err != nil || gone.AnnotationState != annotationNone || gone.AnnotationPath != nil || len(gone.Objects) != 0 ||
+		!strings.Contains(gone.AnnotationBlocked, "标注文件 VOC/Annotations/h.xml 属于另一张图片 VOC/images/h.png") {
+		t.Fatalf("deleted h.jpg = %+v, %v", gone, err)
+	}
+	if after := e.detail(t, h); after.AnnotationBlocked != gone.AnnotationBlocked {
+		t.Errorf("h.jpg detail after delete = %+v", after)
+	}
+	if img := e.image(t, "VOC/JPEGImages/h.jpg"); img.AnnotationPath != nil || img.AnnotationState != annotationNone {
+		t.Errorf("indexed h.jpg = %+v", img)
+	}
+	e.rescan(t)
+	if img := e.image(t, "VOC/images/h.png"); img.AnnotationPath == nil || *img.AnnotationPath != "VOC/Annotations/h.xml" {
+		t.Errorf("h.png after a rescan = %+v", img)
+	}
+	if img := e.image(t, "VOC/JPEGImages/h.jpg"); img.AnnotationPath != nil {
+		t.Errorf("h.jpg after a rescan = %+v", img)
+	}
+}
+
+// An image blocked by another image whose pairing in the index is out of
+// date is told to rescan, not to rename an image.
+func TestIntegrationStaleAnnotationOwner(t *testing.T) {
+	e := newAnnotationEnv(t, map[string][]byte{
+		// The scan gives Annotations/a.xml to JPEGImages/a.jpg (first in
+		// byte order); LabelImg then writes JPEGImages/a.xml.
+		"VOC/JPEGImages/a.jpg":  pngFile(t, 16, 16),
+		"VOC/images/a.jpg":      pngFile(t, 16, 16),
+		"VOC/Annotations/a.xml": vocFile("a.jpg", "platform"),
+		"flat/c.jpg":            pngFile(t, 16, 16),
+		"flat/c.png":            pngFile(t, 16, 16),
+		"flat/c.xml":            vocFile("c.jpg", "jpg"),
+		"flat/d.jpg":            pngFile(t, 16, 16),
+		"flat/d.png":            pngFile(t, 16, 16),
+		"flat/d.xml":            vocFile("d.jpg", "jpg"),
+		"flat/g.jpg":            pngFile(t, 16, 16),
+		"flat/g.png":            pngFile(t, 16, 16),
+		"flat/g.xml":            vocFile("g.jpg", "jpg"),
+	})
+	ctx := context.Background()
+	writeFiles(t, e.dir, map[string][]byte{
+		"VOC/JPEGImages/a.xml": vocFile("a.jpg", "labelimg"),
+		"flat/g.xml":           vocFile("g.png", "png"), // rewritten for g.png
+	})
+	for _, rel := range []string{"flat/c.xml", "flat/d.jpg"} {
+		if err := os.Remove(filepath.Join(e.dir, filepath.FromSlash(rel))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := e.detail(t, e.image(t, "VOC/JPEGImages/a.jpg")); *got.AnnotationPath != "VOC/JPEGImages/a.xml" {
+		t.Fatalf("JPEGImages/a.jpg detail = %+v", got)
+	}
+	for rel, owner := range map[string]string{
+		"VOC/images/a.jpg": "VOC/Annotations/a.xml 在索引中仍与图片 VOC/JPEGImages/a.jpg 配对",
+		"flat/c.png":       "flat/c.xml 在索引中仍与图片 flat/c.jpg 配对", // c.xml is gone
+		"flat/d.png":       "flat/d.xml 在索引中仍与图片 flat/d.jpg 配对", // d.jpg is gone
+		"flat/g.png":       "flat/g.xml 在索引中仍与图片 flat/g.jpg 配对", // g.xml names g.png
+	} {
+		img := e.image(t, rel)
+		got := e.detail(t, img)
+		if !strings.Contains(got.AnnotationBlocked, owner) || !strings.Contains(got.AnnotationBlocked, "配对已过期") ||
+			!strings.Contains(got.AnnotationBlocked, "请先重新扫描数据集") || strings.Contains(got.AnnotationBlocked, "重命名") {
+			t.Errorf("%s detail = %+v", rel, got)
+		}
+		_, err := e.svc.SaveAnnotation(ctx, e.d.ID, img.ID, SaveAnnotationInput{Objects: boxNamed("x"), Force: true})
+		wantKind(t, err, ErrConflict, "配对已过期")
+	}
+	if data := e.readFile(t, "VOC/Annotations/a.xml"); !bytes.Equal(data, vocFile("a.jpg", "platform")) {
+		t.Errorf("a blocked save changed the file:\n%s", data)
+	}
+
+	e.rescan(t)
+	for rel, want := range map[string][]string{
+		"VOC/images/a.jpg": {"platform"}, "flat/c.png": {}, "flat/d.png": {"jpg"}, "flat/g.png": {"png"},
+	} {
+		img := e.image(t, rel)
+		got := e.detail(t, img)
+		if got.AnnotationBlocked != "" || !reflect.DeepEqual(objectNames(got.Objects), want) {
+			t.Errorf("%s after a rescan = %+v", rel, got)
+		}
+		if _, err := e.svc.SaveAnnotation(ctx, e.d.ID, img.ID, SaveAnnotationInput{Objects: boxNamed("x"), BaseVersion: got.AnnotationVersion}); err != nil {
+			t.Errorf("%s save after a rescan: %v", rel, err)
+		}
 	}
 }
 
