@@ -1,10 +1,13 @@
-import { QueryClient } from "@tanstack/react-query"
+import { QueryClient, QueryObserver } from "@tanstack/react-query"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
   annotationKeys,
   applySavedDetail,
+  editorImageQuery,
+  openableDetail,
   persistAnnotation,
+  saveEditorAnnotation,
   savedDetail,
   type SaveContext,
 } from "@/features/annotation/api"
@@ -15,6 +18,7 @@ import {
   type AnnotationObject,
   type DatasetImageDetail,
 } from "@/features/datasets/api"
+import { ApiError } from "@/lib/api"
 
 vi.mock("@/features/datasets/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/features/datasets/api")>()),
@@ -152,5 +156,136 @@ describe("savedDetail", () => {
   it("falls back to the loaded detail when the cache has none", () => {
     const loaded = detail("v1", ["dent"])
     expect(savedDetail(new QueryClient(), 1, loaded)).toBe(loaded)
+  })
+})
+
+describe("saveEditorAnnotation", () => {
+  const request = (changes: Partial<SaveContext> = {}) => ({
+    objects: [box],
+    baseVersion: "v1",
+    force: false,
+    context: context(changes),
+  })
+  const cached = (client: QueryClient) =>
+    client.getQueryState(annotationKeys.image(1, 2))
+
+  it("updates the cache and returns the new version", async () => {
+    const client = new QueryClient()
+    vi.mocked(saveAnnotation).mockResolvedValueOnce({
+      id: 2,
+      annotation_version: "v2",
+    } as DatasetImageDetail)
+    await expect(saveEditorAnnotation(client, request())).resolves.toBe("v2")
+    expect(client.getQueryData(annotationKeys.image(1, 2))).toEqual({
+      id: 2,
+      annotation_version: "v2",
+    })
+  })
+
+  it("keeps the version when nothing was written", async () => {
+    const client = new QueryClient()
+    await expect(
+      saveEditorAnnotation(client, {
+        ...request(),
+        objects: [],
+        baseVersion: "",
+      })
+    ).resolves.toBe("")
+  })
+
+  it("marks the cached detail outdated when someone else changed the file", async () => {
+    const client = new QueryClient()
+    client.setQueryData(annotationKeys.image(1, 2), { id: 2 })
+    client.setQueryData(annotationKeys.image(1, 3), { id: 3 })
+    const conflict = new ApiError(409, "annotation_conflict", "已被修改")
+    vi.mocked(saveAnnotation).mockRejectedValueOnce(conflict)
+    await expect(saveEditorAnnotation(client, request())).rejects.toBe(conflict)
+    // 放弃修改、之后再打开时重新读取，不再用缓存中过期的框。
+    expect(cached(client)?.isInvalidated).toBe(true)
+    expect(
+      client.getQueryState(annotationKeys.image(1, 3))?.isInvalidated
+    ).toBe(false)
+  })
+
+  it("leaves the cache alone for other errors", async () => {
+    const client = new QueryClient()
+    client.setQueryData(annotationKeys.image(1, 2), { id: 2 })
+    const failure = new ApiError(500, "internal", "boom")
+    vi.mocked(saveAnnotation).mockRejectedValueOnce(failure)
+    await expect(saveEditorAnnotation(client, request())).rejects.toBe(failure)
+    expect(cached(client)?.isInvalidated).toBe(false)
+  })
+})
+
+describe("openableDetail", () => {
+  const detail = (id: number, version: string) =>
+    ({ id, annotation_version: version }) as DatasetImageDetail
+
+  it("uses fresh cached details, including after a failed refetch", () => {
+    const data = detail(2, "v1")
+    expect(openableDetail({ data, isStale: false, isFetching: false }, 2)).toBe(
+      data
+    )
+    expect(openableDetail({ data, isStale: false, isFetching: true }, 2)).toBe(
+      data
+    )
+    expect(openableDetail({ data, isStale: true, isFetching: false }, 2)).toBe(
+      data
+    )
+  })
+
+  it("does not use another image's detail or a stale one being refetched", () => {
+    const data = detail(2, "v1")
+    expect(
+      openableDetail({ data, isStale: false, isFetching: false }, 3)
+    ).toBeUndefined()
+    expect(
+      openableDetail({ data: undefined, isStale: true, isFetching: true }, 2)
+    ).toBeUndefined()
+    expect(
+      openableDetail({ data, isStale: true, isFetching: true }, 2)
+    ).toBeUndefined()
+  })
+
+  it("waits for the file when an image is opened from an outdated cache", async () => {
+    const client = new QueryClient()
+    let resolve: (value: DatasetImageDetail) => void = () => undefined
+    const options = {
+      ...editorImageQuery(1, 2),
+      queryFn: () =>
+        new Promise<DatasetImageDetail>((done) => {
+          resolve = done
+        }),
+    }
+    // 31 秒前预加载的详情：文件可能已被他人修改。
+    client.setQueryData(options.queryKey, detail(2, "old"), {
+      updatedAt: Date.now() - 31_000,
+    })
+    const observer = new QueryObserver(client, options)
+    const unsubscribe = observer.subscribe(() => undefined)
+    expect(openableDetail(observer.getCurrentResult(), 2)).toBeUndefined()
+
+    resolve(detail(2, "new"))
+    await vi.waitFor(() =>
+      expect(openableDetail(observer.getCurrentResult(), 2)).toEqual(
+        detail(2, "new")
+      )
+    )
+    unsubscribe()
+  })
+
+  it("opens a recently loaded image at once", () => {
+    const client = new QueryClient()
+    const options = {
+      ...editorImageQuery(1, 2),
+      queryFn: () => new Promise<DatasetImageDetail>(() => undefined),
+    }
+    client.setQueryData(options.queryKey, detail(2, "v1"))
+    const observer = new QueryObserver(client, options)
+    const unsubscribe = observer.subscribe(() => undefined)
+    expect(openableDetail(observer.getCurrentResult(), 2)).toEqual(
+      detail(2, "v1")
+    )
+    unsubscribe()
   })
 })

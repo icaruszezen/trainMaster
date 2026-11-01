@@ -56,7 +56,7 @@ import {
 } from "@/components/ui/tooltip"
 import type { ImageAdjustments } from "@/features/annotation/annotation-canvas"
 import type { SaverState } from "@/features/annotation/autosave"
-import type { Tool } from "@/features/annotation/shortcuts"
+import { focusCanvas, type Tool } from "@/features/annotation/shortcuts"
 import { formatNumber } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -681,7 +681,11 @@ export function SaveStatus({
       return (
         <button
           type="button"
-          onClick={onRetry}
+          onClick={(event) => {
+            // 按钮随后变为“保存中”：焦点先移到画布上，不落到 body 上。
+            focusCanvas(event.currentTarget)
+            onRetry()
+          }}
           title={state.error ?? undefined}
           className={cn(
             base,

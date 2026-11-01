@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import {
   boxFromPoints,
+  cancelsPointerDown,
   clampBox,
   fitBox,
   fitViewport,
@@ -457,5 +458,16 @@ describe("pointerMoved", () => {
     expect(pointerMoved(null, { x: 100, y: 50 }, still)).toBe(false)
     expect(pointerMoved(null, { x: 100, y: 50 }, { x: -2, y: 0 })).toBe(true)
     expect(pointerMoved(null, { x: 100, y: 50 }, { x: 0, y: 0.5 })).toBe(true)
+  })
+})
+
+describe("cancelsPointerDown", () => {
+  it("cancels touch and pen presses, whose mouse events come after release", () => {
+    expect(cancelsPointerDown("touch")).toBe(true)
+    expect(cancelsPointerDown("pen")).toBe(true)
+  })
+
+  it("leaves mouse presses alone", () => {
+    expect(cancelsPointerDown("mouse")).toBe(false)
   })
 })

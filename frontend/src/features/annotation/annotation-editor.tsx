@@ -6,6 +6,7 @@ import {
   useReducer,
   useRef,
   useState,
+  type MouseEvent,
 } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useBlocker, useSearchParams, type BlockerFunction } from "react-router"
@@ -38,7 +39,9 @@ import {
   applySavedDetail,
   editorImageQuery,
   fetchImageAt,
+  openableDetail,
   persistAnnotation,
+  saveEditorAnnotation,
   savedDetail,
   type SaveContext,
 } from "@/features/annotation/api"
@@ -78,6 +81,8 @@ import {
   allowsRepeat,
   commandForKey,
   copiesSelectedText,
+  focusAfterDialog,
+  focusCanvas,
   isMac,
   shouldIgnoreKey,
   type Command,
@@ -272,21 +277,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   const [saver] = useState(
     () =>
       new AnnotationSaver<SaveContext>({
-        save: async ({ objects, baseVersion, force, regenerate, context }) => {
-          const saved = await persistAnnotation(
-            objects,
-            baseVersion,
-            force,
-            context,
-            undefined,
-            regenerate
-          )
-          if (!saved) {
-            return baseVersion
-          }
-          applySavedDetail(queryClient, context.datasetId, saved)
-          return saved.annotation_version
-        },
+        save: (request) => saveEditorAnnotation(queryClient, request),
         onChange: (state) => {
           setSaveState(state)
           if (state.status === "saved") {
@@ -297,7 +288,8 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   )
 
   // 换了图片：载入它的框（在渲染中调整状态，避免先渲染一次旧图片的框）。
-  const detail = detailQ.data?.id === imageId ? detailQ.data : undefined
+  // 缓存中的详情过期、正在重新读取时等读取完成（openableDetail）。
+  const detail = openableDetail(detailQ, imageId)
   if (detail && loaded?.detail.id !== detail.id) {
     const next = { detail, token: (loaded?.token ?? 0) + 1 }
     setLoaded(next)
@@ -435,8 +427,17 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     (current && imageSizeOf(current)) ??
     (naturalSize && naturalSize.id === imageId ? naturalSize.size : null)
 
-  // 保存后缓存中的最新详情（状态、标注文件路径）；`current` 是开始编辑时的。
+  // 缓存中的最新详情（保存后、保存冲突后重新读取的状态、标注文件路径等）；
+  // `current` 是开始编辑时的。
   const latest = detailQ.data?.id === imageId ? detailQ.data : current
+
+  /**
+   * 提示中的按钮：先把焦点移到画布上，再执行操作。按钮在处理后随提示消失，
+   * 焦点会落到 body 上（画布因重新载入而更换时，新的画布随后自己获得焦点）。
+   * 按钮在窄屏时弹出的面板中时不移动（focusCanvas）。
+   */
+  const fromNotice = (event: MouseEvent<HTMLElement>) =>
+    focusCanvas(event.currentTarget)
 
   // ---- 只读的原因 ----
   const notices: Notice[] = []
@@ -467,7 +468,10 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
             <Button
               size="sm"
               variant="outline"
-              onClick={() => setUnlocked(current.id)}
+              onClick={(event) => {
+                fromNotice(event)
+                setUnlocked(current.id)
+              }}
             >
               重新标注（保存时覆盖这个文件）
             </Button>
@@ -539,7 +543,13 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     if (classesQ.error) {
       toast.error("无法读取类别列表", {
         description: classesQ.error.message,
-        action: { label: "重试", onClick: () => void classesQ.refetch() },
+        action: {
+          label: "重试",
+          onClick: (event) => {
+            focusCanvas(event.currentTarget) // 提示随即关闭
+            void classesQ.refetch()
+          },
+        },
       })
     } else {
       toast.info("正在读取类别列表，请稍候")
@@ -886,10 +896,24 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         "这张图片的标注文件已被修改（可能有其他人同时在标注它，或在平台外用其它工具改过）。",
       action: (
         <div className="flex flex-wrap gap-2">
-          <Button size="sm" variant="outline" onClick={() => void reload()}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={(event) => {
+              fromNotice(event)
+              void reload()
+            }}
+          >
             载入最新版本（放弃我的修改）
           </Button>
-          <Button size="sm" variant="outline" onClick={() => void overwrite()}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={(event) => {
+              fromNotice(event)
+              void overwrite()
+            }}
+          >
             用我的版本覆盖
           </Button>
         </div>
@@ -902,13 +926,23 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       action:
         saveState.code === ANNOTATION_UNPATCHABLE ? (
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" variant="outline" onClick={() => void reload()}>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={(event) => {
+                fromNotice(event)
+                void reload()
+              }}
+            >
               载入文件（放弃我的修改）
             </Button>
             <Button
               size="sm"
               variant="outline"
-              onClick={() => void saver.regenerate()}
+              onClick={(event) => {
+                fromNotice(event)
+                void saver.regenerate()
+              }}
             >
               仍然保存（重新生成文件）
             </Button>
@@ -917,7 +951,10 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
           <Button
             size="sm"
             variant="outline"
-            onClick={() => void saver.flush()}
+            onClick={(event) => {
+              fromNotice(event)
+              void saver.flush()
+            }}
           >
             重试
           </Button>
@@ -985,7 +1022,11 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
             description: state.error ?? undefined,
             action: {
               label: "放弃修改并切换",
-              onClick: () => discardAndOpen(imageId, target),
+              onClick: (event) => {
+                // 提示随即关闭：焦点先移到画布上，新图片的画布随后自己获得焦点。
+                focusCanvas(event.currentTarget)
+                discardAndOpen(imageId, target)
+              },
             },
           })
         }
@@ -1523,7 +1564,9 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
           }
         }}
       >
-        <AlertDialogContent>
+        <AlertDialogContent
+          onCloseAutoFocus={(event) => focusAfterDialog(event)}
+        >
           <AlertDialogHeader>
             <AlertDialogTitle>修改还没有保存</AlertDialogTitle>
             <AlertDialogDescription>
@@ -1551,7 +1594,9 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         </AlertDialogContent>
       </AlertDialog>
       <AlertDialog open={confirmClear} onOpenChange={setConfirmClear}>
-        <AlertDialogContent>
+        <AlertDialogContent
+          onCloseAutoFocus={(event) => focusAfterDialog(event)}
+        >
           <AlertDialogHeader>
             <AlertDialogTitle>删除这张图片的标注文件？</AlertDialogTitle>
             <AlertDialogDescription>

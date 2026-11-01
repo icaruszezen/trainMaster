@@ -3,8 +3,12 @@
  * `features/datasets/api.ts`。
  */
 import { keepPreviousData, queryOptions } from "@tanstack/react-query"
-import type { QueryClient } from "@tanstack/react-query"
+import type { QueryClient, QueryObserverResult } from "@tanstack/react-query"
 
+import {
+  isConflictError,
+  type SaveRequest,
+} from "@/features/annotation/autosave"
 import {
   datasetKeys,
   datasetPath,
@@ -42,11 +46,31 @@ export function editorImageQuery(datasetId: number, imageId: number) {
         signal,
       }),
     // 30 秒内重新打开同一张图片不再请求（含预加载的前后图片）；之后打开时
-    // 重新读取文件，看到他人的修改。编辑期间不在后台刷新。
+    // 重新读取文件，读取完成后才载入（见 openableDetail），看到他人的修改。
+    // 编辑期间不在后台刷新（保存冲突后的重新读取不改变编辑器中的框）。
     staleTime: 30_000,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
   })
+}
+
+/**
+ * 打开图片时载入编辑器的详情：缓存中这张图片的详情；过期（超过 30 秒，或保存
+ * 冲突后已失效）、正在重新读取时不用它，等读取完成后载入文件的当前内容，否则
+ * 第一次保存就会冲突。重新读取失败时仍用缓存中的。只用于打开图片时：已经在
+ * 编辑的图片在后台重新读取时，编辑器中的框不变。
+ */
+export function openableDetail(
+  result: Pick<
+    QueryObserverResult<DatasetImageDetail>,
+    "data" | "isStale" | "isFetching"
+  >,
+  imageId: number
+) {
+  if (result.data?.id !== imageId || (result.isStale && result.isFetching)) {
+    return undefined
+  }
+  return result.data
 }
 
 export const IMAGE_LIST_PAGE_SIZE = 50
@@ -142,6 +166,42 @@ export async function persistAnnotation(
     },
     init
   )
+}
+
+/**
+ * 编辑器的保存函数（`AnnotationSaver` 的 `save`）：写入后更新缓存，返回
+ * 文件的新版本。文件已被他人修改（`annotation_conflict`）时让这张图片缓存的
+ * 详情失效（正在查看时在后台重新读取，编辑器中的框不变）：放弃修改时回到文件
+ * 的当前内容（{@link savedDetail}），之后再打开这张图片也显示它，而不是缓存中
+ * 过期的框。
+ */
+export async function saveEditorAnnotation(
+  queryClient: QueryClient,
+  { objects, baseVersion, force, regenerate, context }: SaveRequest<SaveContext>
+) {
+  let saved: DatasetImageDetail | null
+  try {
+    saved = await persistAnnotation(
+      objects,
+      baseVersion,
+      force,
+      context,
+      undefined,
+      regenerate
+    )
+  } catch (error) {
+    if (isConflictError(error)) {
+      void queryClient.invalidateQueries({
+        queryKey: annotationKeys.image(context.datasetId, context.imageId),
+      })
+    }
+    throw error
+  }
+  if (!saved) {
+    return baseVersion
+  }
+  applySavedDetail(queryClient, context.datasetId, saved)
+  return saved.annotation_version
 }
 
 /**

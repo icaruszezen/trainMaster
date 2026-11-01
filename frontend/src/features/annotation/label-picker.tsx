@@ -16,7 +16,7 @@ import {
   pointerMoved,
   type OverlayAnchor,
 } from "@/features/annotation/geometry"
-import { classHotkey } from "@/features/annotation/shortcuts"
+import { classHotkey, leaveOverlay } from "@/features/annotation/shortcuts"
 import type { DatasetClass } from "@/features/datasets/api"
 import { cn } from "@/lib/utils"
 
@@ -88,8 +88,12 @@ export function LabelPicker({
   })
 
   // 不用 autoFocus：获得焦点时不滚动任何祖先元素（画布滚开后指针位置就对不上了）。
+  // 关闭时（选好类别、Esc 等）焦点还在选择框中就移回画布，否则焦点随选择框
+  // 一起消失、落到 body 上，Tab 不再切换框。
   useLayoutEffect(() => {
     inputRef.current?.focus({ preventScroll: true })
+    const root = rootRef.current
+    return () => leaveOverlay(root)
   }, [])
 
   const indexed = classes.map((cls, index) => ({ ...cls, index }))
