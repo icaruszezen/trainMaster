@@ -19,6 +19,7 @@ import {
   boxHeight,
   boxToScreen,
   boxWidth,
+  cancelsPointerDown,
   clamp,
   fitBox,
   fitViewport,
@@ -486,6 +487,11 @@ export function AnnotationCanvas({
     const element = event.currentTarget
     // 让输入框等失去焦点，快捷键随即生效。
     element.focus({ preventScroll: true })
+    // 触屏与触控笔：不再产生松开之后才派发的兼容鼠标事件，否则短拖动画好框后
+    // 弹出的类别选择框会被随后的 mousedown 关掉（画布已在上面获得焦点）。
+    if (cancelsPointerDown(event.pointerType)) {
+      event.preventDefault()
+    }
     const screen = local(event)
     pointers.current.set(event.pointerId, screen)
 
@@ -536,9 +542,8 @@ export function AnnotationCanvas({
 
     // 两次单击画框的第二次单击：松开时完成（见 onPointerUp）。按下时就完成的话，
     // 弹出的类别选择框（类别列表为空时）刚获得焦点，随后的 mousedown 就把焦点
-    // 移回画布、关掉了它，框也随之丢弃。触屏与部分触控笔的兼容鼠标事件在松开
-    // 之后才派发，所以这里还要取消 pointerdown，不再产生这些鼠标事件（click
-    // 照常触发，画布在上面已经获得焦点）。
+    // 移回画布、关掉了它，框也随之丢弃。按下同样取消（触屏与触控笔在上面已经
+    // 取消，见 cancelsPointerDown）。
     if (drag?.kind === "draw" && drag.click && canDraw) {
       event.preventDefault()
       element.setPointerCapture(event.pointerId)

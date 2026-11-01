@@ -32,7 +32,7 @@ import {
   removeClass,
   setClassColor,
 } from "@/features/annotation/classes"
-import { classHotkey } from "@/features/annotation/shortcuts"
+import { classHotkey, focusAfterDialog } from "@/features/annotation/shortcuts"
 import {
   classesQuery,
   datasetKeys,
@@ -62,7 +62,10 @@ export function ClassManagerDialog({
 }: ClassManagerDialogProps) {
   return (
     <Dialog open={open && classes !== undefined} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[min(90dvh,760px)] flex-col gap-4 sm:max-w-lg">
+      <DialogContent
+        className="flex max-h-[min(90dvh,760px)] flex-col gap-4 sm:max-w-lg"
+        onCloseAutoFocus={(event) => focusAfterDialog(event)}
+      >
         {open && classes && (
           <ClassManagerForm
             datasetId={datasetId}

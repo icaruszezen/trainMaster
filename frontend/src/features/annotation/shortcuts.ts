@@ -369,6 +369,58 @@ export function focusCanvas(from: Element | null) {
   return true
 }
 
+/**
+ * 画布上的浮层（类别选择框）卸载时调用（React 在移除元素之前清理）：焦点还在
+ * 浮层中，就在浮层移除、焦点落到 body 上之后移回它所在的画布，Tab 随即可以
+ * 依次选中框。用户点到了别的控件上时不移动；画布也一起移除了（切换图片）时
+ * 由新的画布自己获得焦点。浮层之后还在页面上时（开发模式下 StrictMode 模拟的
+ * 卸载再挂载）也不移动，否则输入框失去焦点、选择框随即关闭。
+ */
+export function leaveOverlay(overlay: Element | null) {
+  if (!overlay) {
+    return
+  }
+  const doc = overlay.ownerDocument
+  if (!overlay.contains(doc.activeElement)) {
+    return
+  }
+  const canvas = overlay.closest<HTMLElement>(CANVAS)
+  queueMicrotask(() => {
+    const focused = doc.activeElement
+    if (
+      canvas?.isConnected &&
+      !overlay.isConnected &&
+      (focused === null || focused === doc.body)
+    ) {
+      canvas.focus({ preventScroll: true })
+    }
+  })
+}
+
+const OPEN_DIALOG =
+  '[role="dialog"][data-state="open"], [role="alertdialog"][data-state="open"]'
+
+/**
+ * 工作台的对话框（快捷键说明、类别管理、离开与删除的确认）的
+ * `onCloseAutoFocus`：它们没有触发按钮，Radix 默认不移动焦点，焦点落到 body
+ * 上，Tab 不再切换框。这里改为移到标注画布上；窄屏时弹出的面板（也是对话框）
+ * 还开着时移到面板中，不离开面板。画布还不在页面上（图片还在读取）时保持默认
+ * 行为，画布显示后自己获得焦点。Radix 调用时关闭的对话框已经从页面上移除。
+ */
+export function focusAfterDialog(
+  event: { preventDefault: () => void },
+  doc: Pick<Document, "querySelector" | "querySelectorAll"> = document
+) {
+  const target =
+    [...doc.querySelectorAll<HTMLElement>(OPEN_DIALOG)].at(-1) ??
+    doc.querySelector<HTMLElement>(CANVAS)
+  if (!target) {
+    return
+  }
+  event.preventDefault()
+  target.focus({ preventScroll: true })
+}
+
 /** 与 `Selection` 中用到的字段一致，便于测试。 */
 export type SelectionInput = Pick<
   Selection,

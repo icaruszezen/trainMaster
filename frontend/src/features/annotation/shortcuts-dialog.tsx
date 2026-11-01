@@ -6,7 +6,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Kbd } from "@/components/ui/kbd"
-import { shortcutHelp } from "@/features/annotation/shortcuts"
+import { focusAfterDialog, shortcutHelp } from "@/features/annotation/shortcuts"
 
 export function ShortcutsDialog({
   open,
@@ -19,7 +19,10 @@ export function ShortcutsDialog({
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[min(90dvh,820px)] overflow-y-auto sm:max-w-3xl">
+      <DialogContent
+        className="max-h-[min(90dvh,820px)] overflow-y-auto sm:max-w-3xl"
+        onCloseAutoFocus={(event) => focusAfterDialog(event)}
+      >
         <DialogHeader>
           <DialogTitle>快捷键</DialogTitle>
           <DialogDescription>

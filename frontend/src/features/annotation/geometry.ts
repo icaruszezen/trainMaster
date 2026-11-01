@@ -577,3 +577,14 @@ export function pointerMoved(
   }
   return movement.x !== 0 || movement.y !== 0
 }
+
+/**
+ * 画布是否要取消这次按下（pointerdown 的 `preventDefault`）：触屏与部分触控笔的
+ * 兼容鼠标事件在松开之后才派发，浏览器当作轻点的短拖动画好框、弹出类别选择框
+ * 之后，随后的 mousedown 会把焦点移回画布、关掉选择框，框也随之丢弃。取消后
+ * 不再产生这些鼠标事件（click 照常触发）。鼠标的 mousedown 在松开之前派发，
+ * 不用取消。
+ */
+export function cancelsPointerDown(pointerType: string) {
+  return pointerType !== "mouse"
+}

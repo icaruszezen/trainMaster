@@ -5,7 +5,9 @@ import {
   classHotkey,
   commandForKey,
   copiesSelectedText,
+  focusAfterDialog,
   focusCanvas,
+  leaveOverlay,
   preventTypeahead,
   shortcutHelp,
   shouldIgnoreKey,
@@ -353,6 +355,105 @@ describe("focusCanvas", () => {
     expect(focusCanvas(trigger([], null))).toBe(false)
     expect(focusCanvas(null)).toBe(false)
     expect(canvas.focus).not.toHaveBeenCalled()
+  })
+})
+
+describe("leaveOverlay", () => {
+  /**
+   * A picker in a canvas. `focused`: the focus is inside it when it unmounts.
+   * `remove()` takes it off the page, as React does after the cleanup.
+   */
+  const picker = (focused: boolean, canvas: { focus: () => void } | null) => {
+    const body = {}
+    const input = {}
+    const doc = { body, activeElement: focused ? input : body }
+    const overlay = {
+      isConnected: true,
+      contains: (node: unknown) => node === input,
+      ownerDocument: doc,
+      closest: (selector: string) =>
+        selector === '[role="application"]' ? canvas : null,
+    }
+    const remove = () => {
+      overlay.isConnected = false
+      doc.activeElement = body
+    }
+    return { overlay: overlay as unknown as Element, remove }
+  }
+  const canvas = () => ({ focus: vi.fn(), isConnected: true })
+  const settle = () => new Promise<void>((done) => queueMicrotask(done))
+
+  it("moves the focus back to the canvas once the closed picker is gone", async () => {
+    const target = canvas()
+    const { overlay, remove } = picker(true, target)
+    leaveOverlay(overlay)
+    remove()
+    await settle()
+    expect(target.focus).toHaveBeenCalledWith({ preventScroll: true })
+  })
+
+  it("leaves the focus where the user moved it", async () => {
+    const target = canvas()
+    const { overlay, remove } = picker(false, target)
+    leaveOverlay(overlay)
+    remove()
+    leaveOverlay(null)
+    await settle()
+    expect(target.focus).not.toHaveBeenCalled()
+  })
+
+  it("keeps the focus in a picker that stays on the page (StrictMode)", async () => {
+    const target = canvas()
+    leaveOverlay(picker(true, target).overlay)
+    await settle()
+    expect(target.focus).not.toHaveBeenCalled()
+  })
+
+  it("leaves a canvas that was removed with the picker to the next one", async () => {
+    const target = { ...canvas(), isConnected: false }
+    const { overlay, remove } = picker(true, target)
+    leaveOverlay(overlay)
+    remove()
+    await settle()
+    expect(target.focus).not.toHaveBeenCalled()
+  })
+})
+
+describe("focusAfterDialog", () => {
+  /** A page with the given open dialogs (in DOM order) and maybe a canvas. */
+  const page = (
+    dialogs: { focus: () => void }[],
+    canvas: { focus: () => void } | null
+  ) =>
+    ({
+      querySelectorAll: () => dialogs,
+      querySelector: (selector: string) =>
+        selector === '[role="application"]' ? canvas : null,
+    }) as unknown as Document
+  const event = () => ({ preventDefault: vi.fn() })
+
+  it("moves the focus to the canvas instead of leaving it on the body", () => {
+    const canvas = { focus: vi.fn() }
+    const closed = event()
+    focusAfterDialog(closed, page([], canvas))
+    expect(closed.preventDefault).toHaveBeenCalled()
+    expect(canvas.focus).toHaveBeenCalledWith({ preventScroll: true })
+  })
+
+  it("keeps the focus in a sheet that is still open", () => {
+    const canvas = { focus: vi.fn() }
+    const sheet = { focus: vi.fn() }
+    const closed = event()
+    focusAfterDialog(closed, page([sheet], canvas))
+    expect(closed.preventDefault).toHaveBeenCalled()
+    expect(sheet.focus).toHaveBeenCalledWith({ preventScroll: true })
+    expect(canvas.focus).not.toHaveBeenCalled()
+  })
+
+  it("keeps the default while the canvas is not on the page", () => {
+    const closed = event()
+    focusAfterDialog(closed, page([], null))
+    expect(closed.preventDefault).not.toHaveBeenCalled()
   })
 })
 
