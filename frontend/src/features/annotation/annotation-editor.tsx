@@ -847,7 +847,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         session.imageId,
         saver.getVersion()
       )
-      applySavedDetail(queryClient, datasetId, saved)
+      await applySavedDetail(queryClient, datasetId, saved)
       if (!isCurrent(start)) {
         return
       }

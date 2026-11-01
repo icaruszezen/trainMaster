@@ -116,21 +116,42 @@ describe("applySavedDetail", () => {
       annotation: { labels },
     }) as unknown as DatasetImageDetail
 
-  it("updates both image caches and refreshes counts only when labels change", () => {
+  it("updates both image caches and refreshes counts only when labels change", async () => {
     const client = new QueryClient()
     const invalidate = vi.spyOn(client, "invalidateQueries")
     client.setQueryData(annotationKeys.image(1, 2), detail("annotated", ["a"]))
 
-    applySavedDetail(client, 1, detail("annotated", ["a"]))
+    await applySavedDetail(client, 1, detail("annotated", ["a"]))
     expect(invalidate).not.toHaveBeenCalled()
     expect(client.getQueryData(datasetKeys.image(1, 2))).toEqual(
       detail("annotated", ["a"])
     )
 
-    applySavedDetail(client, 1, detail("annotated", ["a", "b"]))
+    await applySavedDetail(client, 1, detail("annotated", ["a", "b"]))
     expect(invalidate).toHaveBeenCalledWith({
       queryKey: datasetKeys.detail(1),
     })
+  })
+
+  it("is not replaced by a read of the image that started before the save", async () => {
+    const client = new QueryClient()
+    const key = annotationKeys.image(1, 2)
+    client.setQueryData(key, detail("annotated", ["a"]))
+    let resolve: (value: DatasetImageDetail) => void = () => undefined
+    const read = client.fetchQuery({
+      queryKey: key,
+      queryFn: () =>
+        new Promise<DatasetImageDetail>((done) => {
+          resolve = done
+        }),
+    })
+
+    // 删除标注文件后图片为未标注；读取晚于删除返回，读到的是删除前的文件。
+    await applySavedDetail(client, 1, detail("none", []))
+    resolve(detail("annotated", ["a"]))
+    await read
+    await new Promise((done) => setTimeout(done, 0))
+    expect(client.getQueryData(key)).toEqual(detail("none", []))
   })
 })
 
@@ -142,14 +163,14 @@ describe("savedDetail", () => {
       objects: names.map((name) => ({ ...box, name })),
     }) as unknown as DatasetImageDetail
 
-  it("returns what the last successful save wrote, not the loaded detail", () => {
+  it("returns what the last successful save wrote, not the loaded detail", async () => {
     const client = new QueryClient()
     const loaded = detail("", [])
     client.setQueryData(annotationKeys.image(1, 2), loaded)
     expect(savedDetail(client, 1, loaded)).toBe(loaded)
 
     const saved = detail("v1", ["dent"])
-    applySavedDetail(client, 1, saved)
+    await applySavedDetail(client, 1, saved)
     expect(savedDetail(client, 1, loaded)).toEqual(saved)
   })
 
@@ -214,6 +235,44 @@ describe("saveEditorAnnotation", () => {
     vi.mocked(saveAnnotation).mockRejectedValueOnce(failure)
     await expect(saveEditorAnnotation(client, request())).rejects.toBe(failure)
     expect(cached(client)?.isInvalidated).toBe(false)
+  })
+
+  it("keeps the overwritten version when the conflict refetch returns later", async () => {
+    const client = new QueryClient()
+    const reads: ((value: DatasetImageDetail) => void)[] = []
+    const options = {
+      ...editorImageQuery(1, 2),
+      queryFn: () =>
+        new Promise<DatasetImageDetail>((done) => {
+          reads.push(done)
+        }),
+    }
+    const version = (annotation_version: string) =>
+      ({ id: 2, annotation_version }) as DatasetImageDetail
+    client.setQueryData(options.queryKey, version("v1"))
+    // 编辑器正在查看这张图片：冲突后在后台重新读取。
+    const observer = new QueryObserver(client, options)
+    const unsubscribe = observer.subscribe(() => undefined)
+
+    const conflict = new ApiError(409, "annotation_conflict", "已被修改")
+    vi.mocked(saveAnnotation).mockRejectedValueOnce(conflict)
+    await expect(saveEditorAnnotation(client, request())).rejects.toBe(conflict)
+    expect(reads).toHaveLength(1)
+
+    // 读取还没有返回时用户选择了“用我的版本覆盖”。
+    vi.mocked(saveAnnotation).mockResolvedValueOnce(version("mine"))
+    await expect(
+      saveEditorAnnotation(client, { ...request(), force: true })
+    ).resolves.toBe("mine")
+    // 读取返回的是覆盖之前的文件，不能替换缓存中保存的结果。
+    reads[0](version("theirs"))
+    await vi.waitFor(() =>
+      expect(observer.getCurrentResult().isFetching).toBe(false)
+    )
+    await new Promise((done) => setTimeout(done, 0))
+    expect(client.getQueryData(options.queryKey)).toEqual(version("mine"))
+    expect(cached(client)?.isInvalidated).toBe(false)
+    unsubscribe()
   })
 })
 

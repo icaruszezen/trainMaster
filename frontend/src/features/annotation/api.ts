@@ -173,7 +173,8 @@ export async function persistAnnotation(
  * 文件的新版本。文件已被他人修改（`annotation_conflict`）时让这张图片缓存的
  * 详情失效（正在查看时在后台重新读取，编辑器中的框不变）：放弃修改时回到文件
  * 的当前内容（{@link savedDetail}），之后再打开这张图片也显示它，而不是缓存中
- * 过期的框。
+ * 过期的框。读取返回前就“用我的版本覆盖”时，以覆盖的结果为准（见
+ * {@link applySavedDetail}）。
  */
 export async function saveEditorAnnotation(
   queryClient: QueryClient,
@@ -200,7 +201,7 @@ export async function saveEditorAnnotation(
   if (!saved) {
     return baseVersion
   }
-  applySavedDetail(queryClient, context.datasetId, saved)
+  await applySavedDetail(queryClient, context.datasetId, saved)
   return saved.annotation_version
 }
 
@@ -233,13 +234,18 @@ function labelKey(detail: DatasetImageDetail | undefined) {
 /**
  * 保存后更新缓存：编辑器与查看大图的图片详情直接替换；标注状态或标签变了
  * 时（数据集计数、图片列表的状态、标签分布随之变化）让数据集的查询失效。
+ * 先取消这张图片还没有返回的读取（如保存冲突后的重新读取）：它读到的是保存
+ * 之前的文件，晚于保存返回时会替换缓存中保存的结果，之后打开这张图片显示旧的
+ * 框，第一次保存又会冲突。
  */
-export function applySavedDetail(
+export async function applySavedDetail(
   queryClient: QueryClient,
   datasetId: number,
   detail: DatasetImageDetail
 ) {
   const editorKey = annotationKeys.image(datasetId, detail.id)
+  // 等取消完成：被取消的读取先恢复读取前的缓存，之后再写入保存的结果。
+  await queryClient.cancelQueries({ queryKey: editorKey })
   const previous = queryClient.getQueryData<DatasetImageDetail>(editorKey)
   queryClient.setQueryData(editorKey, detail)
   queryClient.setQueryData(datasetKeys.image(datasetId, detail.id), detail)
