@@ -843,8 +843,14 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       }
       const next = { detail: saved, token: start.token + 1 }
       setLoaded(next)
-      dispatch({ type: "load", objects: [], key: docKey(next) })
-      toast.success("已删除标注文件，图片恢复为未标注")
+      // 还有别的标注文件（如 Annotations/ 中被图片旁的文件取代的那个）时，
+      // 图片改用它，和重新扫描的结果一致。
+      dispatch({ type: "load", objects: saved.objects, key: docKey(next) })
+      toast.success(
+        saved.annotation_state === "none"
+          ? "已删除标注文件，图片恢复为未标注"
+          : `已删除标注文件，图片现在使用另一个标注文件 ${saved.annotation_path ?? ""}`
+      )
     } catch (error) {
       toast.error(
         isConflictError(error)
@@ -1556,7 +1562,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
             <AlertDialogTitle>删除这张图片的标注文件？</AlertDialogTitle>
             <AlertDialogDescription>
               {latest?.annotation_path ?? "标注文件"}
-              会从数据集文件夹中删除，图片恢复为“未标注”。这一步不能撤销。
+              会从数据集文件夹中删除。还有重新扫描时会使用的其它标注文件时，图片改用它，否则恢复为“未标注”。这一步不能撤销。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

@@ -86,6 +86,10 @@ type annotationTarget struct {
 	// it belongs to another image (see resolveAnnotationTarget). It names
 	// that image.
 	Owner string
+	// StaleOwner is set when the index pairs the file with Owner but a scan
+	// would no longer do so (see stalePairing): a rescan settles who the
+	// file belongs to.
+	StaleOwner bool
 }
 
 // resolveAnnotationTarget finds the VOC file of img: the file a scan would
@@ -98,13 +102,15 @@ type annotationTarget struct {
 // tries first is looked for: <stem>.xml next to the image (LabelImg writes
 // there by default) takes over from a paired file elsewhere, such as in
 // Annotations/. That costs one stat, so viewing stays cheap; an edit looks
-// for the other candidates too (see checkPairedTarget).
+// for the other candidates, and for other images claiming the paired file,
+// too (see checkPairedTarget).
 //
 // The file may belong to another image: the index pairs it with another
 // image, or a scan would give it to another image that claims it too (a.jpg
-// and a.png both want a.xml, see claimOwner, and for a file yet to be
-// written newFileOwner). Owner then names that image, and the annotation
-// of img can neither be shown nor saved.
+// and a.png both want a.xml, see claimOwner). Owner then names that image,
+// and the annotation of img can neither be shown nor saved. A new file is
+// put where a scan gives it to img (see defaultAnnotationPath), except in
+// one layout where there is no such place (see annotationsFolderRival).
 func resolveAnnotationTarget(ctx context.Context, q querier, root *os.Root, img Image) (annotationTarget, error) {
 	var t annotationTarget
 	found := false
@@ -122,41 +128,103 @@ func resolveAnnotationTarget(ctx context.Context, q querier, root *os.Root, img 
 			t.Path = defaultAnnotationPath(root, img.Path)
 		}
 	}
-	err := q.QueryRow(ctx, `SELECT rel_path FROM dataset_images
-		WHERE dataset_id = $1 AND id <> $2 AND lower(annotation_path) = lower($3)
-		ORDER BY `+ImageOrder+` LIMIT 1`, img.DatasetID, img.ID, t.Path).Scan(&t.Owner)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-	case err != nil:
+	var err error
+	if t.Owner, t.StaleOwner, err = indexedOwner(ctx, q, root, img, t.Path); err != nil {
 		return t, err
 	}
-	if t.Owner == "" {
-		claim := claimOwner
-		if !found {
-			claim = newFileOwner
-		}
-		if t.Owner, err = claim(ctx, q, root, img, t.Path); err != nil {
+	switch {
+	case t.Owner != "":
+	case found:
+		if t.Owner, err = claimOwner(ctx, q, root, img, t.Path, ""); err != nil {
 			return t, err
 		}
+	default:
+		t.Owner = annotationsFolderRival(root, img, t.Path)
 	}
 	return t, nil
 }
 
-// checkPairedTarget makes sure that an edit of the paired image img does
-// not go to a file the next scan would not pair with it: it looks for all
-// the candidates of a scan (resolveAnnotationTarget, for viewing, only
-// looks for the first). When a scan would pick another file, for example
-// one written in another case or in another "Annotations" folder, or one
-// found instead of a paired file that is gone, the edit is refused until a
-// rescan pairs the image with that file.
-func checkPairedTarget(root *os.Root, img Image, t annotationTarget) error {
-	if img.AnnotationPath == nil {
-		return nil // t is what a scan would pick (see resolveAnnotationTarget)
+// indexedOwner returns the image other than img that the index pairs with
+// the VOC file rel, "" if there is none, and whether that pairing is out of
+// date (see stalePairing). A path that differs in case only counts when it
+// names the same file (on a file system that ignores case), not another
+// file such as Annotations/a.xml for annotations/a.xml.
+func indexedOwner(ctx context.Context, q querier, root *os.Root, img Image, rel string) (owner string, stale bool, err error) {
+	rows, err := q.Query(ctx, `SELECT rel_path, annotation_path FROM dataset_images
+		WHERE dataset_id = $1 AND id <> $2 AND lower(annotation_path) = lower($3)
+		ORDER BY `+ImageOrder, img.DatasetID, img.ID, rel)
+	if err != nil {
+		return "", false, err
 	}
-	if c := annotationCandidate(root, img.Path); c != "" && !sameFile(root, c, t.Path) {
-		return newError(ErrConflict, "数据集文件夹中出现了这张图片的另一个标注文件 %s，请先重新扫描数据集，再编辑这张图片的标注", c)
+	type pairing struct{ image, file string }
+	pairings, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (pairing, error) {
+		var p pairing
+		err := row.Scan(&p.image, &p.file)
+		return p, err
+	})
+	if err != nil {
+		return "", false, err
 	}
-	return nil
+	for _, p := range pairings {
+		if p.file == rel || sameFile(root, p.file, rel) {
+			return p.image, stalePairing(root, img, p.image, p.file, rel), nil
+		}
+	}
+	return "", false, nil
+}
+
+// stalePairing reports whether a scan would no longer pair the image owner
+// with its file ownerPath in the index, which is rel (or the same file in
+// another case), a candidate of img or where a new file of img goes: the
+// image or the file is gone, a file next to the image takes over from a
+// file elsewhere (see resolveAnnotationTarget), or the <filename> recorded
+// in rel names img and not owner (see claimOwner). It takes a few stats and
+// one read, and only runs for an image that another one blocks.
+func stalePairing(root *os.Root, img Image, owner, ownerPath, rel string) bool {
+	if !isRegularFile(root, owner) || !isRegularFile(root, ownerPath) {
+		return true
+	}
+	if path.Dir(ownerPath) != path.Dir(owner) && isRegularFile(root, exactAnnotationPath(owner)) {
+		return true
+	}
+	a, _, _, err := readVersionedAnnotation(root, rel)
+	return err == nil && a.Filename == path.Base(img.Path) && a.Filename != path.Base(owner)
+}
+
+// checkPairedTarget makes sure that an edit of the paired image img goes to
+// the file the next scan pairs with it: it looks for all the candidates of
+// a scan and for other images claiming the file (resolveAnnotationTarget,
+// for viewing, only looks for the first candidate). When a scan would pick
+// another file, for example one written in another case or in another
+// "Annotations" folder, or one found instead of a paired file that is gone,
+// or would give the file to another image (another tool changed its
+// <filename>, or that image lost a file of its own), the edit is refused
+// until a rescan. A paired file that is gone, with no other file found, is
+// written anew (create) where a new file of an image without one goes.
+func checkPairedTarget(ctx context.Context, q querier, root *os.Root, img Image, t annotationTarget, create bool) (annotationTarget, error) {
+	if !t.Paired {
+		return t, nil // t is what a scan would pick (see resolveAnnotationTarget)
+	}
+	c := annotationCandidate(root, img.Path)
+	switch {
+	case c == "" && create: // a rescan would leave the image without a file
+		unpaired := img
+		unpaired.AnnotationPath = nil
+		return resolveAnnotationTarget(ctx, q, root, unpaired)
+	case c == "":
+		return t, nil // nothing to remove
+	case !sameFile(root, c, t.Path):
+		return t, newError(ErrConflict, "数据集文件夹中出现了这张图片的另一个标注文件 %s，请先重新扫描数据集，再编辑这张图片的标注", c)
+	}
+	owner, err := claimOwner(ctx, q, root, img, t.Path, "")
+	if err != nil {
+		return t, err
+	}
+	if owner != "" {
+		return t, newError(ErrConflict, "标注文件 %s 按 VOC 的配对规则现在属于%s %s（上次扫描之后文件夹中的文件有变化），"+
+			"请先重新扫描数据集，再编辑这张图片的标注", t.Path, otherImage(img, owner), owner)
+	}
+	return t, nil
 }
 
 // sameFile reports whether the paths a and b name the same file (on a file
@@ -173,36 +241,22 @@ func sameFile(root *os.Root, a, b string) bool {
 	return err == nil && os.SameFile(fa, fb)
 }
 
-// claimOwner decides, like pairAnnotations, which image the VOC file rel
-// (found for img and not paired with another image in the index) belongs
-// to when other indexed images claim it too: a.jpg and a.png both take
-// a.xml, and JPEGImages/a.jpg and images/a.jpg both take Annotations/a.xml.
-// The <filename> recorded in the file decides; without a match, the first
-// image in sorted order gets it. It returns that image, or "" if it is
-// img.
-func claimOwner(ctx context.Context, q querier, root *os.Root, img Image, rel string) (string, error) {
-	dir, base := path.Split(img.Path)
-	stem := strings.TrimSuffix(base, path.Ext(base))
-	// Only images with the same stem (ignoring case) can claim rel: in the
-	// folder of img or, for a VOC image folder, in another one next to it.
-	patterns := []string{likePrefix(dir+stem) + ".%"}
-	if parent, ok := vocImageFolder(dir); ok {
-		patterns = append(patterns, likePrefix(parent+"jpegimages/"+stem)+".%", likePrefix(parent+"images/"+stem)+".%")
-	}
-	rows, err := q.Query(ctx, `SELECT rel_path FROM dataset_images WHERE dataset_id = $1 AND id <> $2
-		AND lower(rel_path) LIKE ANY (SELECT lower(p) FROM unnest($3::text[]) AS p)`, img.DatasetID, img.ID, patterns)
-	if err != nil {
-		return "", err
-	}
-	others, err := pgx.CollectRows(rows, pgx.RowTo[string])
+// claimOwner decides, like pairAnnotations, which image a scan gives the
+// VOC file rel, a candidate of img, when other indexed images claim it too:
+// a.jpg and a.png both take a.xml, and JPEGImages/a.jpg, images/a.jpg and
+// even an image Annotations/a.jpg all take Annotations/a.xml. The
+// <filename> recorded in the file decides; without a match, the first image
+// in byte order of the path gets it. The file gone ("" for none) counts as
+// removed. It returns that image, or "" if it is img.
+func claimOwner(ctx context.Context, q querier, root *os.Root, img Image, rel, gone string) (string, error) {
+	others, err := possibleClaimants(ctx, q, root, img, rel)
 	if err != nil {
 		return "", err
 	}
 	claims := []string{img.Path}
 	for _, other := range others {
-		// A scan only sees the images that are still there.
-		if exists, _ := regularFileExists(root, other); exists && annotationCandidate(root, other) == rel {
-			claims = append(claims, other)
+		if annotationCandidateWithout(root, other.Path, gone) == rel {
+			claims = append(claims, other.Path)
 		}
 	}
 	if len(claims) == 1 {
@@ -219,49 +273,32 @@ func claimOwner(ctx context.Context, q querier, root *os.Root, img Image, rel st
 	return "", nil
 }
 
-// newFileOwner decides like claimOwner which image the new VOC file rel of
-// img (see defaultAnnotationPath) would belong to once written. The file
-// records the file name of img (see SaveAnnotation), so pickByFilename
-// gives it to img unless another image of that very name claims it too and
-// comes first in sorted order. Such an image can only be in another VOC
-// image folder next to the one of img: JPEGImages/a.jpg and images/a.jpg
-// both take a new Annotations/a.xml, which a scan gives to the one in
-// JPEGImages. It returns that image, or "" if it is img.
-func newFileOwner(ctx context.Context, q querier, root *os.Root, img Image, rel string) (string, error) {
-	dir, base := path.Split(img.Path)
-	parent, ok := vocImageFolder(dir)
-	if !ok || path.Dir(rel) == path.Dir(img.Path) {
-		return "", nil // no other image of the folder has that name
+// possibleClaimants returns the indexed images other than img that are
+// still there (a scan only sees those) and may take the VOC file rel as
+// their candidate (see annotationCandidate): the images of its stem
+// (ignoring case) in its folder and, for a file in an "Annotations" folder,
+// in the VOC image folders next to it.
+func possibleClaimants(ctx context.Context, q querier, root *os.Root, img Image, rel string) ([]Image, error) {
+	dir, base := path.Split(rel)
+	stem := strings.TrimSuffix(base, path.Ext(base))
+	patterns := []string{likePrefix(dir+stem) + ".%"}
+	if parent, name := path.Split(strings.TrimSuffix(dir, "/")); dir != "" && strings.ToLower(name) == "annotations" {
+		patterns = append(patterns, likePrefix(parent+"jpegimages/"+stem)+".%", likePrefix(parent+"images/"+stem)+".%")
 	}
-	var before []string // the images that would come first, by their exact path
-	for _, folder := range []string{"jpegimages", "images"} {
-		for _, name := range namesIn(root, parent, folder) {
-			if other := parent + name + "/" + base; other < img.Path {
-				before = append(before, other)
-			}
-		}
-	}
-	if len(before) == 0 {
-		return "", nil
-	}
-	rows, err := q.Query(ctx, `SELECT rel_path FROM dataset_images WHERE dataset_id = $1 AND rel_path = ANY($2)`,
-		img.DatasetID, before)
+	rows, err := q.Query(ctx, `SELECT id, rel_path FROM dataset_images WHERE dataset_id = $1 AND id <> $2
+		AND lower(rel_path) LIKE ANY (SELECT lower(p) FROM unnest($3::text[]) AS p)`, img.DatasetID, img.ID, patterns)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	others, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	others, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Image, error) {
+		other := Image{DatasetID: img.DatasetID}
+		err := row.Scan(&other.ID, &other.Path)
+		return other, err
+	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	slices.Sort(others)
-	for _, other := range others {
-		// A scan only sees the images that are still there; one that has a
-		// file of its own does not claim rel.
-		if exists, _ := regularFileExists(root, other); exists && annotationCandidate(root, other) == "" {
-			return other, nil
-		}
-	}
-	return "", nil
+	return slices.DeleteFunc(others, func(other Image) bool { return !isRegularFile(root, other.Path) }), nil
 }
 
 // likePrefix escapes the LIKE wildcards of s (with the default escape
@@ -278,25 +315,32 @@ func likePrefix(s string) string {
 // does not consider other images claiming the file (see claimOwner). It
 // returns "" when there is none.
 func annotationCandidate(root *os.Root, rel string) string {
+	return annotationCandidateWithout(root, rel, "")
+}
+
+// annotationCandidateWithout is annotationCandidate as if the file gone
+// ("" for none) had been removed.
+func annotationCandidateWithout(root *os.Root, rel, gone string) string {
+	ok := func(p string) bool { return isRegularFile(root, p) && (gone == "" || !sameFile(root, p, gone)) }
 	dir, base := path.Split(rel)
 	stem := strings.TrimSuffix(base, path.Ext(base))
-	if exact := exactAnnotationPath(rel); isRegularFile(root, exact) {
+	if exact := exactAnnotationPath(rel); ok(exact) {
 		return exact
 	}
 	want := strings.ToLower(stem + ".xml")
 	for _, name := range namesIn(root, dir, want) {
-		if isRegularFile(root, dir+name) {
+		if ok(dir + name) {
 			return dir + name
 		}
 	}
-	parent, ok := vocImageFolder(dir)
-	if !ok {
+	parent, isVOC := vocImageFolder(dir)
+	if !isVOC {
 		return ""
 	}
 	found := ""
 	for _, ann := range annotationsDirs(root, parent) {
 		for _, name := range namesIn(root, parent+ann+"/", want) {
-			if p := parent + ann + "/" + name; isRegularFile(root, p) {
+			if p := parent + ann + "/" + name; ok(p) {
 				if found == "" || p < found {
 					found = p
 				}
@@ -382,16 +426,71 @@ func annotationsDirs(root *os.Root, parent string) []string {
 // <stem>.xml next to it, or, for an image in a Pascal VOC "JPEGImages" (or
 // "images") folder with a sibling "Annotations" folder, <stem>.xml in
 // there. A scan pairs the image with that file (see pairAnnotations) as
-// long as no other candidate exists (see annotationCandidate).
+// long as no other candidate exists (see annotationCandidate), and gives it
+// to that image when other images claim it too, by the <filename> it
+// records (see SaveAnnotation). That only fails to tell two images apart
+// that have the same file name, such as JPEGImages/a.jpg and images/a.jpg
+// sharing Annotations/, or JPEGImages/a.jpg and an image Annotations/a.jpg;
+// which of them a scan picks would then depend on whether the other one has
+// a file of its own at the time. Such an image gets <stem>.xml next to it
+// instead, which no image of another folder claims. (An image in an
+// "Annotations" folder itself has no other place: see
+// annotationsFolderRival.)
 func defaultAnnotationPath(root *os.Root, rel string) string {
 	dir, base := path.Split(rel)
 	stem := strings.TrimSuffix(base, path.Ext(base))
 	if parent, ok := vocImageFolder(dir); ok {
-		if ann := siblingAnnotationsDir(root, parent); ann != "" {
+		if ann := siblingAnnotationsDir(root, parent); ann != "" && !hasNamesake(root, parent, rel) {
 			return parent + ann + "/" + stem + ".xml"
 		}
 	}
 	return dir + stem + ".xml"
+}
+
+// hasNamesake reports whether another VOC image folder ("JPEGImages" or
+// "images", any case) or an "Annotations" folder in the folder parent holds
+// an image of the same file name as the image at rel.
+func hasNamesake(root *os.Root, parent, rel string) bool {
+	base := path.Base(rel)
+	for _, folder := range []string{"jpegimages", "images", "annotations"} {
+		for _, name := range namesIn(root, parent, folder) {
+			if other := parent + name + "/" + base; isRegularFile(root, other) && !sameFile(root, other, rel) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// annotationsFolderRival returns the image a scan would give the new VOC
+// file rel of img (see defaultAnnotationPath) instead of img, or "" if
+// there is none. That can only happen when img is itself in an
+// "Annotations" folder, so rel goes next to it: an image of the same file
+// name in a VOC image folder next to it ("JPEGImages" or "images", any
+// case) takes rel too unless it has a file of its own that comes first (see
+// annotationCandidate), the <filename> recorded in rel cannot tell the two
+// apart, and the first in byte order of the path gets it (see claimOwner).
+func annotationsFolderRival(root *os.Root, img Image, rel string) string {
+	dir, base := path.Split(img.Path)
+	parent, name := path.Split(strings.TrimSuffix(dir, "/"))
+	if dir == "" || strings.ToLower(name) != "annotations" {
+		return ""
+	}
+	rival := ""
+	for _, folder := range []string{"jpegimages", "images"} {
+		for _, n := range namesIn(root, parent, folder) {
+			other := parent + n + "/" + base
+			if other >= img.Path || (rival != "" && other >= rival) || !isRegularFile(root, other) {
+				continue
+			}
+			// rel would come first among its candidates in the Annotations
+			// folders, but not before a file in its own folder.
+			if c := annotationCandidate(root, other); c == "" || (path.Dir(c) != path.Dir(other) && rel < c) {
+				rival = other
+			}
+		}
+	}
+	return rival
 }
 
 // siblingAnnotationsDir returns the name of the real folder called
@@ -569,11 +668,10 @@ func (s *Service) SaveAnnotation(ctx context.Context, datasetID, imageID int64, 
 }
 
 // DeleteAnnotation removes the VOC file of an image, which becomes
-// unannotated. baseVersion and force work as in SaveAnnotation.
+// unannotated, or is paired with another candidate file that remains (see
+// remainingAnnotation). baseVersion and force work as in SaveAnnotation.
 func (s *Service) DeleteAnnotation(ctx context.Context, datasetID, imageID int64, baseVersion string, force bool) (ImageDetail, error) {
-	return s.editAnnotation(ctx, datasetID, imageID, baseVersion, force, func(*annotationEdit) ([]byte, error) {
-		return nil, nil
-	})
+	return s.editAnnotation(ctx, datasetID, imageID, baseVersion, force, nil)
 }
 
 // annotationEdit is the state an annotation change works on.
@@ -589,12 +687,106 @@ type annotationEdit struct {
 // ownerConflict is the error for the image img whose VOC file belongs to
 // another image (see annotationTarget.Owner).
 func ownerConflict(img Image, t annotationTarget) *Error {
-	other := "另一张图片"
-	if path.Dir(t.Owner) == path.Dir(img.Path) {
-		other = "同一文件夹中的另一张图片"
+	if t.StaleOwner {
+		return newError(ErrConflict, "标注文件 %s 在索引中仍与图片 %s 配对，但该配对已过期（上次扫描之后文件夹中的文件有变化）；"+
+			"请先重新扫描数据集，再编辑这张图片的标注", t.Path, t.Owner)
 	}
 	return newError(ErrConflict, "标注文件 %s 属于%s %s（VOC 按文件名配对），"+
-		"无法为这张图片单独保存标注；请先重命名其中一张图片", t.Path, other, t.Owner)
+		"无法为这张图片单独保存标注；请先重命名其中一张图片", t.Path, otherImage(img, t.Owner), t.Owner)
+}
+
+// otherImage names the image other in a message about img.
+func otherImage(img Image, other string) string {
+	if path.Dir(other) == path.Dir(img.Path) {
+		return "同一文件夹中的另一张图片"
+	}
+	return "另一张图片"
+}
+
+// remainingAnnotation finds the VOC file a scan pairs img with once the
+// file gone is removed: another candidate of img (see annotationCandidate),
+// such as Annotations/a.xml after a.xml next to the image took over from
+// it. The result is empty when there is none; its Owner is set when the
+// file belongs to another image by the scan's rule (img is then left
+// without annotation, see resolveAnnotationTarget).
+//
+// The other images that claim gone now and lose it to img (a.png when a.jpg
+// wins a.xml, see claimOwner) each claim their own next candidate then,
+// too. The removal is refused when a file the index pairs with another
+// image would then go to img or to one of those images: the boxes of that
+// image would move with it at the next scan.
+func remainingAnnotation(ctx context.Context, q querier, root *os.Root, img Image, gone string) (annotationTarget, error) {
+	others, err := possibleClaimants(ctx, q, root, img, gone)
+	if err != nil {
+		return annotationTarget{}, err
+	}
+	freed := []Image{img} // the images that claim gone now
+	for _, other := range others {
+		if c := annotationCandidate(root, other.Path); c != "" && sameFile(root, c, gone) {
+			freed = append(freed, other)
+		}
+	}
+	var t annotationTarget
+	for i, c := range freed {
+		r := annotationCandidateWithout(root, c.Path, gone)
+		if i == 0 {
+			t.Path = r
+		} else if t.Path != "" && sameFile(root, r, t.Path) {
+			continue // decided with img, which claims r too
+		}
+		if r == "" {
+			continue
+		}
+		winner, err := claimOwner(ctx, q, root, c, r, gone)
+		if err != nil {
+			return t, err
+		}
+		if winner == "" {
+			winner = c.Path
+		}
+		owner, stale, err := indexedOwner(ctx, q, root, c, r)
+		if err != nil {
+			return t, err
+		}
+		// The removal moves r away from its owner when a scan then gives it
+		// to an image that claims it only because gone is removed. A winner
+		// that claims r already shows an index out of date, which the
+		// removal does not change.
+		moved := owner != "" && owner != img.Path && owner != winner &&
+			slices.ContainsFunc(freed, func(f Image) bool { return f.Path == winner })
+		switch {
+		case moved && stale:
+			who := "这张图片"
+			if winner != img.Path {
+				who = otherImage(img, winner) + " " + winner + " "
+			}
+			return t, newError(ErrConflict, "删除 %s 后，%s会改用标注文件 %s，它在索引中仍与图片 %s 配对，但该配对已过期；"+
+				"请先重新扫描数据集，再删除这张图片的标注", gone, who, r, owner)
+		case moved && winner == img.Path:
+			return t, newError(ErrConflict, "删除 %s 后，重新扫描会把%s %s 的标注文件 %s 配对给这张图片（VOC 按文件名配对），"+
+				"那张图片的框会转到这张图片上，因此不能删除；如需清空这张图片的框，请把它标为空标注", gone, otherImage(img, owner), owner, r)
+		case moved:
+			return t, newError(ErrConflict, "删除 %s 后，重新扫描会把图片 %s 的标注文件 %s 改为配对给%s %s（VOC 按文件名配对），"+
+				"框也会跟着转过去，因此不能删除；如需清空这张图片的框，请把它标为空标注", gone, owner, r, otherImage(img, winner), winner)
+		case i == 0 && winner != img.Path:
+			t.Owner, t.StaleOwner = winner, winner == owner && stale
+		}
+	}
+	return t, nil
+}
+
+// indexAnnotation records in the index row of img that it is paired with
+// the VOC file rel (fi describes it), read as a or failing with err, as a
+// scan does (see indexImage), and refreshes the dataset counters.
+func indexAnnotation(ctx context.Context, tx pgx.Tx, img Image, rel string, fi fs.FileInfo, a *vocAnnotation, err error) error {
+	state, objects, labels := annotationInvalid, 0, map[string]int{}
+	if err == nil {
+		state, objects, labels = annotationEmpty, len(a.Objects), a.labelCounts()
+		if objects > 0 {
+			state = annotationAnnotated
+		}
+	}
+	return updateAnnotationIndex(ctx, tx, img, &rel, dbTime(fi.ModTime()), fi.Size(), state, objects, labels)
 }
 
 // updateAnnotationIndex records the new annotation of img in its index row
@@ -619,16 +811,18 @@ func updateAnnotationIndex(ctx context.Context, tx pgx.Tx, img Image, annPath *s
 }
 
 // editAnnotation replaces the annotation file of an image with the content
-// change returns (nil removes the file) after checking that the file is
-// still at baseVersion, and updates the index and the dataset counters.
-// Changes of one image are serialized, so the check and the write cannot
-// interleave with another save in this process.
+// change returns (a nil change removes the file) after checking that the
+// file is still at baseVersion, and updates the index and the dataset
+// counters. Changes of one image are serialized, so the check and the
+// write cannot interleave with another save in this process.
 //
 // The database is updated first and the file is put in place as the last
 // step before the commit; when the commit fails, the previous file is put
 // back, so the file and the index stay in step. The result describes the
-// file this request wrote (no file after a delete), so its version is the
-// one the next edit starts from even if the file changes again meanwhile.
+// file this request wrote, so its version is the one the next edit starts
+// from even if the file changes again meanwhile. After a delete it
+// describes the file a scan pairs the image with now (see
+// remainingAnnotation), usually none.
 func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, baseVersion string, force bool,
 	change func(e *annotationEdit) ([]byte, error)) (ImageDetail, error) {
 	unlock, err := s.annotationLocks.lock(ctx, imageID)
@@ -669,11 +863,11 @@ func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, 
 		if err != nil {
 			return err
 		}
+		if t, err = checkPairedTarget(ctx, tx, root, img, t, change != nil); err != nil {
+			return err
+		}
 		if t.Owner != "" {
 			return ownerConflict(img, t)
-		}
-		if err := checkPairedTarget(root, img, t); err != nil {
-			return err
 		}
 		e := &annotationEdit{root: root, img: img, target: t}
 		exists, err := regularFileExists(root, t.Path)
@@ -700,7 +894,13 @@ func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, 
 		if !force && version != baseVersion {
 			return errAnnotationChanged
 		}
-		data, err := change(e)
+		var data []byte
+		var rest annotationTarget // after a delete: the file a scan pairs img with then
+		if change != nil {
+			data, err = change(e)
+		} else {
+			rest, err = remainingAnnotation(ctx, tx, root, img, t.Path)
+		}
 		if err != nil {
 			return err
 		}
@@ -719,26 +919,49 @@ func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, 
 			if err != nil {
 				return err
 			}
-			state := annotationEmpty
-			if len(written.Objects) > 0 {
-				state = annotationAnnotated
-			}
-			err = updateAnnotationIndex(ctx, tx, img, &t.Path, dbTime(fi.ModTime()), fi.Size(), state,
-				len(written.Objects), written.labelCounts())
-			if err != nil {
+			if err := indexAnnotation(ctx, tx, img, t.Path, fi, written, nil); err != nil {
 				return err
 			}
-		} else if err := updateAnnotationIndex(ctx, tx, img, nil, time.Time{}, 0, annotationNone, 0, map[string]int{}); err != nil {
-			return err
+		}
+		// After a delete, a remaining candidate that is free becomes the file
+		// of img, as with a scan (see remainingAnnotation).
+		var restInfo fs.FileInfo // nil: no such file
+		var restRead *vocAnnotation
+		var restVersion string
+		var restErr error
+		if data == nil && rest.Path != "" && rest.Owner == "" {
+			if fi, err := root.Lstat(filepath.FromSlash(rest.Path)); err == nil {
+				restRead, restVersion, _, restErr = readVersionedAnnotation(root, rest.Path)
+				if !errors.Is(restErr, fs.ErrNotExist) { // not removed meanwhile
+					restInfo = fi
+				}
+			}
+		}
+		switch {
+		case data != nil: // indexed above
+		case restInfo != nil:
+			if err := indexAnnotation(ctx, tx, img, rest.Path, restInfo, restRead, restErr); err != nil {
+				return err
+			}
+		default:
+			if err := updateAnnotationIndex(ctx, tx, img, nil, time.Time{}, 0, annotationNone, 0, map[string]int{}); err != nil {
+				return err
+			}
 		}
 		if img, err = queryImage(ctx, tx, datasetID, imageID); err != nil {
 			return err
 		}
 		detail = ImageDetail{Image: img}
-		if data != nil {
+		switch {
+		case data != nil:
 			describeAnnotation(&detail, annotationTarget{Path: t.Path, Paired: true}, written, annotationVersion(data), nil)
-		} else {
+		case restInfo != nil:
+			describeAnnotation(&detail, annotationTarget{Path: rest.Path, Paired: true}, restRead, restVersion, restErr)
+		default:
 			describeAnnotation(&detail, annotationTarget{}, nil, "", fs.ErrNotExist)
+			if rest.Owner != "" {
+				detail.AnnotationBlocked = ownerConflict(img, rest).Message
+			}
 		}
 
 		// Refreshing the counters of a large dataset takes a while: make
