@@ -37,8 +37,10 @@ import {
 } from "@/features/annotation/annotation-canvas"
 import {
   applySavedDetail,
+  cancelImageReads,
   editorImageQuery,
   fetchImageAt,
+  markImageOutdated,
   openableDetail,
   persistAnnotation,
   saveEditorAnnotation,
@@ -842,6 +844,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       return // 已切换到别的图片
     }
     try {
+      await cancelImageReads(queryClient, datasetId, session.imageId)
       const saved = await deleteAnnotation(
         datasetId,
         session.imageId,
@@ -862,6 +865,9 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
           : `已删除标注文件，图片现在使用另一个标注文件 ${saved.annotation_path ?? ""}`
       )
     } catch (error) {
+      if (isConflictError(error)) {
+        markImageOutdated(queryClient, datasetId, session.imageId)
+      }
       toast.error(
         isConflictError(error)
           ? "标注文件已被修改，请重新读取后再试"

@@ -4,7 +4,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import {
   annotationKeys,
   applySavedDetail,
+  cancelImageReads,
   editorImageQuery,
+  markImageOutdated,
   openableDetail,
   persistAnnotation,
   saveEditorAnnotation,
@@ -133,25 +135,44 @@ describe("applySavedDetail", () => {
     })
   })
 
-  it("is not replaced by a read of the image that started before the save", async () => {
+  it("is not replaced by a read that started before the request", async () => {
     const client = new QueryClient()
     const key = annotationKeys.image(1, 2)
     client.setQueryData(key, detail("annotated", ["a"]))
     let resolve: (value: DatasetImageDetail) => void = () => undefined
-    const read = client.fetchQuery({
-      queryKey: key,
-      queryFn: () =>
-        new Promise<DatasetImageDetail>((done) => {
-          resolve = done
-        }),
-    })
+    const read = client
+      .fetchQuery({
+        queryKey: key,
+        queryFn: () =>
+          new Promise<DatasetImageDetail>((done) => {
+            resolve = done
+          }),
+      })
+      .catch(() => undefined)
 
-    // 删除标注文件后图片为未标注；读取晚于删除返回，读到的是删除前的文件。
+    // 删除标注文件（clearFile）：先取消之前开始的读取，再发出请求。读取晚于
+    // 删除返回，读到的是删除前的文件。
+    await cancelImageReads(client, 1, 2)
     await applySavedDetail(client, 1, detail("none", []))
     resolve(detail("annotated", ["a"]))
     await read
     await new Promise((done) => setTimeout(done, 0))
     expect(client.getQueryData(key)).toEqual(detail("none", []))
+  })
+})
+
+describe("markImageOutdated", () => {
+  it("invalidates only that image's editor detail", () => {
+    const client = new QueryClient()
+    client.setQueryData(annotationKeys.image(1, 2), { id: 2 })
+    client.setQueryData(annotationKeys.image(1, 3), { id: 3 })
+    markImageOutdated(client, 1, 2)
+    expect(
+      client.getQueryState(annotationKeys.image(1, 2))?.isInvalidated
+    ).toBe(true)
+    expect(
+      client.getQueryState(annotationKeys.image(1, 3))?.isInvalidated
+    ).toBe(false)
   })
 })
 
@@ -273,6 +294,41 @@ describe("saveEditorAnnotation", () => {
     expect(client.getQueryData(options.queryKey)).toEqual(version("mine"))
     expect(cached(client)?.isInvalidated).toBe(false)
     unsubscribe()
+  })
+
+  it("lets a read started after the request was sent finish (re-reading the file during a save)", async () => {
+    const client = new QueryClient()
+    const version = (annotation_version: string) =>
+      ({ id: 2, annotation_version }) as DatasetImageDetail
+    const key = annotationKeys.image(1, 2)
+    client.setQueryData(key, version("v1"))
+
+    let finishSave: (value: DatasetImageDetail) => void = () => undefined
+    vi.mocked(saveAnnotation).mockImplementationOnce(
+      () =>
+        new Promise<DatasetImageDetail>((done) => {
+          finishSave = done
+        })
+    )
+    const save = saveEditorAnnotation(client, request())
+    await vi.waitFor(() => expect(saveAnnotation).toHaveBeenCalled())
+
+    // 保存的请求已发出，用户选择“重新读取标注文件”。
+    let finishRead: (value: DatasetImageDetail) => void = () => undefined
+    const reload = client.fetchQuery({
+      ...editorImageQuery(1, 2),
+      staleTime: 0,
+      queryFn: () =>
+        new Promise<DatasetImageDetail>((done) => {
+          finishRead = done
+        }),
+    })
+    finishSave(version("v2"))
+    await expect(save).resolves.toBe("v2")
+    // 读取晚于保存返回，读到的是保存后的文件。
+    finishRead(version("v2"))
+    await expect(reload).resolves.toEqual(version("v2"))
+    expect(client.getQueryData(key)).toEqual(version("v2"))
   })
 })
 
