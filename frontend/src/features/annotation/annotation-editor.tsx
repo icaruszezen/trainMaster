@@ -1562,7 +1562,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
             <AlertDialogTitle>删除这张图片的标注文件？</AlertDialogTitle>
             <AlertDialogDescription>
               {latest?.annotation_path ?? "标注文件"}
-              会从数据集文件夹中删除，图片恢复为“未标注”。这一步不能撤销。
+              会从数据集文件夹中删除。还有重新扫描时会使用的其它标注文件时，图片改用它，否则恢复为“未标注”。这一步不能撤销。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

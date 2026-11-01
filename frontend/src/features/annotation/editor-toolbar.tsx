@@ -613,7 +613,7 @@ function MoreMenu(props: EditorToolbarProps) {
           disabled={!props.canClearFile}
         >
           <FileX2 />
-          删除标注文件（恢复为未标注）
+          删除标注文件
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={props.onManageClasses}>
