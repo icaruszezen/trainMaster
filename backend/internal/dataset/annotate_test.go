@@ -1365,6 +1365,69 @@ func TestIntegrationAnnotationsFolderImages(t *testing.T) {
 	}
 }
 
+// On a file system that tells case apart, a new file in the "Annotations"
+// folder that comes first in byte order (ANNOTATIONS/) would come before
+// the file another image has in the next one (annotations/): the image
+// that would create it is refused, so the other image keeps its boxes.
+func TestIntegrationCaseVariantAnnotationsFolders(t *testing.T) {
+	if !caseSensitive(t) {
+		t.Skip("needs a file system that tells case apart")
+	}
+	e := newAnnotationEnv(t, map[string][]byte{
+		// JPEGImages/a.jpg wins annotations/a.xml (first in byte order);
+		// ANNOTATIONS/a.png would write ANNOTATIONS/a.xml next to it.
+		"V/JPEGImages/a.jpg":  pngFile(t, 16, 16),
+		"V/annotations/a.jpg": pngFile(t, 16, 16),
+		"V/annotations/a.xml": vocFile("a.jpg", "tool"),
+		"V/ANNOTATIONS/a.png": pngFile(t, 16, 16),
+		// ANNOTATIONS/b.png has ANNOTATIONS/b.xml; JPEGImages/b.jpg claims it
+		// first and loses it, so annotations/b.xml is nobody's until then.
+		"W/JPEGImages/b.jpg":  pngFile(t, 16, 16),
+		"W/annotations/b.xml": vocFile("b.jpg", "waiting"),
+		"W/ANNOTATIONS/b.png": pngFile(t, 16, 16),
+		"W/ANNOTATIONS/b.xml": vocFile("b.png", "png"),
+	})
+	ctx := context.Background()
+	jpeg := e.image(t, "V/JPEGImages/a.jpg")
+	if _, err := e.svc.SaveAnnotation(ctx, e.d.ID, jpeg.ID, SaveAnnotationInput{Objects: boxNamed("platform"), BaseVersion: e.detail(t, jpeg).AnnotationVersion}); err != nil {
+		t.Fatalf("save JPEGImages/a.jpg: %v", err)
+	}
+	png := e.image(t, "V/ANNOTATIONS/a.png")
+	const blocked = "标注文件 V/ANNOTATIONS/a.xml 属于另一张图片 V/JPEGImages/a.jpg"
+	if got := e.detail(t, png); !strings.Contains(got.AnnotationBlocked, blocked) {
+		t.Errorf("ANNOTATIONS/a.png detail = %+v", got)
+	}
+	for _, force := range []bool{false, true} {
+		_, err := e.svc.SaveAnnotation(ctx, e.d.ID, png.ID, SaveAnnotationInput{Objects: boxNamed("png"), Force: force})
+		wantKind(t, err, ErrConflict, blocked)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, "V", "ANNOTATIONS", "a.xml")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("ANNOTATIONS/a.xml written: %v", err)
+	}
+
+	// Once ANNOTATIONS/b.xml is deleted, JPEGImages/b.jpg gets
+	// annotations/b.xml: the result says that b.png cannot have a file again,
+	// as the next view does.
+	bpng := e.image(t, "W/ANNOTATIONS/b.png")
+	gone, err := e.svc.DeleteAnnotation(ctx, e.d.ID, bpng.ID, e.detail(t, bpng).AnnotationVersion, false)
+	const bBlocked = "标注文件 W/ANNOTATIONS/b.xml 属于另一张图片 W/JPEGImages/b.jpg"
+	if err != nil || gone.AnnotationState != annotationNone || !strings.Contains(gone.AnnotationBlocked, bBlocked) {
+		t.Fatalf("delete ANNOTATIONS/b.xml = %+v, %v", gone, err)
+	}
+	if got := e.detail(t, bpng); got.AnnotationBlocked != gone.AnnotationBlocked {
+		t.Errorf("ANNOTATIONS/b.png after the delete = %+v, the delete said %q", got, gone.AnnotationBlocked)
+	}
+
+	e.rescan(t)
+	for rel, want := range map[string][]string{
+		"V/JPEGImages/a.jpg": {"platform"}, "V/annotations/a.jpg": {}, "W/JPEGImages/b.jpg": {"waiting"},
+	} {
+		if got := e.detail(t, e.image(t, rel)); !reflect.DeepEqual(objectNames(got.Objects), want) {
+			t.Errorf("%s after a rescan = %+v", rel, got)
+		}
+	}
+}
+
 // An image blocked by another image whose pairing in the index is out of
 // date is told to rescan, not to rename an image.
 func TestIntegrationStaleAnnotationOwner(t *testing.T) {

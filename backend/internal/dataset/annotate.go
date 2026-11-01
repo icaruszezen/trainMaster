@@ -109,39 +109,77 @@ type annotationTarget struct {
 // image, or a scan would give it to another image that claims it too (a.jpg
 // and a.png both want a.xml, see claimOwner). Owner then names that image,
 // and the annotation of img can neither be shown nor saved. A new file is
-// put where a scan gives it to img (see defaultAnnotationPath), except in
-// one layout where there is no such place (see annotationsFolderRival).
+// put where a scan gives it to img (see newFileTarget).
 func resolveAnnotationTarget(ctx context.Context, q querier, root *os.Root, img Image) (annotationTarget, error) {
 	var t annotationTarget
-	found := false
 	if img.AnnotationPath != nil {
 		t = annotationTarget{Path: *img.AnnotationPath, Paired: true}
 		exact := exactAnnotationPath(img.Path)
 		if path.Dir(t.Path) == path.Dir(img.Path) || !isRegularFile(root, exact) {
 			return t, nil
 		}
-		t, found = annotationTarget{Path: exact}, true
-	} else {
-		t.Path = annotationCandidate(root, img.Path)
-		found = t.Path != ""
-		if !found {
-			t.Path = defaultAnnotationPath(root, img.Path)
-		}
+		t = annotationTarget{Path: exact}
+	} else if t.Path = annotationCandidate(root, img.Path); t.Path == "" {
+		return newFileTarget(ctx, q, root, img, "")
 	}
 	var err error
-	if t.Owner, t.StaleOwner, err = indexedOwner(ctx, q, root, img, t.Path); err != nil {
+	if t.Owner, t.StaleOwner, err = indexedOwner(ctx, q, root, img, t.Path); err != nil || t.Owner != "" {
 		return t, err
 	}
-	switch {
-	case t.Owner != "":
-	case found:
-		if t.Owner, err = claimOwner(ctx, q, root, img, t.Path, ""); err != nil {
-			return t, err
-		}
-	default:
-		t.Owner = annotationsFolderRival(root, img, t.Path)
+	t.Owner, err = claimOwner(ctx, q, root, img, t.Path, "")
+	return t, err
+}
+
+// newFileTarget is the target of img when a scan pairs it with no VOC file,
+// as if the file gone ("" for none) had been removed: where a new file goes
+// (see defaultAnnotationPath). Owner is set when a scan would not give that
+// file to img (see annotationsFolderRival), or when it would make the file
+// of another image go elsewhere (see newFileTaker); img cannot be saved
+// then, so that the boxes of the other image stay with it.
+func newFileTarget(ctx context.Context, q querier, root *os.Root, img Image, gone string) (annotationTarget, error) {
+	t := annotationTarget{Path: defaultAnnotationPath(root, img.Path)}
+	var err error
+	if t.Owner, t.StaleOwner, err = indexedOwner(ctx, q, root, img, t.Path); err != nil || t.Owner != "" {
+		return t, err
 	}
-	return t, nil
+	if t.Owner = annotationsFolderRival(root, img, t.Path, gone); t.Owner != "" {
+		return t, nil
+	}
+	t.Owner, err = newFileTaker(ctx, q, root, img, t.Path, gone)
+	return t, err
+}
+
+// newFileTaker returns the image whose file a new VOC file rel of img would
+// take at the next scan, or "" if there is none, as if the file gone ("" for
+// none) had been removed. That image S has a file c now (see
+// annotationCandidate), and rel would come before c among its candidates:
+// an image in a VOC image folder takes the first in byte order of the
+// "Annotations" folders next to it, so on a file system that tells case
+// apart, ANNOTATIONS/a.xml (written next to the image ANNOTATIONS/a.png)
+// comes before annotations/a.xml, the file of JPEGImages/a.jpg. S would
+// claim rel instead and lose it to img by the <filename> recorded in rel;
+// c, with the boxes of S, would go to another image (annotations/a.jpg) or
+// to none. Only a file that a scan gives S counts (see claimOwner): an image
+// that loses c to another one now keeps no file either way.
+func newFileTaker(ctx context.Context, q querier, root *os.Root, img Image, rel, gone string) (string, error) {
+	others, err := possibleClaimants(ctx, q, root, img, rel)
+	if err != nil {
+		return "", err
+	}
+	for _, other := range others {
+		c := annotationCandidateWithout(root, other.Path, gone)
+		if c == "" || sameFile(root, c, rel) || annotationCandidateAfter(root, other.Path, gone, rel) != rel {
+			continue
+		}
+		owner, err := claimOwner(ctx, q, root, other, c, gone)
+		if err != nil {
+			return "", err
+		}
+		if owner == "" {
+			return other.Path, nil
+		}
+	}
+	return "", nil
 }
 
 // indexedOwner returns the image other than img that the index pairs with
@@ -321,14 +359,31 @@ func annotationCandidate(root *os.Root, rel string) string {
 // annotationCandidateWithout is annotationCandidate as if the file gone
 // ("" for none) had been removed.
 func annotationCandidateWithout(root *os.Root, rel, gone string) string {
-	ok := func(p string) bool { return isRegularFile(root, p) && (gone == "" || !sameFile(root, p, gone)) }
+	return annotationCandidateAfter(root, rel, gone, "")
+}
+
+// annotationCandidateAfter is annotationCandidate as if the file gone ("" for
+// none) had been removed and then the file added ("" for none) created, in a
+// folder that exists.
+func annotationCandidateAfter(root *os.Root, rel, gone, added string) string {
+	ok := func(p string) bool {
+		return (added != "" && p == added) || (isRegularFile(root, p) && (gone == "" || !sameFile(root, p, gone)))
+	}
+	names := func(dir, want string) []string {
+		found := namesIn(root, dir, want)
+		if d, name := path.Split(added); added != "" && d == dir && strings.ToLower(name) == want && !slices.Contains(found, name) {
+			found = append(found, name)
+			slices.Sort(found)
+		}
+		return found
+	}
 	dir, base := path.Split(rel)
 	stem := strings.TrimSuffix(base, path.Ext(base))
 	if exact := exactAnnotationPath(rel); ok(exact) {
 		return exact
 	}
 	want := strings.ToLower(stem + ".xml")
-	for _, name := range namesIn(root, dir, want) {
+	for _, name := range names(dir, want) {
 		if ok(dir + name) {
 			return dir + name
 		}
@@ -339,7 +394,7 @@ func annotationCandidateWithout(root *os.Root, rel, gone string) string {
 	}
 	found := ""
 	for _, ann := range annotationsDirs(root, parent) {
-		for _, name := range namesIn(root, parent+ann+"/", want) {
+		for _, name := range names(parent+ann+"/", want) {
 			if p := parent + ann + "/" + name; ok(p) {
 				if found == "" || p < found {
 					found = p
@@ -470,7 +525,8 @@ func hasNamesake(root *os.Root, parent, rel string) bool {
 // case) takes rel too unless it has a file of its own that comes first (see
 // annotationCandidate), the <filename> recorded in rel cannot tell the two
 // apart, and the first in byte order of the path gets it (see claimOwner).
-func annotationsFolderRival(root *os.Root, img Image, rel string) string {
+// The file gone ("" for none) counts as removed.
+func annotationsFolderRival(root *os.Root, img Image, rel, gone string) string {
 	dir, base := path.Split(img.Path)
 	parent, name := path.Split(strings.TrimSuffix(dir, "/"))
 	if dir == "" || strings.ToLower(name) != "annotations" {
@@ -485,7 +541,7 @@ func annotationsFolderRival(root *os.Root, img Image, rel string) string {
 			}
 			// rel would come first among its candidates in the Annotations
 			// folders, but not before a file in its own folder.
-			if c := annotationCandidate(root, other); c == "" || (path.Dir(c) != path.Dir(other) && rel < c) {
+			if c := annotationCandidateWithout(root, other, gone); c == "" || (path.Dir(c) != path.Dir(other) && rel < c) {
 				rival = other
 			}
 		}
@@ -959,8 +1015,14 @@ func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, 
 			describeAnnotation(&detail, annotationTarget{Path: rest.Path, Paired: true}, restRead, restVersion, restErr)
 		default:
 			describeAnnotation(&detail, annotationTarget{}, nil, "", fs.ErrNotExist)
-			if rest.Owner != "" {
-				detail.AnnotationBlocked = ownerConflict(img, rest).Message
+			blocked := rest
+			if blocked.Owner == "" { // no file left: where a new file goes, as the next view finds
+				if blocked, err = newFileTarget(ctx, tx, root, img, t.Path); err != nil {
+					return err
+				}
+			}
+			if blocked.Owner != "" {
+				detail.AnnotationBlocked = ownerConflict(img, blocked).Message
 			}
 		}
 
