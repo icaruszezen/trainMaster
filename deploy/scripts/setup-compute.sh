@@ -86,8 +86,9 @@ usage() {
                            gpu / cpu：强制使用；off：不运行训练节点。指定后同时写入 TM_TRAINER_MODE
   --install-toolkit        Docker 无法使用显卡时安装并配置 NVIDIA Container Toolkit（需要 root 或 sudo）
   --yes                    安装前不再询问确认
-  --variant NAME           指定 PyTorch 变体（$(tm_variant_names | grep -vx cpu | tr '\n' ' ' | sed 's/ $//' | sed 's/ / \/ /g')），
-                           不按驱动与显卡自动选择
+  --variant NAME           固定 PyTorch 变体（$(cuda_variant_names | sed 's/ / \/ /g')），
+                           不按驱动与显卡自动选择。写入 TM_TRAINER_VARIANT，之后的 make setup /
+                           make up 都沿用它；--variant auto 恢复自动选择
   --server-url URL         平台地址（在其它机器上运行训练节点时），写入 TM_SERVER_URL
   --token TOKEN            节点令牌，与平台 .env 中的 TM_NODE_TOKEN 相同，写入 TM_NODE_TOKEN
   --env-file PATH          要修改的 .env（默认仓库根目录的 .env；不存在时从 .env.example 复制）
@@ -173,12 +174,12 @@ validate_args() {
 		local re='^[A-Za-z0-9._~+/=-]+$'
 		[ "${#TOKEN_ARG}" -ge 16 ] && [ "${#TOKEN_ARG}" -le 256 ] && [[ "$TOKEN_ARG" =~ $re ]] || usage_error "--token 必须是 16–256 个字符，只能包含字母、数字和 . _ ~ + / = -（其它字符请直接编辑 .env）"
 	fi
-	if [ -n "$VARIANT_ARG" ]; then
+	if [ -n "$VARIANT_ARG" ] && [ "$VARIANT_ARG" != auto ]; then
 		if [ "$VARIANT_ARG" = cpu ]; then
 			usage_error "CPU 训练节点请使用 --mode cpu"
 		fi
 		tm_variant_field "$VARIANT_ARG" cuda >/dev/null 2>&1 ||
-			usage_error "未知的 PyTorch 变体 $VARIANT_ARG（可选：$(tm_variant_names | grep -vx cpu | tr '\n' ' ' | sed 's/ $//')）"
+			usage_error "未知的 PyTorch 变体 $VARIANT_ARG（可选：auto $(cuda_variant_names)）"
 		case "$MODE_ARG" in cpu | off) usage_error "--variant 只能与 --mode auto 或 gpu 一起使用" ;; esac
 	fi
 	if [ -n "$ENV_FILE" ]; then
@@ -189,6 +190,11 @@ validate_args() {
 }
 
 # ---- 小工具 ----
+
+# CUDA 版的变体名，空格分隔（变体表中除 cpu 以外的）。
+cuda_variant_names() {
+	tm_variant_names | grep -vx cpu | tr '\n' ' ' | sed 's/ $//'
+}
 
 strip_trailing_slashes() {
 	local v="$1"
@@ -921,6 +927,8 @@ merge_profiles() {
 
 MODE=""
 MODE_SOURCE=""
+PIN=""            # 固定的 PyTorch 变体（--variant / TM_TRAINER_VARIANT），空为自动选择
+PIN_SOURCE=""
 RESULT=""         # gpu / cpu / off
 RESULT_REASON=""
 FIX_HINT=""       # 退回 CPU 时，改用 GPU 需要做的事
@@ -953,6 +961,36 @@ resolve_mode() {
 		MODE_SOURCE="默认"
 		;;
 	esac
+}
+
+# 固定的 PyTorch 变体：命令行 > 环境变量 > .env 中的 TM_TRAINER_VARIANT；auto 或没有设置时自动选择。
+# 写在 .env 中，这样 make up 每次重新检测时不会把手动选择的变体改回自动选择的结果。
+resolve_variant() {
+	local v src
+	if [ -n "$VARIANT_ARG" ]; then
+		v="$VARIANT_ARG"
+		src="命令行参数 --variant"
+	elif [ -n "${TM_TRAINER_VARIANT:-}" ]; then
+		v="$TM_TRAINER_VARIANT"
+		src="环境变量 TM_TRAINER_VARIANT"
+	elif v="$(env_get TM_TRAINER_VARIANT "$ENV_SOURCE")" && [ -n "$v" ]; then
+		src=".env 中的 TM_TRAINER_VARIANT"
+	else
+		return 0
+	fi
+	case "$v" in
+	auto) return 0 ;;
+	cpu)
+		warn "$src=cpu 无效：CPU 训练节点请设置 TM_TRAINER_MODE=cpu（或 --mode cpu），按自动选择处理"
+		return 0
+		;;
+	esac
+	if ! tm_variant_field "$v" cuda >/dev/null 2>&1; then
+		warn "$src=$v 无效（应为 auto $(cuda_variant_names)），按自动选择处理"
+		return 0
+	fi
+	PIN="$v"
+	PIN_SOURCE="$src"
 }
 
 # 自动模式下退回 CPU 的原因与改用 GPU 的方法。
@@ -1031,10 +1069,10 @@ decide() {
 	cpu) VARIANT=cpu ;;
 	gpu)
 		local existing first
-		if [ -n "$VARIANT_ARG" ]; then
-			VARIANT="$VARIANT_ARG"
+		if [ -n "$PIN" ]; then
+			VARIANT="$PIN"
 			if [ "$VARIANT" != "$TM_VARIANT" ]; then
-				say "按 --variant 使用 PyTorch 变体 $VARIANT（按驱动与显卡推荐 $TM_VARIANT）"
+				say "使用 PyTorch 变体 $VARIANT（$PIN_SOURCE 指定；按驱动与显卡推荐 $TM_VARIANT）"
 			fi
 			local min
 			min="$(tm_variant_field "$VARIANT" min_driver)"
@@ -1107,8 +1145,9 @@ main() {
 		ENV_SOURCE="$ENV_FILE"
 	fi
 
-	# 2. 模式：命令行 > 环境变量 > .env > auto
+	# 2. 模式与固定的变体：命令行 > 环境变量 > .env > auto
 	resolve_mode
+	resolve_variant
 
 	PYTHON_IMAGE="$(conf_value TRAINER_PYTHON_IMAGE "$DEFAULT_PYTHON_IMAGE")"
 	TOOLKIT_REPO="$(strip_trailing_slashes "$(conf_value NVIDIA_TOOLKIT_REPO "$DEFAULT_TOOLKIT_REPO")")"
@@ -1184,6 +1223,7 @@ main() {
 	old_profiles="$(env_get COMPOSE_PROFILES "$ENV_SOURCE" || true)"
 	new_profiles="$(merge_profiles "$old_profiles" "$RESULT")"
 	if [ -n "$MODE_ARG" ]; then set_key TM_TRAINER_MODE "$MODE_ARG"; fi
+	if [ -n "$VARIANT_ARG" ]; then set_key TM_TRAINER_VARIANT "$VARIANT_ARG"; fi
 	set_key COMPOSE_PROFILES "$new_profiles"
 	if [ "$RESULT" != off ]; then
 		set_key TM_TORCH_VARIANT "$VARIANT"
@@ -1236,6 +1276,9 @@ main() {
 	off) say "  训练节点：不运行" ;;
 	esac
 	say "  模式：$MODE（$MODE_SOURCE）"
+	if [ "$RESULT" = gpu ] && [ -n "$PIN" ]; then
+		say "  PyTorch 变体：固定为 $PIN（$PIN_SOURCE；恢复自动选择：make setup SETUP_ARGS=\"--variant auto\"）"
+	fi
 	say "  原因：$RESULT_REASON"
 	if [ "$RESULT" = cpu ] && [ "$MODE" = auto ] && [ -n "$FIX_HINT" ]; then
 		say "  改用 GPU：$FIX_HINT"

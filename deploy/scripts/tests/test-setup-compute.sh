@@ -872,15 +872,67 @@ expect_out "Docker 无法使用显卡（见上文），仍按要求使用 GPU �
 expect_env COMPOSE_PROFILES gpu
 expect_env TM_TORCH_VARIANT cu126
 
-# --variant 指定变体
+# --variant 固定变体：写入 TM_TRAINER_VARIANT，之后的运行（make up）沿用，--variant auto 恢复自动选择
 new_case "variant override"
 with_toolkit
 run_setup --variant cu118
 expect_rc 0
 expect_env TM_TORCH_VARIANT cu118
-expect_out "按 --variant 使用 PyTorch 变体 cu118（按驱动与显卡推荐 cu126）"
+expect_env TM_TRAINER_VARIANT cu118
+expect_out "使用 PyTorch 变体 cu118（命令行参数 --variant 指定；按驱动与显卡推荐 cu126）"
+expect_out "PyTorch 变体：固定为 cu118"
+EXTRA_ENV=(TM_SETUP_CALLER=up)
+run_setup
+expect_rc 0
+expect_env TM_TORCH_VARIANT cu118
+expect_out "使用 PyTorch 变体 cu118（.env 中的 TM_TRAINER_VARIANT 指定；按驱动与显卡推荐 cu126）"
+expect_out ".env 无需修改"
+EXTRA_ENV=()
+run_setup --variant auto
+expect_rc 0
+expect_env TM_TRAINER_VARIANT auto
+expect_env TM_TORCH_VARIANT cu126
+expect_no_out "固定为"
 run_setup --variant cu130
 expect_out "cu130 需要驱动 ≥ 580"
+expect_env TM_TORCH_VARIANT cu130
+
+# 固定的变体只在 GPU 模式下使用；退回 CPU 时保留它，下次能用 GPU 时继续生效
+new_case "variant pinned cpu fallback"
+printf 'TM_TRAINER_VARIANT=cu118\n' >"$ENV"
+run_setup
+expect_rc 0
+expect_env COMPOSE_PROFILES cpu
+expect_env TM_TORCH_VARIANT cpu
+expect_env TM_TRAINER_VARIANT cu118
+expect_no_out "固定为"
+# --mode cpu 与 --variant auto 可以一起使用（只是取消固定）
+run_setup --mode cpu --variant auto
+expect_rc 0
+expect_env TM_TRAINER_VARIANT auto
+expect_env TM_TORCH_VARIANT cpu
+
+# 环境变量优先于 .env；无效的值警告并自动选择
+new_case "variant pinned precedence"
+with_toolkit
+printf 'TM_TRAINER_VARIANT=cu118\n' >"$ENV"
+EXTRA_ENV=(TM_TRAINER_VARIANT=cu128)
+run_setup
+expect_rc 0
+expect_env TM_TORCH_VARIANT cu128
+expect_out "环境变量 TM_TRAINER_VARIANT 指定"
+EXTRA_ENV=()
+printf 'TM_TRAINER_VARIANT=cu999\n' >"$ENV"
+run_setup
+expect_rc 0
+expect_out "TM_TRAINER_VARIANT=cu999 无效"
+expect_env TM_TORCH_VARIANT cu126
+expect_env TM_TRAINER_VARIANT cu999
+printf 'TM_TRAINER_VARIANT=cpu\n' >"$ENV"
+run_setup
+expect_out "CPU 训练节点请设置 TM_TRAINER_MODE=cpu"
+expect_env COMPOSE_PROFILES gpu
+expect_env TM_TORCH_VARIANT cu126
 
 # 令牌只生成一次；已有的令牌不变
 new_case "token generated once"
