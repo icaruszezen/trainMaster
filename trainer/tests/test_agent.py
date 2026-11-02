@@ -51,11 +51,13 @@ class FakeDetector:
         self.error = error
         self.calls = 0
         self.hardware_seen: list[dict[str, Any]] = []
+        self.host_drivers_seen: list[str | None] = []
         self.cancelled = threading.Event()
 
-    def detect(self, hardware, *, device_nodes=(), pci_gpu_count=None):
+    def detect(self, hardware, *, device_nodes=(), pci_gpu_count=None, host_driver_version=None):
         self.calls += 1
         self.hardware_seen.append(hardware)
+        self.host_drivers_seen.append(host_driver_version)
         if self.gate is not None:
             while not self.gate.wait(0.01):
                 if self.cancelled.is_set():
@@ -78,6 +80,7 @@ class FakeHardware:
             hardware={"os": "Test OS", "gpus": [], "probe": self.count},
             gpu=gpu.GpuProbe(None, [], {"method": "none", "error": None, "host_gpu_count": None}),
             device_nodes=[],
+            host_driver_version="440.100",
         )
 
 
@@ -264,6 +267,7 @@ def test_probe_requested_triggers_new_probe(platform, tmp_path):
         assert node["hardware"]["probe"] == 2
         assert node["environment"]["run"] == 2
         assert h.detector.hardware_seen[-1]["probe"] == 2
+        assert h.detector.host_drivers_seen == ["440.100", "440.100"]  # 诊断信息交给检测
         hb = node["heartbeats"]
         wait_until(lambda: node["heartbeats"] >= hb + 3)
         assert h.detector.calls == 2  # 请求被清除后不再重复检测

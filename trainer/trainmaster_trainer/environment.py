@@ -546,6 +546,7 @@ class EnvironmentDetector:
         *,
         device_nodes: Sequence[str] = (),
         pci_gpu_count: int | None = None,
+        host_driver_version: str | None = None,
     ) -> dict[str, Any]:
         raw = self.run_child()
         return issues_mod.build_environment(
@@ -555,6 +556,7 @@ class EnvironmentDetector:
             probed_at=utc_now(),
             device_nodes=device_nodes,
             pci_gpu_count=pci_gpu_count,
+            host_driver_version=host_driver_version,
             deployment=self.deployment,
         )
 

@@ -86,7 +86,10 @@ def _detect(cfg: config_mod.Config) -> tuple[Any, dict[str, Any]]:
     # Ctrl+C / docker stop 时结束检测子进程（run_child 收到 KeyboardInterrupt 会终止它）。
     signal.signal(signal.SIGTERM, _raise_interrupt)
     env = detector.detect(
-        probe.hardware, device_nodes=probe.device_nodes, pci_gpu_count=probe.pci_gpu_count
+        probe.hardware,
+        device_nodes=probe.device_nodes,
+        pci_gpu_count=probe.pci_gpu_count,
+        host_driver_version=probe.host_driver_version,
     )
     return probe, env
 

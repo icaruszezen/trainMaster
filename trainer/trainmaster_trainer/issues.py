@@ -308,7 +308,9 @@ def _gpu_detection_issues(
     hardware: Mapping[str, Any],
     device_nodes: Sequence[str],
     pci_gpu_count: int | None,
+    host_driver: str | None,
     fixes: Fixes,
+    table: Sequence[Variant] | None,
 ) -> list[dict[str, Any]]:
     gpus = hardware.get("gpus") or []
     detection = hardware.get("gpu_detection") or {}
@@ -332,6 +334,20 @@ def _gpu_detection_issues(
     if container and host_count > 0 and not device_nodes:
         if cpu_mode:
             return [_cpu_mode_issue(host_count, fixes, driver_missing=False)]
+        # 宿主机驱动低于任何 CUDA 版 PyTorch 的要求时，make setup 选择 CPU 并且不安装 NVIDIA Container
+        # Toolkit：显卡没有传入容器的原因是驱动过旧，先升级驱动。
+        lowest = variants_mod.lowest_cuda_driver(hardware.get("arch") or None, table)
+        if host_driver and lowest and not variants_mod.version_ge(host_driver, lowest):
+            return [
+                issue(
+                    "warning",
+                    "driver_too_old",
+                    f"宿主机 NVIDIA 驱动 {host_driver} 过旧，CUDA 版 PyTorch 至少需要 {lowest}，"
+                    "将使用 CPU 训练",
+                    "升级 NVIDIA 驱动（推荐 580 或更新）并重启，然后"
+                    + fixes.after_driver(toolkit=True),
+                )
+            ]
         return [
             issue(
                 "warning",
@@ -372,12 +388,14 @@ def build_environment(
     probed_at: str,
     device_nodes: Sequence[str] = (),
     pci_gpu_count: int | None = None,
+    host_driver_version: str | None = None,
     table: Sequence[Variant] | None = None,
     deployment: Deployment | None = None,
 ) -> dict[str, Any]:
     """合并硬件与子进程检测结果（raw，见 environment.collect）得到数据契约中的 Environment。
 
-    device_nodes（容器内的 /dev/nvidia*）、pci_gpu_count（PCI 总线上的 NVIDIA 显卡数）只用于诊断，不上报；
+    device_nodes（容器内的 /dev/nvidia*）、pci_gpu_count（PCI 总线上的 NVIDIA 显卡数）、
+    host_driver_version（/proc/driver/nvidia/version 中宿主机的驱动版本）只用于诊断，不上报；
     deployment（部署方式）只用于生成 hint 中的命令。
     """
     gpus: list[Mapping[str, Any]] = list(hardware.get("gpus") or [])
@@ -396,7 +414,9 @@ def build_environment(
     installed_info = variants_mod.get_variant(installed, table)
 
     issues: list[dict[str, Any]] = []
-    issues += _gpu_detection_issues(hardware, device_nodes, pci_gpu_count, fixes)
+    issues += _gpu_detection_issues(
+        hardware, device_nodes, pci_gpu_count, host_driver_version, fixes, table
+    )
 
     # 子进程整体失败（超时、崩溃、输出无法解析）时，torch 等信息未知，只报告自检失败。
     child_failed = bool(raw.get("probe_error"))

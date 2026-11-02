@@ -877,6 +877,89 @@ def test_auto_mode_still_warns_when_gpu_not_passed_through():
     assert codes(env) == ["gpu_not_passed_through"]
 
 
+# ---- 显卡没有传入容器、宿主机驱动过旧（make setup 因此选择了 CPU，安装 Toolkit 也没有用）----
+
+
+def test_old_host_driver_is_driver_too_old_not_gpu_not_passed_through():
+    env = env_of(
+        hw(host_gpu_count=1),
+        cpu_raw(),
+        torch_variant="cpu",
+        host_driver_version="440.100",
+        deployment=Deployment(service="trainer-cpu", mode="auto"),
+    )
+    assert codes(env) == ["driver_too_old"]
+    issue = env["issues"][0]
+    assert issue["level"] == "warning"
+    assert issue["message"] == (
+        "宿主机 NVIDIA 驱动 440.100 过旧，CUDA 版 PyTorch 至少需要 450.80.02，将使用 CPU 训练"
+    )
+    assert issue["hint"] == (
+        "升级 NVIDIA 驱动（推荐 580 或更新）并重启，然后安装 NVIDIA Container Toolkit 并以 GPU 模式"
+        '启动（需要 sudo）：`make up SETUP_ARGS="--install-toolkit"`'
+    )
+    assert env["status"] == "cpu_only"
+
+
+def test_old_host_driver_remote_hint_starts_only_the_trainer():
+    env = env_of(
+        hw(host_gpu_count=2),
+        cpu_raw(),
+        torch_variant="cpu",
+        host_driver_version="418.87",
+        deployment=remote("trainer-cpu", mode="auto"),
+    )
+    hint = only(env, "driver_too_old")["hint"]
+    assert hint.startswith("升级 NVIDIA 驱动（推荐 580 或更新）并重启，然后")
+    assert '`make setup SETUP_ARGS="--install-toolkit"`' in hint
+    assert "`docker compose up -d --build trainer`" in hint and "make up" not in hint
+
+
+def test_cpu_mode_wins_over_old_host_driver():
+    env = env_of(
+        hw(host_gpu_count=1),
+        cpu_raw(),
+        torch_variant="cpu",
+        host_driver_version="440.100",
+        deployment=Deployment(service="trainer-cpu", mode="cpu"),
+    )
+    assert codes(env) == ["cpu_mode_selected"]
+
+
+@pytest.mark.parametrize(
+    ("arch", "driver", "expected"),
+    [
+        ("x86_64", "450.80.02", "gpu_not_passed_through"),  # 驱动够用：没有传入容器的原因是 Toolkit
+        ("x86_64", "580.65.06", "gpu_not_passed_through"),
+        ("x86_64", None, "gpu_not_passed_through"),  # 读不到 /proc/driver/nvidia/version
+        ("aarch64", "575.57.08", "driver_too_old"),  # ARM 服务器只有 CUDA 13 版，需要 580
+        ("aarch64", "580.65.06", "gpu_not_passed_through"),
+        ("ppc64le", "440.100", "gpu_not_passed_through"),  # 没有 CUDA 版 PyTorch，与驱动无关
+    ],
+)
+def test_old_host_driver_threshold_follows_the_platform(arch, driver, expected):
+    env = env_of(
+        hw(host_gpu_count=1, arch=arch),
+        cpu_raw(),
+        torch_variant="cpu",
+        host_driver_version=driver,
+    )
+    assert codes(env) == [expected]
+    if expected == "driver_too_old":
+        assert "至少需要 580" in env["issues"][0]["message"]
+
+
+def test_host_driver_only_matters_when_gpu_is_not_passed_through():
+    # 显卡已传入容器（NVML 正常）：按 NVML 的驱动版本判断，/proc 中的版本不参与。
+    env = env_of(hw([gpu()]), raw(), host_driver_version="440.100")
+    assert env["issues"] == [] and env["status"] == "ready"
+    # 裸机：不存在“没有传入容器”的情况
+    env = env_of(
+        hw(host_gpu_count=1, container=False), raw(available=False), host_driver_version="440.100"
+    )
+    assert codes(env) == ["no_gpu"]
+
+
 # ---- hint 中的命令都用反引号包住（前端据此显示为代码、提供复制）----
 
 # 只会出现在命令中的片段：出现在反引号外面就说明有命令没有包住。
@@ -902,6 +985,11 @@ def _all_hints() -> list[tuple[str, str, str]]:
         (hw(), cpu_raw(), {"pci_gpu_count": 2}),
         (hw(error="NVML Shared Library Not Found", host_gpu_count=2), raw(available=False), {}),
         (hw(method="nvml", host_gpu_count=1), cpu_raw(), {"torch_variant": "cpu"}),
+        (
+            hw(host_gpu_count=1),
+            cpu_raw(),
+            {"torch_variant": "cpu", "host_driver_version": "440.100"},
+        ),
         (hw(error="Driver Not Loaded", host_gpu_count=1), cpu_raw(), {"device_nodes": ["nvidia0"]}),
         (hw(error="Unknown Error", host_gpu_count=1), cpu_raw(), {"device_nodes": ["nvidia0"]}),
         (hw([gpu()], method="nvidia-smi", error="Insufficient Permissions"), raw(), {}),

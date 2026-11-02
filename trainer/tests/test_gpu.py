@@ -446,6 +446,41 @@ def test_host_gpu_count(tmp_path: Path):
     assert gpu.host_gpu_count(tmp_path) == 2
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # 与 backend/internal/hostinfo/hostinfo_test.go 的 TestParseDriverVersion 相同的用例
+        ("NVRM version: NVIDIA UNIX x86_64 Kernel Module  550.54.15  Tue Mar  5 22:23:56 UTC 2024\n"
+         "GCC version:  gcc version 12.2.0 (Debian 12.2.0-14)\n", "550.54.15"),
+        ("NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.65.06  Release Build  "
+         "(dvs-builder@U16-I3-B03-4-3)  Sun Jul 27 07:09:29 UTC 2025\n", "580.65.06"),
+        ("NVRM version: NVIDIA UNIX Open Kernel Module for aarch64  575.57.08  Release Build\n",
+         "575.57.08"),
+        ("NVRM version: NVIDIA UNIX x86_64 Kernel Module  418.87  Thu Aug  8 15:35:46 CDT 2019\n",
+         "418.87"),
+        ("NVIDIA UNIX x86_64 Kernel Module  470.256.02\n", "470.256.02"),  # 没有 NVRM 行：在全文中查找
+        ("", None),
+        ("garbage", None),
+        ("GCC version:  gcc version 12.2.0\n", None),
+        ("NVRM version: unknown\nGCC version: 12.2.0", None),
+    ],
+)  # fmt: skip
+def test_parse_proc_driver_version(text, expected):
+    assert gpu.parse_proc_driver_version(text) == expected
+
+
+def test_host_driver_version(tmp_path: Path):
+    assert gpu.host_driver_version(tmp_path) is None
+    write_files(
+        tmp_path,
+        {
+            "proc/driver/nvidia/version": "NVRM version: NVIDIA UNIX x86_64 Kernel Module  "
+            "440.100  Fri May 29 08:45:51 UTC 2020\nGCC version:  gcc version 9.3.0\n"
+        },
+    )
+    assert gpu.host_driver_version(tmp_path) == "440.100"
+
+
 def test_pci_gpu_count(tmp_path: Path):
     assert gpu.pci_gpu_count(tmp_path) is None
     write_files(

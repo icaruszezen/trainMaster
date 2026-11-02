@@ -45,6 +45,7 @@ class Detector(Protocol):
         *,
         device_nodes: Iterable[str] = (),
         pci_gpu_count: int | None = None,
+        host_driver_version: str | None = None,
     ) -> dict[str, Any]: ...
 
     def cancel(self) -> None: ...
@@ -222,7 +223,10 @@ class Agent:
         log.info("detecting CUDA / PyTorch environment")
         try:
             env = self.detector.detect(
-                probe.hardware, device_nodes=probe.device_nodes, pci_gpu_count=probe.pci_gpu_count
+                probe.hardware,
+                device_nodes=probe.device_nodes,
+                pci_gpu_count=probe.pci_gpu_count,
+                host_driver_version=probe.host_driver_version,
             )
         except Exception as exc:
             log.exception("environment detection failed")

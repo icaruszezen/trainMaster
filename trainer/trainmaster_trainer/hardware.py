@@ -252,12 +252,14 @@ def shm_bytes(root: Path) -> int | None:
 @dataclass
 class HardwareProbe:
     """一次探测的结果：hardware 为数据契约中的 Hardware；gpu 保留实时指标的 sampler；
-    device_nodes（/dev/nvidia*）与 pci_gpu_count 只用于诊断（issues），不上报。"""
+    device_nodes（/dev/nvidia*）、pci_gpu_count 与 host_driver_version（/proc/driver/nvidia/version
+    中宿主机的驱动版本）只用于诊断（issues），不上报。"""
 
     hardware: dict[str, Any]
     gpu: gpu_mod.GpuProbe
     device_nodes: list[str]
     pci_gpu_count: int | None = None
+    host_driver_version: str | None = None
 
 
 def probe(
@@ -310,6 +312,7 @@ def probe(
         gpu=gp,
         device_nodes=gpu_mod.nvidia_device_nodes(root),
         pci_gpu_count=None if gp.gpus else gpu_mod.pci_gpu_count(root),
+        host_driver_version=None if gp.gpus else gpu_mod.host_driver_version(root),
     )
 
 

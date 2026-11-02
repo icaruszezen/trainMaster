@@ -412,6 +412,16 @@ def test_detect_builds_hints_for_the_deployment(tmp_path: Path):
     assert env["status"] == "cpu_only"
 
 
+def test_detect_passes_the_host_driver_version(tmp_path: Path):
+    # 显卡没有传入容器、宿主机驱动过旧：提示升级驱动，而不是安装 NVIDIA Container Toolkit。
+    cmd = script(tmp_path, f"import json\nprint(json.dumps({GOOD_RAW!r}))\n")
+    hardware = dict(HARDWARE, gpu_detection={"method": "none", "error": None, "host_gpu_count": 1})
+    env = detector(tmp_path, cmd).detect(hardware, host_driver_version="440.100")
+    assert [i["code"] for i in env["issues"]] == ["driver_too_old"]
+    env = detector(tmp_path, cmd).detect(hardware)
+    assert [i["code"] for i in env["issues"]] == ["gpu_not_passed_through"]
+
+
 def test_detect_self_test_disabled_env(tmp_path: Path):
     cmd = script(
         tmp_path,
