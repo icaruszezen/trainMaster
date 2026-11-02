@@ -351,6 +351,28 @@ node_hostname() {
 	printf '%s' "${h:0:64}"
 }
 
+# Docker 把容器的主机名（含点时还有第一个点之前的部分）写入容器的 /etc/hosts，容器中这个名字指向容器自己。
+# host_names_match <地址中的主机名> <容器的主机名>：容器中前者会解析为容器自己时返回 0（不区分大小写）。
+host_names_match() {
+	local name container
+	name="$(lower "$1")"
+	container="$(lower "$2")"
+	[ -n "$name" ] && [ -n "$container" ] || return 1
+	[ "$name" = "$container" ] || [ "$name" = "${container%%.*}" ]
+}
+
+# 容器之间按服务名连接（app 连接 postgres，本机的训练节点连接 app）：本机的主机名与它们相同时
+# 不能用作容器的主机名，否则这些连接会指向容器自己。
+COMPOSE_LINKED_SERVICES="app postgres"
+
+hostname_clashes_with_service() {
+	local svc
+	for svc in $COMPOSE_LINKED_SERVICES; do
+		if host_names_match "$svc" "$1"; then return 0; fi
+	done
+	return 1
+}
+
 # 生成 32 个字符的随机令牌（字母与数字）。去掉 base64 中的 / + = 后可能不足 32 位，因此多读一些并重试。
 generate_token() {
 	local t="" i
@@ -510,6 +532,7 @@ STATIC_GPU=0      # Docker 的配置看起来支持 GPU（nvidia 运行时、Doc
 DOCKER_GPU=""     # ok / unsupported / failed / unverified / untested / 空（不适用）
 DOCKER_GPU_DETAIL=""
 CONTAINER_GPU_COUNT=0
+DOCKER_GPU_TIMED_OUT=0  # docker run --gpus 验证超时（结果未知，不说明 Docker 不能使用显卡）
 
 detect_docker() {
 	DOCKER_STATE="" DOCKER_ERROR="" DOCKER_DESKTOP=0 DOCKER_FLAVOR="" NV_RUNTIME=0 CDI_SPEC="" TOOLKIT_INSTALLED=0 STATIC_GPU=0
@@ -558,6 +581,7 @@ detect_docker() {
 docker_gpu_test() {
 	DOCKER_GPU_DETAIL=""
 	CONTAINER_GPU_COUNT=0
+	DOCKER_GPU_TIMED_OUT=0
 	local image="$PYTHON_IMAGE" out rc=0 name="trainmaster-gpu-check-$$"
 	if ! "$DOCKER" image inspect "$image" >/dev/null 2>&1; then
 		say "  正在拉取 $image（构建训练节点镜像也要用它），用于验证 Docker 能否使用显卡…"
@@ -587,6 +611,7 @@ docker_gpu_test() {
 	if [ "$rc" -eq 124 ]; then
 		"$DOCKER" rm -f "$name" >/dev/null 2>&1 || true
 		DOCKER_GPU=failed
+		DOCKER_GPU_TIMED_OUT=1
 		DOCKER_GPU_DETAIL="docker run 超过 $DOCKER_TEST_TIMEOUT 秒没有结束"
 		return 0
 	fi
@@ -1201,7 +1226,8 @@ previous_result() {
 # - 无法连接 Docker（当前用户不在 docker 组、dockerd 正在重启等）：无从得知 Docker 能否使用显卡。
 #   .env 中还没有训练节点配置时什么也不写，退出码 1；
 # - 驱动更新后还没有重启（Driver/library version mismatch）：重启前 nvidia-smi 无法运行，
-#   正在运行的 GPU 训练节点通常仍然正常，重启后即可恢复。
+#   正在运行的 GPU 训练节点通常仍然正常，重启后即可恢复；
+# - 原来是 GPU、在 Docker 中验证显卡超时：只说明这次没有得到结果。
 # 不适用时返回 1。
 keep_previous_result() {
 	local prev
@@ -1221,6 +1247,12 @@ keep_previous_result() {
 		RESULT=gpu
 		KEPT_PREVIOUS=1
 		RESULT_REASON="驱动更新后还没有重启机器（nvidia-smi：$NVSMI_ERROR），暂时无法检测显卡，沿用 .env 中原来的 GPU 设置；重启机器后再运行 make setup"
+		return 0
+	fi
+	if [ "$DOCKER_GPU" = failed ] && [ "$DOCKER_GPU_TIMED_OUT" = 1 ] && [ "$prev" = gpu ] && host_gpu_ok && [ "$TM_VARIANT" != cpu ]; then
+		RESULT=gpu
+		KEPT_PREVIOUS=1
+		RESULT_REASON="在 Docker 中验证显卡超时（$DOCKER_GPU_DETAIL），无法判断，沿用 .env 中原来的 GPU 设置；Docker 恢复正常后再运行 make setup"
 		return 0
 	fi
 	return 1
@@ -1438,9 +1470,16 @@ main() {
 			if [ -n "$node_name" ]; then set_key TM_NODE_NAME "$node_name"; fi
 		fi
 	fi
-	# app 与训练节点容器的主机名（docker-compose.yml 中的 hostname）：每次都写入本机当前的主机名
+	# app 与训练节点容器的主机名（docker-compose.yml 中的 hostname）：每次都写入本机当前的主机名。
+	# 与 compose 中的服务名相同时留空（使用 compose 中的默认值），否则容器连不上同名的服务。
 	host_name="$(node_hostname)"
-	if [ -n "$host_name" ]; then set_key TM_HOST_HOSTNAME "$host_name"; fi
+	if [ -n "$host_name" ] && hostname_clashes_with_service "$host_name"; then
+		say "本机的主机名 $host_name 与 docker-compose.yml 中的服务名相同：用作容器的主机名时，容器中这个名字会指向容器自己。TM_HOST_HOSTNAME 留空，页面上的服务器主机名显示为 trainmaster，训练节点为 trainmaster-trainer"
+		if [ -n "$(env_get TM_HOST_HOSTNAME "$ENV_SOURCE" || true)" ]; then set_key TM_HOST_HOSTNAME ""; fi
+		host_name=""
+	elif [ -n "$host_name" ]; then
+		set_key TM_HOST_HOSTNAME "$host_name"
+	fi
 	if [ -n "$SERVER_URL_ARG" ]; then
 		set_key TM_SERVER_URL "$SERVER_URL_ARG"
 		server_url="$SERVER_URL_ARG"
@@ -1512,9 +1551,8 @@ main() {
 	if [ "$remote" = 1 ] && [ -z "$TOKEN_ARG" ] && [ -z "$token" ] && [ "$RESULT" != off ]; then
 		warn "这台机器上的训练节点连接 $server_url，但没有设置 TM_NODE_TOKEN：平台设置了令牌时节点无法注册。把平台 .env 中的 TM_NODE_TOKEN 填入 .env，或重新运行并加 --token <令牌>"
 	fi
-	# 训练节点容器的主机名就是本机的主机名，容器中这个名字指向容器自己，连接不到平台。
-	if [ "$remote" = 1 ] && [ "$RESULT" != off ] && [ -n "$host_name" ] &&
-		[ "$(lower "$(url_host "$server_url")")" = "$(lower "$host_name")" ]; then
+	# 训练节点容器的主机名就是本机的主机名，容器中这个名字（以及它第一个点之前的部分）指向容器自己，连接不到平台。
+	if [ "$remote" = 1 ] && [ "$RESULT" != off ] && host_names_match "$(url_host "$server_url")" "$host_name"; then
 		warn "TM_SERVER_URL（$server_url）使用了本机的主机名：训练节点容器的主机名与本机相同，在容器中这个名字指向容器自己，节点连接不到平台。平台在这台机器上时请使用默认的 http://app:8080（make setup SETUP_ARGS=\"--server-url http://app:8080\"），否则改用平台的 IP 地址"
 	fi
 

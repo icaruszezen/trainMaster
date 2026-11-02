@@ -149,7 +149,8 @@ build-backend:
 docker-build: ## 构建应用镜像 trainmaster:$TM_IMAGE_TAG
 	$(COMPOSE) build app
 
-# 两个训练节点服务（trainer / trainer-cpu）使用同一个镜像，变体（TM_TORCH_VARIANT）由 make setup 写入 .env。
+# 变体（TM_TORCH_VARIANT）由 make setup 写入 .env，两个训练节点服务（trainer / trainer-cpu）使用同一个镜像；
+# 没有写入时 trainer 为 cu130，trainer-cpu 为 cpu（构建它：docker compose --profile cpu build trainer-cpu）。
 docker-build-trainer: ## 构建训练节点镜像 trainmaster-trainer:$TM_IMAGE_TAG-$TM_TORCH_VARIANT
 	$(COMPOSE) --profile gpu build trainer
 

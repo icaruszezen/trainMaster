@@ -1146,6 +1146,27 @@ expect_out "超过 1 秒没有结束"
 expect_log "docker rm -f trainmaster-gpu-check-"
 expect_env COMPOSE_PROFILES cpu
 
+# 验证超时、.env 中原来是 GPU：结果未知，沿用 GPU 配置，不删除 GPU 训练节点
+new_case "docker run timeout keeps gpu"
+FAKE_DOCKER_GPU=hang
+EXTRA_ENV=(TM_DOCKER_TEST_TIMEOUT=1)
+printf 'COMPOSE_PROFILES=gpu\nTM_TORCH_VARIANT=cu126\n' >"$ENV"
+touch "$FAKE_STATE/container-trainer"
+run_setup
+expect_rc 0
+expect_env COMPOSE_PROFILES gpu
+expect_env TM_TORCH_VARIANT cu126
+expect_out "沿用 .env 中原来的 GPU 设置"
+expect_no_out "改用 GPU"
+expect_no_log "docker compose"
+checks=$((checks + 1))
+[ -e "$FAKE_STATE/container-trainer" ] || fail "不应删除 GPU 训练节点的容器"
+# 原来是 CPU 时照常（仍为 CPU）
+printf 'COMPOSE_PROFILES=cpu\nTM_TORCH_VARIANT=cpu\n' >"$ENV"
+run_setup
+expect_env COMPOSE_PROFILES cpu
+expect_out "在 Docker 中验证显卡失败"
+
 # 没有 timeout 命令时同样能超时
 new_case "docker run timeout without timeout command"
 SYS="$SYSBIN_NO_TIMEOUT"
@@ -1327,6 +1348,44 @@ run_setup --server-url http://admin@gpu-host-01/trainmaster --token abcdefghijkl
 expect_out "使用了本机的主机名"
 run_setup --server-url http://gpu-host-02:8080 --token abcdefghijklmnop.1234
 expect_no_out "使用了本机的主机名"
+# 主机名带域名时，Docker 在容器的 /etc/hosts 中同时写入第一个点之前的部分
+FAKE_HOSTNAME=gpu-host-01.lab.example
+run_setup --server-url http://gpu-host-01:8080 --token abcdefghijklmnop.1234
+expect_out "使用了本机的主机名"
+run_setup --server-url http://gpu-host-01.lab.example:8080 --token abcdefghijklmnop.1234
+expect_out "使用了本机的主机名"
+run_setup --server-url http://gpu-host-01.other.example:8080 --token abcdefghijklmnop.1234
+expect_no_out "使用了本机的主机名"
+
+# 本机的主机名与 compose 中的服务名（app、postgres）相同：容器中这个名字会指向容器自己，
+# app 连不上 postgres、本机的训练节点连不上 app。TM_HOST_HOSTNAME 留空，使用 compose 中的默认值
+new_case "host hostname clashes with service"
+with_toolkit
+printf 'TM_HOST_HOSTNAME=old-name\n' >"$ENV"
+FAKE_HOSTNAME=Postgres.lab.example
+run_setup
+expect_rc 0
+expect_out "与 docker-compose.yml 中的服务名相同"
+expect_env TM_HOST_HOSTNAME ""
+expect_env TM_NODE_NAME Postgres.lab.example
+FAKE_HOSTNAME=app
+run_setup
+expect_out "与 docker-compose.yml 中的服务名相同"
+expect_env TM_HOST_HOSTNAME ""
+# 只是包含服务名时照常写入
+FAKE_HOSTNAME=app-server
+run_setup
+expect_no_out "与 docker-compose.yml 中的服务名相同"
+expect_env TM_HOST_HOSTNAME app-server
+# 没有 TM_HOST_HOSTNAME 的 .env 不追加空值
+new_case "host hostname clashes without key"
+with_toolkit
+printf 'TM_DB_PASSWORD=secret\n' >"$ENV"
+FAKE_HOSTNAME=app
+run_setup
+expect_rc 0
+checks=$((checks + 1))
+grep -q '^TM_HOST_HOSTNAME=' "$ENV" && fail "不应写入空的 TM_HOST_HOSTNAME"
 
 # snap 版 Docker：不读取 /etc/docker/daemon.json，也没有 docker.service，只打印手动步骤
 new_case "install toolkit snap docker"

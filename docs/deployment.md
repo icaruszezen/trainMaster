@@ -83,7 +83,7 @@ docker compose --profile '*' down   # 停止并删除全部容器（即 make dow
 | `COMPOSE_PROFILES` | 空 | docker compose 启用的 profile：`gpu` → `trainer` 服务，`cpu` → `trainer-cpu` 服务，都没有时不运行训练节点。由 `make setup` 写入，其中的其它 profile 会保留 |
 | `TM_TORCH_VARIANT` | `cu130`（`trainer-cpu` 为 `cpu`） | 训练节点镜像中的 PyTorch 变体（`cu130` / `cu126` / `cu128` / `cu118` / `cpu`，见第 10.3 节）。**`make setup` 每次运行（包括 `make up`）都按检测结果重新写入**，手动修改会被覆盖：要换变体请用 `--variant`（写入 `TM_TRAINER_VARIANT`），如 `make up SETUP_ARGS="--variant cu128"`。只有不用 `make setup` 的手动配置（第 10.4 节）才直接修改它，然后 `docker compose up -d --build` |
 | `TM_NODE_NAME` | 空 | 训练节点在平台上显示的名称；`make setup` 写入本机主机名，为空时为主机名 |
-| `TM_HOST_HOSTNAME` | 空 | 本机的主机名，`make setup` 每次写入。app 与训练节点容器以它作为主机名（compose 中的 `hostname`），页面上显示的服务器与节点主机名就是真实的机器名，重建容器后也不变；为空时 app 为 `trainmaster`、训练节点为 `trainmaster-trainer` |
+| `TM_HOST_HOSTNAME` | 空 | 本机的主机名，`make setup` 每次写入。app 与训练节点容器以它作为主机名（compose 中的 `hostname`），页面上显示的服务器与节点主机名就是真实的机器名，重建容器后也不变；为空时 app 为 `trainmaster`、训练节点为 `trainmaster-trainer`。本机的主机名与 compose 中的服务名 `app`、`postgres` 相同（或第一个点之前的部分相同）时 `make setup` 把它留空：容器中这个名字会指向容器自己 |
 | `TM_SERVER_URL` | `http://app:8080` | 训练节点连接的平台地址；只在其它机器上运行训练节点时设置，如 `http://192.168.1.10:8080` |
 | `TM_HOST_TRAINER_DIR` | `./data/trainer` | 训练节点的状态目录（节点标识 `node-key`、心跳文件、Ultralytics 配置），挂载为容器内 `/var/lib/trainmaster`。训练节点还把 `TM_HOST_STORAGE_DIR` 挂载为 `/data`。不要拷贝到其它机器（见第 6 节） |
 | `TM_TRAINER_SHM_SIZE` | `8gb` | 训练节点容器的 `/dev/shm` 大小（PyTorch DataLoader 多进程加载数据使用） |
@@ -401,7 +401,8 @@ server {
 7. 决定结果：`auto` 时显卡、驱动与 Docker 验证都通过才用 GPU，否则用 CPU，并说明原因与改用 GPU 的方法；`gpu` / `cpu` 强制使用（强制 GPU 而检查没有通过时只警告）；`off` 不运行训练节点。暂时无法判断时不改动原来的结果：
    - 无法连接 Docker（当前用户不在 `docker` 组、dockerd 正在重启等）：`.env` 中已有训练节点配置（`COMPOSE_PROFILES` 含 `gpu` 或 `cpu`）时沿用它；还没有时什么也不写，以退出码 1 结束，提示先解决 Docker 的连接问题（或用 `--mode gpu` / `--mode cpu` 直接指定）。
    - 驱动更新后还没有重启（`nvidia-smi` 报 `Driver/library version mismatch`）：原来是 GPU 时沿用 GPU 配置，不删除仍在运行的 GPU 训练节点，提示重启机器。
-8. 写入 `.env`：只替换或追加 `COMPOSE_PROFILES`（保留其中的其它 profile，去掉 `gpu` / `cpu` 后按结果加入）、`TM_TORCH_VARIANT`、`TM_NODE_NAME`（为空时设为主机名）、`TM_HOST_HOSTNAME`（每次写入本机当前的主机名，app 与训练节点容器以它作为主机名）、`TM_NODE_TOKEN`（为空时生成 32 个字符的随机令牌；`TM_SERVER_URL` 指向其它机器时不生成，见 10.6），以及通过参数指定的 `TM_TRAINER_MODE`、`TM_TRAINER_VARIANT`、`TM_SERVER_URL`。其它内容、注释与顺序保持不变，文件权限不变；追加的键放在一个注释标题下。输出中的令牌只显示前 4 个字符。
+   - 原来是 GPU、`docker run --gpus all` 验证超时：只说明这次没有得到结果，沿用 GPU 配置。
+8. 写入 `.env`：只替换或追加 `COMPOSE_PROFILES`（保留其中的其它 profile，去掉 `gpu` / `cpu` 后按结果加入）、`TM_TORCH_VARIANT`、`TM_NODE_NAME`（为空时设为主机名）、`TM_HOST_HOSTNAME`（每次写入本机当前的主机名，app 与训练节点容器以它作为主机名；与服务名 `app`、`postgres` 相同时留空）、`TM_NODE_TOKEN`（为空时生成 32 个字符的随机令牌；`TM_SERVER_URL` 指向其它机器时不生成，见 10.6），以及通过参数指定的 `TM_TRAINER_MODE`、`TM_TRAINER_VARIANT`、`TM_SERVER_URL`。其它内容、注释与顺序保持不变，文件权限不变；追加的键放在一个注释标题下。输出中的令牌只显示前 4 个字符。
 9. 结果从 GPU 改为 CPU（或反过来，或改为 off）时，删除不再启用的那个训练节点容器，避免同一台机器上有两个节点。
 10. 输出中文摘要：显卡（名称、显存、计算能力）、驱动、Docker 的 GPU 支持、模式与变体及原因、下一步命令。
 
@@ -568,7 +569,7 @@ services:
 | 现象 | 原因与解决 |
 |---|---|
 | 启动 `trainer` 时报 `could not select device driver "nvidia" with capabilities: [[gpu]]`（较新的 Docker 为 `failed to discover GPU vendor from CDI: no known GPU vendor found`） | Docker 没有安装或没有配置 NVIDIA Container Toolkit：`make up SETUP_ARGS="--install-toolkit"`（其它机器上的训练节点：`make setup SETUP_ARGS="--install-toolkit"`，再 `docker compose up -d --build trainer`）。暂时不用 GPU：`make up SETUP_ARGS="--mode cpu"` |
-| `docker run --gpus all …` 或启动 `trainer` 时报 `AMD CDI spec not found` | Docker 29.5 起，dockerd 启动时还没有安装 NVIDIA Container Toolkit（装好 Toolkit 后没有重启 Docker）就会这样报错，与 AMD 显卡无关：`make up SETUP_ARGS="--install-toolkit"`（已安装时只配置并重启 Docker），或手动 `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` |
+| `docker run --gpus all …` 或启动 `trainer` 时报 `AMD CDI spec not found` | Docker 29.5 起，dockerd 启动时还没有安装 NVIDIA Container Toolkit（装好 Toolkit 后没有重启 Docker）就会这样报错，与 AMD 显卡无关：`make up SETUP_ARGS="--install-toolkit"`（已安装时只配置并重启 Docker；其它机器上的训练节点：`make setup SETUP_ARGS="--install-toolkit"`，再 `docker compose up -d --build trainer`），或手动 `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` |
 | `--install-toolkit` 只打印了手动步骤，没有安装 | snap 版或 rootless 模式的 Docker、没有运行 systemd 的 WSL：脚本不能可靠地配置它们，按打印的步骤执行后重新运行 `make setup`，见 10.2 |
 | `make setup` 报“无法连接 Docker，无法判断训练节点能否使用显卡，没有写入 .env”并退出 | 当前用户不能访问 Docker：`sudo usermod -aG docker $USER` 后重新登录（或用 sudo 运行），确认 `docker info` 正常后重新运行。`.env` 中已有训练节点配置时 `make setup` 不报错，沿用原来的配置 |
 | `Failed to initialize NVML: Driver/library version mismatch` | 升级了驱动，但内核中还是旧版的驱动模块：重启机器（或卸载并重新加载 nvidia 内核模块）。`make setup` 与“计算资源”页面会给出同样的提示；重启前 `make setup` 沿用原来的 GPU 配置 |
