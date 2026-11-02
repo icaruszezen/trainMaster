@@ -300,14 +300,9 @@ describe("hintLayout", () => {
     })
   })
 
-  it("keeps commands inline when text follows or there are several", () => {
-    // A command in the middle of a sentence.
-    const middle = layout(
-      '`make setup SETUP_ARGS="--install-toolkit"`，再按它最后输出的服务名启动（通常是 `docker compose up -d --build trainer`）'
-    )
-    expect(middle.command).toBeNull()
-    expect(middle.text.filter((segment) => segment.code)).toHaveLength(2)
-    // Several commands in a row: copying only the last one would skip a step.
+  it("keeps the other commands of the prose inline", () => {
+    // Only the trailing command becomes a block; the step before it stays in
+    // the sentence that leads to it.
     expect(
       layout(
         '改用 PyTorch 变体 cu128 重新构建镜像：`make setup SETUP_ARGS="--variant cu128"` 然后 `docker compose up -d --build trainer-cpu`'
@@ -317,15 +312,41 @@ describe("hintLayout", () => {
         { text: "改用 PyTorch 变体 cu128 重新构建镜像：", code: false },
         { text: 'make setup SETUP_ARGS="--variant cu128"', code: true },
         { text: " 然后 ", code: false },
-        { text: "docker compose up -d --build trainer-cpu", code: true },
       ],
-      command: null,
+      command: "docker compose up -d --build trainer-cpu",
     })
+    expect(
+      layout("`make setup` 然后 `docker compose up -d --build trainer`")
+    ).toEqual({
+      text: [
+        { text: "make setup", code: true },
+        { text: " 然后 ", code: false },
+      ],
+      command: "docker compose up -d --build trainer",
+    })
+  })
+
+  it("keeps commands inline when text follows them or no text precedes", () => {
+    // A command in the middle of a sentence.
+    const middle = layout(
+      '`make setup SETUP_ARGS="--install-toolkit"`，再按它最后输出的服务名启动（通常是 `docker compose up -d --build trainer`）'
+    )
+    expect(middle.command).toBeNull()
+    expect(middle.text.filter((segment) => segment.code)).toHaveLength(2)
     expect(layout("在宿主机运行 `nvidia-smi` 检查驱动。")).toEqual({
       text: [
         { text: "在宿主机运行 ", code: false },
         { text: "nvidia-smi", code: true },
         { text: " 检查驱动。", code: false },
+      ],
+      command: null,
+    })
+    // Two commands with no prose: not "a command preceded by prose".
+    expect(layout("`make setup` `make up`")).toEqual({
+      text: [
+        { text: "make setup", code: true },
+        { text: " ", code: false },
+        { text: "make up", code: true },
       ],
       command: null,
     })

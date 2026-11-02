@@ -215,11 +215,11 @@ export type HintLayout = {
 }
 
 /**
- * 修复建议的排版（输入为 hintSegments 的结果）：整段就是一条命令，或以唯一的
- * 一条命令结尾（如 "…，然后以 GPU 模式启动：`make up …`"）时，这条命令单独一行
- * 显示为可复制的代码块，前面的文字照常显示。含有多条命令时（如 "`make setup`
- * 然后 `docker compose up -d --build trainer`"）都显示为行内代码：只给最后一条
- * 复制按钮，容易漏掉前面的步骤。
+ * 修复建议的排版（输入为 hintSegments 的结果）：整段就是一条命令，或以一条命令
+ * 结尾、前面是说明文字时（如 "…，然后以 GPU 模式启动：`make up …`"），最后这条
+ * 命令单独一行显示为可复制的代码块；前面的文字照常显示，其中的其它命令（如
+ * "…：`make setup` 然后 `docker compose up -d --build trainer`" 中的 make setup）
+ * 仍是行内代码。命令后面还有文字，或前面只有命令没有文字时都显示为行内代码。
  */
 export function hintLayout(segments: readonly TextSegment[]): HintLayout {
   const blank = (segment: TextSegment) => !segment.code && !segment.text.trim()
@@ -228,15 +228,13 @@ export function hintLayout(segments: readonly TextSegment[]): HintLayout {
     end -= 1
   }
   const last = segments[end - 1]
-  const commands = segments.filter((segment) => segment.code).length
-  if (!last?.code || commands !== 1) {
+  const before = segments.slice(0, Math.max(end - 1, 0))
+  const onlyCommand = before.every(blank)
+  const prose = before.some((segment) => !segment.code && !blank(segment))
+  if (!last?.code || !(onlyCommand || prose)) {
     return { text: [...segments], command: null }
   }
-  const text = segments.slice(0, end - 1)
-  return {
-    text: text.every(blank) ? [] : text,
-    command: last.text,
-  }
+  return { text: onlyCommand ? [] : before, command: last.text }
 }
 
 /**
