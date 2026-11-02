@@ -21,11 +21,15 @@ class Err:
 
 NOT_SUPPORTED = Err(pynvml.NVML_ERROR_NOT_SUPPORTED)
 GPU_IS_LOST = Err(pynvml.NVML_ERROR_GPU_IS_LOST)
+# 驱动的 libnvidia-ml 比 nvidia-ml-py 旧：不带版本号的函数抛出 NVMLLibraryMismatchError（不是 NVMLError）。
+LIBRARY_MISMATCH = object()
 
 
 def _value(v: Any) -> Any:
     if isinstance(v, Err):
         raise pynvml.NVMLError(v.code)
+    if v is LIBRARY_MISMATCH:
+        raise pynvml.NVMLLibraryMismatchError("Unversioned function called (fake)")
     return v
 
 
@@ -63,7 +67,7 @@ def make_nvml(
     devices = devices if devices is not None else [rtx4090()]
     mod = types.ModuleType("pynvml")
     for name in dir(pynvml):
-        if name.startswith(("NVML_", "NVMLError")):
+        if name.startswith(("NVML_", "NVMLError", "NVMLLibraryMismatchError")):
             setattr(mod, name, getattr(pynvml, name))
     state = {"init": 0, "shutdown": 0}
     mod.state = state  # type: ignore[attr-defined]
@@ -122,6 +126,7 @@ def make_nvml(
         "nvmlDeviceGetPowerUsage": field("power"),
         "nvmlDeviceGetFanSpeed": field("fan"),
         "nvmlDeviceGetComputeRunningProcesses": field("procs"),
+        "nvmlDeviceGetComputeRunningProcesses_v2": field("procs_v2"),
     }
     for name, fn in funcs.items():
         if name not in missing:

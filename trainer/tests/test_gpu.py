@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pynvml
 import pytest
-from fakes import GPU_IS_LOST, NOT_SUPPORTED, Err, make_nvml, rtx4090, write_files
+from fakes import (
+    GPU_IS_LOST,
+    LIBRARY_MISMATCH,
+    NOT_SUPPORTED,
+    Err,
+    make_nvml,
+    rtx4090,
+    write_files,
+)
 
 from trainmaster_trainer import gpu
 
@@ -86,6 +94,51 @@ def test_nvml_unsupported_fields_become_null():
     assert m["temperature_c"] is None
     assert m["process_count"] is None
     assert m["memory_used_bytes"] == 20401094656
+
+
+def test_nvml_library_mismatch_only_loses_that_field():
+    # R470 驱动的 libnvidia-ml 没有 _v3：进程数退回 _v2，其它指标照常读取。
+    dev = rtx4090(procs=LIBRARY_MISMATCH, procs_v2=[object()])
+    result = gpu.probe(nvml_loader=lambda: make_nvml([dev]), find_smi=False)
+    m = result.sampler.sample()[0]
+    assert m["process_count"] == 1
+    assert m["utilization_percent"] == 87
+    assert m["memory_used_bytes"] == 20401094656
+    assert m["temperature_c"] == 71 and m["power_watts"] == 312.4 and m["fan_percent"] == 55
+
+    dev["procs_v2"] = LIBRARY_MISMATCH
+    m = result.sampler.sample()[0]
+    assert m["process_count"] is None
+    assert m["utilization_percent"] == 87
+
+
+def test_real_pynvml_library_mismatch_is_caught(monkeypatch):
+    """真实的 nvidia-ml-py：驱动库缺少 nvmlDeviceGetComputeRunningProcesses_v3 时不抛出异常。"""
+
+    class OldLib:  # R470 的 libnvidia-ml：只有 _v2
+        @staticmethod
+        def nvmlDeviceGetComputeRunningProcesses_v2(handle, count, infos):  # noqa: N802
+            return pynvml.NVML_SUCCESS  # 没有进程
+
+    class RealNvml:
+        def __getattr__(self, name):
+            return getattr(pynvml, name)
+
+        def nvmlInit(self):  # noqa: N802
+            pass
+
+        def nvmlShutdown(self):  # noqa: N802
+            pass
+
+    monkeypatch.setattr(pynvml, "nvmlLib", OldLib())
+    monkeypatch.setattr(pynvml, "_nvmlGetFunctionPointer_cache", {})
+    with pytest.raises(pynvml.NVMLLibraryMismatchError):
+        pynvml.nvmlDeviceGetComputeRunningProcesses(object())
+    session = gpu.NvmlSession(RealNvml())
+    assert session.call("nvmlDeviceGetComputeRunningProcesses", object()) is None
+    m = session.metrics(0, object())
+    assert m["process_count"] == 0
+    assert m["index"] == 0 and m["utilization_percent"] is None
 
 
 def test_nvml_mig_modes():
