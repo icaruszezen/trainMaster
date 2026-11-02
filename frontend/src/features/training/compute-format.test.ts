@@ -188,6 +188,54 @@ describe("hintSegments", () => {
     ])
   })
 
+  it("shows each command of a multi-command hint as code", () => {
+    expect(
+      hintSegments("`make setup` 然后 `docker compose up -d --build trainer`")
+    ).toEqual([
+      { text: "make setup", code: true },
+      { text: " 然后 ", code: false },
+      { text: "docker compose up -d --build trainer", code: true },
+    ])
+    // Quotes inside a command stay part of it.
+    expect(
+      hintSegments(
+        '改用 PyTorch 变体 cu128 重新构建镜像：`make setup SETUP_ARGS="--variant cu128"` 然后 `docker compose up -d --build trainer-cpu`'
+      )
+    ).toEqual([
+      { text: "改用 PyTorch 变体 cu128 重新构建镜像：", code: false },
+      { text: 'make setup SETUP_ARGS="--variant cu128"', code: true },
+      { text: " 然后 ", code: false },
+      { text: "docker compose up -d --build trainer-cpu", code: true },
+    ])
+    expect(
+      hintSegments(
+        '安装并配置 NVIDIA Container Toolkit（需要 sudo），然后以 GPU 模式启动：`make setup SETUP_ARGS="--install-toolkit"`，再按它最后输出的服务名启动（通常是 `docker compose up -d --build trainer`）'
+      ).filter((segment) => segment.code)
+    ).toEqual([
+      { text: 'make setup SETUP_ARGS="--install-toolkit"', code: true },
+      { text: "docker compose up -d --build trainer", code: true },
+    ])
+  })
+
+  it("keeps a hint that is one quoted command as a single command", () => {
+    // HintText shows it as a command block with a copy button.
+    expect(
+      hintSegments(
+        "`docker compose exec trainer python -m trainmaster_trainer selftest`"
+      )
+    ).toEqual([
+      {
+        text: "docker compose exec trainer python -m trainmaster_trainer selftest",
+        code: true,
+      },
+    ])
+    expect(
+      hintSegments("`sudo trainer/scripts/install.sh --variant cu128`")
+    ).toEqual([
+      { text: "sudo trainer/scripts/install.sh --variant cu128", code: true },
+    ])
+  })
+
   it("keeps an unclosed backtick as text", () => {
     expect(hintSegments("运行 `make setup` 或 `make")).toEqual([
       { text: "运行 ", code: false },
@@ -219,6 +267,7 @@ describe("suggestServerUrl", () => {
         protocol: "http:",
         host: "192.168.1.10:8080",
         hostname: "192.168.1.10",
+        port: "8080",
       })
     ).toBe("http://192.168.1.10:8080")
     expect(
@@ -226,11 +275,12 @@ describe("suggestServerUrl", () => {
         protocol: "https:",
         host: "ai.example.com",
         hostname: "ai.example.com",
+        port: "",
       })
     ).toBe("https://ai.example.com")
   })
 
-  it("uses a placeholder for loopback addresses", () => {
+  it("replaces a loopback host but keeps the protocol and port", () => {
     for (const hostname of [
       "localhost",
       "127.0.0.1",
@@ -240,10 +290,34 @@ describe("suggestServerUrl", () => {
       expect(
         suggestServerUrl({
           protocol: "http:",
-          host: `${hostname}:5173`,
+          host: `${hostname}:18080`,
           hostname,
+          port: "18080",
         })
-      ).toBe("http://<平台服务器 IP>:8080")
+      ).toBe("http://<平台服务器 IP>:18080")
     }
+    expect(
+      suggestServerUrl({
+        protocol: "http:",
+        host: "localhost:8080",
+        hostname: "localhost",
+        port: "8080",
+      })
+    ).toBe("http://<平台服务器 IP>:8080")
+    // The default port of the protocol: no port in the URL.
+    expect(
+      suggestServerUrl({
+        protocol: "https:",
+        host: "localhost",
+        hostname: "localhost",
+        port: "",
+      })
+    ).toBe("https://<平台服务器 IP>")
+  })
+
+  it("falls back to the default port when the address is unknown", () => {
+    expect(
+      suggestServerUrl({ protocol: "file:", host: "", hostname: "", port: "" })
+    ).toBe("http://<平台服务器 IP>:8080")
   })
 })

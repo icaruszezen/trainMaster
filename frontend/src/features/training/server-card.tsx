@@ -30,6 +30,7 @@ import {
   shortenGpuName,
 } from "@/features/training/compute-format"
 import {
+  hasOnlineGpuNode,
   serverGpuHint,
   type ServerGpuHint,
 } from "@/features/training/compute-status"
@@ -175,7 +176,7 @@ function ServerDetails({
             </ServerFact>
           )}
         </dl>
-        <ServerGpus server={server} />
+        <ServerGpus server={server} nodes={nodes} />
       </div>
     </div>
   )
@@ -198,7 +199,13 @@ function ServerFact({
   )
 }
 
-function ServerGpus({ server }: { server: ComputeServer }) {
+function ServerGpus({
+  server,
+  nodes,
+}: {
+  server: ComputeServer
+  nodes: readonly ComputeNode[] | undefined
+}) {
   const { nvidia } = server
 
   return (
@@ -232,9 +239,12 @@ function ServerGpus({ server }: { server: ComputeServer }) {
           ))}
         </ul>
       )}
-      {!nvidia && (
+      {/* 平台在 Docker Desktop（WSL 2）或虚拟机中时可能看不到显卡；已有 GPU
+          节点在线时不需要这句说明。 */}
+      {!nvidia && nodes && !hasOnlineGpuNode(nodes) && (
         <p className="text-muted-foreground">
-          这台机器上没有 NVIDIA 显卡，训练节点可以部署在其它 GPU 机器上。
+          未检测到 NVIDIA 显卡（平台运行在 Docker Desktop
+          或虚拟机中时可能检测不到）。训练节点也可以部署在其它 GPU 机器上。
         </p>
       )}
     </div>
@@ -248,11 +258,10 @@ function ServerGpuAlert({
   hint: ServerGpuHint
   onConnect: () => void
 }) {
-  const command = (
-    <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground">
-      make setup && make up
-    </code>
-  )
+  // make up 先运行 make setup；--install-toolkit 在 Docker 还不能使用显卡时
+  // 安装并配置 NVIDIA Container Toolkit，已经可以使用时什么也不做。不加它时
+  // make setup 只打印安装命令并改用 CPU 训练节点，提示不会消失。
+  const command = <AlertCode>make up SETUP_ARGS="--install-toolkit"</AlertCode>
 
   if (hint.kind === "driver_missing") {
     return (
@@ -264,11 +273,10 @@ function ServerGpuAlert({
         <AlertDescription>
           <p>
             先在这台机器上安装 NVIDIA 驱动（如 Ubuntu 上运行{" "}
-            <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground">
-              sudo ubuntu-drivers install
-            </code>
-            ）并重启，然后在部署目录中运行 {command}，自动配置 Docker
-            使用显卡并启动 GPU 训练节点。
+            <AlertCode>sudo ubuntu-drivers install</AlertCode>
+            ）并重启，然后在部署目录中运行 {command}：Docker
+            还不能使用显卡时安装并配置 NVIDIA Container Toolkit（需要
+            sudo），然后启动 GPU 训练节点。
           </p>
         </AlertDescription>
       </Alert>
@@ -283,8 +291,10 @@ function ServerGpuAlert({
       </AlertTitle>
       <AlertDescription>
         <p>
-          在部署目录中运行 {command}：检查 Docker 能否使用显卡、按驱动选择
-          PyTorch 的 CUDA 版本，然后启动 GPU 训练节点。
+          在部署目录中运行 {command}：检查 Docker 能否使用显卡，需要时安装并配置
+          NVIDIA Container Toolkit（需要 sudo），按驱动选择 PyTorch 的 CUDA
+          版本，然后启动 GPU 训练节点。缺少 Toolkit 时，不加这个参数的{" "}
+          <AlertCode>make up</AlertCode> 只会再次启动 CPU 训练节点。
         </p>
         <Button
           variant="outline"
@@ -297,6 +307,14 @@ function ServerGpuAlert({
         </Button>
       </AlertDescription>
     </Alert>
+  )
+}
+
+function AlertCode({ children }: { children: ReactNode }) {
+  return (
+    <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs break-all text-foreground">
+      {children}
+    </code>
   )
 }
 

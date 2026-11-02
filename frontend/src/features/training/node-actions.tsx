@@ -1,3 +1,4 @@
+import { useRef, type ReactNode } from "react"
 import { useMutation } from "@tanstack/react-query"
 import { Ellipsis, FileSearch, RefreshCw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
@@ -53,8 +54,9 @@ export function useProbeNode() {
 
 type NodeActionsMenuProps = {
   node: ComputeNode
-  onShowDetails: () => void
-  onDelete: () => void
+  /** 参数为菜单按钮：对话框关闭后把焦点还给它（菜单项此时已经不在页面上）。 */
+  onShowDetails: (trigger: HTMLElement | null) => void
+  onDelete: (trigger: HTMLElement | null) => void
 }
 
 export function NodeActionsMenu({
@@ -63,6 +65,7 @@ export function NodeActionsMenu({
   onDelete,
 }: NodeActionsMenuProps) {
   const probe = useProbeNode()
+  const triggerRef = useRef<HTMLButtonElement>(null)
   const online = isOnline(node)
   const probing = probe.isPending || isProbing(node)
 
@@ -71,6 +74,7 @@ export function NodeActionsMenu({
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
         <Button
+          ref={triggerRef}
           variant="ghost"
           size="icon-sm"
           className="shrink-0"
@@ -94,14 +98,14 @@ export function NodeActionsMenu({
             )}
           </span>
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onShowDetails}>
+        <DropdownMenuItem onSelect={() => onShowDetails(triggerRef.current)}>
           <FileSearch />
           查看详情
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem
           variant="destructive"
-          onSelect={onDelete}
+          onSelect={() => onDelete(triggerRef.current)}
           disabled={online}
         >
           <Trash2 />
@@ -126,13 +130,16 @@ export function NodeActionsMenu({
 export function DeleteNodeDialog({
   node,
   onOpenChange,
+  onCloseAutoFocus,
 }: {
   node: ComputeNode | null
   onOpenChange: (open: boolean) => void
+  /** 关闭后焦点去哪里（对话框没有触发按钮，见 returnFocus）。 */
+  onCloseAutoFocus?: (event: Event) => void
 }) {
   return (
     <AlertDialog open={node !== null} onOpenChange={onOpenChange}>
-      <AlertDialogContent>
+      <AlertDialogContent onCloseAutoFocus={onCloseAutoFocus}>
         {node && (
           <DeleteNodeForm node={node} onDeleted={() => onOpenChange(false)} />
         )}
@@ -180,8 +187,15 @@ function DeleteNodeForm({
           删除节点“{node.name}”？
         </AlertDialogTitle>
         <AlertDialogDescription>
-          只删除平台中的节点记录与最近的指标历史，不影响那台机器上的文件。节点的
-          trainer 服务重新启动后会自动重新注册。
+          只删除平台中的节点记录与最近的指标历史，不影响那台机器上的文件。只要那台机器上的
+          trainer
+          服务还在运行，恢复连接后节点就会自动重新注册。要永久移除，先在那台机器上停止训练节点：Docker
+          部署运行 <Command>docker compose stop trainer</Command>（CPU 节点为{" "}
+          <Command>trainer-cpu</Command>；平台所在的机器上之后的{" "}
+          <Command>make up</Command> 会再次启动它，改用{" "}
+          <Command>make setup SETUP_ARGS="--mode off"</Command>
+          ），直接安装的运行{" "}
+          <Command>sudo systemctl disable --now trainmaster-trainer</Command>。
         </AlertDialogDescription>
       </AlertDialogHeader>
       {online && (
@@ -208,5 +222,13 @@ function DeleteNodeForm({
         </Button>
       </AlertDialogFooter>
     </>
+  )
+}
+
+function Command({ children }: { children: ReactNode }) {
+  return (
+    <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.8125rem] break-all text-foreground">
+      {children}
+    </code>
   )
 }

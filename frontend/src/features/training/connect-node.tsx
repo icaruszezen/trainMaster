@@ -1,6 +1,7 @@
 import type { ReactNode } from "react"
 import { useQuery } from "@tanstack/react-query"
 import {
+  Globe,
   KeyRound,
   Monitor,
   Network,
@@ -17,7 +18,10 @@ import {
 } from "@/components/ui/dialog"
 import { CommandBlock } from "@/features/training/command-block"
 import { computeServerQuery } from "@/features/training/compute-api"
-import { suggestServerUrl } from "@/features/training/compute-format"
+import {
+  SERVER_HOST_PLACEHOLDER,
+  suggestServerUrl,
+} from "@/features/training/compute-format"
 import {
   connectCommands,
   TOKEN_PLACEHOLDER,
@@ -31,6 +35,8 @@ function useConnectInfo() {
   return {
     tokenRequired,
     serverUrl,
+    /** 通过 localhost 访问页面：命令中的平台地址是占位符。 */
+    serverUrlIsPlaceholder: serverUrl.includes(SERVER_HOST_PLACEHOLDER),
     commands: connectCommands({ serverUrl, tokenRequired }),
     heartbeatSeconds: server.data?.node_registration.heartbeat_interval_seconds,
   }
@@ -91,9 +97,35 @@ function TokenNote({ tokenRequired }: { tokenRequired: boolean }) {
   )
 }
 
-/** 空状态中的简要说明：三种接入方式各一条命令。 */
+function ServerUrlNote() {
+  return (
+    <p className="flex items-start gap-2 rounded-md border bg-muted/40 px-3 py-2 text-left text-xs text-muted-foreground">
+      <Globe className="mt-px size-3.5 shrink-0" />
+      <span>
+        当前通过本机地址访问平台，其它机器不能使用：把命令中的{" "}
+        <Code>{SERVER_HOST_PLACEHOLDER}</Code> 换成平台服务器在局域网中的 IP
+        或域名，端口按实际填写（部署机 <Code>.env</Code> 中的{" "}
+        <Code>TM_HTTP_PORT</Code>）。
+      </span>
+    </p>
+  )
+}
+
+/** 其它机器上的训练节点按 make setup 的结果启动。 */
+function RemoteStartNote() {
+  return (
+    <>
+      按 <Code>make setup</Code> 最后输出的服务名启动（选择 CPU 时为{" "}
+      <Code>trainer-cpu</Code>）；Docker 还不能使用显卡时在{" "}
+      <Code>SETUP_ARGS</Code> 中加上 <Code>--install-toolkit</Code> 让脚本安装
+      NVIDIA Container Toolkit（需要 sudo）。
+    </>
+  )
+}
+
+/** 空状态中的简要说明：三种接入方式各自的命令。 */
 export function ConnectMethodsBrief() {
-  const { commands, tokenRequired } = useConnectInfo()
+  const { commands, tokenRequired, serverUrlIsPlaceholder } = useConnectInfo()
 
   return (
     <div className="grid w-full min-w-0 gap-3 text-left">
@@ -102,38 +134,42 @@ export function ConnectMethodsBrief() {
           icon={Monitor}
           title="本机（Docker）"
           description="在平台的部署目录中运行"
-          command={commands.local}
+          commands={[commands.local]}
         />
         <BriefMethod
           icon={Network}
           title="其它 GPU 机器（Docker）"
-          description={
-            <>
-              在 <Code>.env</Code> 中设置 <Code>TM_SERVER_URL</Code>
-              {tokenRequired && (
-                <>
-                  {" "}
-                  与 <Code>TM_NODE_TOKEN</Code>
-                </>
-              )}{" "}
-              后运行
-            </>
-          }
-          command="docker compose up -d trainer"
+          description="在那台机器上的仓库目录中依次运行，只启动训练节点"
+          // 两条命令分开复制：make setup 选择 CPU 时第二条要换成 trainer-cpu，
+          // 一起粘贴会立刻启动 GPU 的 trainer 服务。
+          commands={[commands.remoteSetup, commands.remoteStart]}
+          note={<RemoteStartNote />}
         />
         <BriefMethod
           icon={Terminal}
           title="不用 Docker"
           description="在 GPU 机器上的仓库目录中运行"
-          command={commands.bareMetal}
+          commands={[commands.bareMetal]}
         />
       </ol>
-      {tokenRequired && (
-        <p className="text-xs text-muted-foreground">
-          <Code>{TOKEN_PLACEHOLDER}</Code> 是部署机 <Code>.env</Code> 中{" "}
-          <Code>TM_NODE_TOKEN</Code> 的值。
+      <div className="grid gap-1 text-xs text-muted-foreground">
+        <p>
+          {serverUrlIsPlaceholder ? (
+            <>
+              把 <Code>{SERVER_HOST_PLACEHOLDER}</Code>{" "}
+              换成其它机器能访问的平台服务器 IP 或域名，端口按实际填写。
+            </>
+          ) : (
+            "平台地址取自当前页面；其它机器访问平台的地址或端口不同时按实际填写。"
+          )}
         </p>
-      )}
+        {tokenRequired && (
+          <p>
+            <Code>{TOKEN_PLACEHOLDER}</Code> 是部署机 <Code>.env</Code> 中{" "}
+            <Code>TM_NODE_TOKEN</Code> 的值。
+          </p>
+        )}
+      </div>
     </div>
   )
 }
@@ -142,12 +178,16 @@ function BriefMethod({
   icon: Icon,
   title,
   description,
-  command,
+  commands,
+  note,
 }: {
   icon: LucideIcon
   title: string
   description: ReactNode
-  command: string
+  /** 每条命令一个代码块，各自复制。 */
+  commands: readonly string[]
+  /** 命令下方的补充说明。 */
+  note?: ReactNode
 }) {
   return (
     <li className="grid min-w-0 gap-2 rounded-lg border bg-background p-3 md:grid-cols-[15rem_minmax(0,1fr)] md:items-center md:gap-4">
@@ -158,7 +198,12 @@ function BriefMethod({
         </h3>
         <p className="text-xs text-muted-foreground">{description}</p>
       </div>
-      <CommandBlock command={command} />
+      <div className="grid min-w-0 gap-1.5">
+        {commands.map((command) => (
+          <CommandBlock key={command} command={command} />
+        ))}
+        {note && <p className="text-xs text-muted-foreground">{note}</p>}
+      </div>
     </li>
   )
 }
@@ -167,13 +212,19 @@ function BriefMethod({
 export function ConnectNodeDialog({
   open,
   onOpenChange,
+  onCloseAutoFocus,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** 关闭后焦点去哪里（对话框没有触发按钮，见 returnFocus）。 */
+  onCloseAutoFocus?: (event: Event) => void
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl">
+      <DialogContent
+        className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl"
+        onCloseAutoFocus={onCloseAutoFocus}
+      >
         {open && <ConnectNodeContent />}
       </DialogContent>
     </Dialog>
@@ -181,7 +232,8 @@ export function ConnectNodeDialog({
 }
 
 function ConnectNodeContent() {
-  const { commands, tokenRequired, heartbeatSeconds } = useConnectInfo()
+  const { commands, tokenRequired, heartbeatSeconds, serverUrlIsPlaceholder } =
+    useConnectInfo()
 
   return (
     <>
@@ -216,36 +268,45 @@ function ConnectNodeContent() {
 
         <Method icon={Network} title="2. 其它 GPU 机器（Docker）">
           <p>
-            在 GPU 机器上克隆本仓库，复制 <Code>.env.example</Code> 为{" "}
-            <Code>.env</Code>，在其中设置平台地址
-            {tokenRequired && "与节点令牌"}（按实际的平台地址与端口填写）：
+            在 GPU 机器上克隆本仓库，在仓库目录中运行 <Code>make setup</Code>
+            ：把平台地址{tokenRequired && "与节点令牌"}写入 <Code>.env</Code>
+            （没有时从 <Code>.env.example</Code> 创建）、检测显卡与驱动、检查
+            Docker 能否使用显卡，并按驱动选择 PyTorch 的 CUDA
+            版本。平台地址按其它机器实际能访问的地址与端口填写。
           </p>
-          <CommandBlock command={commands.remoteEnv} />
-          <p>然后检测显卡、选择 CUDA 版本，并只启动训练节点：</p>
+          <CommandBlock command={commands.remoteSetup} />
+          <p>然后只启动训练节点，构建与驱动匹配的镜像：</p>
           <CommandBlock command={commands.remoteStart} />
           <p className="text-xs">
-            没有可用显卡的机器把 <Code>trainer</Code> 换成{" "}
-            <Code>trainer-cpu</Code>。
+            <RemoteStartNote />
+            不要在这台机器上运行 <Code>make up</Code> 或不带服务名的{" "}
+            <Code>docker compose up -d</Code>：它们会再启动一套 postgres 与
+            app。
           </p>
         </Method>
 
         <Method icon={Terminal} title="3. 不用 Docker（直接安装）">
           <p>
-            需要 NVIDIA 驱动与 Python 3.10 及以上。在 GPU
-            机器上的仓库目录中运行：自动选择 CUDA 版本，安装到{" "}
+            需要 NVIDIA 驱动与 Python 3.10 及以上。在 GPU 机器上的仓库目录中以
+            root 权限运行：自动选择 CUDA 版本，安装到{" "}
             <Code>/opt/trainmaster-trainer</Code> 的虚拟环境中，
-            <Code>--systemd</Code> 注册为开机自启的系统服务。
+            <Code>--systemd</Code>{" "}
+            注册为开机自启的系统服务。平台地址按其它机器实际能访问的地址与端口填写。
           </p>
           <CommandBlock command={commands.bareMetal} />
           <p className="text-xs">
             加 <Code>--dry-run</Code> 只打印将要执行的步骤；
             <Code>--variant</Code> 可以手动指定 CUDA 版本（如 <Code>cu126</Code>
-            ）。
+            ）；使用 pip 镜像时这样传入：
+            <Code>sudo env PIP_INDEX_URL=… trainer/scripts/install.sh …</Code>。
           </p>
         </Method>
       </ol>
 
-      <TokenNote tokenRequired={tokenRequired} />
+      <div className="grid gap-2">
+        {serverUrlIsPlaceholder && <ServerUrlNote />}
+        <TokenNote tokenRequired={tokenRequired} />
+      </div>
     </>
   )
 }

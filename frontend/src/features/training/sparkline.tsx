@@ -38,6 +38,7 @@ export function Sparkline({
     <svg
       role="img"
       aria-label={label}
+      data-slot="sparkline"
       viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
       preserveAspectRatio="none"
       className={cn("h-6 w-full overflow-visible text-primary", className)}

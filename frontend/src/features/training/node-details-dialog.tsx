@@ -8,6 +8,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { Spinner } from "@/components/ui/spinner"
 import { CopyButton } from "@/features/training/command-block"
 import type {
   ComputeNode,
@@ -27,6 +28,7 @@ import {
 import {
   environmentBadge,
   isOnline,
+  isRedetecting,
   nodeStatusText,
   selfTestLabels,
   sortIssues,
@@ -59,15 +61,21 @@ export function NodeDetailsDialog({
   node,
   now,
   onOpenChange,
+  onCloseAutoFocus,
 }: {
   /** 列表中的最新数据；节点被删除后为 null，对话框随之关闭。 */
   node: ComputeNode | null
   now: number
   onOpenChange: (open: boolean) => void
+  /** 关闭后焦点去哪里（对话框没有触发按钮，见 returnFocus）。 */
+  onCloseAutoFocus?: (event: Event) => void
 }) {
   return (
     <Dialog open={node !== null} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl">
+      <DialogContent
+        className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl"
+        onCloseAutoFocus={onCloseAutoFocus}
+      >
         {node && <NodeDetails node={node} now={now} />}
       </DialogContent>
     </Dialog>
@@ -208,7 +216,11 @@ function NodeDetails({ node, now }: { node: ComputeNode; now: number }) {
         )}
 
         {env ? (
-          <EnvironmentDetails env={env} now={now} />
+          <EnvironmentDetails
+            env={env}
+            now={now}
+            previous={isRedetecting(node)}
+          />
         ) : (
           <Section title="CUDA 环境">
             <p className="text-sm text-muted-foreground sm:col-span-2">
@@ -226,18 +238,28 @@ function NodeDetails({ node, now }: { node: ComputeNode; now: number }) {
 function EnvironmentDetails({
   env,
   now,
+  previous,
 }: {
   env: NodeEnvironment
   now: number
+  /** 正在重新检测：这些是上次检测的结果。 */
+  previous: boolean
 }) {
   const test = env.self_test
   const variantDiffers =
     env.torch_variant !== null && env.torch_variant !== env.recommended_variant
   const issues = sortIssues(env.issues)
+  const suffix = previous ? "（上次检测）" : ""
 
   return (
     <>
-      <Section title="CUDA 环境">
+      {previous && (
+        <p className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Spinner className="size-3.5 shrink-0" aria-hidden />
+          正在重新检测 CUDA 环境…（通常需要几十秒），下面是上次检测的结果
+        </p>
+      )}
+      <Section title={`CUDA 环境${suffix}`}>
         <Fact label="状态">{statusLabels[env.status] ?? env.status}</Fact>
         <Fact label="训练设备">
           {env.accelerator === "cuda" ? "GPU（CUDA）" : "CPU"}
@@ -302,7 +324,7 @@ function EnvironmentDetails({
         </div>
       </Section>
 
-      <Section title="自检">
+      <Section title={`自检${suffix}`}>
         <Fact label="结果">{selfTestLabels[test.status] ?? test.status}</Fact>
         <Fact label="设备">
           <Mono>{test.device}</Mono>
@@ -326,7 +348,9 @@ function EnvironmentDetails({
 
       {issues.length > 0 && (
         <section className="grid min-w-0 gap-2">
-          <SectionHeading>检测到的问题（{issues.length}）</SectionHeading>
+          <SectionHeading>
+            {previous ? "上次检测到的问题" : "检测到的问题"}（{issues.length}）
+          </SectionHeading>
           <ul className="grid gap-2">
             {issues.map((issue, index) => (
               <li

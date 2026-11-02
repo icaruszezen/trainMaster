@@ -68,7 +68,10 @@ export type NodeHardware = {
 
 export type IssueLevel = "error" | "warning" | "info"
 
-/** 环境检测发现的问题；前端只展示 message / hint，不需要认识每个 code。 */
+/**
+ * 环境检测发现的问题；前端只展示 message / hint，不需要认识每个 code（只有
+ * `cpu_mode_selected` 用来隐藏平台服务器卡片上的 GPU 提示，见 serverGpuHint）。
+ */
 export type EnvironmentIssue = {
   level: IssueLevel
   code: string
@@ -177,7 +180,10 @@ export type ComputeNode = {
   agent_version: string
   /** 服务端按最后心跳时间计算。 */
   status: NodeStatus
-  /** 已请求重新检测，节点尚未上报新的检测结果。 */
+  /**
+   * 已请求重新检测，或节点刚刚重新启动（注册时还没有检测结果，environment
+   * 保留上次的结果），节点尚未上报新的检测结果。
+   */
   probe_pending: boolean
   /** 节点最近一次启动（注册）的时间。 */
   registered_at: string

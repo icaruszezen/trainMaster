@@ -40,7 +40,7 @@ import {
   environmentFacts,
   gpuMetricsOf,
   isOnline,
-  isProbing,
+  isRedetecting,
   selfTestLabels,
   sortIssues,
   type EnvironmentBadge,
@@ -68,8 +68,9 @@ type NodeCardProps = {
   node: ComputeNode
   /** 当前时间，用于“3 分钟前”这类相对时间。 */
   now: number
-  onShowDetails: () => void
-  onDelete: () => void
+  /** 参数为打开对话框的按钮，对话框关闭后焦点回到它上面。 */
+  onShowDetails: (trigger: HTMLElement | null) => void
+  onDelete: (trigger: HTMLElement | null) => void
 }
 
 export function NodeCard({
@@ -86,9 +87,10 @@ export function NodeCard({
       aria-labelledby={titleId}
       className={cn(
         "flex min-w-0 flex-col rounded-xl border bg-card text-card-foreground shadow-sm",
-        // 离线节点整体变淡；悬停或键盘聚焦时恢复，方便阅读与操作。
+        // 离线节点：用虚线边框与“离线 / 离线前”标记说明，只淡化进度条与折线图
+        // 这些图形；文字不变淡，保持足够的对比度（WCAG AA）。
         !online &&
-          "opacity-70 transition-opacity focus-within:opacity-100 hover:opacity-100"
+          "border-dashed shadow-none [&_[data-slot=progress]]:opacity-50 [&_[data-slot=sparkline]]:opacity-50"
       )}
     >
       <header className="flex items-start gap-3 p-4 sm:px-6 sm:pt-5">
@@ -110,12 +112,6 @@ export function NodeCard({
               {acceleratorLabel(node)}
             </Badge>
             <EnvironmentStatusBadge badge={environmentBadge(node)} />
-            {isProbing(node) && (
-              <Badge variant="outline" className="text-muted-foreground">
-                <Spinner className="size-3" aria-hidden />
-                正在重新检测
-              </Badge>
-            )}
           </div>
           <NodeIdentity node={node} />
         </div>
@@ -128,7 +124,10 @@ export function NodeCard({
 
       <div className="grid min-w-0 gap-5 border-t p-4 sm:px-6 sm:pb-5">
         <EnvironmentSummary node={node} />
-        <IssueList issues={node.environment?.issues ?? []} />
+        <IssueList
+          issues={node.environment?.issues ?? []}
+          previous={isRedetecting(node)}
+        />
         <ResourceSection node={node} />
         {node.hardware.gpus.length > 0 && <GpuSection node={node} />}
         {node.environment && (
@@ -226,6 +225,12 @@ function EnvironmentSummary({ node }: { node: ComputeNode }) {
 
   return (
     <div className="grid gap-2">
+      {isRedetecting(node) && (
+        <p className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Spinner className="size-3.5 shrink-0" aria-hidden />
+          正在重新检测 CUDA 环境…（通常需要几十秒），下面是上次检测的结果
+        </p>
+      )}
       {detecting && (
         <p className="flex items-center gap-2 text-sm text-muted-foreground">
           {isOnline(node) ? (
@@ -261,8 +266,17 @@ function EnvironmentSummary({ node }: { node: ComputeNode }) {
   )
 }
 
-/** 环境问题：error 用醒目的提示框，warning 用普通提示框，info 用一行次要文字。 */
-function IssueList({ issues }: { issues: readonly EnvironmentIssue[] }) {
+/**
+ * 环境问题：error 用醒目的提示框，warning 用普通提示框，info 用一行次要文字。
+ * `previous`：正在重新检测，这些是上次检测的结果，error 不再用醒目的颜色。
+ */
+function IssueList({
+  issues,
+  previous = false,
+}: {
+  issues: readonly EnvironmentIssue[]
+  previous?: boolean
+}) {
   if (issues.length === 0) {
     return null
   }
@@ -280,13 +294,20 @@ function IssueList({ issues }: { issues: readonly EnvironmentIssue[] }) {
           <Alert
             key={`${issue.code}-${index}`}
             role="note"
-            variant={isError ? "destructive" : "default"}
+            variant={isError && !previous ? "destructive" : "default"}
           >
             <Icon
-              className={cn(!isError && "text-amber-600 dark:text-amber-500")}
+              className={cn(
+                previous
+                  ? "text-muted-foreground"
+                  : !isError && "text-amber-600 dark:text-amber-500"
+              )}
             />
             <AlertTitle className="line-clamp-none leading-snug break-words">
-              <span className="sr-only">{isError ? "错误：" : "警告："}</span>
+              <span className="sr-only">
+                {previous && "上次检测的"}
+                {isError ? "错误：" : "警告："}
+              </span>
               {issue.message}
             </AlertTitle>
             {issue.hint && (
@@ -587,7 +608,7 @@ function SelfTestLine({
 }: {
   node: ComputeNode
   now: number
-  onShowDetails: () => void
+  onShowDetails: (trigger: HTMLElement | null) => void
 }) {
   const env = node.environment
   if (!env) {
@@ -605,7 +626,7 @@ function SelfTestLine({
     test.message,
     test.device,
     test.duration_ms !== null && formatMilliseconds(test.duration_ms),
-    `检测于 ${formatRelativeTime(env.probed_at, now)}`,
+    `${isRedetecting(node) ? "上次检测于" : "检测于"} ${formatRelativeTime(env.probed_at, now)}`,
   ].filter(Boolean)
 
   return (
@@ -632,7 +653,7 @@ function SelfTestLine({
           variant="link"
           size="xs"
           className="h-auto px-0 text-xs"
-          onClick={onShowDetails}
+          onClick={(event) => onShowDetails(event.currentTarget)}
         >
           查看错误详情
         </Button>

@@ -7,20 +7,37 @@ import type {
   ComputeNode,
   ComputeServer,
   EnvironmentIssue,
+  EnvironmentStatus,
   GpuMetrics,
   IssueLevel,
   SelfTestStatus,
 } from "@/features/training/compute-api"
 import { shortenGpuName } from "@/features/training/compute-format"
-import { formatRelativeTime } from "@/lib/format"
+import {
+  formatBytes,
+  formatNumber,
+  formatPercent,
+  formatRelativeTime,
+  percentOf,
+} from "@/lib/format"
 
 export function isOnline(node: Pick<ComputeNode, "status">) {
   return node.status === "online"
 }
 
-/** 节点已请求重新检测、且还能完成检测（在线）。 */
+/**
+ * 节点正在重新检测、且还能完成检测（在线）：请求了重新检测，或节点刚刚重新
+ * 启动（注册时还没有检测结果，服务端保留上次的结果并标记为待检测）。
+ */
 export function isProbing(node: Pick<ComputeNode, "status" | "probe_pending">) {
   return node.probe_pending && isOnline(node)
+}
+
+/** 正在重新检测，页面上显示的还是上次的检测结果。 */
+export function isRedetecting(
+  node: Pick<ComputeNode, "status" | "probe_pending" | "environment">
+) {
+  return node.environment !== null && isProbing(node)
 }
 
 /** 加速器标记：“GPU × 2” / “仅 CPU”。 */
@@ -38,9 +55,13 @@ export type EnvironmentBadge = {
   description: string
 }
 
-/** 环境标记：CUDA 就绪 / CPU 模式 / 环境异常 / 正在检测。 */
+/**
+ * 环境标记：CUDA 就绪 / CPU 模式 / 环境异常 / 正在检测。重新检测时显示
+ * “正在重新检测”，上次的结果放在说明中：节点重启后（如按提示修复后）不再
+ * 把上次的“环境异常”当作当前状态显示。
+ */
 export function environmentBadge(
-  node: Pick<ComputeNode, "status" | "environment">
+  node: Pick<ComputeNode, "status" | "environment" | "probe_pending">
 ): EnvironmentBadge {
   const env = node.environment
   if (!env) {
@@ -56,7 +77,19 @@ export function environmentBadge(
           description: "节点离线前没有完成 CUDA 环境检测",
         }
   }
-  switch (env.status) {
+  const last = statusBadge(env.status)
+  if (isProbing(node)) {
+    return {
+      tone: "pending",
+      label: "正在重新检测",
+      description: `节点正在重新检测 CUDA 环境并运行 YOLO 自检，通常需要几十秒；上次检测的结果为“${last.label}”`,
+    }
+  }
+  return last
+}
+
+function statusBadge(status: EnvironmentStatus): EnvironmentBadge {
+  switch (status) {
     case "ready":
       return {
         tone: "ready",
@@ -176,10 +209,13 @@ export type ComputeSummary = {
   offlineGpuCount: number
   /** 在线显卡按型号汇总。 */
   gpuModels: GpuModelCount[]
-  /** 在线显卡的显存合计（未知的不计入）。 */
+  /** 在线显卡的显存合计（未知的不计入）；全部未知时为 0。 */
   memoryTotalBytes: number
-  /** 有实时数据的在线显卡的已用 / 总显存；都没有实时数据时为 null。 */
-  memoryUsage: { used: number; total: number } | null
+  /**
+   * 有实时数据的在线显卡的已用 / 总显存与显卡数；都没有实时数据时为 null。
+   * 只有部分显卡有实时数据时 total 小于 memoryTotalBytes。
+   */
+  memoryUsage: { used: number; total: number; gpus: number } | null
   /** 在线节点中 CUDA 就绪的数量。 */
   readyCount: number
   /** 在线节点中环境异常的数量。 */
@@ -212,7 +248,7 @@ export function summarizeNodes(nodes: readonly ComputeNode[]): ComputeSummary {
   const names: string[] = []
   let used = 0
   let usedTotal = 0
-  let hasUsage = false
+  let usedGpus = 0
 
   for (const node of nodes) {
     const { gpus } = node.hardware
@@ -248,15 +284,62 @@ export function summarizeNodes(nodes: readonly ComputeNode[]): ComputeSummary {
         if (knownBytes(metrics?.memory_used_bytes) && total > 0) {
           used += Math.min(metrics.memory_used_bytes, total)
           usedTotal += total
-          hasUsage = true
+          usedGpus += 1
         }
       }
     }
   }
 
   summary.gpuModels = groupGpuModels(names)
-  summary.memoryUsage = hasUsage ? { used, total: usedTotal } : null
+  summary.memoryUsage =
+    usedGpus > 0 ? { used, total: usedTotal, gpus: usedGpus } : null
   return summary
+}
+
+export type MemoryStat = {
+  /** 大号数值：在线显卡的显存合计，全部未知时为“—”。 */
+  value: string
+  /** 进度条的比例；没有与合计对应的实时数据时为 null（不显示进度条）。 */
+  percent: number | null
+  /** 底部说明。 */
+  detail: string
+}
+
+/**
+ * 顶部“显存”统计：合计与已用使用同一组显卡。只有部分显卡有实时数据时不显示
+ * 比例（它只对这几块卡成立，与合计放在一起会误导），说明有几块卡有数据。
+ */
+export function memoryStat(
+  summary: Pick<ComputeSummary, "gpuCount" | "memoryTotalBytes" | "memoryUsage">
+): MemoryStat {
+  const total = summary.memoryTotalBytes
+  const usage = summary.memoryUsage
+  const value = total > 0 ? formatBytes(total) : "—"
+  if (!usage) {
+    return {
+      value,
+      percent: null,
+      detail:
+        summary.gpuCount === 0
+          ? "在线节点的显存合计"
+          : total > 0
+            ? "暂无实时数据"
+            : "显存大小未知",
+    }
+  }
+  if (usage.total < total) {
+    return {
+      value,
+      percent: null,
+      detail: `已用 ${formatBytes(usage.used)}（${formatNumber(usage.gpus)} 块有实时数据）`,
+    }
+  }
+  const percent = percentOf(usage.used, usage.total)
+  return {
+    value,
+    percent,
+    detail: `已用 ${formatBytes(usage.used)}（${formatPercent(percent)}）`,
+  }
 }
 
 /** 工作台上的一行摘要，如 “1 个节点在线 · 2 块 GPU（RTX 4090）”。 */
@@ -283,6 +366,16 @@ export function dashboardComputeText(summary: ComputeSummary): string {
   return parts.join(" · ")
 }
 
+/** 训练节点在 TM_TRAINER_MODE=cpu（用户选择了 CPU 模式）的 GPU 机器上上报的问题。 */
+export const CPU_MODE_SELECTED = "cpu_mode_selected"
+
+/** 有在线的 GPU 训练节点（可能就在平台服务器上）。 */
+export function hasOnlineGpuNode(
+  nodes: readonly Pick<ComputeNode, "status" | "hardware">[]
+) {
+  return nodes.some((node) => isOnline(node) && node.hardware.gpus.length > 0)
+}
+
 export type ServerGpuHint = {
   /** driver_missing：只在 PCI 总线上看到显卡；no_gpu_node：驱动正常但没有 GPU 节点在线。 */
   kind: "driver_missing" | "no_gpu_node"
@@ -291,17 +384,23 @@ export type ServerGpuHint = {
 
 /**
  * 平台服务器上有 NVIDIA 显卡、但没有在线的 GPU 训练节点时，提示如何接入。
- * 已有 GPU 节点在线（可能就在这台机器上）时不提示。
+ * 已有 GPU 节点在线（可能就在这台机器上），或在线节点说明是有意选择了 CPU
+ * 模式（`cpu_mode_selected`）时不提示。
  */
 export function serverGpuHint(
   server: Pick<ComputeServer, "nvidia">,
-  nodes: readonly Pick<ComputeNode, "status" | "hardware">[]
+  nodes: readonly Pick<ComputeNode, "status" | "hardware" | "environment">[]
 ): ServerGpuHint | null {
   const gpuCount = server.nvidia?.gpus.length ?? 0
-  if (!server.nvidia || gpuCount === 0) {
+  if (!server.nvidia || gpuCount === 0 || hasOnlineGpuNode(nodes)) {
     return null
   }
-  if (nodes.some((node) => isOnline(node) && node.hardware.gpus.length > 0)) {
+  const cpuModeSelected = nodes.some(
+    (node) =>
+      isOnline(node) &&
+      node.environment?.issues.some((issue) => issue.code === CPU_MODE_SELECTED)
+  )
+  if (cpuModeSelected) {
     return null
   }
   return {
