@@ -4,13 +4,16 @@
 # 检测本机的 NVIDIA 显卡、驱动与 Docker 的 GPU 支持，决定训练节点以 GPU 还是 CPU 模式运行，
 # 按驱动与显卡选择 PyTorch 变体（规则见 trainer/scripts/lib/torch-variant.sh），然后把结果写入 .env：
 # COMPOSE_PROFILES（gpu → trainer 服务，cpu → trainer-cpu 服务）、TM_TORCH_VARIANT、TM_NODE_NAME、
-# TM_NODE_TOKEN 等，.env 中的其它内容与注释保持不变。
+# TM_HOST_HOSTNAME、TM_NODE_TOKEN 等，.env 中的其它内容与注释保持不变。
+# 暂时无法判断时（无法连接 Docker、驱动更新后还没有重启）沿用 .env 中原来的训练节点配置。
 #
 # 默认只读取系统信息并修改 .env，不需要 root。只有加 --install-toolkit 时才会（列出命令并确认后）
-# 安装 NVIDIA Container Toolkit、修改 Docker 配置并重启 Docker，这一步需要 root 或 sudo。
+# 安装 NVIDIA Container Toolkit、修改 Docker 配置并重启 Docker，这一步需要 root 或 sudo；已经安装时
+# 只配置并重启 Docker，Docker 已经能使用显卡时什么也不做。snap 或 rootless 方式安装的 Docker、
+# 没有运行 systemd 的 WSL 只打印手动步骤，不自动执行。
 #
 # 用法见 --help。退出码：0 正常（包括要求 GPU 但检查没有通过、只给出警告的情况）；
-# 1 执行失败（安装失败、无法写入 .env 等）；2 参数错误。
+# 1 执行失败（安装失败、无法写入 .env、无法连接 Docker 而 .env 中还没有训练节点配置等）；2 参数错误。
 #
 # 测试替身（deploy/scripts/tests/test-setup-compute.sh 使用，平时不需要设置）：
 #   TM_NVIDIA_SMI / TM_DOCKER   nvidia-smi / docker 命令
@@ -19,6 +22,8 @@
 #   TM_MACHINE                 CPU 架构（默认 uname -m）
 #   TM_DOCKER_TEST_TIMEOUT     Docker GPU 验证的超时秒数（默认 120）；TM_DOCKER_PULL_TIMEOUT 拉取镜像的超时（默认 600）
 #   TM_DOCKER_WAIT             安装后等待 Docker 重新启动的秒数（默认 30）
+#   TM_SYSTEMD_DIR             该目录存在时认为 systemd 正在运行（默认 /run/systemd/system）
+#   TM_OSRELEASE_FILE          内核版本文件（默认 /proc/sys/kernel/osrelease），用于识别 WSL
 # 其余命令（id、sudo、apt-get、dnf、yum、zypper、curl、gpg、tee、nvidia-ctk、systemctl 等）从 PATH 查找。
 # shellcheck disable=SC1111 # 中文提示中的引号“”是有意使用的
 set -euo pipefail
@@ -36,6 +41,8 @@ MACHINE="${TM_MACHINE:-$(uname -m)}"
 DOCKER_TEST_TIMEOUT="${TM_DOCKER_TEST_TIMEOUT:-120}"
 DOCKER_PULL_TIMEOUT="${TM_DOCKER_PULL_TIMEOUT:-600}"
 DOCKER_WAIT="${TM_DOCKER_WAIT:-30}"
+SYSTEMD_DIR="${TM_SYSTEMD_DIR:-/run/systemd/system}"
+OSRELEASE_FILE="${TM_OSRELEASE_FILE:-/proc/sys/kernel/osrelease}"
 
 DEFAULT_PYTHON_IMAGE=python:3.12-slim-bookworm
 DEFAULT_TOOLKIT_REPO=https://nvidia.github.io/libnvidia-container
@@ -84,7 +91,8 @@ usage() {
   --mode auto|gpu|cpu|off  训练节点模式。默认取 .env 中的 TM_TRAINER_MODE，没有时为 auto。
                            auto：显卡、驱动与 Docker 的 GPU 支持都正常时用 GPU，否则用 CPU；
                            gpu / cpu：强制使用；off：不运行训练节点。指定后同时写入 TM_TRAINER_MODE
-  --install-toolkit        Docker 无法使用显卡时安装并配置 NVIDIA Container Toolkit（需要 root 或 sudo）
+  --install-toolkit        Docker 无法使用显卡时安装并配置 NVIDIA Container Toolkit（需要 root 或 sudo）；
+                           已安装时只配置并重启 Docker，Docker 已能使用显卡时不做任何事
   --yes                    安装前不再询问确认
   --variant NAME           固定 PyTorch 变体（$(cuda_variant_names | sed 's/ / \/ /g')），
                            不按驱动与显卡自动选择。写入 TM_TRAINER_VARIANT，之后的 make setup /
@@ -215,6 +223,25 @@ trim() {
 	printf '%s' "$v"
 }
 
+lower() {
+	printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# url_host <URL>：地址中的主机名（去掉协议、用户信息、端口与路径；IPv6 地址去掉方括号）。
+url_host() {
+	local h="${1#*://}"
+	h="${h%%[/?#]*}"
+	h="${h##*@}"
+	case "$h" in
+	\[*)
+		h="${h#\[}"
+		h="${h%%]*}"
+		;;
+	*) h="${h%%:*}" ;;
+	esac
+	printf '%s' "$h"
+}
+
 # contains_ci <文本> <子串>：忽略大小写包含时返回 0。
 contains_ci() {
 	grep -qiF -- "$2" <<<"$1"
@@ -322,6 +349,28 @@ node_hostname() {
 	h="$(trim "$(printf '%s' "$h" | tr -d '\r\n')")"
 	# 平台要求节点名称不超过 64 个字符
 	printf '%s' "${h:0:64}"
+}
+
+# Docker 把容器的主机名（含点时还有第一个点之前的部分）写入容器的 /etc/hosts，容器中这个名字指向容器自己。
+# host_names_match <地址中的主机名> <容器的主机名>：容器中前者会解析为容器自己时返回 0（不区分大小写）。
+host_names_match() {
+	local name container
+	name="$(lower "$1")"
+	container="$(lower "$2")"
+	[ -n "$name" ] && [ -n "$container" ] || return 1
+	[ "$name" = "$container" ] || [ "$name" = "${container%%.*}" ]
+}
+
+# 容器之间按服务名连接（app 连接 postgres，本机的训练节点连接 app）：本机的主机名与它们相同时
+# 不能用作容器的主机名，否则这些连接会指向容器自己。
+COMPOSE_LINKED_SERVICES="app postgres"
+
+hostname_clashes_with_service() {
+	local svc
+	for svc in $COMPOSE_LINKED_SERVICES; do
+		if host_names_match "$svc" "$1"; then return 0; fi
+	done
+	return 1
 }
 
 # 生成 32 个字符的随机令牌（字母与数字）。去掉 base64 中的 / + = 后可能不足 32 位，因此多读一些并重试。
@@ -475,6 +524,7 @@ EOF
 DOCKER_STATE=""   # ok / missing / unreachable
 DOCKER_ERROR=""
 DOCKER_DESKTOP=0
+DOCKER_FLAVOR=""  # Docker Engine 的安装方式：system（系统的 dockerd）/ snap / rootless
 NV_RUNTIME=0
 CDI_SPEC=""
 TOOLKIT_INSTALLED=0
@@ -482,16 +532,17 @@ STATIC_GPU=0      # Docker 的配置看起来支持 GPU（nvidia 运行时、Doc
 DOCKER_GPU=""     # ok / unsupported / failed / unverified / untested / 空（不适用）
 DOCKER_GPU_DETAIL=""
 CONTAINER_GPU_COUNT=0
+DOCKER_GPU_TIMED_OUT=0  # docker run --gpus 验证超时（结果未知，不说明 Docker 不能使用显卡）
 
 detect_docker() {
-	DOCKER_STATE="" DOCKER_ERROR="" DOCKER_DESKTOP=0 NV_RUNTIME=0 CDI_SPEC="" TOOLKIT_INSTALLED=0 STATIC_GPU=0
+	DOCKER_STATE="" DOCKER_ERROR="" DOCKER_DESKTOP=0 DOCKER_FLAVOR="" NV_RUNTIME=0 CDI_SPEC="" TOOLKIT_INSTALLED=0 STATIC_GPU=0
 	if ! command -v "$DOCKER" >/dev/null 2>&1; then
 		DOCKER_STATE=missing
 		return 0
 	fi
-	local out rc=0 os runtimes f
+	local out rc=0 os runtimes root secopts f bin
 	# shellcheck disable=SC2016 # Go 模板，由 docker 解析
-	out="$("$DOCKER" info --format '{{.OperatingSystem}}|{{range $k, $v := .Runtimes}}{{$k}} {{end}}' 2>"$TMP_DIR/docker-info.err")" || rc=$?
+	out="$("$DOCKER" info --format '{{.OperatingSystem}}|{{range $k, $v := .Runtimes}}{{$k}} {{end}}|{{.DockerRootDir}}|{{.SecurityOptions}}' 2>"$TMP_DIR/docker-info.err")" || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		DOCKER_STATE=unreachable
 		DOCKER_ERROR="$(error_line "$(cat "$TMP_DIR/docker-info.err") $out")"
@@ -499,10 +550,17 @@ detect_docker() {
 	fi
 	DOCKER_STATE=ok
 	out="$(printf '%s' "$out" | tr -d '\r\n')"
-	os="${out%%|*}"
-	runtimes="${out#*|}"
+	IFS='|' read -r os runtimes root secopts <<<"$out" || true
 	case "$os" in *"Docker Desktop"*) DOCKER_DESKTOP=1 ;; esac
 	case " $runtimes " in *" nvidia "*) NV_RUNTIME=1 ;; esac
+	# snap 版 Docker 的数据目录在 /var/snap/docker 下，命令是指向 /usr/bin/snap 的链接；
+	# rootless Docker 的 SecurityOptions 中有 name=rootless。
+	DOCKER_FLAVOR=system
+	bin="$(command -v "$DOCKER")"
+	if command -v readlink >/dev/null 2>&1; then bin="$(readlink -f "$bin" 2>/dev/null || printf '%s' "$bin")"; fi
+	case "$root" in */snap/docker/*) DOCKER_FLAVOR=snap ;; esac
+	case "$bin" in /snap/* | */bin/snap) DOCKER_FLAVOR=snap ;; esac
+	case "$secopts" in *rootless*) DOCKER_FLAVOR=rootless ;; esac
 	for f in $CDI_SPECS; do
 		if [ -f "$f" ]; then
 			CDI_SPEC="$f"
@@ -523,6 +581,7 @@ detect_docker() {
 docker_gpu_test() {
 	DOCKER_GPU_DETAIL=""
 	CONTAINER_GPU_COUNT=0
+	DOCKER_GPU_TIMED_OUT=0
 	local image="$PYTHON_IMAGE" out rc=0 name="trainmaster-gpu-check-$$"
 	if ! "$DOCKER" image inspect "$image" >/dev/null 2>&1; then
 		say "  正在拉取 $image（构建训练节点镜像也要用它），用于验证 Docker 能否使用显卡…"
@@ -552,13 +611,18 @@ docker_gpu_test() {
 	if [ "$rc" -eq 124 ]; then
 		"$DOCKER" rm -f "$name" >/dev/null 2>&1 || true
 		DOCKER_GPU=failed
+		DOCKER_GPU_TIMED_OUT=1
 		DOCKER_GPU_DETAIL="docker run 超过 $DOCKER_TEST_TIMEOUT 秒没有结束"
 		return 0
 	fi
 	# Docker 找不到 NVIDIA 的支持：较早的版本报 could not select device driver "nvidia"；
 	# 较新的版本（经 CDI 实现 --gpus）报 failed to discover GPU vendor from CDI / unresolvable CDI devices。
+	# Docker 29.5 起只在 dockerd 启动时找得到 NVIDIA Container Toolkit 的 hook 才使用 NVIDIA 的驱动，
+	# 否则由 AMD 的 CDI 驱动处理 --gpus：安装了 Toolkit（有 NVIDIA 的 CDI 配置）却没有重启 Docker 时报
+	# AMD CDI spec not found。
 	if contains_ci "$out" 'could not select device driver' || contains_ci "$out" 'failed to discover GPU vendor' ||
-		contains_ci "$out" 'no known GPU vendor' || contains_ci "$out" 'unresolvable CDI devices'; then
+		contains_ci "$out" 'no known GPU vendor' || contains_ci "$out" 'unresolvable CDI devices' ||
+		contains_ci "$out" 'AMD CDI spec not found'; then
 		DOCKER_GPU=unsupported
 	else
 		DOCKER_GPU=failed
@@ -596,6 +660,9 @@ report_docker_gpu() {
 		say "Docker GPU 支持：不可用（$DOCKER_GPU_DETAIL）"
 		if [ "$TOOLKIT_INSTALLED" = 1 ]; then
 			say "  已安装 NVIDIA Container Toolkit，但 Docker 还没有配置或重启"
+			if contains_ci "$DOCKER_GPU_DETAIL" 'AMD CDI spec not found'; then
+				say "  （Docker 启动时还没有安装 Toolkit：Docker 29.5 起这时会报 AMD CDI spec not found，重启 Docker 后即可使用显卡）"
+			fi
 		else
 			say "  没有安装 NVIDIA Container Toolkit"
 		fi
@@ -655,11 +722,31 @@ detect_pkg_manager() {
 	return 1
 }
 
-# toolkit_commands <包管理器> <sudo 前缀>：安装与配置命令，每行一条，与 NVIDIA 官方安装文档一致：
+systemd_running() {
+	[ -d "$SYSTEMD_DIR" ]
+}
+
+is_wsl() {
+	[ -r "$OSRELEASE_FILE" ] && grep -qi -e microsoft -e wsl "$OSRELEASE_FILE"
+}
+
+# 已安装 NVIDIA Container Toolkit（有 nvidia-ctk）时只需配置并重启 Docker，不用再安装软件包。
+toolkit_has_ctk() {
+	command -v nvidia-ctk >/dev/null 2>&1
+}
+
+# 脚本不能自动配置的 Docker（只打印手动步骤）：snap、rootless，以及没有运行 systemd 的 WSL
+# （systemctl 在那里无法使用，Docker 的启动方式也不确定）。
+toolkit_manual_only() {
+	case "$DOCKER_FLAVOR" in snap | rootless) return 0 ;; esac
+	is_wsl && ! systemd_running
+}
+
+# toolkit_package_commands <包管理器> <sudo 前缀>：安装软件包的命令，每行一条，与 NVIDIA 官方安装文档一致：
 #   $TOOLKIT_DOC_URL
 # 仓库地址可用 NVIDIA_TOOLKIT_REPO 换成镜像（同时把下载的仓库文件中的地址替换为镜像）。
 # 与文档的差别：curl 加 -f（HTTP 错误时不把错误页写进软件源），gpg 加 --batch --yes（重复运行时覆盖密钥文件）。
-toolkit_commands() {
+toolkit_package_commands() {
 	local pm="$1" s="$2" repo="$TOOLKIT_REPO" mirror_sed=""
 	if [ "$repo" != "$DEFAULT_TOOLKIT_REPO" ]; then
 		mirror_sed=" -e 's#$DEFAULT_TOOLKIT_REPO#$repo#g'"
@@ -689,12 +776,26 @@ toolkit_commands() {
 			"${s}zypper --non-interactive --gpg-auto-import-keys install -y nvidia-container-toolkit"
 		;;
 	esac
-	printf '%s\n' "${s}nvidia-ctk runtime configure --runtime=docker"
-	if command -v systemctl >/dev/null 2>&1; then
+}
+
+# 重启系统的 dockerd：systemd 正在运行时用 systemctl，否则用 service；都不能用时不输出。
+docker_restart_command() {
+	local s="$1"
+	if systemd_running && command -v systemctl >/dev/null 2>&1; then
 		printf '%s\n' "${s}systemctl restart docker"
 	elif command -v service >/dev/null 2>&1; then
 		printf '%s\n' "${s}service docker restart"
 	fi
+}
+
+# toolkit_commands <包管理器> <sudo 前缀>：系统的 dockerd 上安装（已安装时跳过）并配置 Toolkit 的命令。
+toolkit_commands() {
+	local pm="$1" s="$2"
+	if ! toolkit_has_ctk; then
+		toolkit_package_commands "$pm" "$s"
+	fi
+	printf '%s\n' "${s}nvidia-ctk runtime configure --runtime=docker"
+	docker_restart_command "$s"
 }
 
 sudo_prefix() {
@@ -705,20 +806,80 @@ sudo_prefix() {
 	fi
 }
 
+# print_package_steps <缩进>：手动安装软件包的命令（已安装时不输出）。
+print_package_steps() {
+	local indent="$1" pm s
+	toolkit_has_ctk && return 0
+	s="$(sudo_prefix)"
+	if pm="$(detect_pkg_manager)"; then
+		say "${indent}安装软件包（$pm）："
+	else
+		pm=apt-get
+		say "${indent}安装软件包（下面是 Debian / Ubuntu 的命令，其它发行版见 $TOOLKIT_DOC_URL）："
+	fi
+	toolkit_package_commands "$pm" "$s" | sed "s/^/$indent  /"
+}
+
+# snap / rootless Docker 与没有 systemd 的 WSL：需要手动执行的步骤。
+print_manual_toolkit_steps() {
+	local s
+	s="$(sudo_prefix)"
+	case "$DOCKER_FLAVOR" in
+	snap)
+		say "  这台机器的 Docker 是 snap 版：它不读取 /etc/docker/daemon.json，由 snap 自己配置 NVIDIA 的支持，脚本不自动安装。手动步骤："
+		print_package_steps "    "
+		say "    重启 Docker（snap 在启动时找到 NVIDIA Container Toolkit 后自动配置显卡）："
+		say "      ${s}snap restart docker"
+		say "    检查 NVIDIA 支持没有被关闭（应为空或 false）：snap get docker nvidia-support.disabled"
+		say "    仍然不能使用显卡时，改用 Docker 官方的软件包（https://docs.docker.com/engine/install/），再运行 make setup SETUP_ARGS=--install-toolkit"
+		;;
+	rootless)
+		say "  这台机器的 Docker 以 rootless 模式运行：配置文件与服务都在当前用户下，脚本不自动配置。手动步骤（与 NVIDIA 文档的 Rootless mode 一节相同）："
+		print_package_steps "    "
+		say "    配置并重启 rootless Docker（不用 sudo）："
+		# shellcheck disable=SC2016 # $HOME 原样打印，由用户的 shell 展开
+		say '      nvidia-ctk runtime configure --runtime=docker --config=$HOME/.config/docker/daemon.json'
+		say "      systemctl --user restart docker"
+		say "    rootless 模式下 NVIDIA 容器运行时不能使用 cgroups："
+		say "      ${s}nvidia-ctk config --set nvidia-container-cli.no-cgroups --in-place"
+		;;
+	*)
+		say "  这台 WSL 中没有运行 systemd，脚本无法确定如何重启 Docker，不自动配置。手动步骤："
+		print_package_steps "    "
+		say "    配置并重启 Docker："
+		say "      ${s}nvidia-ctk runtime configure --runtime=docker"
+		say "      ${s}service docker restart    # 用其它方式启动的 dockerd 请同样重启它"
+		say "    或者在 WSL 中启用 systemd：在 /etc/wsl.conf 中加入 [boot] 一节与 systemd=true，在 Windows 中执行 wsl --shutdown 后重新打开 WSL，再运行 make setup SETUP_ARGS=--install-toolkit"
+		;;
+	esac
+	say "  完成后重新运行 make setup"
+}
+
 print_toolkit_hint() {
 	local pm s
+	if toolkit_manual_only; then
+		print_manual_toolkit_steps
+		return 0
+	fi
 	s="$(sudo_prefix)"
-	say "  Docker 需要 NVIDIA Container Toolkit 才能使用显卡。自动安装（需要 root 或 sudo，执行前列出命令并询问确认）："
+	if toolkit_has_ctk; then
+		say "  已安装 NVIDIA Container Toolkit，还需要配置并重启 Docker。自动执行（需要 root 或 sudo，执行前列出命令并询问确认）："
+	else
+		say "  Docker 需要 NVIDIA Container Toolkit 才能使用显卡。自动安装（需要 root 或 sudo，执行前列出命令并询问确认）："
+	fi
 	say "    make setup SETUP_ARGS=--install-toolkit"
 	say "    （或 deploy/scripts/setup-compute.sh --install-toolkit）"
-	if pm="$(detect_pkg_manager)"; then
+	if toolkit_has_ctk; then
+		pm=apt-get
+		say "  也可以手动执行："
+	elif pm="$(detect_pkg_manager)"; then
 		say "  也可以手动执行（$pm）："
 	else
 		pm=apt-get
 		say "  也可以手动安装（下面是 Debian / Ubuntu 的命令，其它发行版见 $TOOLKIT_DOC_URL）："
 	fi
 	toolkit_commands "$pm" "$s" | sed 's/^/    /'
-	if ! command -v systemctl >/dev/null 2>&1 && ! command -v service >/dev/null 2>&1; then
+	if [ -z "$(docker_restart_command "$s")" ]; then
 		say "    然后重启 Docker"
 	fi
 }
@@ -733,12 +894,20 @@ wait_for_docker() {
 	return 1
 }
 
-# 返回 0：已安装并配置；1：失败；2：没有执行（用户取消或 --dry-run）。
+# 返回 0：已安装并配置；1：失败；2：没有执行（用户取消或 --dry-run）；3：只打印了手动步骤。
 install_toolkit() {
-	local pm s="" cmds cmd answer
-	if ! pm="$(detect_pkg_manager)"; then
+	local pm="" s="" cmds cmd answer what
+	if toolkit_manual_only; then
+		print_manual_toolkit_steps
+		return 3
+	fi
+	if toolkit_has_ctk; then
+		what="配置 Docker 使用已安装的 NVIDIA Container Toolkit"
+	elif ! pm="$(detect_pkg_manager)"; then
 		error "无法识别包管理器（支持 apt-get、dnf、yum、zypper），请按 NVIDIA 官方文档手动安装：$TOOLKIT_DOC_URL"
 		return 1
+	else
+		what="安装 NVIDIA Container Toolkit 并配置 Docker"
 	fi
 	if ! is_root; then
 		if ! command -v sudo >/dev/null 2>&1; then
@@ -748,7 +917,7 @@ install_toolkit() {
 		s="sudo "
 	fi
 	cmds="$(toolkit_commands "$pm" "$s")"
-	say "将执行以下命令安装 NVIDIA Container Toolkit 并配置 Docker（会重启 Docker，正在运行的容器随之重启）："
+	say "将执行以下命令$what（会重启 Docker，正在运行的容器随之重启）："
 	printf '%s\n' "$cmds" | sed 's/^/  /'
 	if [ "$DRY_RUN" = 1 ]; then
 		say "（--dry-run：不执行）"
@@ -777,7 +946,7 @@ install_toolkit() {
 	done <<EOF
 $cmds
 EOF
-	if ! command -v systemctl >/dev/null 2>&1 && ! command -v service >/dev/null 2>&1; then
+	if [ -z "$(docker_restart_command "$s")" ]; then
 		warn "找不到 systemctl / service，请手动重启 Docker 后再运行 make setup"
 	fi
 	return 0
@@ -934,6 +1103,8 @@ RESULT_REASON=""
 FIX_HINT=""       # 退回 CPU 时，改用 GPU 需要做的事
 VARIANT=""
 ENV_WRITTEN=""
+KEPT_PREVIOUS=0   # 暂时无法判断，沿用了 .env 中原来的结果
+CREATED_ENV=0     # 本次从 .env.example 创建了 .env
 
 resolve_mode() {
 	local from_env
@@ -993,6 +1164,17 @@ resolve_variant() {
 	PIN_SOURCE="$src"
 }
 
+# Docker 无法使用显卡、需要（配置）NVIDIA Container Toolkit 时改用 GPU 的方法。
+toolkit_fix_hint() {
+	if toolkit_manual_only; then
+		printf '按上面的步骤手动安装并配置 NVIDIA Container Toolkit 后，重新运行 make setup'
+	elif toolkit_has_ctk; then
+		printf '配置并重启 Docker：make setup SETUP_ARGS=--install-toolkit'
+	else
+		printf '安装 NVIDIA Container Toolkit：make setup SETUP_ARGS=--install-toolkit'
+	fi
+}
+
 # 自动模式下退回 CPU 的原因与改用 GPU 的方法。
 explain_cpu_fallback() {
 	if [ "$NVSMI_STATE" = missing ] && [ "$PCI_GPU_COUNT" -gt 0 ]; then
@@ -1008,25 +1190,72 @@ explain_cpu_fallback() {
 		FIX_HINT="升级 NVIDIA 驱动（推荐 580 或更新）后，重新运行 make setup"
 	elif [ "$DOCKER_STATE" = missing ]; then
 		RESULT_REASON="未安装 Docker"
-	elif [ "$DOCKER_STATE" = unreachable ]; then
-		RESULT_REASON="无法连接 Docker（$DOCKER_ERROR），无法检查它能否使用显卡"
-		FIX_HINT="解决 Docker 的连接问题后，重新运行 make setup"
 	elif [ "$DOCKER_GPU" = failed ]; then
 		RESULT_REASON="在 Docker 中验证显卡失败（$DOCKER_GPU_DETAIL）"
 		FIX_HINT="解决上面的问题后，重新运行 make setup；确认 Docker 能使用显卡时也可以用 make setup SETUP_ARGS=\"--mode gpu\" 强制使用 GPU"
 	elif [ "$DOCKER_GPU" = unverified ]; then
 		RESULT_REASON="Docker 中没有 NVIDIA 的配置，也无法实际验证（$DOCKER_GPU_DETAIL）"
-		FIX_HINT="安装 NVIDIA Container Toolkit（make setup SETUP_ARGS=--install-toolkit）；确认 Docker 能使用显卡时也可以用 make setup SETUP_ARGS=\"--mode gpu\" 强制使用 GPU"
+		FIX_HINT="$(toolkit_fix_hint)；确认 Docker 能使用显卡时也可以用 make setup SETUP_ARGS=\"--mode gpu\" 强制使用 GPU"
 	elif [ "$DOCKER_GPU" = untested ]; then
 		RESULT_REASON="Docker 中没有 NVIDIA 的配置（nvidia 运行时、CDI 或 NVIDIA Container Toolkit）"
-		FIX_HINT="安装 NVIDIA Container Toolkit：make setup SETUP_ARGS=--install-toolkit"
+		FIX_HINT="$(toolkit_fix_hint)"
 	elif [ "$DOCKER_DESKTOP" = 1 ]; then
 		RESULT_REASON="Docker Desktop 无法使用显卡（$DOCKER_GPU_DETAIL）"
 		FIX_HINT="Docker Desktop 的 GPU 支持需要 WSL 2 后端与 Windows 上较新的 NVIDIA 驱动：更新 NVIDIA 驱动、WSL（wsl --update）与 Docker Desktop 后，重新运行 make setup"
+	elif [ "$TOOLKIT_INSTALLED" = 1 ]; then
+		RESULT_REASON="Docker 无法使用显卡（已安装 NVIDIA Container Toolkit，但 Docker 还没有配置或重启）"
+		FIX_HINT="$(toolkit_fix_hint)"
 	else
 		RESULT_REASON="Docker 无法使用显卡（没有安装或配置 NVIDIA Container Toolkit）"
-		FIX_HINT="安装 NVIDIA Container Toolkit：make setup SETUP_ARGS=--install-toolkit"
+		FIX_HINT="$(toolkit_fix_hint)"
 	fi
+}
+
+# .env 中原来的训练节点：gpu / cpu，没有时为空。
+previous_result() {
+	local profiles
+	profiles="$(env_get COMPOSE_PROFILES "$ENV_SOURCE" || true)"
+	profiles=",$(printf '%s' "$profiles" | tr -d ' \t'),"
+	case "$profiles" in
+	*,gpu,*) printf gpu ;;
+	*,cpu,*) printf cpu ;;
+	esac
+}
+
+# 自动模式下暂时无法判断时沿用 .env 中原来的结果，不把正常工作的 GPU 配置改成 CPU（也不删除它的容器）：
+# - 无法连接 Docker（当前用户不在 docker 组、dockerd 正在重启等）：无从得知 Docker 能否使用显卡。
+#   .env 中还没有训练节点配置时什么也不写，退出码 1；
+# - 驱动更新后还没有重启（Driver/library version mismatch）：重启前 nvidia-smi 无法运行，
+#   正在运行的 GPU 训练节点通常仍然正常，重启后即可恢复；
+# - 原来是 GPU、在 Docker 中验证显卡超时：只说明这次没有得到结果。
+# 不适用时返回 1。
+keep_previous_result() {
+	local prev
+	prev="$(previous_result)"
+	if [ "$DOCKER_STATE" = unreachable ] && host_gpu_ok && [ "$TM_VARIANT" != cpu ]; then
+		if [ -z "$prev" ]; then
+			if [ "$CREATED_ENV" = 1 ]; then rm -f "$ENV_FILE"; fi
+			fail "无法连接 Docker，无法判断训练节点能否使用显卡，没有写入 .env。解决上面的 Docker 连接问题后重新运行；也可以用 --mode gpu 或 --mode cpu 直接指定训练节点的模式"
+		fi
+		RESULT="$prev"
+		KEPT_PREVIOUS=1
+		RESULT_REASON="无法连接 Docker（见上文），无法检查它能否使用显卡，沿用 .env 中原来的设置"
+		FIX_HINT="解决 Docker 的连接问题后，重新运行 make setup"
+		return 0
+	fi
+	if [ "$NVSMI_STATE" = error ] && contains_ci "$NVSMI_ERROR" mismatch && [ "$prev" = gpu ]; then
+		RESULT=gpu
+		KEPT_PREVIOUS=1
+		RESULT_REASON="驱动更新后还没有重启机器（nvidia-smi：$NVSMI_ERROR），暂时无法检测显卡，沿用 .env 中原来的 GPU 设置；重启机器后再运行 make setup"
+		return 0
+	fi
+	if [ "$DOCKER_GPU" = failed ] && [ "$DOCKER_GPU_TIMED_OUT" = 1 ] && [ "$prev" = gpu ] && host_gpu_ok && [ "$TM_VARIANT" != cpu ]; then
+		RESULT=gpu
+		KEPT_PREVIOUS=1
+		RESULT_REASON="在 Docker 中验证显卡超时（$DOCKER_GPU_DETAIL），无法判断，沿用 .env 中原来的 GPU 设置；Docker 恢复正常后再运行 make setup"
+		return 0
+	fi
+	return 1
 }
 
 decide() {
@@ -1058,6 +1287,8 @@ decide() {
 			unverified) warn "没能实际验证 Docker 能否使用显卡（$DOCKER_GPU_DETAIL），按 Docker 的配置使用 GPU 模式；启动后在“计算资源”页面确认" ;;
 			untested) warn "没有实际验证 Docker 能否使用显卡（--no-docker-test），按 Docker 的配置使用 GPU 模式" ;;
 			esac
+		elif keep_previous_result; then
+			:
 		else
 			RESULT=cpu
 			explain_cpu_fallback
@@ -1071,7 +1302,7 @@ decide() {
 		local existing first
 		if [ -n "$PIN" ]; then
 			VARIANT="$PIN"
-			if [ "$VARIANT" != "$TM_VARIANT" ]; then
+			if [ "$VARIANT" != "$TM_VARIANT" ] && host_gpu_ok; then
 				say "使用 PyTorch 变体 $VARIANT（$PIN_SOURCE 指定；按驱动与显卡推荐 $TM_VARIANT）"
 			fi
 			local min
@@ -1091,7 +1322,9 @@ decide() {
 			else
 				VARIANT="$first"
 			fi
-			warn "按驱动与显卡无法选择 CUDA 版的 PyTorch（$TM_VARIANT_REASON），使用 $VARIANT；可用 --variant 指定"
+			if [ "$KEPT_PREVIOUS" = 0 ] || [ "$VARIANT" != "$existing" ]; then
+				warn "按驱动与显卡无法选择 CUDA 版的 PyTorch（$TM_VARIANT_REASON），使用 $VARIANT；可用 --variant 指定"
+			fi
 		fi
 		if [ -n "$TM_VARIANT_UNSUPPORTED" ] && [ "$VARIANT" = "$TM_VARIANT" ]; then
 			warn "计算能力为 $(tm_cc_list "$TM_VARIANT_UNSUPPORTED") 的显卡不被 $VARIANT 支持，无法用于训练"
@@ -1142,6 +1375,7 @@ main() {
 			: >"$ENV_FILE" || fail "无法创建 $ENV_FILE"
 		fi
 		created=1
+		CREATED_ENV=1
 		ENV_SOURCE="$ENV_FILE"
 	fi
 
@@ -1181,6 +1415,7 @@ main() {
 		if toolkit_needed; then
 			if [ "$INSTALL_TOOLKIT" = 1 ]; then
 				local rc=0
+				# rc 2（取消、--dry-run）与 3（只打印了手动步骤）：不重新检查，按当前结果继续
 				install_toolkit || rc=$?
 				if [ "$rc" -eq 1 ]; then
 					fail "NVIDIA Container Toolkit 安装失败，没有修改 .env。解决上面的问题后重新运行，或参考 $TOOLKIT_DOC_URL 手动安装"
@@ -1199,7 +1434,7 @@ main() {
 				print_toolkit_hint
 			fi
 		elif [ "$INSTALL_TOOLKIT" = 1 ] && docker_gpu_usable; then
-			say "Docker 已经可以使用显卡，不需要安装 NVIDIA Container Toolkit"
+			say "Docker 已经可以使用显卡，不需要安装或配置 NVIDIA Container Toolkit"
 		elif [ "$INSTALL_TOOLKIT" = 1 ] && [ "$DOCKER_DESKTOP" = 1 ]; then
 			say "Docker Desktop 自带 GPU 支持，不需要（也不能）安装 NVIDIA Container Toolkit"
 		elif [ "$INSTALL_TOOLKIT" = 1 ]; then
@@ -1210,6 +1445,8 @@ main() {
 			say "没有可用的 NVIDIA 显卡与驱动，不安装 NVIDIA Container Toolkit"
 		elif [ "$DOCKER_STATE" != ok ]; then
 			say "Docker 不可用，不安装 NVIDIA Container Toolkit"
+		elif [ "$MODE" = auto ] && [ "$TM_VARIANT" = cpu ]; then
+			say "驱动不能使用 CUDA 版的 PyTorch（$TM_VARIANT_REASON），不安装 NVIDIA Container Toolkit"
 		else
 			say "当前模式（$MODE）不使用 GPU，不安装 NVIDIA Container Toolkit"
 		fi
@@ -1219,7 +1456,7 @@ main() {
 	decide
 
 	# 8. 写入 .env
-	local old_profiles new_profiles server_url node_name token remote=0
+	local old_profiles new_profiles server_url node_name host_name token remote=0
 	old_profiles="$(env_get COMPOSE_PROFILES "$ENV_SOURCE" || true)"
 	new_profiles="$(merge_profiles "$old_profiles" "$RESULT")"
 	if [ -n "$MODE_ARG" ]; then set_key TM_TRAINER_MODE "$MODE_ARG"; fi
@@ -1232,6 +1469,16 @@ main() {
 			node_name="$(node_hostname)"
 			if [ -n "$node_name" ]; then set_key TM_NODE_NAME "$node_name"; fi
 		fi
+	fi
+	# app 与训练节点容器的主机名（docker-compose.yml 中的 hostname）：每次都写入本机当前的主机名。
+	# 与 compose 中的服务名相同时留空（使用 compose 中的默认值），否则容器连不上同名的服务。
+	host_name="$(node_hostname)"
+	if [ -n "$host_name" ] && hostname_clashes_with_service "$host_name"; then
+		say "本机的主机名 $host_name 与 docker-compose.yml 中的服务名相同：用作容器的主机名时，容器中这个名字会指向容器自己。TM_HOST_HOSTNAME 留空，页面上的服务器主机名显示为 trainmaster，训练节点为 trainmaster-trainer"
+		if [ -n "$(env_get TM_HOST_HOSTNAME "$ENV_SOURCE" || true)" ]; then set_key TM_HOST_HOSTNAME ""; fi
+		host_name=""
+	elif [ -n "$host_name" ]; then
+		set_key TM_HOST_HOSTNAME "$host_name"
 	fi
 	if [ -n "$SERVER_URL_ARG" ]; then
 		set_key TM_SERVER_URL "$SERVER_URL_ARG"
@@ -1254,7 +1501,7 @@ main() {
 
 	# docker compose 优先使用 shell 中的环境变量，其次才是 .env：与 .env 中的结果不同时提醒。
 	local key var final
-	for key in COMPOSE_PROFILES TM_TORCH_VARIANT TM_NODE_NAME TM_NODE_TOKEN TM_SERVER_URL; do
+	for key in COMPOSE_PROFILES TM_TORCH_VARIANT TM_NODE_NAME TM_HOST_HOSTNAME TM_NODE_TOKEN TM_SERVER_URL; do
 		[ -n "${!key+x}" ] || continue
 		var="NEW_$key"
 		if [ -n "${!var+x}" ]; then
@@ -1304,6 +1551,10 @@ main() {
 	if [ "$remote" = 1 ] && [ -z "$TOKEN_ARG" ] && [ -z "$token" ] && [ "$RESULT" != off ]; then
 		warn "这台机器上的训练节点连接 $server_url，但没有设置 TM_NODE_TOKEN：平台设置了令牌时节点无法注册。把平台 .env 中的 TM_NODE_TOKEN 填入 .env，或重新运行并加 --token <令牌>"
 	fi
+	# 训练节点容器的主机名就是本机的主机名，容器中这个名字（以及它第一个点之前的部分）指向容器自己，连接不到平台。
+	if [ "$remote" = 1 ] && [ "$RESULT" != off ] && host_names_match "$(url_host "$server_url")" "$host_name"; then
+		warn "TM_SERVER_URL（$server_url）使用了本机的主机名：训练节点容器的主机名与本机相同，在容器中这个名字指向容器自己，节点连接不到平台。平台在这台机器上时请使用默认的 http://app:8080（make setup SETUP_ARGS=\"--server-url http://app:8080\"），否则改用平台的 IP 地址"
+	fi
 
 	if [ "$ENV_WRITTEN" = written ]; then
 		remove_stale_trainers "$old_profiles" "$new_profiles"
@@ -1316,7 +1567,11 @@ main() {
 		if [ "$remote" = 1 ] && [ "$RESULT" != off ]; then
 			warn "这台机器配置为连接其它平台的训练节点（TM_SERVER_URL=$server_url），make up 会同时启动本机的平台服务；只运行训练节点请用 docker compose up -d --build $svc"
 		fi
-		say "接下来构建并启动服务（docker compose up -d --build）…"
+		if [ "$RESULT" = off ]; then
+			say "接下来构建并启动平台（postgres 与 app）…"
+		else
+			say "接下来先构建并启动平台（postgres 与 app），再构建并启动训练节点（$svc）；训练节点镜像构建失败时平台照常运行…"
+		fi
 		return 0
 	fi
 	say "下一步："

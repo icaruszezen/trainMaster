@@ -149,7 +149,8 @@ build-backend:
 docker-build: ## 构建应用镜像 trainmaster:$TM_IMAGE_TAG
 	$(COMPOSE) build app
 
-# 两个训练节点服务（trainer / trainer-cpu）使用同一个镜像，变体（TM_TORCH_VARIANT）由 make setup 写入 .env。
+# 变体（TM_TORCH_VARIANT）由 make setup 写入 .env，两个训练节点服务（trainer / trainer-cpu）使用同一个镜像；
+# 没有写入时 trainer 为 cu130，trainer-cpu 为 cpu（构建它：docker compose --profile cpu build trainer-cpu）。
 docker-build-trainer: ## 构建训练节点镜像 trainmaster-trainer:$TM_IMAGE_TAG-$TM_TORCH_VARIANT
 	$(COMPOSE) --profile gpu build trainer
 
@@ -162,12 +163,25 @@ setup: ## 检测本机显卡、驱动与 Docker 的 GPU 支持，把训练节点
 
 # 每次启动前重新检测（换了显卡、升级了驱动或装好 NVIDIA Container Toolkit 后自动切换到 GPU）；
 # .env 中 TM_TRAINER_MODE=off 时不运行训练节点。TM_SETUP_CALLER 让脚本按“接下来自动启动”给出提示。
+# 先构建并启动平台（postgres 与 app），再构建并启动其余服务（启用的训练节点等）：训练节点镜像要下载
+# 数 GB 的 PyTorch，下载失败时只警告，不影响平台的部署与升级（compose 一次构建全部镜像时，
+# 任何一个镜像构建失败都不会重建任何容器）。
 up: export TM_SETUP_CALLER := up
-up: setup ## 检测计算资源（同 make setup）后构建并启动全部服务
-	$(COMPOSE) up -d --build
+up: setup ## 检测计算资源（同 make setup）后构建并启动全部服务（训练节点构建失败时只警告）
+	$(COMPOSE) up -d --build postgres app
+	@services="$$($(COMPOSE) config --services | grep -vx -e postgres -e app || true)"; \
+	if [ -n "$$services" ]; then \
+		echo $(COMPOSE) up -d --build --no-deps $$services; \
+		$(COMPOSE) up -d --build --no-deps $$services || { \
+			echo "警告：训练节点（$$(echo $$services)）没有构建或启动成功，平台（postgres 与 app）已经启动并可以使用。" >&2; \
+			echo "  按上面的错误解决后重新运行 make up；下载 PyTorch 等依赖失败时在 .env 中配置镜像源（见 docs/deployment.md 第 7 节）" >&2; \
+		}; \
+	fi
 
-down: ## 停止并删除容器（宿主机上的数据目录保留）
-	$(COMPOSE) down
+# 包括没有启用的 profile 中的服务（如切换过 COMPOSE_PROFILES 后留下的另一个训练节点）。
+# '*' 表示全部 profile；不支持它的旧版 compose 至少包括 gpu 与 cpu。
+down: ## 停止并删除全部容器，包括各个 profile 中的训练节点（宿主机上的数据目录保留）
+	$(COMPOSE) --profile '*' --profile gpu --profile cpu down
 
 logs: ## 查看日志（Ctrl+C 退出）
 	$(COMPOSE) logs -f --tail=200

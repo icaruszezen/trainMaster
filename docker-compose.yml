@@ -15,6 +15,8 @@
 #   gpu  → trainer      使用全部 NVIDIA 显卡（需要 NVIDIA 驱动与 NVIDIA Container Toolkit）
 #   cpu  → trainer-cpu  没有可用的显卡时用 CPU 训练
 # 没有设置 COMPOSE_PROFILES 时只运行 postgres 与 app。
+# 停止并删除全部容器（包括没有启用的 profile 中的训练节点）：make down，即
+#   docker compose --profile '*' down
 
 name: trainmaster
 
@@ -30,7 +32,7 @@ x-logging: &logging
 x-trainer: &trainer
   build:
     context: ./trainer
-    args:
+    args: &trainer-build-args
       # 基础镜像，可换成内网镜像仓库中的同名镜像
       PYTHON_IMAGE: ${TRAINER_PYTHON_IMAGE:-python:3.12-slim-bookworm}
       # Debian 软件源（安装 OpenCV 依赖的系统库），留空使用官方源
@@ -45,13 +47,19 @@ x-trainer: &trainer
   logging: *logging
   # 由 init 进程回收训练与检测子进程
   init: true
-  environment:
+  # 容器的主机名用宿主机的主机名（make setup 写入 TM_HOST_HOSTNAME）：节点上报真实的机器名，
+  # 重建容器后也不变。不设置时 Docker 使用每次重建都会变化的容器 ID
+  hostname: ${TM_HOST_HOSTNAME:-trainmaster-trainer}
+  # 两个训练节点服务各自在 environment 中加上 TM_TRAINER_SERVICE（YAML 的 << 只做浅合并）
+  environment: &trainer-env
     # 平台地址：同一台机器上为 compose 网络中的 app；其它机器上的训练节点改为平台的地址
     TM_SERVER_URL: ${TM_SERVER_URL:-http://app:8080}
     # 与 app 的 TM_NODE_TOKEN 相同（make setup 自动生成）
     TM_NODE_TOKEN: ${TM_NODE_TOKEN:-}
-    # 节点名称，留空时使用容器的主机名（make setup 写入宿主机的主机名）
+    # 节点名称，留空时使用主机名（make setup 写入宿主机的主机名）
     TM_NODE_NAME: ${TM_NODE_NAME:-}
+    # make setup 的模式（auto / gpu / cpu）：为 cpu 时节点知道是有意选择了 CPU，不再提示显卡没有传入容器
+    TM_TRAINER_MODE: ${TM_TRAINER_MODE:-auto}
     TM_DATA_DIR: /data
     TM_LOG_LEVEL: ${TM_LOG_LEVEL:-info}
     # 容器以 root 启动，修正状态目录属主后以 PUID:PGID 运行（与 app 相同，才能读写 /data 中的文件）
@@ -109,6 +117,8 @@ services:
     image: trainmaster:${TM_IMAGE_TAG:-latest}
     restart: unless-stopped
     logging: *logging
+    # 页面上显示的服务器主机名：用宿主机的主机名（make setup 写入），不设置时为 trainmaster
+    hostname: ${TM_HOST_HOSTNAME:-trainmaster}
     depends_on:
       postgres:
         condition: service_healthy
@@ -143,6 +153,10 @@ services:
   trainer:
     <<: *trainer
     profiles: [gpu]
+    environment:
+      <<: *trainer-env
+      # 服务名：节点据此给出修复建议中的命令（如 docker compose up -d --build trainer）
+      TM_TRAINER_SERVICE: trainer
     deploy:
       resources:
         reservations:
@@ -152,6 +166,16 @@ services:
               capabilities: [gpu]
 
   # CPU 训练节点：没有可用的 NVIDIA 显卡（或 Docker 无法使用显卡）时，COMPOSE_PROFILES=cpu。
+  # 没有运行 make setup（TM_TORCH_VARIANT 为空）时构建 CPU 版 PyTorch，而不是 GPU 版的 cu130。
   trainer-cpu:
     <<: *trainer
     profiles: [cpu]
+    build:
+      context: ./trainer
+      args:
+        <<: *trainer-build-args
+        TORCH_VARIANT: ${TM_TORCH_VARIANT:-cpu}
+    image: trainmaster-trainer:${TM_IMAGE_TAG:-latest}-${TM_TORCH_VARIANT:-cpu}
+    environment:
+      <<: *trainer-env
+      TM_TRAINER_SERVICE: trainer-cpu

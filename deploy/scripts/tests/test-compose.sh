@@ -64,7 +64,25 @@ TRAINER_PYTHON_IMAGE=registry.example.com/python:3.12-slim-bookworm
 PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 TORCH_FIND_LINKS=https://mirrors.aliyun.com/pytorch-wheels
 DEBIAN_MIRROR=https://mirrors.aliyun.com/debian
+TM_HOST_HOSTNAME=gpu-host-01
+TM_TRAINER_MODE=cpu
 "
+# trainer-cpu 在 TM_TORCH_VARIANT 设置时同样使用它（make setup 选择 CPU 时写入 cpu）
+config variant "COMPOSE_PROFILES=gpu,cpu
+TM_TORCH_VARIANT=cu126
+"
+
+# make down 使用的 --profile '*'：列出全部 profile 中的服务（包括 COMPOSE_PROFILES 中没有启用的）
+if [ "$fails" -eq 0 ]; then
+	printf 'COMPOSE_PROFILES=cpu\n' >"$WORK/down.env"
+	services="$(cd "$ROOT" && env -i PATH="$PATH" HOME="${HOME:-/tmp}" \
+		docker compose -f docker-compose.yml --env-file "$WORK/down.env" --profile '*' --profile gpu --profile cpu \
+		config --services | sort | tr '\n' ' ')"
+	if [ "$services" != "app postgres trainer trainer-cpu " ]; then
+		echo "FAIL [down] --profile '*' 应列出全部服务，实际为：$services" >&2
+		fails=$((fails + 1))
+	fi
+fi
 
 if [ "$fails" -eq 0 ]; then
 	python3 - "$WORK" <<'EOF' || fails=$((fails + 1))
@@ -98,7 +116,8 @@ def volume_targets(svc):
     return {v["target"]: v["source"] for v in svc.get("volumes", [])}
 
 
-def check_trainer(name, svc, variant="cu130", tag="latest", shm=8 * 1024**3):
+def check_trainer(name, svc, variant="cu130", tag="latest", shm=8 * 1024**3, service="trainer", mode="auto",
+                  hostname="trainmaster-trainer"):
     check(name, svc.get("image") == f"trainmaster-trainer:{tag}-{variant}", f"image 为 {svc.get('image')}")
     build = svc.get("build", {})
     check(name, build.get("context", "").rstrip("/").endswith("/trainer"), f"build.context 为 {build.get('context')}")
@@ -113,11 +132,17 @@ def check_trainer(name, svc, variant="cu130", tag="latest", shm=8 * 1024**3):
     check(name, env(svc, "TM_DATA_DIR") == "/data", "TM_DATA_DIR 应为 /data")
     for key in ("TM_SERVER_URL", "TM_NODE_TOKEN", "TM_NODE_NAME", "TM_LOG_LEVEL", "PUID", "PGID", "TZ"):
         check(name, key in (svc.get("environment") or {}), f"缺少环境变量 {key}")
+    # 节点据此给出修复建议中的服务名与命令（docs/deployment.md 第 10 节）
+    check(name, env(svc, "TM_TRAINER_SERVICE") == service, f"TM_TRAINER_SERVICE 为 {env(svc, 'TM_TRAINER_SERVICE')}")
+    check(name, env(svc, "TM_TRAINER_MODE") == mode, f"TM_TRAINER_MODE 为 {env(svc, 'TM_TRAINER_MODE')}")
+    # 主机名用宿主机的主机名（TM_HOST_HOSTNAME），不是每次重建都会变化的容器 ID
+    check(name, svc.get("hostname") == hostname, f"hostname 为 {svc.get('hostname')}")
 
 
 # 没有 profile：与之前一样只有 postgres 与 app
 s = load("none")
 check("none", sorted(s) == ["app", "postgres"], f"服务为 {sorted(s)}")
+check("none", s["app"].get("hostname") == "trainmaster", f"app 的 hostname 为 {s['app'].get('hostname')}")
 check("none", "TM_NODE_TOKEN" in (s["app"].get("environment") or {}), "app 缺少 TM_NODE_TOKEN")
 check("none", env(s["app"], "TM_NODE_TOKEN") == "", "默认不设置令牌")
 
@@ -133,7 +158,8 @@ check("gpu", "deploy" not in s["app"] and "deploy" not in s["postgres"], "只有
 # cpu：trainer-cpu 不预留 GPU
 s = load("cpu")
 check("cpu", sorted(s) == ["app", "postgres", "trainer-cpu"], f"服务为 {sorted(s)}")
-check_trainer("cpu", s["trainer-cpu"])
+# 没有运行 make setup（TM_TORCH_VARIANT 为空）时 CPU 训练节点构建 CPU 版 PyTorch，不是 cu130
+check_trainer("cpu", s["trainer-cpu"], variant="cpu", service="trainer-cpu")
 check("cpu", gpu_devices(s["trainer-cpu"]) is None, "trainer-cpu 不应预留 GPU")
 
 s = load("both")
@@ -141,9 +167,11 @@ check("both", sorted(s) == ["app", "postgres", "trainer", "trainer-cpu"], f"服�
 
 # 变量插值：两个训练节点与 app 使用同一个令牌，镜像标签带变体
 s = load("custom")
+check("custom", s["app"].get("hostname") == "gpu-host-01", f"app 的 hostname 为 {s['app'].get('hostname')}")
 for name in ("trainer", "trainer-cpu"):
     svc = s[name]
-    check_trainer(f"custom/{name}", svc, variant="cpu", tag="v1", shm=2 * 1024**3)
+    check_trainer(f"custom/{name}", svc, variant="cpu", tag="v1", shm=2 * 1024**3, service=name, mode="cpu",
+                  hostname="gpu-host-01")
     check(name, env(svc, "TM_NODE_TOKEN") == "abcdefghijklmnop0123", "令牌应来自 .env")
     check(name, env(svc, "TM_NODE_NAME") == "gpu-01", "节点名称应来自 .env")
     check(name, env(svc, "TM_SERVER_URL") == "http://10.0.0.5:8080", "平台地址应来自 .env")
@@ -158,6 +186,10 @@ for name in ("trainer", "trainer-cpu"):
     check(name, args.get("TORCH_INDEX_URL") == "", "TORCH_INDEX_URL 默认为空")
 check("custom", env(s["app"], "TM_NODE_TOKEN") == "abcdefghijklmnop0123", "app 的令牌应来自 .env")
 
+s = load("variant")
+check_trainer("variant/trainer", s["trainer"], variant="cu126")
+check_trainer("variant/trainer-cpu", s["trainer-cpu"], variant="cu126", service="trainer-cpu")
+
 for p in problems:
     print("FAIL " + p, file=sys.stderr)
 sys.exit(1 if problems else 0)
@@ -168,4 +200,4 @@ if [ "$fails" -gt 0 ]; then
 	echo "compose: 检查失败" >&2
 	exit 1
 fi
-echo "compose: 全部通过（无 profile、gpu、cpu 与变量插值）"
+echo "compose: 全部通过（无 profile、gpu、cpu、全部 profile 与变量插值）"

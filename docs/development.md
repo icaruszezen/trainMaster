@@ -110,8 +110,9 @@ docker rm -f tm-test-pg
 - **pytest**（`trainer/tests/`）：不依赖 GPU、torch 与网络——NVML、torch、ultralytics 用假模块代替，平台用本地 `http.server` 模拟。CI 在 Python 3.10（`requires-python` 的下限）与 3.12（镜像中的版本）上运行。
 - **`trainer/scripts/tests/test-torch-variant.sh`**：变体选择规则（`lib/torch-variant.sh`）；Python 侧的 `tests/test_variants.py` 覆盖同样的用例，两边必须一致。修改 `torch_variants.txt` 时运行这两组测试，并同步 README 与部署指南第 10.3 节中抄录的表格。
 - **`trainer/scripts/tests/test-install.sh`**：裸机安装脚本 `install.sh` 与 `install-torch.sh`。
-- **`deploy/scripts/tests/test-setup-compute.sh`**：`make setup` 的脚本。用假的 `nvidia-smi`、`docker`、sysfs、`sudo`、apt / dnf / yum / zypper 等覆盖各种机器（有 / 没有显卡与驱动、旧驱动、RTX 50 系列、有 / 没有 NVIDIA Container Toolkit、新旧 Docker 的报错、Docker Desktop、离线、超时等）、`.env` 的合并与安装流程，不需要 Docker 与 GPU，也不会改动本机。`VERBOSE=1` 打印每次运行的输出；脚本兼容 macOS 自带的 bash 3.2。
+- **`deploy/scripts/tests/test-setup-compute.sh`**：`make setup` 的脚本。用假的 `nvidia-smi`、`docker`、sysfs、`sudo`、apt / dnf / yum / zypper 等覆盖各种机器（有 / 没有显卡与驱动、旧驱动、RTX 50 系列、有 / 没有 NVIDIA Container Toolkit、新旧 Docker 的报错（包括 Docker 29.5 的 `AMD CDI spec not found`）、Docker Desktop、snap 与 rootless Docker、有 / 没有 systemd、WSL、无法连接 Docker、离线、超时等）、`.env` 的合并与安装流程，不需要 Docker 与 GPU，也不会改动本机。`VERBOSE=1` 打印每次运行的输出；脚本兼容 macOS 自带的 bash 3.2。
 - **`deploy/scripts/tests/test-compose.sh`**：用真实的 `docker compose config` 检查各 profile 的服务、GPU 预留与变量插值，不启动容器（没有 docker compose 时跳过）。
+- **`deploy/scripts/tests/test-makefile.sh`**：用假的 `docker compose`（`COMPOSE=<替身>`）运行 `make up` / `make down`，检查先启动平台、训练节点构建失败只警告、`make down` 包括全部 profile。
 
 在真实机器上调试 `make setup` 时，加 `SETUP_ARGS=--dry-run` 只检测、不修改任何文件，或用 `--env-file` 写到别的文件。
 
