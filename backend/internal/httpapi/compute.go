@@ -84,17 +84,21 @@ type nodeRegistration struct {
 	TokenRequired            bool    `json:"token_required"` // TM_NODE_TOKEN is set
 	HeartbeatIntervalSeconds float64 `json:"heartbeat_interval_seconds"`
 	OfflineAfterSeconds      float64 `json:"offline_after_seconds"`
+	// LocalTrainerMode is TM_TRAINER_MODE of this machine's own training
+	// node ("auto", "gpu", "cpu" or "off"); null when not known.
+	LocalTrainerMode *string `json:"local_trainer_mode"`
 }
 
 func (s *server) getComputeServer(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, computeServerInfo{
-		Server: s.host.Info(),
-		NodeRegistration: nodeRegistration{
-			TokenRequired:            s.nodeToken != "",
-			HeartbeatIntervalSeconds: s.compute.HeartbeatInterval().Seconds(),
-			OfflineAfterSeconds:      s.compute.OfflineAfter().Seconds(),
-		},
-	})
+	reg := nodeRegistration{
+		TokenRequired:            s.nodeToken != "",
+		HeartbeatIntervalSeconds: s.compute.HeartbeatInterval().Seconds(),
+		OfflineAfterSeconds:      s.compute.OfflineAfter().Seconds(),
+	}
+	if s.localTrainerMode != "" {
+		reg.LocalTrainerMode = &s.localTrainerMode
+	}
+	writeJSON(w, http.StatusOK, computeServerInfo{Server: s.host.Info(), NodeRegistration: reg})
 }
 
 func (s *server) listComputeNodes(w http.ResponseWriter, r *http.Request) {
