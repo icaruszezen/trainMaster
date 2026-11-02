@@ -51,11 +51,13 @@ class FakeDetector:
         self.error = error
         self.calls = 0
         self.hardware_seen: list[dict[str, Any]] = []
+        self.host_drivers_seen: list[str | None] = []
         self.cancelled = threading.Event()
 
-    def detect(self, hardware, *, device_nodes=(), pci_gpu_count=None):
+    def detect(self, hardware, *, device_nodes=(), pci_gpu_count=None, host_driver_version=None):
         self.calls += 1
         self.hardware_seen.append(hardware)
+        self.host_drivers_seen.append(host_driver_version)
         if self.gate is not None:
             while not self.gate.wait(0.01):
                 if self.cancelled.is_set():
@@ -71,13 +73,15 @@ class FakeDetector:
 class FakeHardware:
     def __init__(self) -> None:
         self.count = 0
+        self.extra: dict[str, Any] = {}  # 加到 hardware 中的其它字段
 
     def __call__(self) -> HardwareProbe:
         self.count += 1
         return HardwareProbe(
-            hardware={"os": "Test OS", "gpus": [], "probe": self.count},
+            hardware={"os": "Test OS", "gpus": [], "probe": self.count, **self.extra},
             gpu=gpu.GpuProbe(None, [], {"method": "none", "error": None, "host_gpu_count": None}),
             device_nodes=[],
+            host_driver_version="440.100",
         )
 
 
@@ -264,6 +268,7 @@ def test_probe_requested_triggers_new_probe(platform, tmp_path):
         assert node["hardware"]["probe"] == 2
         assert node["environment"]["run"] == 2
         assert h.detector.hardware_seen[-1]["probe"] == 2
+        assert h.detector.host_drivers_seen == ["440.100", "440.100"]  # 诊断信息交给检测
         hb = node["heartbeats"]
         wait_until(lambda: node["heartbeats"] >= hb + 3)
         assert h.detector.calls == 2  # 请求被清除后不再重复检测
@@ -407,6 +412,23 @@ def test_detector_crash_reports_error_environment(platform, tmp_path):
         env = node["environment"]
         assert env["status"] == "error"
         assert "boom" in env["self_test"]["message"]
+
+
+def test_detector_crash_keeps_the_probe_diagnostics(platform, tmp_path):
+    # 检测出错时的结果同样按探测到的诊断信息判断：显卡没有传入容器、宿主机驱动 440.100 过旧时
+    # 提示升级驱动，而不是安装 NVIDIA Container Toolkit。
+    h = Harness(tmp_path, platform.url, detector=FakeDetector(error=RuntimeError("boom")))
+    h.hardware.extra = {
+        "arch": "x86_64",
+        "in_container": True,
+        "gpu_detection": {"method": "none", "error": None, "host_gpu_count": 1},
+    }
+    with h:
+        node = wait_until(lambda: registered(platform))
+        # 检测很快出错：结果可能在注册时就已上报，也可能在之后的心跳中上报
+        env = wait_until(lambda: node.get("environment"))
+        codes = [i["code"] for i in env["issues"]]
+    assert "driver_too_old" in codes and "gpu_not_passed_through" not in codes
 
 
 def test_unexpected_client_error_does_not_stop_loop(platform, tmp_path, caplog):

@@ -263,6 +263,28 @@ def select_variant(
     )
 
 
+def lowest_cuda_driver(
+    machine: str | None = None, variants: Sequence[Variant] | None = None
+) -> str | None:
+    """本机架构上 CUDA 版 PyTorch 最低需要的驱动版本：驱动低于它时 select_variant 只能选择 cpu。
+
+    x86_64：变体表中最低的 min_driver；ARM 服务器：cu130 的（只有它有 ARM 版，见 select_variant）；
+    其它平台没有 CUDA 版 PyTorch，为 None。machine 默认取当前机器。
+    """
+    table = list(variants) if variants is not None else list(_default_variants())
+    machine = machine or platform.machine()
+    if machine in ("aarch64", "arm64"):
+        cu130 = get_variant("cu130", table)
+        return cu130.min_driver if cu130 else None
+    if machine not in ("x86_64", "amd64"):
+        return None
+    lowest: str | None = None
+    for v in table:
+        if v.cuda and v.min_driver and (lowest is None or not version_ge(v.min_driver, lowest)):
+            lowest = v.min_driver
+    return lowest
+
+
 def min_driver_for_cuda(cuda: str | None, variants: Sequence[Variant] | None = None) -> str | None:
     """某个 CUDA 版本的 PyTorch 需要的最低驱动：先找 cuda 完全相同的变体，再找同一主版本的变体。"""
     if not cuda:

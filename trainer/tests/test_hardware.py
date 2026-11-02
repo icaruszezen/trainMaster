@@ -238,6 +238,7 @@ def test_probe_builds_contract_shape(tmp_path: Path, monkeypatch):
     assert hw["gpu_detection"]["method"] == "nvml"
     assert result.device_nodes == ["nvidia0"]
     assert result.pci_gpu_count is None  # 已经检测到显卡，不需要再扫描 PCI
+    assert result.host_driver_version is None  # 驱动版本来自 NVML
 
 
 def test_probe_drops_limits_not_below_host(tmp_path: Path, monkeypatch):
@@ -259,6 +260,27 @@ def test_probe_drops_limits_not_below_host(tmp_path: Path, monkeypatch):
     assert result.hardware["memory"]["limit_bytes"] is None
     assert result.hardware["shm_bytes"] is None
     assert result.pci_gpu_count is None  # 没有 /sys/bus/pci
+    assert result.host_driver_version is None  # 没有 /proc/driver/nvidia/version
+
+
+def test_probe_reads_host_driver_when_no_gpu_is_visible(tmp_path: Path):
+    # 容器中没有传入显卡：NVML 看不到显卡，宿主机的驱动版本只能从 /proc 读取（只用于诊断，不上报）。
+    write_files(
+        tmp_path,
+        {
+            ".dockerenv": "",
+            "proc/driver/nvidia/version": "NVRM version: NVIDIA UNIX x86_64 Kernel Module  "
+            "440.100  Fri May 29 08:45:51 UTC 2020\n",
+            "proc/driver/nvidia/gpus/0000:01:00.0/information": "Model: x\n",
+        },
+    )
+    no_gpu = gpu.GpuProbe(
+        driver=None, gpus=[], detection={"method": "none", "error": None, "host_gpu_count": 1}
+    )
+    result = hardware.probe(tmp_path, gpu_probe=lambda: no_gpu)
+    assert result.host_driver_version == "440.100"
+    assert result.hardware["gpu_driver"] is None
+    assert "440.100" not in repr(result.hardware)
 
 
 def test_probe_real_machine_smoke():

@@ -463,6 +463,35 @@ def host_gpu_count(root: str | Path = "/") -> int | None:
         return None
 
 
+# /proc/driver/nvidia/version 中的驱动版本（如 550.54.15、418.87），与平台读取宿主机信息时相同
+# （backend/internal/hostinfo/procfs.go 的 parseDriverVersion）。
+_PROC_DRIVER_RE = re.compile(r"[0-9]{3,}\.[0-9]+(?:\.[0-9]+)?")
+
+
+def parse_proc_driver_version(text: str) -> str | None:
+    """取 "NVRM version: NVIDIA UNIX x86_64 Kernel Module  550.54.15  …" 一行中的驱动版本；
+    没有 NVRM 行时在整个文本中查找。"""
+    line = text
+    for candidate in text.split("\n"):
+        if candidate.startswith("NVRM version:"):
+            line = candidate
+            break
+    m = _PROC_DRIVER_RE.search(line)
+    return m.group(0) if m else None
+
+
+def host_driver_version(root: str | Path = "/") -> str | None:
+    """宿主机已加载的 NVIDIA 内核模块的版本（/proc/driver/nvidia/version）。与 /proc/driver/nvidia/gpus
+    一样，容器中也能看到：显卡没有传入容器（NVML、nvidia-smi 都不可用）时用它判断宿主机驱动是否过旧。
+    读不到或无法解析时为 None。"""
+    path = Path(root) / "proc" / "driver" / "nvidia" / "version"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return parse_proc_driver_version(text)
+
+
 def pci_gpu_count(root: str | Path = "/") -> int | None:
     """PCI 总线上的 NVIDIA 显卡数（vendor 0x10de，class 0x0300 VGA 或 0x0302 3D 控制器）。
 

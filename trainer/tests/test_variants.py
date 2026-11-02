@@ -16,6 +16,7 @@ from trainmaster_trainer.variants import (
     cc_list,
     cc_to_int,
     infer_variant,
+    lowest_cuda_driver,
     min_driver_for_cuda,
     parse_table,
     select_variant,
@@ -178,6 +179,32 @@ def test_package_data_is_readable():
 )  # fmt: skip
 def test_min_driver_for_cuda(cuda, expected):
     assert min_driver_for_cuda(cuda) == expected
+
+
+@pytest.mark.parametrize(
+    ("machine", "expected", "below", "cc"),
+    [("x86_64", "450.80.02", "450.80.01", "7.5"), ("amd64", "450.80.02", "440.100", "7.5"),
+     ("aarch64", "580", "575.57.08", "8.0"), ("arm64", "580", "570.86.15", "9.0")],
+)  # fmt: skip
+def test_lowest_cuda_driver(machine, expected, below, cc):
+    assert lowest_cuda_driver(machine) == expected
+    # 低于它时只能选择 cpu，达到它时（该平台支持的显卡）可以选择 CUDA 版。
+    assert select_variant(below, cc, machine).variant == "cpu"
+    assert select_variant(expected, cc, machine).variant != "cpu"
+
+
+def test_lowest_cuda_driver_without_cuda_builds():
+    assert lowest_cuda_driver("ppc64le") is None
+
+
+def test_lowest_cuda_driver_follows_the_table():
+    table = parse_table(
+        "cu999 9.9 9.9 pytorch 99.9 999 120\n"
+        "cu100 9.9 9.9 pytorch 10.0 410.48 75\n"
+        "cpu 9.9 9.9 pytorch - - -\n"
+    )
+    assert lowest_cuda_driver("x86_64", table) == "410.48"
+    assert lowest_cuda_driver("aarch64", table) is None  # 没有 cu130
 
 
 @pytest.mark.parametrize(
