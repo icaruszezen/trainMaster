@@ -228,7 +228,7 @@ function DeleteNodeForm({
 
 function Command({ children }: { children: ReactNode }) {
   return (
-    <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.8125rem] break-words text-foreground">
+    <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.8125rem] wrap-anywhere text-foreground">
       {children}
     </code>
   )

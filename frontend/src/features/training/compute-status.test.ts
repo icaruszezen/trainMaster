@@ -734,6 +734,13 @@ describe("serverGpuHint", () => {
       })
 
     expect(serverGpuHint(server(), [cpuMode()])).toBeNull()
+    // Also with a driver too old for CUDA PyTorch: CPU was chosen on purpose.
+    expect(
+      serverGpuHint(
+        server({ nvidia: { ...nvidia, driver_version: "440.100" } }),
+        [cpuMode()]
+      )
+    ).toBeNull()
     // Only online nodes count: an old offline record does not hide the hint.
     expect(serverGpuHint(server(), [cpuMode({ status: "offline" })])).toEqual({
       kind: "no_gpu_node",
