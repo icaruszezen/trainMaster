@@ -61,15 +61,21 @@ export function NodeDetailsDialog({
   node,
   now,
   onOpenChange,
+  onCloseAutoFocus,
 }: {
   /** 列表中的最新数据；节点被删除后为 null，对话框随之关闭。 */
   node: ComputeNode | null
   now: number
   onOpenChange: (open: boolean) => void
+  /** 关闭后焦点去哪里（对话框没有触发按钮，见 returnFocus）。 */
+  onCloseAutoFocus?: (event: Event) => void
 }) {
   return (
     <Dialog open={node !== null} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl">
+      <DialogContent
+        className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl"
+        onCloseAutoFocus={onCloseAutoFocus}
+      >
         {node && <NodeDetails node={node} now={now} />}
       </DialogContent>
     </Dialog>

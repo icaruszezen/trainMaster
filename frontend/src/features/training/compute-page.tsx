@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useMemo, useRef, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { CircleAlert, Cpu, Gpu, MemoryStick, Plug, Server } from "lucide-react"
 
@@ -31,6 +31,7 @@ import { DeleteNodeDialog } from "@/features/training/node-actions"
 import { NodeCard } from "@/features/training/node-card"
 import { NodeDetailsDialog } from "@/features/training/node-details-dialog"
 import { RefreshStatus } from "@/features/training/refresh-status"
+import { returnFocus } from "@/features/training/return-focus"
 import { ServerCard } from "@/features/training/server-card"
 import { useNow } from "@/hooks/use-now"
 import { formatNumber, formatPercent } from "@/lib/format"
@@ -42,6 +43,17 @@ export function ComputePage() {
   // 对话框只记住节点 id，内容取列表中的最新数据（每 5 秒刷新）。
   const [detailsId, setDetailsId] = useState<number | null>(null)
   const [deletingId, setDeletingId] = useState<number | null>(null)
+  // 打开对话框的元素：对话框没有 DialogTrigger，关闭后由 returnFocus 把焦点还给它。
+  const opener = useRef<HTMLElement | null>(null)
+  const restoreFocus = (event: Event) => returnFocus(event, opener.current)
+  const openConnect = () => {
+    // 点击或按键打开时焦点在按钮上（“接入节点”、空状态、平台服务器的提示）。
+    opener.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null
+    setConnectOpen(true)
+  }
 
   const items = nodes.data?.items
   const summary = useMemo(() => (items ? summarizeNodes(items) : null), [items])
@@ -54,7 +66,7 @@ export function ComputePage() {
         title="计算资源"
         description="训练节点自动上报显卡、CPU 与 CUDA 环境，页面每 5 秒刷新。"
         actions={
-          <Button onClick={() => setConnectOpen(true)}>
+          <Button onClick={openConnect}>
             <Plug />
             接入节点
           </Button>
@@ -63,7 +75,7 @@ export function ComputePage() {
 
       <ComputeStats summary={summary} pending={nodes.isPending} />
 
-      <ServerCard nodes={items} onConnect={() => setConnectOpen(true)} />
+      <ServerCard nodes={items} onConnect={openConnect} />
 
       <section aria-labelledby="compute-nodes-title" className="grid gap-4">
         <div className="flex min-w-0 items-center justify-between gap-3">
@@ -98,7 +110,7 @@ export function ComputePage() {
             onRetry={() => nodes.refetch()}
           />
         ) : nodes.data.items.length === 0 ? (
-          <NodesEmptyState onConnect={() => setConnectOpen(true)} />
+          <NodesEmptyState onConnect={openConnect} />
         ) : (
           <div className="grid gap-4">
             {nodes.data.items.map((node) => (
@@ -106,23 +118,35 @@ export function ComputePage() {
                 key={node.id}
                 node={node}
                 now={now}
-                onShowDetails={() => setDetailsId(node.id)}
-                onDelete={() => setDeletingId(node.id)}
+                onShowDetails={(trigger) => {
+                  opener.current = trigger
+                  setDetailsId(node.id)
+                }}
+                onDelete={(trigger) => {
+                  opener.current = trigger
+                  setDeletingId(node.id)
+                }}
               />
             ))}
           </div>
         )}
       </section>
 
-      <ConnectNodeDialog open={connectOpen} onOpenChange={setConnectOpen} />
+      <ConnectNodeDialog
+        open={connectOpen}
+        onOpenChange={setConnectOpen}
+        onCloseAutoFocus={restoreFocus}
+      />
       <NodeDetailsDialog
         node={findNode(detailsId)}
         now={now}
         onOpenChange={(open) => !open && setDetailsId(null)}
+        onCloseAutoFocus={restoreFocus}
       />
       <DeleteNodeDialog
         node={findNode(deletingId)}
         onOpenChange={(open) => !open && setDeletingId(null)}
+        onCloseAutoFocus={restoreFocus}
       />
     </>
   )

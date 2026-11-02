@@ -1,3 +1,4 @@
+import { useRef } from "react"
 import { useMutation } from "@tanstack/react-query"
 import { Ellipsis, FileSearch, RefreshCw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
@@ -53,8 +54,9 @@ export function useProbeNode() {
 
 type NodeActionsMenuProps = {
   node: ComputeNode
-  onShowDetails: () => void
-  onDelete: () => void
+  /** 参数为菜单按钮：对话框关闭后把焦点还给它（菜单项此时已经不在页面上）。 */
+  onShowDetails: (trigger: HTMLElement | null) => void
+  onDelete: (trigger: HTMLElement | null) => void
 }
 
 export function NodeActionsMenu({
@@ -63,6 +65,7 @@ export function NodeActionsMenu({
   onDelete,
 }: NodeActionsMenuProps) {
   const probe = useProbeNode()
+  const triggerRef = useRef<HTMLButtonElement>(null)
   const online = isOnline(node)
   const probing = probe.isPending || isProbing(node)
 
@@ -71,6 +74,7 @@ export function NodeActionsMenu({
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
         <Button
+          ref={triggerRef}
           variant="ghost"
           size="icon-sm"
           className="shrink-0"
@@ -94,14 +98,14 @@ export function NodeActionsMenu({
             )}
           </span>
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onShowDetails}>
+        <DropdownMenuItem onSelect={() => onShowDetails(triggerRef.current)}>
           <FileSearch />
           查看详情
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem
           variant="destructive"
-          onSelect={onDelete}
+          onSelect={() => onDelete(triggerRef.current)}
           disabled={online}
         >
           <Trash2 />
@@ -126,13 +130,16 @@ export function NodeActionsMenu({
 export function DeleteNodeDialog({
   node,
   onOpenChange,
+  onCloseAutoFocus,
 }: {
   node: ComputeNode | null
   onOpenChange: (open: boolean) => void
+  /** 关闭后焦点去哪里（对话框没有触发按钮，见 returnFocus）。 */
+  onCloseAutoFocus?: (event: Event) => void
 }) {
   return (
     <AlertDialog open={node !== null} onOpenChange={onOpenChange}>
-      <AlertDialogContent>
+      <AlertDialogContent onCloseAutoFocus={onCloseAutoFocus}>
         {node && (
           <DeleteNodeForm node={node} onDeleted={() => onOpenChange(false)} />
         )}

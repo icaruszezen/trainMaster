@@ -68,8 +68,9 @@ type NodeCardProps = {
   node: ComputeNode
   /** 当前时间，用于“3 分钟前”这类相对时间。 */
   now: number
-  onShowDetails: () => void
-  onDelete: () => void
+  /** 参数为打开对话框的按钮，对话框关闭后焦点回到它上面。 */
+  onShowDetails: (trigger: HTMLElement | null) => void
+  onDelete: (trigger: HTMLElement | null) => void
 }
 
 export function NodeCard({
@@ -606,7 +607,7 @@ function SelfTestLine({
 }: {
   node: ComputeNode
   now: number
-  onShowDetails: () => void
+  onShowDetails: (trigger: HTMLElement | null) => void
 }) {
   const env = node.environment
   if (!env) {
@@ -651,7 +652,7 @@ function SelfTestLine({
           variant="link"
           size="xs"
           className="h-auto px-0 text-xs"
-          onClick={onShowDetails}
+          onClick={(event) => onShowDetails(event.currentTarget)}
         >
           查看错误详情
         </Button>
