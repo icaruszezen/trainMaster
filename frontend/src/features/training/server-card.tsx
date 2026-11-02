@@ -263,6 +263,29 @@ function ServerGpuAlert({
   // make setup 只打印安装命令并改用 CPU 训练节点，提示不会消失。
   const command = <AlertCode>make up SETUP_ARGS="--install-toolkit"</AlertCode>
 
+  if (hint.kind === "driver_too_old") {
+    // 驱动过旧时 make setup 选择 CPU，也不安装 Toolkit：先升级驱动（与训练节点
+    // 上报的 driver_too_old 的建议相同）。
+    return (
+      <Alert role="note">
+        <TriangleAlert className="text-amber-600 dark:text-amber-500" />
+        <AlertTitle className="line-clamp-none leading-snug">
+          检测到 {hint.gpuCount} 块 NVIDIA 显卡，但驱动 {hint.driverVersion}{" "}
+          过旧
+        </AlertTitle>
+        <AlertDescription>
+          <p>
+            CUDA 版 PyTorch 至少需要驱动 {hint.minDriver}
+            ，这些显卡现在不能用于训练。先在这台机器上升级 NVIDIA 驱动（推荐 580
+            或更新）并重启，然后在部署目录中运行 {command}：Docker
+            还不能使用显卡时安装并配置 NVIDIA Container Toolkit（需要
+            sudo），然后启动 GPU 训练节点。
+          </p>
+        </AlertDescription>
+      </Alert>
+    )
+  }
+
   if (hint.kind === "driver_missing") {
     return (
       <Alert role="note">
@@ -312,7 +335,7 @@ function ServerGpuAlert({
 
 function AlertCode({ children }: { children: ReactNode }) {
   return (
-    <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs break-all text-foreground">
+    <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs wrap-anywhere text-foreground">
       {children}
     </code>
   )

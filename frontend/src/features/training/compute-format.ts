@@ -207,22 +207,59 @@ export function hintSegments(text: string): TextSegment[] {
   return segments
 }
 
-/** 平台地址中的主机占位符：通过 localhost 访问时，其它机器需要换成平台服务器的 IP 或域名。 */
-export const SERVER_HOST_PLACEHOLDER = "<平台服务器 IP>"
+export type HintLayout = {
+  /** 命令前面的文字（其中的其它命令显示为行内代码）；没有时为空数组。 */
+  text: TextSegment[]
+  /** 单独一行显示、可以复制的命令；没有时为 null。 */
+  command: string | null
+}
 
 /**
- * 节点接入说明中的平台地址：通过 IP / 域名访问时就是当前地址；通过 localhost
- * 访问时其它机器无法使用，主机名换成占位符，协议与端口沿用当前地址（.env 中的
- * TM_HTTP_PORT 不一定是 8080）。不知道地址时按默认部署的 8080 端口。
+ * 修复建议的排版（输入为 hintSegments 的结果）：整段就是一条命令，或以一条命令
+ * 结尾、前面是说明文字时（如 "…，然后以 GPU 模式启动：`make up …`"），最后这条
+ * 命令单独一行显示为可复制的代码块；前面的文字照常显示，其中的其它命令（如
+ * "…：`make setup` 然后 `docker compose up -d --build trainer`" 中的 make setup）
+ * 仍是行内代码。命令后面还有文字，或前面只有命令没有文字时都显示为行内代码。
  */
-export function suggestServerUrl(location: {
+export function hintLayout(segments: readonly TextSegment[]): HintLayout {
+  const blank = (segment: TextSegment) => !segment.code && !segment.text.trim()
+  let end = segments.length
+  while (end > 0 && blank(segments[end - 1])) {
+    end -= 1
+  }
+  const last = segments[end - 1]
+  const before = segments.slice(0, Math.max(end - 1, 0))
+  const onlyCommand = before.every(blank)
+  const prose = before.some((segment) => !segment.code && !blank(segment))
+  if (!last?.code || !(onlyCommand || prose)) {
+    return { text: [...segments], command: null }
+  }
+  return { text: onlyCommand ? [] : before, command: last.text }
+}
+
+/**
+ * 平台地址中的主机占位符：通过 localhost 或 IPv6 地址访问时，需要换成平台服务器的
+ * IP（IPv4）或域名。
+ */
+export const SERVER_HOST_PLACEHOLDER = "<平台服务器 IP>"
+
+type PageLocation = {
   protocol: string
   host: string
   hostname: string
   port: string
-}): string {
+}
+
+/**
+ * 接入说明中的平台地址为什么不能直接用当前地址：local 为本机地址（localhost
+ * 等，其它机器无法使用；不知道地址时也按它处理），ipv6 为 IPv6 地址（训练节点
+ * 容器的 Docker 网络默认没有 IPv6，make setup 也不接受）。可以直接使用时为 null。
+ */
+export function serverUrlPlaceholderReason(
+  location: PageLocation
+): "local" | "ipv6" | null {
   if (!location.host || !/^https?:$/.test(location.protocol)) {
-    return `http://${SERVER_HOST_PLACEHOLDER}:8080`
+    return "local"
   }
   const hostname = location.hostname.replace(/^\[|\]$/g, "").toLowerCase()
   const loopback =
@@ -232,6 +269,22 @@ export function suggestServerUrl(location: {
     hostname === "0.0.0.0" ||
     /^127\./.test(hostname)
   if (loopback) {
+    return "local"
+  }
+  return location.hostname.startsWith("[") ? "ipv6" : null
+}
+
+/**
+ * 节点接入说明中的平台地址：通过 IPv4 地址 / 域名访问时就是当前地址；通过
+ * localhost 或 IPv6 地址访问时（见 serverUrlPlaceholderReason）主机名换成占位符，
+ * 协议与端口沿用当前地址（.env 中的 TM_HTTP_PORT 不一定是 8080）。不知道地址时
+ * 按默认部署的 8080 端口。
+ */
+export function suggestServerUrl(location: PageLocation): string {
+  if (!location.host || !/^https?:$/.test(location.protocol)) {
+    return `http://${SERVER_HOST_PLACEHOLDER}:8080`
+  }
+  if (serverUrlPlaceholderReason(location)) {
     const port = location.port ? `:${location.port}` : ""
     return `${location.protocol}//${SERVER_HOST_PLACEHOLDER}${port}`
   }

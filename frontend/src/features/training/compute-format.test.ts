@@ -13,7 +13,9 @@ import {
   formatTemperature,
   formatUsage,
   formatWatts,
+  hintLayout,
   hintSegments,
+  serverUrlPlaceholderReason,
   shortenCpuModel,
   shortenGpuName,
   suggestServerUrl,
@@ -260,6 +262,109 @@ describe("hintSegments", () => {
   })
 })
 
+describe("hintLayout", () => {
+  const layout = (hint: string) => hintLayout(hintSegments(hint))
+
+  it("puts a trailing command on its own line with a copy button", () => {
+    expect(
+      layout(
+        '安装并配置 NVIDIA Container Toolkit（需要 sudo），然后以 GPU 模式启动：`make up SETUP_ARGS="--install-toolkit"`'
+      )
+    ).toEqual({
+      text: [
+        {
+          text: "安装并配置 NVIDIA Container Toolkit（需要 sudo），然后以 GPU 模式启动：",
+          code: false,
+        },
+      ],
+      command: 'make up SETUP_ARGS="--install-toolkit"',
+    })
+    expect(
+      layout(
+        "改用 PyTorch 变体 cu128 重新安装（在 trainMaster 仓库目录中运行）：`sudo trainer/scripts/install.sh --variant cu128`"
+      ).command
+    ).toBe("sudo trainer/scripts/install.sh --variant cu128")
+    // Trailing spaces after the command do not count as text after it.
+    expect(layout("然后运行 `make up`  ")).toEqual({
+      text: [{ text: "然后运行 ", code: false }],
+      command: "make up",
+    })
+  })
+
+  it("shows a hint that is one command as a block only", () => {
+    expect(layout("`make up`")).toEqual({ text: [], command: "make up" })
+    expect(layout("  `make up` ")).toEqual({ text: [], command: "make up" })
+    expect(layout("TM_TORCH_VARIANT=cu128 make up")).toEqual({
+      text: [],
+      command: "TM_TORCH_VARIANT=cu128 make up",
+    })
+  })
+
+  it("keeps the other commands of the prose inline", () => {
+    // Only the trailing command becomes a block; the step before it stays in
+    // the sentence that leads to it.
+    expect(
+      layout(
+        '改用 PyTorch 变体 cu128 重新构建镜像：`make setup SETUP_ARGS="--variant cu128"` 然后 `docker compose up -d --build trainer-cpu`'
+      )
+    ).toEqual({
+      text: [
+        { text: "改用 PyTorch 变体 cu128 重新构建镜像：", code: false },
+        { text: 'make setup SETUP_ARGS="--variant cu128"', code: true },
+        { text: " 然后 ", code: false },
+      ],
+      command: "docker compose up -d --build trainer-cpu",
+    })
+    expect(
+      layout("`make setup` 然后 `docker compose up -d --build trainer`")
+    ).toEqual({
+      text: [
+        { text: "make setup", code: true },
+        { text: " 然后 ", code: false },
+      ],
+      command: "docker compose up -d --build trainer",
+    })
+  })
+
+  it("keeps commands inline when text follows them or no text precedes", () => {
+    // A command in the middle of a sentence.
+    const middle = layout(
+      '`make setup SETUP_ARGS="--install-toolkit"`，再按它最后输出的服务名启动（通常是 `docker compose up -d --build trainer`）'
+    )
+    expect(middle.command).toBeNull()
+    expect(middle.text.filter((segment) => segment.code)).toHaveLength(2)
+    expect(layout("在宿主机运行 `nvidia-smi` 检查驱动。")).toEqual({
+      text: [
+        { text: "在宿主机运行 ", code: false },
+        { text: "nvidia-smi", code: true },
+        { text: " 检查驱动。", code: false },
+      ],
+      command: null,
+    })
+    // Two commands with no prose: not "a command preceded by prose".
+    expect(layout("`make setup` `make up`")).toEqual({
+      text: [
+        { text: "make setup", code: true },
+        { text: " ", code: false },
+        { text: "make up", code: true },
+      ],
+      command: null,
+    })
+  })
+
+  it("leaves plain text and empty hints alone", () => {
+    expect(layout("重启机器或重新加载驱动")).toEqual({
+      text: [{ text: "重启机器或重新加载驱动", code: false }],
+      command: null,
+    })
+    expect(layout("")).toEqual({ text: [], command: null })
+    expect(layout("运行 `make")).toEqual({
+      text: [{ text: "运行 `make", code: false }],
+      command: null,
+    })
+  })
+})
+
 describe("suggestServerUrl", () => {
   it("uses the current address when other machines can reach it", () => {
     expect(
@@ -313,6 +418,48 @@ describe("suggestServerUrl", () => {
         port: "",
       })
     ).toBe("https://<平台服务器 IP>")
+  })
+
+  it("replaces an IPv6 host, which the trainer containers cannot reach", () => {
+    // The compose network has no IPv6 by default, and make setup rejects it.
+    const ipv6 = {
+      protocol: "http:",
+      host: "[fd00::10]:8080",
+      hostname: "[fd00::10]",
+      port: "8080",
+    }
+    expect(suggestServerUrl(ipv6)).toBe("http://<平台服务器 IP>:8080")
+    expect(serverUrlPlaceholderReason(ipv6)).toBe("ipv6")
+    expect(
+      suggestServerUrl({
+        protocol: "https:",
+        host: "[2001:db8::1]",
+        hostname: "[2001:db8::1]",
+        port: "",
+      })
+    ).toBe("https://<平台服务器 IP>")
+  })
+
+  it("says why the address is a placeholder", () => {
+    const at = (hostname: string) => ({
+      protocol: "http:",
+      host: `${hostname}:8080`,
+      hostname,
+      port: "8080",
+    })
+    expect(serverUrlPlaceholderReason(at("192.168.1.10"))).toBeNull()
+    expect(serverUrlPlaceholderReason(at("ai.example.com"))).toBeNull()
+    expect(serverUrlPlaceholderReason(at("localhost"))).toBe("local")
+    // The IPv6 loopback address is a local address first.
+    expect(serverUrlPlaceholderReason(at("[::1]"))).toBe("local")
+    expect(
+      serverUrlPlaceholderReason({
+        protocol: "file:",
+        host: "",
+        hostname: "",
+        port: "",
+      })
+    ).toBe("local")
   })
 
   it("falls back to the default port when the address is unknown", () => {

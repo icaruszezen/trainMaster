@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest"
 
 import type {
   ComputeNode,
+  ComputeServer,
   EnvironmentIssue,
   NodeEnvironment,
   NodeGpu,
+  TrainerMode,
 } from "@/features/training/compute-api"
 import {
   acceleratorLabel,
@@ -18,10 +20,12 @@ import {
   isProbing,
   isRedetecting,
   memoryStat,
+  minCudaDriver,
   nodeStatusText,
   serverGpuHint,
   sortIssues,
   summarizeNodes,
+  versionBelow,
 } from "@/features/training/compute-status"
 
 const GiB = 1024 ** 3
@@ -390,6 +394,47 @@ describe("summarizeNodes", () => {
     })
   })
 
+  it("counts a node that is re-detecting as detecting, not by its last result", () => {
+    // After a restart the node registers without an environment: the server
+    // keeps the last one and marks the node probe_pending (badge 正在重新检测).
+    const redetecting = (
+      status: NodeEnvironment["status"],
+      overrides: Partial<ComputeNode> = {}
+    ) =>
+      withGpus([gpu(0)], {
+        probe_pending: true,
+        environment: environment({ status }),
+        ...overrides,
+      })
+
+    expect(
+      summarizeNodes([
+        redetecting("error", { id: 1 }),
+        redetecting("ready", { id: 2 }),
+        redetecting("cpu_only", { id: 3 }),
+      ])
+    ).toMatchObject({
+      onlineCount: 3,
+      gpuCount: 3,
+      readyCount: 0,
+      problemCount: 0,
+      cpuOnlyCount: 0,
+      detectingCount: 3,
+    })
+    expect(
+      dashboardComputeText(summarizeNodes([redetecting("error")]))
+    ).not.toContain("环境异常")
+    // An offline node cannot finish the detection: it is not counted online.
+    expect(
+      summarizeNodes([redetecting("error", { status: "offline" })])
+    ).toMatchObject({
+      onlineCount: 0,
+      problemCount: 0,
+      detectingCount: 0,
+      offlineGpuCount: 1,
+    })
+  })
+
   it("returns empty counts without nodes", () => {
     expect(summarizeNodes([])).toMatchObject({
       nodeCount: 0,
@@ -566,39 +611,116 @@ describe("serverGpuHint", () => {
     ],
   }
 
+  const server = (
+    overrides: Partial<Pick<ComputeServer, "nvidia" | "arch">> = {},
+    localTrainerMode: TrainerMode | null = "auto"
+  ) => ({
+    nvidia,
+    arch: "amd64",
+    ...overrides,
+    node_registration: { local_trainer_mode: localTrainerMode },
+  })
+
   it("hints when the server has GPUs but no GPU node is online", () => {
-    expect(serverGpuHint({ nvidia }, [])).toEqual({
+    expect(serverGpuHint(server(), [])).toEqual({
       kind: "no_gpu_node",
       gpuCount: 2,
     })
     expect(
-      serverGpuHint({ nvidia }, [
+      serverGpuHint(server(), [
         withGpus([gpu(0)], { status: "offline" }),
         withGpus([]),
       ])
     ).toEqual({ kind: "no_gpu_node", gpuCount: 2 })
+    // Outside docker compose the platform does not know the local mode.
+    expect(serverGpuHint(server({}, null), [])).toEqual({
+      kind: "no_gpu_node",
+      gpuCount: 2,
+    })
   })
 
   it("asks for a driver when the GPUs are only visible on the PCI bus", () => {
     expect(
       serverGpuHint(
-        {
+        server({
           nvidia: {
             driver_version: null,
             gpus: [{ name: null, uuid: null, bus_id: "0000:01:00.0" }],
           },
-        },
+        }),
         []
       )
     ).toEqual({ kind: "driver_missing", gpuCount: 1 })
   })
 
+  it("asks for a newer driver when no CUDA PyTorch supports it", () => {
+    const oldDriver = (driver_version: string, arch = "amd64") =>
+      server({ nvidia: { ...nvidia, driver_version }, arch })
+
+    // Below cu118's 450.80.02: make setup chooses CPU and installs no toolkit.
+    expect(serverGpuHint(oldDriver("440.100"), [])).toEqual({
+      kind: "driver_too_old",
+      gpuCount: 2,
+      driverVersion: "440.100",
+      minDriver: "450.80.02",
+    })
+    // It replaces the no_gpu_node hint, also next to an online CPU node.
+    expect(serverGpuHint(oldDriver("450.80.01"), [withGpus([])])).toMatchObject(
+      { kind: "driver_too_old" }
+    )
+    expect(serverGpuHint(oldDriver("450.80.02"), [])).toMatchObject({
+      kind: "no_gpu_node",
+    })
+    expect(serverGpuHint(oldDriver("470.256.02"), [])).toMatchObject({
+      kind: "no_gpu_node",
+    })
+    // ARM servers only have the CUDA 13 build, which needs 580.
+    expect(serverGpuHint(oldDriver("575.57.08", "arm64"), [])).toEqual({
+      kind: "driver_too_old",
+      gpuCount: 2,
+      driverVersion: "575.57.08",
+      minDriver: "580",
+    })
+    expect(serverGpuHint(oldDriver("580.65.06", "arm64"), [])).toMatchObject({
+      kind: "no_gpu_node",
+    })
+    // An online GPU node elsewhere still hides it.
+    expect(serverGpuHint(oldDriver("440.100"), [withGpus([gpu(0)])])).toBeNull()
+  })
+
   it("stays quiet when a GPU node is online or the server has no GPU", () => {
-    expect(serverGpuHint({ nvidia }, [withGpus([gpu(0)])])).toBeNull()
-    expect(serverGpuHint({ nvidia: null }, [])).toBeNull()
+    expect(serverGpuHint(server(), [withGpus([gpu(0)])])).toBeNull()
+    expect(serverGpuHint(server({ nvidia: null }), [])).toBeNull()
     expect(
-      serverGpuHint({ nvidia: { driver_version: "550.54.15", gpus: [] } }, [])
+      serverGpuHint(
+        server({ nvidia: { driver_version: "550.54.15", gpus: [] } }),
+        []
+      )
     ).toBeNull()
+  })
+
+  it("stays quiet when this machine's trainer is off or in CPU mode", () => {
+    // make up SETUP_ARGS="--mode off": no node runs here, so none can report
+    // cpu_mode_selected; the platform reads the mode from its own .env.
+    for (const mode of ["off", "cpu"] as const) {
+      expect(serverGpuHint(server({}, mode), [])).toBeNull()
+      expect(
+        serverGpuHint(
+          server({ nvidia: { ...nvidia, driver_version: null } }, mode),
+          []
+        )
+      ).toBeNull()
+      expect(
+        serverGpuHint(
+          server({ nvidia: { ...nvidia, driver_version: "440.100" } }, mode),
+          []
+        )
+      ).toBeNull()
+    }
+    expect(serverGpuHint(server({}, "gpu"), [])).toEqual({
+      kind: "no_gpu_node",
+      gpuCount: 2,
+    })
   })
 
   it("stays quiet when an online node runs in the chosen CPU mode", () => {
@@ -611,14 +733,22 @@ describe("serverGpuHint", () => {
         ...overrides,
       })
 
-    expect(serverGpuHint({ nvidia }, [cpuMode()])).toBeNull()
+    expect(serverGpuHint(server(), [cpuMode()])).toBeNull()
+    // Also with a driver too old for CUDA PyTorch: CPU was chosen on purpose.
+    expect(
+      serverGpuHint(
+        server({ nvidia: { ...nvidia, driver_version: "440.100" } }),
+        [cpuMode()]
+      )
+    ).toBeNull()
     // Only online nodes count: an old offline record does not hide the hint.
-    expect(serverGpuHint({ nvidia }, [cpuMode({ status: "offline" })])).toEqual(
-      { kind: "no_gpu_node", gpuCount: 2 }
-    )
+    expect(serverGpuHint(server(), [cpuMode({ status: "offline" })])).toEqual({
+      kind: "no_gpu_node",
+      gpuCount: 2,
+    })
     // A CPU node that did not choose CPU mode (e.g. no toolkit) keeps it.
     expect(
-      serverGpuHint({ nvidia }, [
+      serverGpuHint(server(), [
         withGpus([], {
           environment: environment({
             status: "cpu_only",
@@ -627,6 +757,33 @@ describe("serverGpuHint", () => {
         }),
       ])
     ).toEqual({ kind: "no_gpu_node", gpuCount: 2 })
+  })
+})
+
+describe("driver versions", () => {
+  it("compares dotted versions numerically", () => {
+    expect(versionBelow("440.100", "450.80.02")).toBe(true)
+    expect(versionBelow("450.80.01", "450.80.02")).toBe(true)
+    expect(versionBelow("450.80.02", "450.80.02")).toBe(false)
+    // 450.100 > 450.80 even though "1" < "8" as text.
+    expect(versionBelow("450.100.01", "450.80.02")).toBe(false)
+    expect(versionBelow("1000.1", "580")).toBe(false)
+    expect(versionBelow("575.57.08", "580")).toBe(true)
+    expect(versionBelow("580", "580.0")).toBe(false)
+    expect(versionBelow(" 440.100 ", "450.80.02")).toBe(true)
+  })
+
+  it("does not call an unparsable version too old", () => {
+    expect(versionBelow("", "450.80.02")).toBe(false)
+    expect(versionBelow("unknown", "450.80.02")).toBe(false)
+    expect(versionBelow("440.100-beta", "450.80.02")).toBe(false)
+  })
+
+  it("needs the CUDA 13 driver on ARM servers", () => {
+    expect(minCudaDriver("amd64")).toBe("450.80.02")
+    expect(minCudaDriver("arm64")).toBe("580")
+    expect(minCudaDriver("aarch64")).toBe("580")
+    expect(minCudaDriver(null)).toBe("450.80.02")
   })
 })
 
