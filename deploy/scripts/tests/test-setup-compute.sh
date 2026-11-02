@@ -2,8 +2,9 @@
 # deploy/scripts/setup-compute.sh 的测试：bash deploy/scripts/tests/test-setup-compute.sh
 #
 # 每个用例在临时目录中运行脚本的副本：nvidia-smi、docker、id、sudo、curl、gpg、tee、包管理器、
-# nvidia-ctk、systemctl、hostname 都是记录调用的替身脚本，PATH 中只有这些替身和白名单中的基础工具
-# （awk、sed 等），因此测试不需要 Docker 或显卡，也不会读取或修改真实系统的配置。
+# nvidia-ctk、systemctl、service、hostname 都是记录调用的替身脚本，PATH 中只有这些替身和白名单中的
+# 基础工具（awk、sed 等）；systemd 是否在运行、是不是 WSL 也由用例目录中的文件决定。因此测试不需要
+# Docker 或显卡，也不会读取或修改真实系统的配置。
 # FAKE_* 变量经 run_setup（compgen）传给替身命令；单引号中的 $ 属于替身脚本或期望的文件内容；中文引号是有意的。
 # shellcheck disable=SC2034,SC2016,SC1111
 set -euo pipefail
@@ -123,7 +124,11 @@ info)
 	if [ -e "$state/toolkit" ]; then runtimes="io.containerd.runc.v2 nvidia runc "; fi
 	if [ -n "${FAKE_DOCKER_RUNTIMES:-}" ]; then runtimes="$FAKE_DOCKER_RUNTIMES"; fi
 	case "$*" in
-	*OperatingSystem*) printf '%s|%s\n' "${FAKE_DOCKER_OS:-Ubuntu 22.04.4 LTS}" "$runtimes" ;;
+	*OperatingSystem*)
+		# FAKE_DOCKER_ROOT：数据目录（snap 版为 /var/snap/docker/…）；FAKE_DOCKER_SECURITY：SecurityOptions
+		printf '%s|%s|%s|%s\n' "${FAKE_DOCKER_OS:-Ubuntu 22.04.4 LTS}" "$runtimes" \
+			"${FAKE_DOCKER_ROOT:-/var/lib/docker}" "${FAKE_DOCKER_SECURITY:-[name=apparmor name=seccomp,profile=builtin name=cgroupns]}"
+		;;
 	*) echo "Server Version: 28.5.1" ;;
 	esac
 	;;
@@ -163,6 +168,16 @@ run)
 	nocdi)
 		# Docker 28 之后经 CDI 实现 --gpus，没有 NVIDIA Container Toolkit 时的报错
 		echo 'docker: Error response from daemon: failed to discover GPU vendor from CDI: no known GPU vendor found' >&2
+		exit 125
+		;;
+	amdcdi)
+		# Docker 29.5 起：安装了 Toolkit（有 NVIDIA 的 CDI 配置）但没有重启 Docker 时的报错；
+		# nvidia-ctk runtime configure 之后（state/toolkit）视为已重启
+		if [ -e "$state/toolkit" ]; then
+			echo "GPU 0: NVIDIA GeForce RTX 4090 (UUID: GPU-00000000)"
+			exit 0
+		fi
+		echo 'docker: Error response from daemon: AMD CDI spec not found' >&2
 		exit 125
 		;;
 	mismatch)
@@ -206,6 +221,9 @@ touch "$FAKE_STATE/toolkit"
 EOF
 fake "$BIN/systemctl" <<'EOF'
 log "systemctl $*"
+EOF
+fake "$BIN/service" <<'EOF'
+log "service $*"
 EOF
 fake "$WORK/net/curl" <<'EOF'
 log "curl $*"
@@ -268,11 +286,13 @@ cp "$WORK/hook/nvidia-container-runtime-hook" "$WORK/net/curl" "$WORK/net/gpg" "
 
 GPU_4090="NVIDIA GeForce RTX 4090|550.54.15|8.9|24564"
 
-# new_case <名称>：新的空目录与默认设置（一块 RTX 4090、驱动 550、Docker 正常但没有 NVIDIA Container Toolkit）
+# new_case <名称>：新的空目录与默认设置（一块 RTX 4090、驱动 550、Docker 正常但没有 NVIDIA Container Toolkit，
+# systemd 正在运行，不是 WSL）
 new_case() {
 	CASE_NAME="$1"
 	CASE="$WORK/cases/$(printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '_')"
-	mkdir -p "$CASE/state" "$CASE/tmp" "$CASE/sys/bus/pci/devices" "$CASE/cdi"
+	mkdir -p "$CASE/state" "$CASE/tmp" "$CASE/sys/bus/pci/devices" "$CASE/cdi" "$CASE/run-systemd"
+	echo "6.8.0-45-generic" >"$CASE/osrelease"
 	ENV="$CASE/.env"
 	local v
 	for v in $(compgen -v FAKE_); do unset "$v"; done
@@ -301,6 +321,7 @@ run_setup() {
 		PATH="${EXTRA_PATH:+$EXTRA_PATH:}$CASE/installed:$FAKEBIN:$SYS" HOME="$CASE" TMPDIR="$CASE/tmp" LANG=C.UTF-8 \
 		TM_NVIDIA_SMI="$SMI" TM_DOCKER="$BIN/docker" TM_SYSFS_ROOT="$CASE/sys" \
 		TM_CDI_SPECS="$CASE/cdi/nvidia.yaml" TM_MACHINE=x86_64 TM_DOCKER_WAIT=2 \
+		TM_SYSTEMD_DIR="$CASE/run-systemd" TM_OSRELEASE_FILE="$CASE/osrelease" \
 		"${vars[@]}" ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
 		"$BASH" "$SCRIPT" --env-file "$ENV" "$@" 2>&1 <"$STDIN_FILE")" || RC=$?
 	if [ -n "${VERBOSE:-}" ]; then
@@ -396,8 +417,13 @@ $(cat "$FAKE_LOG")"
 
 # with_toolkit：已安装 NVIDIA Container Toolkit 并配置了 Docker
 with_toolkit() {
-	cp "$WORK/pkgs/nvidia-ctk" "$WORK/pkgs/nvidia-container-runtime-hook" "$CASE/installed/"
+	toolkit_installed_only
 	touch "$FAKE_STATE/toolkit"
+}
+
+# toolkit_installed_only：已安装 NVIDIA Container Toolkit，但还没有配置或重启 Docker
+toolkit_installed_only() {
+	cp "$WORK/pkgs/nvidia-ctk" "$WORK/pkgs/nvidia-container-runtime-hook" "$CASE/installed/"
 }
 
 # expect_out_order <子串…>：输出中各项的先后顺序（安装命令在执行前逐条打印为“+ 命令”）
@@ -443,9 +469,10 @@ expect_out "TM_NODE_TOKEN=${token:0:4}…（32 个字符）"
 # 键都在 .env.example 中，原地替换，不追加标题；其它内容与 .env.example 逐行一致
 checks=$((checks + 1))
 grep -qF -- "由 make setup / deploy/scripts/setup-compute.sh 写入" "$ENV" && fail "不应追加标题"
+expect_env TM_HOST_HOSTNAME gpu-host-01
 expect_same "除写入的键外与 .env.example 相同" \
-	"$(grep -vE '^(COMPOSE_PROFILES|TM_TORCH_VARIANT|TM_NODE_NAME|TM_NODE_TOKEN)=' "$REPO/.env.example")" \
-	"$(grep -vE '^(COMPOSE_PROFILES|TM_TORCH_VARIANT|TM_NODE_NAME|TM_NODE_TOKEN)=' "$ENV")"
+	"$(grep -vE '^(COMPOSE_PROFILES|TM_TORCH_VARIANT|TM_NODE_NAME|TM_HOST_HOSTNAME|TM_NODE_TOKEN)=' "$REPO/.env.example")" \
+	"$(grep -vE '^(COMPOSE_PROFILES|TM_TORCH_VARIANT|TM_NODE_NAME|TM_HOST_HOSTNAME|TM_NODE_TOKEN)=' "$ENV")"
 expect_same "行数不变" "$(wc -l <"$REPO/.env.example")" "$(wc -l <"$ENV")"
 
 # 再运行一次：.env 不变，令牌不重新生成
@@ -498,15 +525,76 @@ expect_out "Docker GPU 支持：不可用（docker: Error response from daemon: 
 expect_out "make setup SETUP_ARGS=--install-toolkit"
 expect_env COMPOSE_PROFILES cpu
 
-# 已安装 NVIDIA Container Toolkit，但没有配置或重启 Docker
+# 已安装 NVIDIA Container Toolkit，但没有配置或重启 Docker：只提示配置与重启，不再提示安装软件包
 new_case "toolkit installed but docker not configured"
-cp "$WORK/pkgs/nvidia-ctk" "$WORK/pkgs/nvidia-container-runtime-hook" "$CASE/installed/"
+toolkit_installed_only
 run_setup
 expect_rc 0
 expect_out "已安装 NVIDIA Container Toolkit，但 Docker 还没有配置或重启"
+expect_out "已安装 NVIDIA Container Toolkit，还需要配置并重启 Docker"
 expect_out "sudo nvidia-ctk runtime configure --runtime=docker"
+expect_out "sudo systemctl restart docker"
+expect_out "改用 GPU：配置并重启 Docker：make setup SETUP_ARGS=--install-toolkit"
+expect_no_out "apt-get install -y nvidia-container-toolkit"
 expect_env COMPOSE_PROFILES cpu
 expect_no_log "nvidia-ctk"
+# --install-toolkit：只配置并重启 Docker（不安装软件包），然后改用 GPU
+run_setup --install-toolkit --yes
+expect_rc 0
+expect_out "将执行以下命令配置 Docker 使用已安装的 NVIDIA Container Toolkit"
+expect_log_order "sudo nvidia-ctk runtime configure --runtime=docker" "sudo systemctl restart docker"
+expect_no_log "apt-get"
+expect_no_log "curl"
+expect_env COMPOSE_PROFILES gpu
+expect_env TM_TORCH_VARIANT cu126
+
+# Docker 29.5 起：安装 Toolkit 后没有重启 Docker 时报 AMD CDI spec not found，同样识别为“需要配置并重启”
+new_case "toolkit installed docker 29 amd cdi"
+toolkit_installed_only
+echo "cdiVersion: 0.5.0" >"$CASE/cdi/nvidia.yaml"
+FAKE_DOCKER_GPU=amdcdi
+run_setup
+expect_rc 0
+expect_out "Docker GPU 支持：不可用（docker: Error response from daemon: AMD CDI spec not found）"
+expect_out "已安装 NVIDIA Container Toolkit，但 Docker 还没有配置或重启"
+expect_out "重启 Docker 后即可使用显卡"
+expect_out "make setup SETUP_ARGS=--install-toolkit"
+expect_no_out "验证失败"
+expect_env COMPOSE_PROFILES cpu
+run_setup --install-toolkit --yes
+expect_rc 0
+expect_no_out "原因不是缺少 NVIDIA Container Toolkit"
+expect_log_order "sudo nvidia-ctk runtime configure --runtime=docker" "sudo systemctl restart docker"
+expect_no_log "apt-get"
+expect_out "Docker GPU 支持：正常"
+expect_env COMPOSE_PROFILES gpu
+
+# Docker 已经能使用显卡时 --install-toolkit 什么也不做，正常完成
+new_case "install toolkit not needed"
+with_toolkit
+run_setup --install-toolkit --yes
+expect_rc 0
+expect_out "Docker 已经可以使用显卡，不需要安装或配置 NVIDIA Container Toolkit"
+expect_no_log "apt-get"
+expect_no_log "nvidia-ctk"
+expect_no_log "systemctl"
+expect_env COMPOSE_PROFILES gpu
+# 没有显卡时同样不做任何事
+new_case "install toolkit without gpu"
+SMI="nvidia-smi-not-installed"
+run_setup --install-toolkit --yes
+expect_rc 0
+expect_out "没有可用的 NVIDIA 显卡与驱动，不安装 NVIDIA Container Toolkit"
+expect_no_log "apt-get"
+expect_env COMPOSE_PROFILES cpu
+# 驱动过旧（只能用 CPU 版 PyTorch）时不安装
+new_case "install toolkit old driver"
+FAKE_GPUS="Tesla T4|418.226.00|7.5|15109"
+run_setup --install-toolkit --yes
+expect_rc 0
+expect_out "驱动不能使用 CUDA 版的 PyTorch"
+expect_no_log "apt-get"
+expect_env COMPOSE_PROFILES cpu
 
 # 安装 NVIDIA Container Toolkit（apt，非 root 用 sudo，--yes）：按官方步骤执行后重新验证，改用 GPU
 new_case "install toolkit apt"
@@ -792,6 +880,7 @@ TZ=UTC
 
 # ---- 计算节点（由 make setup / deploy/scripts/setup-compute.sh 写入，见 docs/deployment.md）----
 TM_NODE_NAME=gpu-host-01
+TM_HOST_HOSTNAME=gpu-host-01
 TM_SERVER_URL=http://10.0.0.5:8080
 TM_NODE_TOKEN=abcdefghijklmnop.1234" "$(cat "$ENV")"
 expect_same "权限保持 600" 600 "$(stat -c %a "$ENV" 2>/dev/null || stat -f %Lp "$ENV")"
@@ -799,6 +888,7 @@ expect_out "TM_TORCH_VARIANT=cu126（原为 cpu）"
 expect_out "COMPOSE_PROFILES=monitoring,debug,gpu（原为 monitoring, cpu ,debug）"
 expect_out "TM_SERVER_URL=http://10.0.0.5:8080（新增）"
 expect_no_out "abcdefghijklmnop.1234"
+expect_no_out "使用了本机的主机名"
 expect_out "docker compose up -d --build trainer"
 # 幂等：再运行一次不改变任何内容（包括没有再追加标题）
 before="$(cat "$ENV")"
@@ -1081,14 +1171,83 @@ FAKE_DOCKER_GPU=ok
 run_setup
 expect_env COMPOSE_PROFILES gpu
 
-# 无法连接 Docker / 没有安装 Docker
+# 无法连接 Docker（如当前用户不在 docker 组）：无从判断，.env 中还没有训练节点配置时什么也不写，退出码 1
 new_case "docker permission denied"
 FAKE_DOCKER_INFO=denied
 run_setup
-expect_rc 0
+expect_rc 1
 expect_out "无法连接 Docker 守护进程"
 expect_out "usermod -aG docker"
+expect_out "无法连接 Docker，无法判断训练节点能否使用显卡，没有写入 .env"
+expect_no_out "训练节点：CPU"
+checks=$((checks + 1))
+[ ! -e "$ENV" ] || fail "无法连接 Docker 时不应创建 .env"
+# 已有 .env、但还没有训练节点配置：同样不修改
+printf 'TM_DB_PASSWORD=secret\nCOMPOSE_PROFILES=\n' >"$ENV"
+before="$(cat "$ENV")"
+run_setup --server-url http://10.0.0.5:8080 --token abcdefghijklmnop.1234
+expect_rc 1
+expect_same "无法连接 Docker 时 .env 不变" "$before" "$(cat "$ENV")"
+# 强制模式不需要 Docker 的检查结果
+run_setup --mode cpu
+expect_rc 0
 expect_env COMPOSE_PROFILES cpu
+
+# 无法连接 Docker、.env 中原来是 GPU：沿用，不改成 CPU，也不删除容器
+new_case "docker unreachable keeps gpu"
+FAKE_DOCKER_INFO=denied
+printf 'COMPOSE_PROFILES=gpu\nTM_TORCH_VARIANT=cu126\n' >"$ENV"
+touch "$FAKE_STATE/container-trainer"
+run_setup
+expect_rc 0
+expect_env COMPOSE_PROFILES gpu
+expect_env TM_TORCH_VARIANT cu126
+expect_out "训练节点：GPU（trainer 服务，PyTorch 变体 cu126）"
+expect_out "沿用 .env 中原来的设置"
+expect_no_out "改用 GPU"
+expect_no_log "docker compose"
+# 驱动升级后推荐的变体变了：变体不依赖 Docker，照常更新
+FAKE_GPUS="NVIDIA GeForce RTX 4090|580.65.06|8.9|24564"
+run_setup
+expect_rc 0
+expect_env COMPOSE_PROFILES gpu
+expect_env TM_TORCH_VARIANT cu130
+
+# dockerd 没有运行、.env 中原来是 CPU：沿用 CPU
+new_case "docker unreachable keeps cpu"
+FAKE_DOCKER_INFO=down
+printf 'COMPOSE_PROFILES=monitoring,cpu\nTM_TORCH_VARIANT=cpu\n' >"$ENV"
+run_setup
+expect_rc 0
+expect_env COMPOSE_PROFILES monitoring,cpu
+expect_env TM_TORCH_VARIANT cpu
+expect_out "沿用 .env 中原来的设置"
+expect_out "改用 GPU：解决 Docker 的连接问题后，重新运行 make setup"
+
+# 没有显卡时与 Docker 无关：照常选择 CPU
+new_case "docker unreachable without gpu"
+FAKE_DOCKER_INFO=denied
+SMI="nvidia-smi-not-installed"
+run_setup
+expect_rc 0
+expect_env COMPOSE_PROFILES cpu
+expect_out "未检测到 NVIDIA 显卡"
+
+# 驱动更新后还没有重启（版本不匹配）、.env 中原来是 GPU：沿用 GPU 配置，不删除仍在运行的 GPU 训练节点
+new_case "nvml mismatch keeps gpu"
+FAKE_SMI_MODE=mismatch
+printf 'COMPOSE_PROFILES=gpu\nTM_TORCH_VARIANT=cu126\n' >"$ENV"
+touch "$FAKE_STATE/container-trainer"
+run_setup
+expect_rc 0
+expect_env COMPOSE_PROFILES gpu
+expect_env TM_TORCH_VARIANT cu126
+expect_out "沿用 .env 中原来的 GPU 设置"
+expect_out "重启机器"
+expect_no_out "按驱动与显卡无法选择 CUDA 版的 PyTorch"
+expect_no_log "docker compose"
+checks=$((checks + 1))
+[ -e "$FAKE_STATE/container-trainer" ] || fail "不应删除 GPU 训练节点的容器"
 
 new_case "docker missing"
 EXTRA_ENV=(TM_DOCKER=docker-not-installed)
@@ -1132,13 +1291,141 @@ expect_out "环境变量 COMPOSE_PROFILES 已设置为“cpu”"
 expect_out "环境变量 TM_NODE_TOKEN 已设置为“shel…（22 个字符）”"
 expect_no_out "shell-token-0123456789"
 
-# make up 调用时提示接下来的步骤
+# make up 调用时提示接下来的步骤：先启动平台，再启动训练节点
 new_case "called from make up"
 with_toolkit
 EXTRA_ENV=(TM_SETUP_CALLER=up)
 run_setup
-expect_out "接下来构建并启动服务"
+expect_out "接下来先构建并启动平台（postgres 与 app），再构建并启动训练节点（trainer）"
 expect_no_out "下一步："
+run_setup --mode off
+expect_out "接下来构建并启动平台（postgres 与 app）…"
+
+# TM_HOST_HOSTNAME（app 与训练节点容器的主机名）每次写入本机当前的主机名；TM_NODE_NAME 已有时不变
+new_case "host hostname"
+with_toolkit
+printf 'TM_NODE_NAME=my-node\nTM_HOST_HOSTNAME=old-name\n' >"$ENV"
+FAKE_HOSTNAME=renamed-host
+run_setup
+expect_rc 0
+expect_env TM_HOST_HOSTNAME renamed-host
+expect_env TM_NODE_NAME my-node
+expect_out "TM_HOST_HOSTNAME=renamed-host（原为 old-name）"
+# 关闭训练节点时也写入（app 使用它）
+run_setup --mode off
+FAKE_HOSTNAME=third-name
+run_setup
+expect_env TM_HOST_HOSTNAME third-name
+
+# TM_SERVER_URL 使用本机的主机名：在训练节点容器中它指向容器自己，提醒改用 http://app:8080 或 IP
+new_case "server url is own hostname"
+with_toolkit
+run_setup --server-url http://GPU-Host-01:8080 --token abcdefghijklmnop.1234
+expect_rc 0
+expect_out "使用了本机的主机名"
+run_setup --server-url http://admin@gpu-host-01/trainmaster --token abcdefghijklmnop.1234
+expect_out "使用了本机的主机名"
+run_setup --server-url http://gpu-host-02:8080 --token abcdefghijklmnop.1234
+expect_no_out "使用了本机的主机名"
+
+# snap 版 Docker：不读取 /etc/docker/daemon.json，也没有 docker.service，只打印手动步骤
+new_case "install toolkit snap docker"
+FAKE_DOCKER_ROOT=/var/snap/docker/common/var-lib-docker
+run_setup --install-toolkit --yes
+expect_rc 0
+expect_out "这台机器的 Docker 是 snap 版"
+expect_out "sudo apt-get install -y nvidia-container-toolkit"
+expect_out "sudo snap restart docker"
+expect_out "改用 GPU：按上面的步骤手动安装并配置 NVIDIA Container Toolkit 后，重新运行 make setup"
+expect_no_out "sudo nvidia-ctk runtime configure --runtime=docker"
+expect_no_out "sudo systemctl restart docker"
+expect_no_log "apt-get"
+expect_no_log "nvidia-ctk"
+expect_no_log "systemctl"
+expect_no_log "sudo"
+expect_env COMPOSE_PROFILES cpu
+# 不加 --install-toolkit 时同样只给出手动步骤，不建议自动安装
+run_setup
+expect_out "这台机器的 Docker 是 snap 版"
+expect_no_out "自动安装（需要 root 或 sudo"
+
+# rootless Docker：配置写到当前用户的 daemon.json，用 systemctl --user 重启
+new_case "install toolkit rootless docker"
+FAKE_DOCKER_SECURITY="[name=seccomp,profile=builtin name=rootless name=cgroupns]"
+run_setup --install-toolkit --yes
+expect_rc 0
+expect_out "以 rootless 模式运行"
+expect_out "sudo apt-get install -y nvidia-container-toolkit"
+expect_out 'nvidia-ctk runtime configure --runtime=docker --config=$HOME/.config/docker/daemon.json'
+expect_out "systemctl --user restart docker"
+expect_out "sudo nvidia-ctk config --set nvidia-container-cli.no-cgroups --in-place"
+expect_no_log "apt-get"
+expect_no_log "nvidia-ctk"
+expect_no_log "systemctl"
+expect_env COMPOSE_PROFILES cpu
+# 已安装 Toolkit 时不再列出安装软件包的命令
+new_case "rootless docker toolkit installed"
+toolkit_installed_only
+FAKE_DOCKER_SECURITY="[name=seccomp,profile=builtin name=rootless name=cgroupns]"
+run_setup --install-toolkit --yes
+expect_rc 0
+expect_no_out "apt-get install -y nvidia-container-toolkit"
+expect_out "systemctl --user restart docker"
+expect_no_log "nvidia-ctk"
+
+# 没有运行 systemd 的 WSL：不执行，给出手动步骤与启用 systemd 的方法
+new_case "install toolkit wsl without systemd"
+echo "5.15.153.1-microsoft-standard-WSL2" >"$CASE/osrelease"
+rmdir "$CASE/run-systemd"
+run_setup --install-toolkit --yes
+expect_rc 0
+expect_out "这台 WSL 中没有运行 systemd"
+expect_out "sudo nvidia-ctk runtime configure --runtime=docker"
+expect_out "sudo service docker restart"
+expect_out "/etc/wsl.conf"
+expect_out "wsl --shutdown"
+expect_no_log "apt-get"
+expect_no_log "nvidia-ctk"
+expect_no_log "systemctl"
+expect_no_log "service"
+expect_env COMPOSE_PROFILES cpu
+
+# 启用了 systemd 的 WSL：与普通 Linux 相同
+new_case "install toolkit wsl with systemd"
+echo "5.15.153.1-microsoft-standard-WSL2" >"$CASE/osrelease"
+run_setup --install-toolkit --yes
+expect_rc 0
+expect_log_order "sudo apt-get install -y nvidia-container-toolkit" "sudo nvidia-ctk runtime configure --runtime=docker" "sudo systemctl restart docker"
+expect_env COMPOSE_PROFILES gpu
+
+# 没有运行 systemd 的 Linux（有 systemctl 命令也不用）：用 service 重启 Docker
+new_case "install toolkit without systemd"
+rmdir "$CASE/run-systemd"
+run_setup --install-toolkit --yes
+expect_rc 0
+expect_log_order "sudo nvidia-ctk runtime configure --runtime=docker" "sudo service docker restart"
+expect_no_log "systemctl"
+expect_env COMPOSE_PROFILES gpu
+# 没有安装 Toolkit 时的提示也用 service
+new_case "toolkit hint without systemd"
+rmdir "$CASE/run-systemd"
+run_setup
+expect_out "sudo service docker restart"
+expect_no_out "systemctl"
+
+# 既没有 systemd 也没有 service：安装后提醒手动重启 Docker
+new_case "install toolkit without service manager"
+rmdir "$CASE/run-systemd"
+mkdir -p "$CASE/nosvc"
+for f in "$BIN"/*; do
+	case "$(basename "$f")" in systemctl | service) ;; *) ln -s "$f" "$CASE/nosvc/" ;; esac
+done
+FAKEBIN="$CASE/nosvc"
+run_setup
+expect_out "然后重启 Docker"
+run_setup --install-toolkit --yes
+expect_rc 0
+expect_out "找不到 systemctl / service，请手动重启 Docker"
 
 # 没有 .env.example 时新建 .env
 new_case "no env example"
