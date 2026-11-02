@@ -368,13 +368,19 @@ func sortedLabels(counts map[string]int) []LabelCount {
 	return out
 }
 
-func queryImages(ctx context.Context, q querier, datasetID int64, f ImageQuery) ([]Image, int, error) {
-	where := "dataset_id = $1"
-	args := []any{datasetID}
-	arg := func(v any) string {
-		args = append(args, v)
-		return fmt.Sprintf("$%d", len(args))
-	}
+// sqlArgs collects the positional arguments of a query being built.
+type sqlArgs []any
+
+// add appends v and returns its placeholder.
+func (a *sqlArgs) add(v any) string {
+	*a = append(*a, v)
+	return fmt.Sprintf("$%d", len(*a))
+}
+
+// imageFilter returns the WHERE condition selecting a dataset's images
+// that match the filters of f (not its offset and limit).
+func imageFilter(datasetID int64, f ImageQuery, args *sqlArgs) string {
+	where := "dataset_id = " + args.add(datasetID)
 	switch f.Status {
 	case FilterAnnotated:
 		where += " AND annotation_state = 'annotated'"
@@ -386,24 +392,76 @@ func queryImages(ctx context.Context, q querier, datasetID int64, f ImageQuery) 
 		where += " AND annotation_state = 'none'"
 	}
 	if f.Label != "" {
-		where += " AND label_counts ? " + arg(f.Label)
+		where += " AND label_counts ? " + args.add(f.Label)
 	}
 	if f.Search != "" {
-		where += " AND strpos(lower(rel_path), lower(" + arg(f.Search) + ")) > 0"
+		where += " AND strpos(lower(rel_path), lower(" + args.add(f.Search) + ")) > 0"
 	}
+	return where
+}
+
+func queryImages(ctx context.Context, q querier, datasetID int64, f ImageQuery) ([]Image, int, error) {
+	var args sqlArgs
+	where := imageFilter(datasetID, f, &args)
 
 	var total int
 	if err := q.QueryRow(ctx, "SELECT count(*) FROM dataset_images WHERE "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	sql := "SELECT " + imageColumns + " FROM dataset_images WHERE " + where +
-		" ORDER BY " + ImageOrder + " LIMIT " + arg(f.Limit) + " OFFSET " + arg(f.Offset)
+		" ORDER BY " + ImageOrder + " LIMIT " + args.add(f.Limit) + " OFFSET " + args.add(f.Offset)
 	rows, err := q.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, 0, err
 	}
 	images, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Image, error) { return scanImage(row) })
 	return images, total, err
+}
+
+// queryNeighbors locates an image among the images matching f (see
+// ImageNeighbors), comparing positions by (sort_key, id) like ImageOrder.
+func queryNeighbors(ctx context.Context, q querier, datasetID, imageID int64, f ImageQuery) (ImageNeighbors, error) {
+	var n ImageNeighbors
+	var key []byte
+	err := q.QueryRow(ctx, "SELECT sort_key FROM dataset_images WHERE id = $1 AND dataset_id = $2",
+		imageID, datasetID).Scan(&key)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return n, errImageNotFound
+	}
+	if err != nil {
+		return n, err
+	}
+	// Every image has a key once the service has started (Start computes
+	// the missing ones before requests are served), so the row comparisons
+	// below can use the index on (dataset_id, sort_key, id).
+	var args sqlArgs
+	where := imageFilter(datasetID, f, &args)
+	k, id := args.add(key), args.add(imageID)
+	before := "(sort_key, id) < (" + k + "::bytea, " + id + "::bigint)"
+	after := "(sort_key, id) > (" + k + "::bytea, " + id + "::bigint)"
+	err = q.QueryRow(ctx, `SELECT count(*) FILTER (WHERE `+before+`), coalesce(bool_or(id = `+id+`::bigint), false), count(*)
+		FROM dataset_images WHERE `+where, args...).Scan(&n.Position, &n.Matches, &n.Total)
+	if err != nil {
+		return n, err
+	}
+	neighbor := func(cond, order string) (*Image, error) {
+		img, err := scanImage(q.QueryRow(ctx, "SELECT "+imageColumns+" FROM dataset_images WHERE "+where+
+			" AND "+cond+" ORDER BY "+order+" LIMIT 1", args...))
+		if errors.Is(err, errImageNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &img, nil
+	}
+	if n.Prev, err = neighbor(before, "sort_key DESC, id DESC"); err != nil {
+		return n, err
+	}
+	if n.Next, err = neighbor(after, ImageOrder); err != nil {
+		return n, err
+	}
+	return n, nil
 }
 
 func queryImage(ctx context.Context, q querier, datasetID, imageID int64) (Image, error) {

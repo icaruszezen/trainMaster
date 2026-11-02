@@ -1,26 +1,49 @@
+import { useState } from "react"
 import { Outlet, ScrollRestoration } from "react-router"
 
 import { AppSidebar } from "@/components/app-sidebar"
 import { SiteHeader } from "@/components/site-header"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
 import { UploadTray } from "@/features/datasets/upload-tray"
-import { useActiveNav, useIsNotFound } from "@/hooks/use-active-nav"
+import {
+  useActiveNav,
+  useIsFullBleed,
+  useIsNotFound,
+} from "@/hooks/use-active-nav"
 import { PageTitleProvider, useCurrentPageTitle } from "@/hooks/use-page-title"
+import { cn } from "@/lib/utils"
 
-// SidebarProvider 会把折叠状态写入该 cookie，这里读回来以便刷新后保持。
+// SidebarProvider 会把普通页面的折叠状态写入该 cookie，这里读回来以便刷新后保持。
 function isSidebarOpenByDefault() {
   return !document.cookie.split("; ").includes("sidebar_state=false")
 }
 
 export function AppLayout() {
+  const fullBleed = useIsFullBleed()
+  const [sidebarOpen, setSidebarOpen] = useState(isSidebarOpenByDefault)
+  // 标注工作台默认收起侧边栏，把宽度留给图片；离开后恢复原来的状态。在那里
+  // 展开 / 收起只是临时的，不写入 cookie，不影响普通页面刷新后的状态。
+  const [fullBleedOpen, setFullBleedOpen] = useState(false)
+
   return (
     <PageTitleProvider>
-      <SidebarProvider defaultOpen={isSidebarOpenByDefault()}>
+      <SidebarProvider
+        open={fullBleed ? fullBleedOpen : sidebarOpen}
+        onOpenChange={fullBleed ? setFullBleedOpen : setSidebarOpen}
+        persist={!fullBleed}
+      >
         <DocumentTitle />
         <AppSidebar />
-        <SidebarInset className="min-w-0">
+        <SidebarInset
+          className={cn("min-w-0", fullBleed && "h-svh overflow-hidden")}
+        >
           <SiteHeader />
-          <div className="flex flex-1 flex-col gap-6 p-4 md:p-6">
+          <div
+            className={cn(
+              "flex flex-1 flex-col",
+              fullBleed ? "min-h-0" : "gap-6 p-4 md:p-6"
+            )}
+          >
             <Outlet />
           </div>
         </SidebarInset>

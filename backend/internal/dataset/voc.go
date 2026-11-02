@@ -39,6 +39,10 @@ type vocAnnotation struct {
 	Width    int    // <size><width>, 0 when missing
 	Height   int
 	Objects  []AnnotationObject
+	// Unsupported counts the <object> elements that are not usable boxes:
+	// without a name or a numeric <bndbox> (such as polygons written by
+	// other tools). They are skipped, and kept when the file is edited.
+	Unsupported int
 }
 
 // labelCounts returns the number of objects per label.
@@ -60,29 +64,47 @@ type vocXML struct {
 		Width  string `xml:"width"`
 		Height string `xml:"height"`
 	} `xml:"size"`
-	Objects []struct {
-		Name      string `xml:"name"`
-		Difficult string `xml:"difficult"`
-		Truncated string `xml:"truncated"`
-		BndBox    *struct {
-			Xmin string `xml:"xmin"`
-			Ymin string `xml:"ymin"`
-			Xmax string `xml:"xmax"`
-			Ymax string `xml:"ymax"`
-		} `xml:"bndbox"`
-	} `xml:"object"`
+	Objects []vocObjectXML `xml:"object"`
 }
 
-// parseVOC parses a Pascal VOC annotation (spec §4.5). It returns an error
-// for malformed XML and for any root element other than <annotation>.
-// Objects without a name or without a numeric bounding box are skipped.
-// Encodings other than UTF-8 (GBK, GB18030, Big5, UTF-16, ...) are decoded
-// as declared, which matters for files written by Chinese Windows tools.
-func parseVOC(r io.Reader) (*vocAnnotation, error) {
-	// A longer file is cut off and then fails to parse.
-	br := bufio.NewReader(io.LimitReader(r, maxAnnotationBytes))
-	src, transcoded := utf16ToUTF8(br)
+type vocObjectXML struct {
+	Name      string `xml:"name"`
+	Difficult string `xml:"difficult"`
+	Truncated string `xml:"truncated"`
+	BndBox    *struct {
+		Xmin string `xml:"xmin"`
+		Ymin string `xml:"ymin"`
+		Xmax string `xml:"xmax"`
+		Ymax string `xml:"ymax"`
+	} `xml:"bndbox"`
+}
 
+// object converts an <object> element; ok is false when it has no name or
+// no numeric bounding box. Coordinates are rounded to whole pixels.
+func (o vocObjectXML) object() (obj AnnotationObject, ok bool) {
+	name := strings.TrimSpace(o.Name)
+	if name == "" || o.BndBox == nil {
+		return obj, false
+	}
+	var box [4]int
+	for i, s := range []string{o.BndBox.Xmin, o.BndBox.Ymin, o.BndBox.Xmax, o.BndBox.Ymax} {
+		f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || math.Abs(f) > math.MaxInt32 {
+			return obj, false
+		}
+		box[i] = int(math.Round(f))
+	}
+	return AnnotationObject{
+		Name: name, Xmin: box[0], Ymin: box[1], Xmax: box[2], Ymax: box[3],
+		Difficult: flag(o.Difficult), Truncated: flag(o.Truncated),
+	}, true
+}
+
+// newVOCDecoder returns a decoder for a VOC file in any of the encodings
+// parseVOC accepts.
+func newVOCDecoder(r io.Reader) *xml.Decoder {
+	br := bufio.NewReader(r)
+	src, transcoded := utf16ToUTF8(br)
 	dec := xml.NewDecoder(src)
 	dec.CharsetReader = func(label string, input io.Reader) (io.Reader, error) {
 		if transcoded {
@@ -94,6 +116,17 @@ func parseVOC(r io.Reader) (*vocAnnotation, error) {
 		}
 		return transform.NewReader(input, enc.NewDecoder()), nil
 	}
+	return dec
+}
+
+// parseVOC parses a Pascal VOC annotation (spec §4.5). It returns an error
+// for malformed XML and for any root element other than <annotation>.
+// Objects without a name or without a numeric bounding box are skipped.
+// Encodings other than UTF-8 (GBK, GB18030, Big5, UTF-16, ...) are decoded
+// as declared, which matters for files written by Chinese Windows tools.
+func parseVOC(r io.Reader) (*vocAnnotation, error) {
+	// A longer file is cut off and then fails to parse.
+	dec := newVOCDecoder(io.LimitReader(r, maxAnnotationBytes))
 
 	// Check the root element first so other XML files (e.g. config files
 	// in the same folder) are reported as "not VOC" rather than decoded.
@@ -124,27 +157,11 @@ func parseVOC(r io.Reader) (*vocAnnotation, error) {
 		a.Filename = ""
 	}
 	for _, o := range doc.Objects {
-		name := strings.TrimSpace(o.Name)
-		if name == "" || o.BndBox == nil {
-			continue
+		if obj, ok := o.object(); ok {
+			a.Objects = append(a.Objects, obj)
+		} else {
+			a.Unsupported++
 		}
-		var box [4]int
-		valid := true
-		for i, s := range []string{o.BndBox.Xmin, o.BndBox.Ymin, o.BndBox.Xmax, o.BndBox.Ymax} {
-			f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || math.Abs(f) > math.MaxInt32 {
-				valid = false
-				break
-			}
-			box[i] = int(math.Round(f))
-		}
-		if !valid {
-			continue
-		}
-		a.Objects = append(a.Objects, AnnotationObject{
-			Name: name, Xmin: box[0], Ymin: box[1], Xmax: box[2], Ymax: box[3],
-			Difficult: flag(o.Difficult), Truncated: flag(o.Truncated),
-		})
 	}
 	return a, nil
 }

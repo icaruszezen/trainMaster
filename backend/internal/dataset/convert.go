@@ -613,31 +613,44 @@ func writeStagedVOC(root *os.Root, rel, filename string, info imageInfo, objects
 // folder is the name of the image's folder ("." for the top level).
 func writeVOC(w io.Writer, folder, filename string, info imageInfo, objects []AnnotationObject) error {
 	var b bytes.Buffer
-	text := func(s string) string {
-		var t bytes.Buffer
-		_ = xml.EscapeText(&t, []byte(s))
-		return t.String()
-	}
 	b.WriteString("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<annotation>\n")
 	if folder != "." && folder != "" {
-		fmt.Fprintf(&b, "\t<folder>%s</folder>\n", text(folder))
+		fmt.Fprintf(&b, "\t<folder>%s</folder>\n", xmlText(folder))
 	}
-	fmt.Fprintf(&b, "\t<filename>%s</filename>\n", text(filename))
+	fmt.Fprintf(&b, "\t<filename>%s</filename>\n", xmlText(filename))
 	b.WriteString("\t<source>\n\t\t<database>Unknown</database>\n\t</source>\n")
 	if info.Width > 0 && info.Height > 0 {
-		fmt.Fprintf(&b, "\t<size>\n\t\t<width>%d</width>\n\t\t<height>%d</height>\n\t\t<depth>%d</depth>\n\t</size>\n",
-			info.Width, info.Height, max(info.Depth, 1))
+		b.WriteString("\t" + vocSizeText(info) + "\n")
 	}
 	b.WriteString("\t<segmented>0</segmented>\n")
 	for _, o := range objects {
-		fmt.Fprintf(&b, "\t<object>\n\t\t<name>%s</name>\n\t\t<pose>Unspecified</pose>\n"+
-			"\t\t<truncated>%d</truncated>\n\t\t<difficult>%d</difficult>\n"+
-			"\t\t<bndbox>\n\t\t\t<xmin>%d</xmin>\n\t\t\t<ymin>%d</ymin>\n\t\t\t<xmax>%d</xmax>\n\t\t\t<ymax>%d</ymax>\n\t\t</bndbox>\n\t</object>\n",
-			text(o.Name), boolInt(o.Truncated), boolInt(o.Difficult), o.Xmin, o.Ymin, o.Xmax, o.Ymax)
+		b.WriteString("\t" + vocObjectText(o) + "\n")
 	}
 	b.WriteString("</annotation>\n")
 	_, err := w.Write(b.Bytes())
 	return err
+}
+
+func xmlText(s string) string {
+	var t bytes.Buffer
+	_ = xml.EscapeText(&t, []byte(s))
+	return t.String()
+}
+
+// vocSizeText is a <size> element at the first level of a VOC file (without
+// the leading indentation and the final newline).
+func vocSizeText(info imageInfo) string {
+	return fmt.Sprintf("<size>\n\t\t<width>%d</width>\n\t\t<height>%d</height>\n\t\t<depth>%d</depth>\n\t</size>",
+		info.Width, info.Height, max(info.Depth, 1))
+}
+
+// vocObjectText is an <object> element at the first level of a VOC file
+// (without the leading indentation and the final newline).
+func vocObjectText(o AnnotationObject) string {
+	return fmt.Sprintf("<object>\n\t\t<name>%s</name>\n\t\t<pose>Unspecified</pose>\n"+
+		"\t\t<truncated>%d</truncated>\n\t\t<difficult>%d</difficult>\n"+
+		"\t\t<bndbox>\n\t\t\t<xmin>%d</xmin>\n\t\t\t<ymin>%d</ymin>\n\t\t\t<xmax>%d</xmax>\n\t\t\t<ymax>%d</ymax>\n\t\t</bndbox>\n\t</object>",
+		xmlText(o.Name), boolInt(o.Truncated), boolInt(o.Difficult), o.Xmin, o.Ymin, o.Xmax, o.Ymax)
 }
 
 func boolInt(b bool) int {

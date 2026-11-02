@@ -108,7 +108,45 @@ export type DatasetImageDetail = DatasetImage & {
    * 无法读取标注时的中文说明（xml 无法解析、已不存在等），否则为 `""`。
    */
   annotation_error: string
+  /**
+   * 标注文件内容的版本（没有文件时为 `""`）。保存时作为 `base_version`
+   * 提交，文件在此期间被他人修改时保存失败（409 `annotation_conflict`）。
+   */
+  annotation_version: string
+  /**
+   * 标注文件中平台无法显示的目标数（不是矩形框，如多边形；或缺少类别、坐标）。
+   * 保存时这些目标原样保留。
+   */
+  annotation_unsupported: number
+  /**
+   * 不能在平台上保存这张图片标注的原因（如同名的另一张图片已经使用了这个
+   * 标注文件），否则为 `""`。
+   */
+  annotation_blocked: string
 }
+
+/**
+ * 按固定顺序（与图片列表相同）相邻的图片，在同样的筛选条件下计算。当前图片
+ * 不必满足筛选条件（如刚标注完的图片不再是“未标注”），`matches` 表示它是否满足。
+ */
+export type ImageNeighbors = {
+  prev: DatasetImage | null
+  next: DatasetImage | null
+  /** 排在当前图片之前、满足筛选条件的图片数（当前图片满足时即其下标）。 */
+  position: number
+  matches: boolean
+  /** 满足筛选条件的图片总数。 */
+  total: number
+}
+
+/** 数据集的类别列表（标注时可选的类别）。`color` 为 `#rrggbb`，`""` 表示按名称自动配色。 */
+export type DatasetClass = { name: string; color: string }
+
+/**
+ * 类别列表接口的响应。`version` 标识列表的内容（不透明的字符串，空列表也有），
+ * 整体替换时作为 `base_version` 带上，列表已被别人修改时返回 409 `conflict`。
+ */
+export type DatasetClassList = ListResponse<DatasetClass> & { version: string }
 
 export type DatasetLabel = {
   name: string
@@ -272,7 +310,10 @@ export const datasetKeys = {
     [...datasetKeys.detail(id), "images", filters] as const,
   image: (id: number, imageId: number) =>
     [...datasetKeys.detail(id), "image", imageId] as const,
+  neighbors: (id: number, imageId: number, filters: ImageFilters) =>
+    [...datasetKeys.image(id, imageId), "neighbors", filters] as const,
   labels: (id: number) => [...datasetKeys.detail(id), "labels"] as const,
+  classes: (id: number) => [...datasetKeys.detail(id), "classes"] as const,
   imports: (id: number) => [...datasetKeys.detail(id), "imports"] as const,
   lastYoloImport: (id: number) =>
     [...datasetKeys.imports(id), "last-yolo"] as const,
@@ -340,9 +381,7 @@ export function imagesQuery(id: number, filters: ImageFilters) {
         withQuery(`${datasetPath(id)}/images`, {
           offset: pageParam,
           limit: IMAGES_PAGE_SIZE,
-          status: filters.status === "all" ? "" : filters.status,
-          label: filters.label,
-          q: filters.q,
+          ...imageFilterParams(filters),
         }),
         { signal }
       ),
@@ -368,6 +407,34 @@ export function imageDetailQuery(id: number, imageId: number) {
   })
 }
 
+/** 图片筛选条件 → 查询参数（`status` 为 `all` 时省略）。 */
+export function imageFilterParams(filters: ImageFilters) {
+  return {
+    status: filters.status === "all" ? "" : filters.status,
+    label: filters.label,
+    q: filters.q,
+  }
+}
+
+export function imageNeighborsQuery(
+  id: number,
+  imageId: number,
+  filters: ImageFilters
+) {
+  return queryOptions({
+    queryKey: datasetKeys.neighbors(id, imageId, filters),
+    queryFn: ({ signal }) =>
+      apiGet<ImageNeighbors>(
+        withQuery(
+          `${datasetPath(id)}/images/${imageId}/neighbors`,
+          imageFilterParams(filters)
+        ),
+        { signal }
+      ),
+    placeholderData: keepPreviousData,
+  })
+}
+
 export function labelsQuery(id: number) {
   return queryOptions({
     queryKey: datasetKeys.labels(id),
@@ -375,6 +442,14 @@ export function labelsQuery(id: number) {
       apiGet<ListResponse<DatasetLabel>>(`${datasetPath(id)}/labels`, {
         signal,
       }),
+  })
+}
+
+export function classesQuery(id: number) {
+  return queryOptions({
+    queryKey: datasetKeys.classes(id),
+    queryFn: ({ signal }) =>
+      apiGet<DatasetClassList>(`${datasetPath(id)}/classes`, { signal }),
   })
 }
 
@@ -523,5 +598,87 @@ export function createExport(datasetId: number, input: CreateExportInput) {
     "POST",
     `${datasetPath(datasetId)}/exports`,
     input
+  )
+}
+
+/**
+ * 设置数据集的类别列表（整体替换），返回保存后的列表。`baseVersion` 是编辑
+ * 开始时列表的 `version`：列表在此之后被修改过时返回 409 `conflict`，不做任何
+ * 改动。
+ */
+export function setDatasetClasses(
+  id: number,
+  classes: DatasetClass[],
+  baseVersion: string
+) {
+  return apiSend<DatasetClassList>("PUT", `${datasetPath(id)}/classes`, {
+    classes,
+    base_version: baseVersion,
+  })
+}
+
+/**
+ * 在类别列表末尾加入一个类别（已有同名类别时列表不变），返回加入后的列表。
+ * 只追加，不会覆盖别人同时做的修改。
+ */
+export function addDatasetClass(id: number, name: string, color = "") {
+  return apiSend<DatasetClassList>("POST", `${datasetPath(id)}/classes`, {
+    name,
+    color,
+  })
+}
+
+export type SaveAnnotationInput = {
+  objects: AnnotationObject[]
+  /** 编辑开始时文件的版本（{@link DatasetImageDetail.annotation_version}）。 */
+  base_version: string
+  /** 不检查版本，直接覆盖（冲突时用户选择“覆盖”）。 */
+  force?: boolean
+  /**
+   * 文件无法在保留其它内容的情况下修改（`annotation_unpatchable`）时，按平台的
+   * 格式重新生成整个文件（用户选择“仍然保存”）。不带 force 时仍然检查版本。
+   */
+  regenerate?: boolean
+}
+
+/**
+ * 把图片的标注写入 VOC 文件（没有目标时写入空标注，即负样本），返回保存后
+ * 的图片详情（含新的 `annotation_version`）。
+ */
+export function saveAnnotation(
+  datasetId: number,
+  imageId: number,
+  input: SaveAnnotationInput,
+  init?: RequestInit
+) {
+  return apiSend<DatasetImageDetail>(
+    "PUT",
+    `${datasetPath(datasetId)}/images/${imageId}/annotation`,
+    input,
+    init
+  )
+}
+
+/**
+ * 删除图片的标注文件（图片变为“未标注”），返回删除后的图片详情。`init` 用于
+ * 关闭页面时的 `keepalive` 请求。
+ */
+export function deleteAnnotation(
+  datasetId: number,
+  imageId: number,
+  baseVersion: string,
+  force = false,
+  init?: RequestInit
+) {
+  // base_version 为空（没有文件）也要带上：它表示“我看到的是没有文件”。
+  const search = new URLSearchParams({ base_version: baseVersion })
+  if (force) {
+    search.set("force", "true")
+  }
+  return apiSend<DatasetImageDetail>(
+    "DELETE",
+    `${datasetPath(datasetId)}/images/${imageId}/annotation?${search}`,
+    undefined,
+    init
   )
 }

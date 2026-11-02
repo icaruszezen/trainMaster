@@ -17,17 +17,19 @@ import (
 
 // Error codes shared by all endpoints.
 const (
-	codeBadRequest           = "bad_request"            // 400: malformed request (JSON, query parameter, multipart)
-	codeNotFound             = "not_found"              // 404
-	codeMethodNotAllowed     = "method_not_allowed"     // 405
-	codeConflict             = "conflict"               // 409: the current state does not allow the operation
-	codeUploadOffsetMismatch = "upload_offset_mismatch" // 409: chunk offset differs from the bytes received so far
-	codePayloadTooLarge      = "payload_too_large"      // 413
-	codeValidationFailed     = "validation_failed"      // 422: a field value is invalid; the message names the problem
-	codeUnsupportedImage     = "unsupported_image"      // 422: no thumbnail can be generated for the image
-	codeInternal             = "internal_error"         // 500
-	codeNotImplemented       = "not_implemented"        // 501: planned module
-	codeInsufficientStorage  = "insufficient_storage"   // 507: not enough free disk space
+	codeBadRequest            = "bad_request"            // 400: malformed request (JSON, query parameter, multipart)
+	codeNotFound              = "not_found"              // 404
+	codeMethodNotAllowed      = "method_not_allowed"     // 405
+	codeConflict              = "conflict"               // 409: the current state does not allow the operation
+	codeUploadOffsetMismatch  = "upload_offset_mismatch" // 409: chunk offset differs from the bytes received so far
+	codeAnnotationConflict    = "annotation_conflict"    // 409: the annotation file changed since the version the edit started from
+	codeAnnotationUnpatchable = "annotation_unpatchable" // 409: the annotation file cannot be edited while keeping its other content; regenerate rewrites it
+	codePayloadTooLarge       = "payload_too_large"      // 413
+	codeValidationFailed      = "validation_failed"      // 422: a field value is invalid; the message names the problem
+	codeUnsupportedImage      = "unsupported_image"      // 422: no thumbnail can be generated for the image
+	codeInternal              = "internal_error"         // 500
+	codeNotImplemented        = "not_implemented"        // 501: planned module
+	codeInsufficientStorage   = "insufficient_storage"   // 507: not enough free disk space
 )
 
 const (

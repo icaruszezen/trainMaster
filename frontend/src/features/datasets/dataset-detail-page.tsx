@@ -11,6 +11,7 @@ import {
   FolderX,
   ImagePlus,
   Images,
+  PenTool,
   RefreshCw,
   SquareDashed,
   Tags,
@@ -65,6 +66,7 @@ import {
 import { ImportDialog } from "@/features/datasets/import-dialog"
 import { ImportProgressCard } from "@/features/datasets/import-progress-card"
 import { LoadError } from "@/features/datasets/load-error"
+import { workspacePath } from "@/features/annotation/workspace-params"
 import { DatasetProjectBadges } from "@/features/projects/dataset-project-badges"
 import { DatasetProjectsDialog } from "@/features/projects/dataset-projects-dialog"
 import { usePageTitle } from "@/hooks/use-page-title"
@@ -249,10 +251,22 @@ function DatasetDetail({ id }: { id: number }) {
                 {/* 手机宽度下只显示图标，让操作按钮保持一行。 */}
                 <span className="hidden sm:inline">下载</span>
               </Button>
-              <Button onClick={openImport} disabled={dataset.directory_missing}>
+              <Button
+                variant={dataset.image_count > 0 ? "outline" : "default"}
+                onClick={openImport}
+                disabled={dataset.directory_missing}
+              >
                 <ImagePlus />
                 导入数据
               </Button>
+              {dataset.image_count > 0 && (
+                <Button asChild>
+                  <Link to={workspacePath(dataset.id)}>
+                    <PenTool />
+                    标注
+                  </Link>
+                </Button>
+              )}
               <DatasetActionsMenu
                 dataset={dataset}
                 onEdit={() => setEditing(true)}

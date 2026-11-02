@@ -138,6 +138,36 @@ type ImageDetail struct {
 	Image
 	Objects         []AnnotationObject `json:"objects"`
 	AnnotationError string             `json:"annotation_error"` // why the VOC file cannot be used, or ""
+	// AnnotationVersion identifies the content of the VOC file read ("" when
+	// there is none). An annotation save names it as its base version.
+	AnnotationVersion string `json:"annotation_version"`
+	// AnnotationUnsupported counts the objects of the VOC file that are not
+	// boxes the platform can show (see vocAnnotation.Unsupported); a save
+	// keeps them.
+	AnnotationUnsupported int `json:"annotation_unsupported"`
+	// AnnotationBlocked says why the annotation of the image cannot be
+	// saved (its VOC file belongs to another image), or "".
+	AnnotationBlocked string `json:"annotation_blocked"`
+}
+
+// ImageNeighbors locates an image among the images matching a filter, in
+// image order. The image itself need not match (it may have been
+// annotated since it was listed as unannotated).
+type ImageNeighbors struct {
+	Prev *Image `json:"prev"` // the matching image before it, nil if none
+	Next *Image `json:"next"` // the matching image after it, nil if none
+	// Position is the number of matching images before it: its index in
+	// the filtered list when Matches.
+	Position int  `json:"position"`
+	Matches  bool `json:"matches"`
+	Total    int  `json:"total"` // matching images
+}
+
+// Class is an entry of a dataset's class list: the labels offered when
+// annotating, in order.
+type Class struct {
+	Name  string `json:"name"`
+	Color string `json:"color"` // "#rrggbb", or "" for the color derived from the name
 }
 
 // Label is one label of a dataset with its totals.

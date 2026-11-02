@@ -9,15 +9,17 @@ import (
 // client can act on is an *Error wrapping one of these, so callers can
 // branch with errors.Is and show Error.Message to the user.
 var (
-	ErrNotFound            = errors.New("not found")
-	ErrInvalid             = errors.New("invalid input")               // a field value is not acceptable
-	ErrBadRequest          = errors.New("malformed request")           // the request itself is malformed
-	ErrConflict            = errors.New("conflict")                    // the current state does not allow it
-	ErrOffsetMismatch      = errors.New("upload offset mismatch")      // archive chunk at the wrong offset
-	ErrTooLarge            = errors.New("payload too large")           // request body over the limit
-	ErrInsufficientStorage = errors.New("insufficient storage")        // not enough free disk space
-	ErrUnsupportedImage    = errors.New("unsupported image")           // no thumbnail can be generated
-	errCanceled            = errors.New("import canceled by the user") // cancel cause of a running job
+	ErrNotFound              = errors.New("not found")
+	ErrInvalid               = errors.New("invalid input")               // a field value is not acceptable
+	ErrBadRequest            = errors.New("malformed request")           // the request itself is malformed
+	ErrConflict              = errors.New("conflict")                    // the current state does not allow it
+	ErrOffsetMismatch        = errors.New("upload offset mismatch")      // archive chunk at the wrong offset
+	ErrTooLarge              = errors.New("payload too large")           // request body over the limit
+	ErrInsufficientStorage   = errors.New("insufficient storage")        // not enough free disk space
+	ErrUnsupportedImage      = errors.New("unsupported image")           // no thumbnail can be generated
+	ErrAnnotationChanged     = errors.New("annotation changed")          // the file is not the version an edit started from
+	ErrAnnotationUnpatchable = errors.New("annotation unpatchable")      // the file cannot be edited in place; a forced save rewrites it
+	errCanceled              = errors.New("import canceled by the user") // cancel cause of a running job
 )
 
 // Error is a user-facing error. Message is written in Chinese and is shown

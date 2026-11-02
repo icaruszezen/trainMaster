@@ -311,12 +311,14 @@ export function DatasetImages({
 }
 
 /** 搜索框：输入停止 300 ms 后才更新筛选条件（以及地址栏）。 */
-function ImageSearch({
+export function ImageSearch({
   value,
   onChange,
+  className,
 }: {
   value: string
   onChange: (value: string) => void
+  className?: string
 }) {
   const [text, setText] = useState(value)
   const [lastValue, setLastValue] = useState(value)
@@ -347,7 +349,7 @@ function ImageSearch({
   }
 
   return (
-    <InputGroup className="w-full md:w-56">
+    <InputGroup className={cn("w-full md:w-56", className)}>
       <InputGroupAddon>
         <Search />
       </InputGroupAddon>

@@ -50,6 +50,9 @@ type Service struct {
 	uploads keyedMutex // serializes writes to one import's staging data
 	exports exportTickets
 
+	// annotationLocks serializes the annotation edits of an image (by ID).
+	annotationLocks keyedMutex
+
 	// base is the context jobs index with after a user cancel; only
 	// stopping the service cancels it.
 	base    context.Context
@@ -702,9 +705,22 @@ func (s *Service) ListImages(ctx context.Context, datasetID int64, q ImageQuery)
 	return queryImages(ctx, s.db, datasetID, q)
 }
 
+// ImageNeighbors returns the images before and after an image among those
+// matching the filters of q, in image order, and its position there. The
+// annotation workspace steps through a dataset with it.
+func (s *Service) ImageNeighbors(ctx context.Context, datasetID, imageID int64, q ImageQuery) (ImageNeighbors, error) {
+	if _, err := queryDataset(ctx, s.db, datasetID, false); err != nil {
+		return ImageNeighbors{}, err
+	}
+	return queryNeighbors(ctx, s.db, datasetID, imageID, q)
+}
+
 // GetImage returns an image with the objects parsed from its VOC file as it
-// is on disk now. The VOC file is the one the index paired with the image;
-// a file added or removed since the last scan is noticed only by a scan.
+// is on disk now. The VOC file is the one the index paired with the image,
+// unless a file next to the image now takes over from a paired file
+// elsewhere; without one, it is the file a scan would pair with it now, if
+// there is one (see resolveAnnotationTarget). Other files added or removed
+// since the last scan are noticed only by a scan.
 func (s *Service) GetImage(ctx context.Context, datasetID, imageID int64) (ImageDetail, error) {
 	d, err := queryDataset(ctx, s.db, datasetID, false)
 	if err != nil {
@@ -714,42 +730,7 @@ func (s *Service) GetImage(ctx context.Context, datasetID, imageID int64) (Image
 	if err != nil {
 		return ImageDetail{}, err
 	}
-	detail := ImageDetail{Image: img, Objects: []AnnotationObject{}}
-	if img.AnnotationPath == nil {
-		return detail, nil
-	}
-	annPath := *img.AnnotationPath
-	a, err := s.readAnnotation(d, annPath)
-	detail.Annotation = nil
-	var ue *Error
-	// A VOC file that is gone keeps its path, so the viewer can say which.
-	switch {
-	case errors.As(err, &ue): // the dataset folder is gone
-		detail.AnnotationState, detail.AnnotationError = annotationNone, ue.Message
-	case errors.Is(err, fs.ErrNotExist):
-		detail.AnnotationState, detail.AnnotationError = annotationNone, "标注文件已不存在，请重新扫描"
-	case err != nil:
-		detail.AnnotationState, detail.AnnotationError = annotationInvalid, annotationErrorMessage(err)
-	default:
-		if a.Objects != nil {
-			detail.Objects = a.Objects
-		}
-		detail.AnnotationState = annotationEmpty
-		if len(a.Objects) > 0 {
-			detail.AnnotationState = annotationAnnotated
-		}
-		detail.Annotation = &ImageAnnotation{Path: annPath, ObjectCount: len(a.Objects), Labels: sortedLabels(a.labelCounts())}
-	}
-	return detail, nil
-}
-
-func (s *Service) readAnnotation(d Dataset, rel string) (*vocAnnotation, error) {
-	root, err := s.openDatasetRoot(d)
-	if err != nil {
-		return nil, err
-	}
-	defer root.Close()
-	return newAnnotationCache(root).get(rel)
+	return s.imageDetail(ctx, d, img)
 }
 
 // annotationErrorMessage explains why an existing VOC file cannot be used.

@@ -13,8 +13,10 @@ import {
   CircleAlert,
   ExternalLink,
   ImageOff,
+  PenTool,
   X,
 } from "lucide-react"
+import { Link } from "react-router"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
@@ -40,6 +42,8 @@ import {
 import { isBrowserNativeImage } from "@/features/datasets/files"
 import { annotationPanel } from "@/features/datasets/images"
 import { labelColor, readableTextColor } from "@/features/datasets/label-colors"
+import { workspacePath } from "@/features/annotation/workspace-params"
+import { useElementSize } from "@/hooks/use-element-size"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -167,6 +171,15 @@ export function ImageViewerDialog({
                   <span className="sm:hidden">标注</span>
                 </Label>
               </div>
+              <Button variant="outline" size="sm" asChild>
+                <Link
+                  to={`${workspacePath(datasetId, image.id)}`}
+                  aria-label="在标注工作台中打开这张图片"
+                >
+                  <PenTool />
+                  <span className="hidden sm:inline">标注</span>
+                </Link>
+              </Button>
               <Button
                 variant="ghost"
                 size="sm"
@@ -421,27 +434,6 @@ function InfoRow({ label, children }: { label: string; children: ReactNode }) {
   )
 }
 
-/** 观察元素的内容尺寸。 */
-function useElementSize<T extends HTMLElement>() {
-  const ref = useRef<T>(null)
-  const [size, setSize] = useState({ width: 0, height: 0 })
-
-  useEffect(() => {
-    const element = ref.current
-    if (!element) {
-      return
-    }
-    const observer = new ResizeObserver(([entry]) => {
-      const { width, height } = entry.contentRect
-      setSize({ width, height })
-    })
-    observer.observe(element)
-    return () => observer.disconnect()
-  }, [])
-
-  return [ref, size] as const
-}
-
 // 目标太多时只画框，不画标签名，避免遮挡图片。
 const MAX_LABELED_OBJECTS = 80
 
@@ -517,9 +509,18 @@ function ImageStage({
             alt={image.file_name}
             decoding="async"
             draggable={false}
+            // 按文件中存储的像素方向显示（不按 EXIF 方向旋转），与原图尺寸、
+            // 缩略图和标注框坐标一致。
+            style={{ imageOrientation: "none" }}
             onLoad={(event) => {
-              const { naturalWidth, naturalHeight } = event.currentTarget
-              setNatural({ w: naturalWidth, h: naturalHeight })
+              // naturalWidth / naturalHeight 总是按 EXIF 方向旋转后的尺寸；尺寸
+              // 未知时图片按原尺寸排版（见下），读排版尺寸。
+              const element = event.currentTarget
+              setNatural(
+                scale === 0 && element.offsetWidth > 0
+                  ? { w: element.offsetWidth, h: element.offsetHeight }
+                  : { w: element.naturalWidth, h: element.naturalHeight }
+              )
               setLoaded(true)
             }}
             onError={() => {
@@ -531,10 +532,12 @@ function ImageStage({
               )
             }}
             className={cn(
-              "absolute inset-0 size-full object-fill shadow-sm transition-opacity duration-200",
+              "absolute shadow-sm transition-opacity duration-200",
               loaded ? "opacity-100" : "opacity-0",
-              // 尺寸未知时先以原尺寸加载，以便读到 naturalWidth。
-              scale === 0 && "invisible"
+              // 尺寸未知时先以原尺寸（不可见地）加载，以便读出尺寸。
+              scale > 0
+                ? "inset-0 size-full object-fill"
+                : "invisible top-0 left-0 max-w-none"
             )}
           />
           {w && h && loaded && objects.length > 0 && (

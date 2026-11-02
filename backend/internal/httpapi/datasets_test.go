@@ -376,7 +376,7 @@ func TestDatasetAPIArchiveImport(t *testing.T) {
 
 	imgURL := fmt.Sprintf("%s/images/%d", base, a.ID)
 	rawDetail := want[map[string]any](t, e.do("GET", imgURL, nil), 200)
-	wantKeys(t, "image detail", rawDetail, append(slices.Clone(imageKeys), "objects", "annotation_error")...)
+	wantKeys(t, "image detail", rawDetail, append(slices.Clone(imageKeys), "objects", "annotation_error", "annotation_version", "annotation_unsupported", "annotation_blocked")...)
 	detail := want[dataset.ImageDetail](t, e.do("GET", imgURL, nil), 200)
 	if len(detail.Objects) != 2 || detail.AnnotationError != "" || !detail.Objects[0].Difficult ||
 		detail.Objects[0].Xmin != 1 || detail.Objects[0].Ymax != 40 {
