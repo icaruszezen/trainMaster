@@ -1337,6 +1337,51 @@ run_setup --mode off
 FAKE_HOSTNAME=third-name
 run_setup
 expect_env TM_HOST_HOSTNAME third-name
+expect_env TM_NODE_NAME my-node
+
+# 把 .env 迁移到新服务器（docs/deployment.md 第 6 节）：TM_NODE_NAME 仍是 make setup 写入的旧主机名
+# （等于原来的 TM_HOST_HOSTNAME）时跟随新的主机名，新服务器的训练节点不会以旧服务器的名字注册
+new_case "node name follows hostname"
+with_toolkit
+FAKE_HOSTNAME=old-server
+run_setup
+expect_env TM_NODE_NAME old-server
+expect_env TM_HOST_HOSTNAME old-server
+FAKE_HOSTNAME=new-server
+EXTRA_ENV=(TM_SETUP_CALLER=up)
+run_setup
+expect_rc 0
+expect_env TM_NODE_NAME new-server
+expect_env TM_HOST_HOSTNAME new-server
+expect_out "TM_NODE_NAME=new-server（原为 old-server）"
+# 主机名没有变化时不改动
+run_setup
+expect_env TM_NODE_NAME new-server
+expect_out ".env 无需修改"
+# 关闭训练节点时同样跟随（以后改回 auto 时名字正确）
+FAKE_HOSTNAME=third-server
+run_setup --mode off
+expect_env TM_NODE_NAME third-server
+expect_env TM_HOST_HOSTNAME third-server
+
+# 没有 TM_HOST_HOSTNAME 的旧 .env，或用户自己设置的名称：TM_NODE_NAME 不变
+new_case "node name without previous hostname"
+with_toolkit
+printf 'TM_NODE_NAME=old-server\n' >"$ENV"
+FAKE_HOSTNAME=new-server
+run_setup
+expect_rc 0
+expect_env TM_NODE_NAME old-server
+expect_env TM_HOST_HOSTNAME new-server
+# 关闭训练节点时，空的 TM_NODE_NAME 保持为空，不写入主机名（与之前相同）
+new_case "node name empty with mode off"
+with_toolkit
+printf 'TM_NODE_NAME=\nTM_HOST_HOSTNAME=old-server\n' >"$ENV"
+FAKE_HOSTNAME=new-server
+run_setup --mode off
+expect_rc 0
+expect_env TM_NODE_NAME ""
+expect_env TM_HOST_HOSTNAME new-server
 
 # TM_SERVER_URL 使用本机的主机名：在训练节点容器中它指向容器自己，提醒改用 http://app:8080 或 IP
 new_case "server url is own hostname"
@@ -1505,6 +1550,17 @@ for args in "--bogus" "--mode" "--mode fast" "--mode=" "--token short" "--token 
 	# shellcheck disable=SC2086 # 按空白拆分为多个参数
 	run_setup $args
 	expect_rc 2
+	checks=$((checks + 1))
+	[ ! -e "$ENV" ] || fail "参数错误时不应创建 .env"
+done
+
+# 方括号中的 IPv6 地址（页面以 http://[fd00::10]:8080 打开时）：训练节点容器的网络默认没有 IPv6，明确说明原因
+for url in "http://[fd00::10]:8080" "https://[2001:db8::1]/trainmaster" "http://admin@[fd00::10]:8080"; do
+	new_case "ipv6 server url: $url"
+	run_setup --server-url "$url" --token abcdefghijklmnop.1234
+	expect_rc 2
+	expect_out "--server-url 不能使用 IPv6 地址：训练节点容器的 Docker 网络默认没有 IPv6，请改用平台的 IPv4 地址或域名"
+	expect_no_out "必须是 http:// 或 https:// 开头的地址"
 	checks=$((checks + 1))
 	[ ! -e "$ENV" ] || fail "参数错误时不应创建 .env"
 done

@@ -3,7 +3,8 @@
 #
 # 用记录调用的假 docker compose（COMPOSE=<替身>）运行仓库的 Makefile，不启动任何容器；
 # make setup 换成 setup-compute.sh --help（SETUP_ARGS），不检测本机，也不修改 .env。
-# 没有 make 时跳过。
+# 构建时间（TM_BUILD_TIME）的部分用例在临时目录中的 Makefile 副本上运行（临时的 git 仓库）。
+# 没有 make 时跳过；没有 git 时跳过构建时间的用例。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -25,12 +26,13 @@ fail() {
 	fails=$((fails + 1))
 }
 
-# 假的 docker compose：记录参数；config --services 输出 FAKE_SERVICES；
-# up 的参数中有 FAKE_FAIL 中的服务时失败（模拟镜像构建失败）。
+# 假的 docker compose：记录参数，以及 make 导出的 TM_BUILD_TIME（app 镜像的构建参数 BUILD_TIME）；
+# config --services 输出 FAKE_SERVICES；up 的参数中有 FAKE_FAIL 中的服务时失败（模拟镜像构建失败）。
 COMPOSE_FAKE="$WORK/compose"
 cat >"$COMPOSE_FAKE" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$FAKE_LOG"
+printf '%s\n' "${TM_BUILD_TIME-（未设置）}" >>"$FAKE_LOG.build-time"
 case "$1" in
 config) printf '%s\n' $FAKE_SERVICES ;;
 up)
@@ -48,14 +50,19 @@ exit 0
 EOF
 chmod +x "$COMPOSE_FAKE"
 
-# run_make <目标>：在仓库根目录运行 make，合并的输出在 $OUT，退出码在 $RC，假 compose 的调用记录在 $LOG。
-# 外层的 make（make test-trainer）通过 MAKEFLAGS 传下来的参数不影响这里。
+# run_make <目标>：在 $MAKE_DIR（默认仓库根目录）运行 make，合并的输出在 $OUT，退出码在 $RC，
+# 假 compose 的调用记录在 $LOG，它看到的 TM_BUILD_TIME 在 $LOG.build-time；MAKE_ENV 是额外的环境变量。
+# 外层的 make（make test-trainer）通过 MAKEFLAGS 传下来的参数与导出的版本信息不影响这里。
+MAKE_DIR="$ROOT"
+MAKE_ENV=()
 run_make() {
 	LOG="$WORK/$1.log"
 	: >"$LOG"
+	: >"$LOG.build-time"
 	RC=0
-	OUT="$(cd "$ROOT" && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL -u MAKEOVERRIDES \
-		FAKE_LOG="$LOG" FAKE_SERVICES="$FAKE_SERVICES" FAKE_FAIL="$FAKE_FAIL" \
+	OUT="$(cd "$MAKE_DIR" && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL -u MAKEOVERRIDES \
+		-u TM_VERSION -u TM_COMMIT -u TM_BUILD_TIME \
+		FAKE_LOG="$LOG" FAKE_SERVICES="$FAKE_SERVICES" FAKE_FAIL="$FAKE_FAIL" ${MAKE_ENV[@]+"${MAKE_ENV[@]}"} \
 		make --no-print-directory "$1" COMPOSE="$COMPOSE_FAKE" SETUP_ARGS=--help 2>&1)" || RC=$?
 	if [ -n "${VERBOSE:-}" ]; then
 		printf -- '---- %s：make %s（退出码 %s）\n%s\n' "$CASE_NAME" "$1" "$RC" "$OUT"
@@ -91,6 +98,13 @@ expect_out() {
 	*) fail "输出中应包含 [$1]；输出：
 $OUT" ;;
 	esac
+}
+
+expect_build_time() { # expect_build_time <值>：假 compose 每次调用时看到的 TM_BUILD_TIME 都是这个值
+	checks=$((checks + 1))
+	local got
+	got="$(sort -u "$LOG.build-time")"
+	[ "$got" = "$1" ] || fail "TM_BUILD_TIME 应为 [$1]，实际为 [$got]"
 }
 
 expect_no_out() {
@@ -149,6 +163,96 @@ CASE_NAME="down all profiles"
 run_make down
 expect_rc 0
 expect_calls "--profile * --profile gpu --profile cpu down"
+
+# 构建时间：代码没有变化时每次 make up 都相同（app 镜像的构建参数不变，compose 复用构建缓存，
+# 不重启正在运行的 app，正在进行的数据集导入不会被中断）
+if command -v git >/dev/null 2>&1; then
+	# 仓库本身是 git 检出时（源码包中没有 .git，构建时间为当前时间）
+	if (cd "$ROOT" && git rev-parse --verify -q HEAD >/dev/null 2>&1); then
+		CASE_NAME="build time stable"
+		FAKE_SERVICES="postgres app trainer"
+		FAKE_FAIL=""
+		run_make up
+		expect_rc 0
+		first="$(sort -u "$LOG.build-time")"
+		sleep 1
+		run_make up
+		expect_rc 0
+		second="$(sort -u "$LOG.build-time")"
+		checks=$((checks + 1))
+		[ -n "$first" ] && [ "$first" = "$second" ] || fail "两次 make up 的 TM_BUILD_TIME 应相同，实际为 [$first] 与 [$second]"
+	fi
+
+	# 默认为当前提交（HEAD）的提交时间，换算为 UTC；.env 与环境变量中的值优先
+	CASE_NAME="build time from commit"
+	GIT_REPO="$WORK/git-repo"
+	mkdir -p "$GIT_REPO"
+	cp "$ROOT/Makefile" "$GIT_REPO/"
+	# 提交带签名（假的 gpg），仓库配置了 log.showSignature=true：git log 的输出中多出验证签名的结果，
+	# 构建时间不能受它影响（GitHub 网页上合并的提交都带签名；多出的文字会让 -ldflags 出错）
+	FAKE_GPG="$WORK/gpg"
+	cat >"$FAKE_GPG" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+*" --verify "*)
+	echo "gpg: Signature made by test key" >&2
+	echo "[GNUPG:] GOODSIG 0123456789ABCDEF test <test@example.com>"
+	;;
+*)
+	cat >/dev/null
+	printf '[GNUPG:] BEGIN_SIGNING H8\n[GNUPG:] SIG_CREATED D 1 8 00 1 0123456789ABCDEF\n' >&2
+	printf -- '-----BEGIN PGP SIGNATURE-----\n\nZmFrZQ==\n-----END PGP SIGNATURE-----\n'
+	;;
+esac
+EOF
+	chmod +x "$FAKE_GPG"
+	if ! (
+		unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+		cd "$GIT_REPO" &&
+			git -c init.defaultBranch=main init -q &&
+			git config gpg.format openpgp &&
+			git config gpg.program "$FAKE_GPG" &&
+			git config user.signingkey test &&
+			git add Makefile &&
+			GIT_AUTHOR_DATE="2026-01-01T00:00:00+00:00" GIT_COMMITTER_DATE="2026-03-04T05:06:07+08:00" \
+				git -c user.name=test -c user.email=test@example.com -c commit.gpgsign=true commit -q -m test &&
+			git config log.showSignature true
+	) >"$WORK/git.log" 2>&1; then
+		fail "无法创建临时 git 仓库：$(cat "$WORK/git.log")"
+	fi
+	MAKE_DIR="$GIT_REPO"
+	MAKE_ENV=(TZ=Asia/Shanghai GIT_CEILING_DIRECTORIES="$WORK")
+	run_make docker-build
+	expect_rc 0
+	expect_calls "build app"
+	expect_build_time "2026-03-03T21:06:07Z"
+	printf 'TM_BUILD_TIME=2020-05-06T07:08:09Z\n' >"$GIT_REPO/.env"
+	run_make docker-build
+	expect_build_time "2020-05-06T07:08:09Z"
+	MAKE_ENV+=(TM_BUILD_TIME=2021-02-03T04:05:06Z)
+	run_make docker-build
+	expect_build_time "2021-02-03T04:05:06Z"
+
+	# 不是 git 检出（如下载的源码包）：当前时间
+	CASE_NAME="build time without git checkout"
+	MAKE_DIR="$WORK/no-git"
+	mkdir -p "$MAKE_DIR"
+	cp "$ROOT/Makefile" "$MAKE_DIR/"
+	MAKE_ENV=(GIT_CEILING_DIRECTORIES="$WORK")
+	before="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	run_make docker-build
+	after="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	expect_rc 0
+	got="$(sort -u "$LOG.build-time")"
+	checks=$((checks + 1))
+	if [[ ! "$got" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || [[ "$got" < "$before" ]] || [[ "$got" > "$after" ]]; then
+		fail "TM_BUILD_TIME 应为当前时间（$before – $after），实际为 [$got]"
+	fi
+	MAKE_DIR="$ROOT"
+	MAKE_ENV=()
+else
+	echo "makefile: 跳过构建时间的用例（没有 git）"
+fi
 
 if [ "$fails" -gt 0 ]; then
 	echo "makefile: $fails 项失败（共 $checks 项检查）" >&2

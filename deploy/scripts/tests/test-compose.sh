@@ -67,9 +67,13 @@ DEBIAN_MIRROR=https://mirrors.aliyun.com/debian
 TM_HOST_HOSTNAME=gpu-host-01
 TM_TRAINER_MODE=cpu
 "
-# trainer-cpu 在 TM_TORCH_VARIANT 设置时同样使用它（make setup 选择 CPU 时写入 cpu）
+# trainer-cpu 在 TM_TORCH_VARIANT 设置时同样使用它（make setup 选择 CPU 时写入 cpu）；
+# make setup --variant 固定的变体（TM_TRAINER_VARIANT）传给两个训练节点
 config variant "COMPOSE_PROFILES=gpu,cpu
 TM_TORCH_VARIANT=cu126
+TM_TRAINER_VARIANT=cu126
+"
+config off "TM_TRAINER_MODE=off
 "
 
 # make down 使用的 --profile '*'：列出全部 profile 中的服务（包括 COMPOSE_PROFILES 中没有启用的）
@@ -117,7 +121,7 @@ def volume_targets(svc):
 
 
 def check_trainer(name, svc, variant="cu130", tag="latest", shm=8 * 1024**3, service="trainer", mode="auto",
-                  hostname="trainmaster-trainer"):
+                  hostname="trainmaster-trainer", pinned="auto"):
     check(name, svc.get("image") == f"trainmaster-trainer:{tag}-{variant}", f"image 为 {svc.get('image')}")
     build = svc.get("build", {})
     check(name, build.get("context", "").rstrip("/").endswith("/trainer"), f"build.context 为 {build.get('context')}")
@@ -135,6 +139,8 @@ def check_trainer(name, svc, variant="cu130", tag="latest", shm=8 * 1024**3, ser
     # 节点据此给出修复建议中的服务名与命令（docs/deployment.md 第 10 节）
     check(name, env(svc, "TM_TRAINER_SERVICE") == service, f"TM_TRAINER_SERVICE 为 {env(svc, 'TM_TRAINER_SERVICE')}")
     check(name, env(svc, "TM_TRAINER_MODE") == mode, f"TM_TRAINER_MODE 为 {env(svc, 'TM_TRAINER_MODE')}")
+    # 固定的变体：节点据此建议 --variant auto，而不是再固定另一个变体
+    check(name, env(svc, "TM_TRAINER_VARIANT") == pinned, f"TM_TRAINER_VARIANT 为 {env(svc, 'TM_TRAINER_VARIANT')}")
     # 主机名用宿主机的主机名（TM_HOST_HOSTNAME），不是每次重建都会变化的容器 ID
     check(name, svc.get("hostname") == hostname, f"hostname 为 {svc.get('hostname')}")
 
@@ -145,6 +151,8 @@ check("none", sorted(s) == ["app", "postgres"], f"服务为 {sorted(s)}")
 check("none", s["app"].get("hostname") == "trainmaster", f"app 的 hostname 为 {s['app'].get('hostname')}")
 check("none", "TM_NODE_TOKEN" in (s["app"].get("environment") or {}), "app 缺少 TM_NODE_TOKEN")
 check("none", env(s["app"], "TM_NODE_TOKEN") == "", "默认不设置令牌")
+# 本机训练节点的模式也传给 app（GET /api/v1/compute/server 的 node_registration.local_trainer_mode）
+check("none", env(s["app"], "TM_TRAINER_MODE") == "auto", f"app 的 TM_TRAINER_MODE 为 {env(s['app'], 'TM_TRAINER_MODE')}")
 
 # gpu：trainer 使用全部显卡
 s = load("gpu")
@@ -185,10 +193,16 @@ for name in ("trainer", "trainer-cpu"):
     check(name, args.get("DEBIAN_MIRROR") == "https://mirrors.aliyun.com/debian", "DEBIAN_MIRROR")
     check(name, args.get("TORCH_INDEX_URL") == "", "TORCH_INDEX_URL 默认为空")
 check("custom", env(s["app"], "TM_NODE_TOKEN") == "abcdefghijklmnop0123", "app 的令牌应来自 .env")
+check("custom", env(s["app"], "TM_TRAINER_MODE") == "cpu", f"app 的 TM_TRAINER_MODE 为 {env(s['app'], 'TM_TRAINER_MODE')}")
 
 s = load("variant")
-check_trainer("variant/trainer", s["trainer"], variant="cu126")
-check_trainer("variant/trainer-cpu", s["trainer-cpu"], variant="cu126", service="trainer-cpu")
+check_trainer("variant/trainer", s["trainer"], variant="cu126", pinned="cu126")
+check_trainer("variant/trainer-cpu", s["trainer-cpu"], variant="cu126", service="trainer-cpu", pinned="cu126")
+
+# 关闭了训练节点（make setup --mode off）：没有训练节点，app 知道模式为 off
+s = load("off")
+check("off", sorted(s) == ["app", "postgres"], f"服务为 {sorted(s)}")
+check("off", env(s["app"], "TM_TRAINER_MODE") == "off", f"app 的 TM_TRAINER_MODE 为 {env(s['app'], 'TM_TRAINER_MODE')}")
 
 for p in problems:
     print("FAIL " + p, file=sys.stderr)
@@ -200,4 +214,4 @@ if [ "$fails" -gt 0 ]; then
 	echo "compose: 检查失败" >&2
 	exit 1
 fi
-echo "compose: 全部通过（无 profile、gpu、cpu、全部 profile 与变量插值）"
+echo "compose: 全部通过（无 profile、gpu、cpu、全部 profile、关闭训练节点与变量插值）"

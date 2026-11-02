@@ -81,7 +81,7 @@
 - **自动识别硬件**：显卡型号、显存、计算能力、驱动与 CUDA 版本，CPU 型号与核数、内存、数据盘与 `/dev/shm`；实时显示每块显卡的利用率、显存、温度、功率，以及 CPU 与内存占用和最近的变化曲线（曲线只保存在平台服务的内存中，重启后清空）。
 - **自动准备 YOLO 的 CUDA 环境**：按驱动与显卡自动选择 PyTorch 的 CUDA 版本（见下表），训练节点镜像中预装对应的 PyTorch、torchvision 与 Ultralytics；CUDA 运行库随 PyTorch 安装，宿主机只需要 NVIDIA 驱动。节点启动后检测 CUDA 是否可用，在每块显卡上做一次计算并用 YOLO11n 做一次前向推理（不下载权重、不访问外网）；驱动过旧、显卡架构不受支持、显卡没有传入容器等问题会在页面上给出原因与修复命令，修复后可以在页面上“重新检测”。
 - **自动配置 Docker 的显卡**：`make setup`（`make up` 会先自动执行它）检测显卡、驱动，并实际运行一次 `docker run --gpus all … nvidia-smi -L` 验证 Docker 能否使用显卡，据此在 `.env` 中启用 GPU 或 CPU 训练节点、选好 PyTorch 版本、生成节点令牌。Docker 还不能使用显卡时，`make up SETUP_ARGS="--install-toolkit"` 按发行版（apt / dnf / yum / zypper）安装并配置 NVIDIA Container Toolkit（已安装时只配置并重启 Docker，Docker 已能使用显卡时什么也不做），再启动 GPU 训练节点——每条需要 root 的命令都先列出并确认；snap 版、rootless 模式的 Docker 与没有 systemd 的 WSL 给出手动步骤。
-- **平台服务器**：页面同时显示平台所在机器的 CPU、内存、负载与检测到的 NVIDIA 显卡；机器上有显卡但还没有 GPU 训练节点在线时会给出提示。
+- **平台服务器**：页面同时显示平台所在机器的 CPU、内存、负载与检测到的 NVIDIA 显卡；机器上有显卡但还没有 GPU 训练节点在线时会给出提示（本机的训练节点用 `--mode off` 关闭或选择了 CPU 模式时不提示；驱动过旧时提示先升级驱动）。
 
 PyTorch 版本的选择规则（变体表 [`trainer/trainmaster_trainer/torch_variants.txt`](trainer/trainmaster_trainer/torch_variants.txt)）：按下表顺序，取第一个**驱动版本满足、且支持全部显卡**的变体；一个都不满足时使用 CPU 版。
 

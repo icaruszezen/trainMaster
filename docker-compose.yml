@@ -60,6 +60,9 @@ x-trainer: &trainer
     TM_NODE_NAME: ${TM_NODE_NAME:-}
     # make setup 的模式（auto / gpu / cpu）：为 cpu 时节点知道是有意选择了 CPU，不再提示显卡没有传入容器
     TM_TRAINER_MODE: ${TM_TRAINER_MODE:-auto}
+    # make setup --variant 固定的 PyTorch 变体（auto 为自动选择）：固定时节点的修复建议用 --variant auto
+    # 恢复自动选择，而不是再固定另一个变体
+    TM_TRAINER_VARIANT: ${TM_TRAINER_VARIANT:-auto}
     TM_DATA_DIR: /data
     TM_LOG_LEVEL: ${TM_LOG_LEVEL:-info}
     # 容器以 root 启动，修正状态目录属主后以 PUID:PGID 运行（与 app 相同，才能读写 /data 中的文件）
@@ -137,6 +140,9 @@ services:
       TM_NODE_TOKEN: ${TM_NODE_TOKEN:-}
       # 训练节点的心跳间隔，留空为 10s
       TM_NODE_HEARTBEAT_INTERVAL: ${TM_NODE_HEARTBEAT_INTERVAL:-}
+      # 本机训练节点的模式（make setup 写入，auto / gpu / cpu / off）：页面据此给出提示，如关闭了训练节点（off）
+      # 时不再提示“没有 GPU 训练节点”。app 启动时读取，修改后需要重新创建 app 容器（make up）
+      TM_TRAINER_MODE: ${TM_TRAINER_MODE:-auto}
       # 容器以 root 启动，修正 /data 目录属主后以 PUID:PGID 运行服务
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
