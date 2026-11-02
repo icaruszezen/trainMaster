@@ -207,6 +207,38 @@ export function hintSegments(text: string): TextSegment[] {
   return segments
 }
 
+export type HintLayout = {
+  /** 命令前面的文字（其中的其它命令显示为行内代码）；没有时为空数组。 */
+  text: TextSegment[]
+  /** 单独一行显示、可以复制的命令；没有时为 null。 */
+  command: string | null
+}
+
+/**
+ * 修复建议的排版（输入为 hintSegments 的结果）：整段就是一条命令，或以唯一的
+ * 一条命令结尾（如 "…，然后以 GPU 模式启动：`make up …`"）时，这条命令单独一行
+ * 显示为可复制的代码块，前面的文字照常显示。含有多条命令时（如 "`make setup`
+ * 然后 `docker compose up -d --build trainer`"）都显示为行内代码：只给最后一条
+ * 复制按钮，容易漏掉前面的步骤。
+ */
+export function hintLayout(segments: readonly TextSegment[]): HintLayout {
+  const blank = (segment: TextSegment) => !segment.code && !segment.text.trim()
+  let end = segments.length
+  while (end > 0 && blank(segments[end - 1])) {
+    end -= 1
+  }
+  const last = segments[end - 1]
+  const commands = segments.filter((segment) => segment.code).length
+  if (!last?.code || commands !== 1) {
+    return { text: [...segments], command: null }
+  }
+  const text = segments.slice(0, end - 1)
+  return {
+    text: text.every(blank) ? [] : text,
+    command: last.text,
+  }
+}
+
 /**
  * 平台地址中的主机占位符：通过 localhost 或 IPv6 地址访问时，需要换成平台服务器的
  * IP（IPv4）或域名。

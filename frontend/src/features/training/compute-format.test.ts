@@ -13,6 +13,7 @@ import {
   formatTemperature,
   formatUsage,
   formatWatts,
+  hintLayout,
   hintSegments,
   serverUrlPlaceholderReason,
   shortenCpuModel,
@@ -258,6 +259,88 @@ describe("hintSegments", () => {
     expect(hintSegments("``")).toEqual([])
     expect(hintSegments("  ")).toEqual([])
     expect(hintSegments("`make up`")).toEqual([{ text: "make up", code: true }])
+  })
+})
+
+describe("hintLayout", () => {
+  const layout = (hint: string) => hintLayout(hintSegments(hint))
+
+  it("puts a trailing command on its own line with a copy button", () => {
+    expect(
+      layout(
+        '安装并配置 NVIDIA Container Toolkit（需要 sudo），然后以 GPU 模式启动：`make up SETUP_ARGS="--install-toolkit"`'
+      )
+    ).toEqual({
+      text: [
+        {
+          text: "安装并配置 NVIDIA Container Toolkit（需要 sudo），然后以 GPU 模式启动：",
+          code: false,
+        },
+      ],
+      command: 'make up SETUP_ARGS="--install-toolkit"',
+    })
+    expect(
+      layout(
+        "改用 PyTorch 变体 cu128 重新安装（在 trainMaster 仓库目录中运行）：`sudo trainer/scripts/install.sh --variant cu128`"
+      ).command
+    ).toBe("sudo trainer/scripts/install.sh --variant cu128")
+    // Trailing spaces after the command do not count as text after it.
+    expect(layout("然后运行 `make up`  ")).toEqual({
+      text: [{ text: "然后运行 ", code: false }],
+      command: "make up",
+    })
+  })
+
+  it("shows a hint that is one command as a block only", () => {
+    expect(layout("`make up`")).toEqual({ text: [], command: "make up" })
+    expect(layout("  `make up` ")).toEqual({ text: [], command: "make up" })
+    expect(layout("TM_TORCH_VARIANT=cu128 make up")).toEqual({
+      text: [],
+      command: "TM_TORCH_VARIANT=cu128 make up",
+    })
+  })
+
+  it("keeps commands inline when text follows or there are several", () => {
+    // A command in the middle of a sentence.
+    const middle = layout(
+      '`make setup SETUP_ARGS="--install-toolkit"`，再按它最后输出的服务名启动（通常是 `docker compose up -d --build trainer`）'
+    )
+    expect(middle.command).toBeNull()
+    expect(middle.text.filter((segment) => segment.code)).toHaveLength(2)
+    // Several commands in a row: copying only the last one would skip a step.
+    expect(
+      layout(
+        '改用 PyTorch 变体 cu128 重新构建镜像：`make setup SETUP_ARGS="--variant cu128"` 然后 `docker compose up -d --build trainer-cpu`'
+      )
+    ).toEqual({
+      text: [
+        { text: "改用 PyTorch 变体 cu128 重新构建镜像：", code: false },
+        { text: 'make setup SETUP_ARGS="--variant cu128"', code: true },
+        { text: " 然后 ", code: false },
+        { text: "docker compose up -d --build trainer-cpu", code: true },
+      ],
+      command: null,
+    })
+    expect(layout("在宿主机运行 `nvidia-smi` 检查驱动。")).toEqual({
+      text: [
+        { text: "在宿主机运行 ", code: false },
+        { text: "nvidia-smi", code: true },
+        { text: " 检查驱动。", code: false },
+      ],
+      command: null,
+    })
+  })
+
+  it("leaves plain text and empty hints alone", () => {
+    expect(layout("重启机器或重新加载驱动")).toEqual({
+      text: [{ text: "重启机器或重新加载驱动", code: false }],
+      command: null,
+    })
+    expect(layout("")).toEqual({ text: [], command: null })
+    expect(layout("运行 `make")).toEqual({
+      text: [{ text: "运行 `make", code: false }],
+      command: null,
+    })
   })
 })
 
