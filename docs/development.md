@@ -7,9 +7,13 @@
 | Go | 1.24+ | 后端 |
 | Node.js / npm | 22 LTS | 前端（包管理统一使用 npm，提交 `package-lock.json`） |
 | Docker + Compose v2 | 24+ | 开发数据库、镜像构建 |
+| Python（含 venv 模块） | 3.10+ | 训练节点（`trainer/`）的开发与测试；Debian / Ubuntu 需要 `python3-venv` |
+| bash、shellcheck | bash 3.2+、shellcheck 可选 | 部署与安装脚本及其测试；`make lint` 需要 shellcheck（也可 `pip install shellcheck-py`） |
 | make | 可选 | 常用命令封装；Windows 下可直接执行下文列出的命令 |
 
-国内网络可设置：`go env -w GOPROXY=https://goproxy.cn,direct`，`npm config set registry https://registry.npmmirror.com`。
+国内网络可设置：`go env -w GOPROXY=https://goproxy.cn,direct`，`npm config set registry https://registry.npmmirror.com`，`pip config set global.index-url https://mirrors.aliyun.com/pypi/simple`（`make test-trainer` 创建虚拟环境时也使用 `.env` 中的 `PIP_INDEX_URL`）。
+
+训练节点的开发与测试不需要 GPU、CUDA 或 PyTorch（测试用假的 NVML / torch 模块），任何开发机上都可以运行。
 
 ## 2. 本地运行
 
@@ -54,19 +58,42 @@ npm run dev
 
 所有可用的环境变量见 [部署指南 · 环境变量](deployment.md#3-环境变量)。
 
+### 训练节点
+
+训练节点（`trainer/`，Python 包 `trainmaster_trainer`）可以直接连接本地运行的后端，在 <http://localhost:5173> 的“计算资源”页面中显示：
+
+```bash
+cd trainer
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt     # psutil、nvidia-ml-py、pytest、ruff；不含 torch
+.venv/bin/python -m trainmaster_trainer probe      # 打印检测报告（JSON），不连接平台
+TM_SERVER_URL=http://localhost:8080 TM_STATE_DIR=../data/trainer-dev .venv/bin/python -m trainmaster_trainer run
+```
+
+- 在 `trainer/` 目录下运行 `python -m trainmaster_trainer` 即可导入本包，不需要安装；也可以 `pip install -e .` 后在任意目录运行 `trainmaster-trainer`。
+- 没有安装 PyTorch 时，硬件与实时指标照常上报，CUDA 环境显示为异常（`torch_missing`）。需要完整的环境时安装 CPU 版或与本机驱动匹配的 PyTorch 与 Ultralytics：`bash scripts/install-torch.sh cpu --python .venv/bin/python && .venv/bin/pip install -r requirements.txt`（变体见 [部署指南第 10.3 节](deployment.md#103-驱动与-pytorch-变体)）。
+- 本地后端默认不要求令牌；设置了 `TM_NODE_TOKEN` 时训练节点也要设置同一个值。`TM_STATE_DIR` 中保存节点标识，换一个目录就会作为新节点注册。
+- 其它子命令：`selftest`（中文的 CUDA 环境检测结果，`--json` 输出 JSON）、`healthcheck`；配置变量见 [部署指南第 3.3 节](deployment.md#33-训练节点配置容器内由-compose-和镜像设置)。
+- 构建并运行镜像：`make docker-build-trainer`（使用 `.env` 中的 `TM_TORCH_VARIANT`），或不需要 GPU 的 CPU 版：`docker build --build-arg TORCH_VARIANT=cpu -t trainmaster-trainer:dev-cpu trainer`，再 `docker run --rm trainmaster-trainer:dev-cpu python -m trainmaster_trainer probe`。
+
 ## 3. 测试与检查
 
 ```bash
-make test     # go test ./... + npm test
-make lint     # gofmt、go vet、ESLint、TypeScript 类型检查
+make test     # go test ./... + npm test + 训练节点（pytest 与 bash 测试）
+make lint     # gofmt、go vet、ESLint、TypeScript 类型检查、ruff、shellcheck
 make build    # frontend/dist + backend/bin/trainmaster
 ```
+
+只运行训练节点相关的部分：`make test-trainer`、`make lint-trainer`（第一次运行时创建虚拟环境 `trainer/.venv`，`requirements-dev.txt` 变化时重新安装；Python 版本过低、缺少 venv 模块或 shellcheck 时会提示安装方法，可用 `PYTHON=python3.12` 指定解释器）。
 
 对应的原始命令：
 
 ```bash
 cd backend && gofmt -l . && go vet ./... && go test ./... && go build ./...
 cd frontend && npm run lint && npm run typecheck && npm test && npm run build
+cd trainer && .venv/bin/python -m pytest && .venv/bin/ruff check . && .venv/bin/ruff format --check .
+for t in trainer/scripts/tests/test-*.sh deploy/scripts/tests/test-*.sh; do bash "$t" || break; done   # 在仓库根目录
+shellcheck -x $(git ls-files '*.sh')
 ```
 
 后端单元测试不依赖数据库（数据集模块的压缩包、VOC、缩略图等测试使用 `backend/internal/dataset/testdata/` 中的小样本，来源见其中的 README）。数据库集成测试（迁移、并发加锁、`app_settings` 读写、数据集导入 / 扫描 / 接口）通过 `TM_TEST_DATABASE_URL` 启用，未设置时自动跳过。数据集相关的测试会为每个测试新建并删除一个独立的数据库，所以该账号需要 `CREATEDB` 权限（postgres 超级用户即可）。请使用一次性的数据库：
@@ -78,7 +105,17 @@ TM_TEST_DATABASE_URL='postgres://postgres:x@localhost:55432/postgres?sslmode=dis
 docker rm -f tm-test-pg
 ```
 
-CI（`.github/workflows/ci.yml`）在每次 push 到 main 和每个 Pull Request 上运行：后端（gofmt、vet、带 PostgreSQL 服务的测试、Windows/macOS 交叉编译）、前端（lint、typecheck、test、build）以及 Docker 镜像构建。
+### 训练节点与脚本的测试
+
+- **pytest**（`trainer/tests/`）：不依赖 GPU、torch 与网络——NVML、torch、ultralytics 用假模块代替，平台用本地 `http.server` 模拟。CI 在 Python 3.10（`requires-python` 的下限）与 3.12（镜像中的版本）上运行。
+- **`trainer/scripts/tests/test-torch-variant.sh`**：变体选择规则（`lib/torch-variant.sh`）；Python 侧的 `tests/test_variants.py` 覆盖同样的用例，两边必须一致。修改 `torch_variants.txt` 时运行这两组测试，并同步 README 与部署指南第 10.3 节中抄录的表格。
+- **`trainer/scripts/tests/test-install.sh`**：裸机安装脚本 `install.sh` 与 `install-torch.sh`。
+- **`deploy/scripts/tests/test-setup-compute.sh`**：`make setup` 的脚本。用假的 `nvidia-smi`、`docker`、sysfs、`sudo`、apt / dnf / yum / zypper 等覆盖各种机器（有 / 没有显卡与驱动、旧驱动、RTX 50 系列、有 / 没有 NVIDIA Container Toolkit、新旧 Docker 的报错、Docker Desktop、离线、超时等）、`.env` 的合并与安装流程，不需要 Docker 与 GPU，也不会改动本机。`VERBOSE=1` 打印每次运行的输出；脚本兼容 macOS 自带的 bash 3.2。
+- **`deploy/scripts/tests/test-compose.sh`**：用真实的 `docker compose config` 检查各 profile 的服务、GPU 预留与变量插值，不启动容器（没有 docker compose 时跳过）。
+
+在真实机器上调试 `make setup` 时，加 `SETUP_ARGS=--dry-run` 只检测、不修改任何文件，或用 `--env-file` 写到别的文件。
+
+CI（`.github/workflows/ci.yml`）在每次 push 到 main 和每个 Pull Request 上运行：后端（gofmt、vet、带 PostgreSQL 服务的测试、Windows/macOS 交叉编译）、前端（lint、typecheck、test、build）、训练节点（ruff、Python 3.10 与 3.12 上的 pytest、shellcheck、bash 测试），以及 Docker 镜像构建：应用镜像、CPU 版训练节点镜像（构建时执行一次 CPU 上的 YOLO 自检，再检查 `probe` 的输出），并分别在不启用训练节点、`COMPOSE_PROFILES=gpu`、`COMPOSE_PROFILES=cpu` 下检查 `docker compose config`。
 
 ## 4. 添加新的后端 API
 
@@ -160,6 +197,17 @@ npx shadcn@latest add dialog
 - 错误向上返回并用 `fmt.Errorf("...: %w", err)` 补充上下文；只在入口处决定退出或返回 HTTP 错误。
 - 日志使用 `slog`，键名用 snake_case；不要打印密码、令牌等敏感信息。
 - 与平台相关的代码（如磁盘用量）用构建标签分文件，保证 `GOOS=windows` / `GOOS=darwin` 能编译。
+
+**Python（训练节点）**
+
+- 提交前 `ruff check` 与 `ruff format --check` 必须通过（配置在 `trainer/pyproject.toml`，CI 会检查）；代码需兼容 Python 3.10。
+- 常驻进程只依赖标准库、`psutil` 与 `nvidia-ml-py`（HTTP 客户端用 `urllib`）；`torch`、`ultralytics` 只在环境检测的子进程中导入，常驻进程不占用显存。
+- 运行依赖在 `requirements.txt` 中固定版本；`psutil`、`nvidia-ml-py` 的版本同时写在 `requirements-dev.txt` 中（有测试检查两者一致）。
+
+**Shell 脚本**
+
+- 使用 bash 与 `set -euo pipefail`，`shellcheck -x` 无警告（CI 会检查所有 `.sh`）；输出给用户的提示用中文。
+- 外部命令（`nvidia-smi`、`docker` 等）不存在时给出说明而不是报错退出；可通过环境变量替换（如 `TM_NVIDIA_SMI`、`TM_DOCKER`、`TM_SYSFS_ROOT`），测试用假命令覆盖，不能改动运行测试的机器。
 
 **前端**
 
