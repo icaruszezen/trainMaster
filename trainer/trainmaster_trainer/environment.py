@@ -24,9 +24,12 @@ import traceback
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import issues as issues_mod
+
+if TYPE_CHECKING:
+    from .config import Config
 
 log = logging.getLogger(__name__)
 
@@ -381,6 +384,18 @@ def child_env(
     return env
 
 
+def deployment_from(cfg: Config) -> issues_mod.Deployment:
+    """由配置得到部署方式（修复建议中的命令按它生成）；裸机安装时解释器与安装目录就是当前的 Python。"""
+    return issues_mod.Deployment(
+        server_url=cfg.server_url,
+        service=cfg.trainer_service,
+        mode=cfg.trainer_mode,
+        pinned_variant=cfg.trainer_variant,
+        python=sys.executable or "python3",
+        prefix=sys.prefix,
+    )
+
+
 class EnvironmentDetector:
     """在子进程中检测 CUDA 环境（限时），合并硬件信息得到 Environment。可从其它线程调用 cancel()。"""
 
@@ -393,9 +408,11 @@ class EnvironmentDetector:
         timeout: float = 300.0,
         command: Sequence[str] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        deployment: issues_mod.Deployment | None = None,
     ) -> None:
         self.state_dir = state_dir
         self.torch_variant = torch_variant
+        self.deployment = deployment
         self.self_test = self_test
         self.timeout = timeout
         self.command = list(command) if command else [sys.executable, "-m", CHILD_MODULE]
@@ -502,6 +519,7 @@ class EnvironmentDetector:
             probed_at=utc_now(),
             device_nodes=device_nodes,
             pci_gpu_count=pci_gpu_count,
+            deployment=self.deployment,
         )
 
 

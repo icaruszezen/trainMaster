@@ -15,6 +15,7 @@ import pytest
 from fakes import TRAINER_DIR, make_torch, make_torchvision, make_ultralytics
 
 from trainmaster_trainer import environment
+from trainmaster_trainer.config import Config
 from trainmaster_trainer.environment import (
     EnvironmentDetector,
     collect,
@@ -328,6 +329,25 @@ def test_detect_success(tmp_path: Path):
     assert (tmp_path / "state" / "ultralytics").is_dir()
     assert env["probed_at"].endswith("Z")
     assert [i["code"] for i in env["issues"]] == ["no_gpu"]
+
+
+def test_detect_builds_hints_for_the_deployment(tmp_path: Path):
+    # 其它机器上的 CPU 训练节点、选择了 CPU 模式：宿主机的显卡只作提示，命令只启动本机的训练节点服务。
+    cmd = script(tmp_path, f"import json\nprint(json.dumps({GOOD_RAW!r}))\n")
+    cfg = Config(
+        server_url="http://192.168.1.10:8080",
+        state_dir=tmp_path,
+        trainer_service="trainer-cpu",
+        trainer_mode="cpu",
+    )
+    deployment = environment.deployment_from(cfg)
+    assert deployment.service == "trainer-cpu" and deployment.mode == "cpu"
+    assert deployment.python == sys.executable and deployment.prefix == sys.prefix
+    hardware = dict(HARDWARE, gpu_detection={"method": "none", "error": None, "host_gpu_count": 1})
+    env = detector(tmp_path, cmd, deployment=deployment).detect(hardware)
+    assert [i["code"] for i in env["issues"]] == ["cpu_mode_selected"]
+    assert "`docker compose up -d --build trainer`" in env["issues"][0]["hint"]
+    assert env["status"] == "cpu_only"
 
 
 def test_detect_self_test_disabled_env(tmp_path: Path):

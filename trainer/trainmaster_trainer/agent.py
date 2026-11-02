@@ -25,7 +25,7 @@ from . import issues as issues_mod
 from . import node_key as node_key_mod
 from .client import ApiError, Client, TransportError
 from .config import Config
-from .environment import EnvironmentDetector, failure_raw, utc_now
+from .environment import EnvironmentDetector, deployment_from, failure_raw, utc_now
 
 log = logging.getLogger(__name__)
 
@@ -97,11 +97,13 @@ class Agent:
         self.config = config
         self.client = client or Client(config.server_url, config.node_token)
         self._probe_hardware = probe_hardware or hardware_mod.probe
+        self.deployment = deployment_from(config)
         self.detector: Detector = detector or EnvironmentDetector(
             state_dir=config.state_dir,
             torch_variant=config.torch_variant,
             self_test=config.self_test,
             timeout=config.self_test_timeout,
+            deployment=self.deployment,
         )
         self._sleep = sleep
         self._clock = clock
@@ -229,6 +231,7 @@ class Agent:
                 failure_raw(f"环境检测出错：{type(exc).__name__}: {exc}"),
                 torch_variant=self.config.torch_variant,
                 probed_at=utc_now(),
+                deployment=self.deployment,
             )
         if self._stop.is_set():
             return

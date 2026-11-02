@@ -32,6 +32,10 @@ _LOG_LEVELS = {
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
 _DURATION = re.compile(r"(\d+(?:\.\d+)?)\s*(s|m)?")
+# make setup 的训练节点模式（deploy/scripts/setup-compute.sh --mode）。
+TRAINER_MODES = ("auto", "gpu", "cpu", "off")
+# compose 服务名（TM_TRAINER_SERVICE）：字母、数字开头，之后可以有 . _ -。
+_SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 class ConfigError(ValueError):
@@ -49,6 +53,12 @@ class Config:
     self_test: bool = True
     self_test_timeout: float = DEFAULT_SELF_TEST_TIMEOUT
     log_level: int = logging.INFO
+    # 以下三项由 docker-compose.yml 传入，只用于生成修复建议中的命令：
+    # 所在的 compose 服务（trainer / trainer-cpu）、make setup 保存的模式（TM_TRAINER_MODE）
+    # 与固定的 PyTorch 变体（TM_TRAINER_VARIANT，没有固定时为 None）。
+    trainer_service: str | None = None
+    trainer_mode: str | None = None
+    trainer_variant: str | None = None
     # 状态目录不可写、退回到其它目录时的说明（启动时记录 WARNING）。
     state_dir_warning: str | None = field(default=None, compare=False)
 
@@ -115,6 +125,20 @@ def parse_timeout(raw: str) -> float:
     if not 0 < seconds <= MAX_SELF_TEST_TIMEOUT:
         raise ValueError(f"{raw!r} 超出范围（应大于 0 且不超过 24 小时）")
     return seconds
+
+
+def parse_service(raw: str) -> str:
+    name = raw.strip()
+    if not _SERVICE.fullmatch(name):
+        raise ValueError(f"{raw!r} 不是合法的 compose 服务名（如 trainer、trainer-cpu）")
+    return name
+
+
+def parse_mode(raw: str) -> str:
+    mode = raw.strip().lower()
+    if mode not in TRAINER_MODES:
+        raise ValueError(f"未知的模式 {raw!r}（{'、'.join(TRAINER_MODES)}）")
+    return mode
 
 
 def parse_log_level(raw: str) -> int:
@@ -218,6 +242,23 @@ def load(
         except ValueError as exc:
             fail("TM_SELF_TEST_TIMEOUT", exc)
 
+    service: str | None = None
+    if _clean(env, "TM_TRAINER_SERVICE"):
+        try:
+            service = parse_service(env["TM_TRAINER_SERVICE"])
+        except ValueError as exc:
+            fail("TM_TRAINER_SERVICE", exc)
+
+    mode: str | None = None
+    if _clean(env, "TM_TRAINER_MODE"):
+        try:
+            mode = parse_mode(env["TM_TRAINER_MODE"])
+        except ValueError as exc:
+            fail("TM_TRAINER_MODE", exc)
+
+    # make setup 把无效的值按自动选择处理，这里同样不报错；auto 表示没有固定。
+    pinned = _clean(env, "TM_TRAINER_VARIANT").lower()
+
     level = logging.INFO
     if _clean(env, "TM_LOG_LEVEL"):
         try:
@@ -247,5 +288,8 @@ def load(
         self_test=self_test,
         self_test_timeout=timeout,
         log_level=level,
+        trainer_service=service,
+        trainer_mode=mode,
+        trainer_variant=pinned if pinned and pinned != "auto" else None,
         state_dir_warning=warning,
     )

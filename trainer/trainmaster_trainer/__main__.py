@@ -73,7 +73,7 @@ def cmd_run() -> int:
 
 def _detect(cfg: config_mod.Config) -> tuple[Any, dict[str, Any]]:
     from . import hardware
-    from .environment import EnvironmentDetector
+    from .environment import EnvironmentDetector, deployment_from
 
     probe = hardware.probe()
     detector = EnvironmentDetector(
@@ -81,6 +81,7 @@ def _detect(cfg: config_mod.Config) -> tuple[Any, dict[str, Any]]:
         torch_variant=cfg.torch_variant,
         self_test=cfg.self_test,
         timeout=cfg.self_test_timeout,
+        deployment=deployment_from(cfg),
     )
     # Ctrl+C / docker stop 时结束检测子进程（run_child 收到 KeyboardInterrupt 会终止它）。
     signal.signal(signal.SIGTERM, _raise_interrupt)

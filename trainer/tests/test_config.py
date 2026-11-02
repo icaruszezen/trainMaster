@@ -60,6 +60,33 @@ def test_full_configuration(tmp_path):
     assert cfg.log_level == logging.DEBUG
 
 
+def test_compose_deployment_settings(tmp_path):
+    cfg = config.load(base_env(tmp_path))
+    assert cfg.trainer_service is None and cfg.trainer_mode is None
+    assert cfg.trainer_variant is None
+    cfg = config.load(
+        base_env(
+            tmp_path,
+            TM_TRAINER_SERVICE=" trainer-cpu ",
+            TM_TRAINER_MODE="CPU",
+            TM_TRAINER_VARIANT=" cu126 ",
+        )
+    )
+    assert cfg.trainer_service == "trainer-cpu"
+    assert cfg.trainer_mode == "cpu"
+    assert cfg.trainer_variant == "cu126"
+    # auto 表示没有固定变体
+    assert config.load(base_env(tmp_path, TM_TRAINER_VARIANT="auto")).trainer_variant is None
+
+
+def test_invalid_compose_deployment_settings(tmp_path):
+    with pytest.raises(ConfigError) as info:
+        config.load(base_env(tmp_path, TM_TRAINER_SERVICE="train er", TM_TRAINER_MODE="fast"))
+    message = str(info.value)
+    assert "TM_TRAINER_SERVICE" in message and "compose 服务名" in message
+    assert "TM_TRAINER_MODE" in message and "auto、gpu、cpu、off" in message
+
+
 def test_server_url_required_for_run(tmp_path):
     with pytest.raises(ConfigError) as info:
         config.load(base_env(tmp_path), require_server=True)
