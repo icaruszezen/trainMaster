@@ -134,20 +134,22 @@ export function ConnectMethodsBrief() {
           icon={Monitor}
           title="本机（Docker）"
           description="在平台的部署目录中运行"
-          command={commands.local}
+          commands={[commands.local]}
         />
         <BriefMethod
           icon={Network}
           title="其它 GPU 机器（Docker）"
-          description="在那台机器上的仓库目录中运行，只启动训练节点"
-          command={`${commands.remoteSetup}\n${commands.remoteStart}`}
+          description="在那台机器上的仓库目录中依次运行，只启动训练节点"
+          // 两条命令分开复制：make setup 选择 CPU 时第二条要换成 trainer-cpu，
+          // 一起粘贴会立刻启动 GPU 的 trainer 服务。
+          commands={[commands.remoteSetup, commands.remoteStart]}
           note={<RemoteStartNote />}
         />
         <BriefMethod
           icon={Terminal}
           title="不用 Docker"
           description="在 GPU 机器上的仓库目录中运行"
-          command={commands.bareMetal}
+          commands={[commands.bareMetal]}
         />
       </ol>
       <div className="grid gap-1 text-xs text-muted-foreground">
@@ -176,13 +178,14 @@ function BriefMethod({
   icon: Icon,
   title,
   description,
-  command,
+  commands,
   note,
 }: {
   icon: LucideIcon
   title: string
   description: ReactNode
-  command: string
+  /** 每条命令一个代码块，各自复制。 */
+  commands: readonly string[]
   /** 命令下方的补充说明。 */
   note?: ReactNode
 }) {
@@ -196,7 +199,9 @@ function BriefMethod({
         <p className="text-xs text-muted-foreground">{description}</p>
       </div>
       <div className="grid min-w-0 gap-1.5">
-        <CommandBlock command={command} />
+        {commands.map((command) => (
+          <CommandBlock key={command} command={command} />
+        ))}
         {note && <p className="text-xs text-muted-foreground">{note}</p>}
       </div>
     </li>
