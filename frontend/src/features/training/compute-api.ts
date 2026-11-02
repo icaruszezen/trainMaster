@@ -243,8 +243,16 @@ export type ComputeServer = {
     token_required: boolean
     heartbeat_interval_seconds: number
     offline_after_seconds: number
+    /**
+     * 这台机器上训练节点的模式（make setup 保存在 .env 中的 TM_TRAINER_MODE，平台启动时读取）；
+     * 不知道时（不是用 docker compose 启动的）为 null。
+     */
+    local_trainer_mode: TrainerMode | null
   }
 }
+
+/** make setup 的 --mode：auto 按显卡自动选择，gpu / cpu 固定，off 不在这台机器上运行训练节点。 */
+export type TrainerMode = "auto" | "gpu" | "cpu" | "off"
 
 const BASE = "/api/v1/compute"
 

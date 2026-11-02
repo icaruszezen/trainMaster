@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest"
 
 import type {
   ComputeNode,
+  ComputeServer,
   EnvironmentIssue,
   NodeEnvironment,
   NodeGpu,
+  TrainerMode,
 } from "@/features/training/compute-api"
 import {
   acceleratorLabel,
@@ -607,39 +609,74 @@ describe("serverGpuHint", () => {
     ],
   }
 
+  const server = (
+    overrides: Partial<Pick<ComputeServer, "nvidia">> = {},
+    localTrainerMode: TrainerMode | null = "auto"
+  ) => ({
+    nvidia,
+    ...overrides,
+    node_registration: { local_trainer_mode: localTrainerMode },
+  })
+
   it("hints when the server has GPUs but no GPU node is online", () => {
-    expect(serverGpuHint({ nvidia }, [])).toEqual({
+    expect(serverGpuHint(server(), [])).toEqual({
       kind: "no_gpu_node",
       gpuCount: 2,
     })
     expect(
-      serverGpuHint({ nvidia }, [
+      serverGpuHint(server(), [
         withGpus([gpu(0)], { status: "offline" }),
         withGpus([]),
       ])
     ).toEqual({ kind: "no_gpu_node", gpuCount: 2 })
+    // Outside docker compose the platform does not know the local mode.
+    expect(serverGpuHint(server({}, null), [])).toEqual({
+      kind: "no_gpu_node",
+      gpuCount: 2,
+    })
   })
 
   it("asks for a driver when the GPUs are only visible on the PCI bus", () => {
     expect(
       serverGpuHint(
-        {
+        server({
           nvidia: {
             driver_version: null,
             gpus: [{ name: null, uuid: null, bus_id: "0000:01:00.0" }],
           },
-        },
+        }),
         []
       )
     ).toEqual({ kind: "driver_missing", gpuCount: 1 })
   })
 
   it("stays quiet when a GPU node is online or the server has no GPU", () => {
-    expect(serverGpuHint({ nvidia }, [withGpus([gpu(0)])])).toBeNull()
-    expect(serverGpuHint({ nvidia: null }, [])).toBeNull()
+    expect(serverGpuHint(server(), [withGpus([gpu(0)])])).toBeNull()
+    expect(serverGpuHint(server({ nvidia: null }), [])).toBeNull()
     expect(
-      serverGpuHint({ nvidia: { driver_version: "550.54.15", gpus: [] } }, [])
+      serverGpuHint(
+        server({ nvidia: { driver_version: "550.54.15", gpus: [] } }),
+        []
+      )
     ).toBeNull()
+  })
+
+  it("stays quiet when this machine's trainer is off or in CPU mode", () => {
+    // make up SETUP_ARGS="--mode off": no node runs here, so none can report
+    // cpu_mode_selected; the platform reads the mode from its own .env.
+    for (const mode of ["off", "cpu"] as const) {
+      expect(serverGpuHint(server({}, mode), [])).toBeNull()
+      expect(
+        serverGpuHint(
+          server({ nvidia: { ...nvidia, driver_version: null } }, mode),
+          []
+        )
+      ).toBeNull()
+    }
+    expect(serverGpuHint(server({}, "gpu"), [])).toEqual({
+      kind: "no_gpu_node",
+      gpuCount: 2,
+    })
   })
 
   it("stays quiet when an online node runs in the chosen CPU mode", () => {
@@ -652,14 +689,15 @@ describe("serverGpuHint", () => {
         ...overrides,
       })
 
-    expect(serverGpuHint({ nvidia }, [cpuMode()])).toBeNull()
+    expect(serverGpuHint(server(), [cpuMode()])).toBeNull()
     // Only online nodes count: an old offline record does not hide the hint.
-    expect(serverGpuHint({ nvidia }, [cpuMode({ status: "offline" })])).toEqual(
-      { kind: "no_gpu_node", gpuCount: 2 }
-    )
+    expect(serverGpuHint(server(), [cpuMode({ status: "offline" })])).toEqual({
+      kind: "no_gpu_node",
+      gpuCount: 2,
+    })
     // A CPU node that did not choose CPU mode (e.g. no toolkit) keeps it.
     expect(
-      serverGpuHint({ nvidia }, [
+      serverGpuHint(server(), [
         withGpus([], {
           environment: environment({
             status: "cpu_only",

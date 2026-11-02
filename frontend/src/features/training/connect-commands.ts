@@ -1,10 +1,14 @@
 /** “接入节点”说明中的命令（纯函数，便于测试）。 */
+import type { TrainerMode } from "@/features/training/compute-api"
 
 /** 命令中的令牌占位符：用户需要换成部署机 .env 中的 TM_NODE_TOKEN。 */
 export const TOKEN_PLACEHOLDER = "<令牌>"
 
 export type ConnectCommands = {
-  /** 本机：检测显卡并配置 Docker，然后启动全部服务（含训练节点）。 */
+  /**
+   * 本机：检测显卡并配置 Docker，然后启动全部服务（含训练节点）。本机的训练节点
+   * 用 --mode off 关闭过时恢复自动选择（off 保存在 .env 中，否则 make up 不启动它）。
+   */
   local: string
   /**
    * 其它机器上的 Docker 部署：make setup 写入平台地址与令牌（没有 .env 时从
@@ -24,9 +28,12 @@ export type ConnectCommands = {
 export function connectCommands({
   serverUrl,
   tokenRequired,
+  localTrainerMode = null,
 }: {
   serverUrl: string
   tokenRequired: boolean
+  /** 平台服务器上训练节点的模式（node_registration.local_trainer_mode）。 */
+  localTrainerMode?: TrainerMode | null
 }): ConnectCommands {
   const args = [`--server-url ${serverUrl}`]
   if (tokenRequired) {
@@ -34,7 +41,10 @@ export function connectCommands({
   }
 
   return {
-    local: "make setup && make up",
+    local:
+      localTrainerMode === "off"
+        ? 'make up SETUP_ARGS="--mode auto"'
+        : "make setup && make up",
     remoteSetup: `make setup SETUP_ARGS="${args.join(" ")}"`,
     remoteStart: "docker compose up -d --build trainer",
     bareMetal: `sudo trainer/scripts/install.sh ${args.join(" ")} --systemd`,

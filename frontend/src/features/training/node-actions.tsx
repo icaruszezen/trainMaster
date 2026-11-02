@@ -193,7 +193,8 @@ function DeleteNodeForm({
           部署运行 <Command>docker compose stop trainer</Command>（CPU 节点为{" "}
           <Command>trainer-cpu</Command>；平台所在的机器上之后的{" "}
           <Command>make up</Command> 会再次启动它，改用{" "}
-          <Command>make setup SETUP_ARGS="--mode off"</Command>
+          <Command>make up SETUP_ARGS="--mode off"</Command>
+          ，以后要恢复时运行 <Command>make up SETUP_ARGS="--mode auto"</Command>
           ），直接安装的运行{" "}
           <Command>sudo systemctl disable --now trainmaster-trainer</Command>。
         </AlertDialogDescription>

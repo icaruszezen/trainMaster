@@ -387,15 +387,25 @@ export type ServerGpuHint = {
 
 /**
  * 平台服务器上有 NVIDIA 显卡、但没有在线的 GPU 训练节点时，提示如何接入。
- * 已有 GPU 节点在线（可能就在这台机器上），或在线节点说明是有意选择了 CPU
- * 模式（`cpu_mode_selected`）时不提示。
+ * 已有 GPU 节点在线（可能就在这台机器上）、这台机器的训练节点有意关闭或选择了
+ * CPU 模式（平台的 TM_TRAINER_MODE 为 off / cpu，或在线节点上报
+ * `cpu_mode_selected`）时不提示。
  */
 export function serverGpuHint(
-  server: Pick<ComputeServer, "nvidia">,
+  server: Pick<ComputeServer, "nvidia"> & {
+    node_registration: Pick<
+      ComputeServer["node_registration"],
+      "local_trainer_mode"
+    >
+  },
   nodes: readonly Pick<ComputeNode, "status" | "hardware" | "environment">[]
 ): ServerGpuHint | null {
   const gpuCount = server.nvidia?.gpus.length ?? 0
   if (!server.nvidia || gpuCount === 0 || hasOnlineGpuNode(nodes)) {
+    return null
+  }
+  const mode = server.node_registration.local_trainer_mode
+  if (mode === "off" || mode === "cpu") {
     return null
   }
   const cpuModeSelected = nodes.some(

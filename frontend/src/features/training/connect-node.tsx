@@ -31,13 +31,17 @@ import {
 function useConnectInfo() {
   const server = useQuery(computeServerQuery)
   const tokenRequired = server.data?.node_registration.token_required ?? true
+  const localTrainerMode =
+    server.data?.node_registration.local_trainer_mode ?? null
   const serverUrl = suggestServerUrl(window.location)
   return {
     tokenRequired,
     serverUrl,
     /** 通过 localhost 访问页面：命令中的平台地址是占位符。 */
     serverUrlIsPlaceholder: serverUrl.includes(SERVER_HOST_PLACEHOLDER),
-    commands: connectCommands({ serverUrl, tokenRequired }),
+    /** 平台服务器上的训练节点用 --mode off 关闭了：本机的命令恢复自动选择。 */
+    localOff: localTrainerMode === "off",
+    commands: connectCommands({ serverUrl, tokenRequired, localTrainerMode }),
     heartbeatSeconds: server.data?.node_registration.heartbeat_interval_seconds,
   }
 }
@@ -111,6 +115,17 @@ function ServerUrlNote() {
   )
 }
 
+/** 本机的训练节点用 --mode off 关闭过：说明本机命令为什么带 --mode auto。 */
+function LocalOffNote() {
+  return (
+    <>
+      这台机器上的训练节点已用 <Code>--mode off</Code> 关闭（保存在{" "}
+      <Code>.env</Code> 中，之后的 <Code>make up</Code>{" "}
+      也不启动它），这条命令恢复自动选择并启动它。
+    </>
+  )
+}
+
 /** 其它机器上的训练节点按 make setup 的结果启动。 */
 function RemoteStartNote() {
   return (
@@ -125,7 +140,8 @@ function RemoteStartNote() {
 
 /** 空状态中的简要说明：三种接入方式各自的命令。 */
 export function ConnectMethodsBrief() {
-  const { commands, tokenRequired, serverUrlIsPlaceholder } = useConnectInfo()
+  const { commands, tokenRequired, serverUrlIsPlaceholder, localOff } =
+    useConnectInfo()
 
   return (
     <div className="grid w-full min-w-0 gap-3 text-left">
@@ -135,6 +151,7 @@ export function ConnectMethodsBrief() {
           title="本机（Docker）"
           description="在平台的部署目录中运行"
           commands={[commands.local]}
+          note={localOff && <LocalOffNote />}
         />
         <BriefMethod
           icon={Network}
@@ -232,8 +249,13 @@ export function ConnectNodeDialog({
 }
 
 function ConnectNodeContent() {
-  const { commands, tokenRequired, heartbeatSeconds, serverUrlIsPlaceholder } =
-    useConnectInfo()
+  const {
+    commands,
+    tokenRequired,
+    heartbeatSeconds,
+    serverUrlIsPlaceholder,
+    localOff,
+  } = useConnectInfo()
 
   return (
     <>
@@ -256,13 +278,27 @@ function ConnectNodeContent() {
             训练节点。
             <Code>make up</Code> 随后构建并启动全部服务。
           </p>
+          {localOff && (
+            <p>
+              <LocalOffNote />
+            </p>
+          )}
           <CommandBlock command={commands.local} />
           <p className="text-xs">
-            Docker 还不能使用显卡时，加上{" "}
-            <Code>SETUP_ARGS="--install-toolkit"</Code> 自动安装 NVIDIA
-            Container Toolkit（需要 sudo）。没有 make（如 Windows）时运行{" "}
-            <Code>deploy/scripts/setup-compute.sh</Code> 或按部署文档手动修改{" "}
-            <Code>.env</Code>。
+            Docker 还不能使用显卡时，
+            {localOff ? (
+              <>
+                在 <Code>SETUP_ARGS</Code> 中再加上{" "}
+                <Code>--install-toolkit</Code>
+              </>
+            ) : (
+              <>
+                加上 <Code>SETUP_ARGS="--install-toolkit"</Code>
+              </>
+            )}{" "}
+            自动安装 NVIDIA Container Toolkit（需要 sudo）。没有 make（如
+            Windows）时运行 <Code>deploy/scripts/setup-compute.sh</Code>{" "}
+            或按部署文档手动修改 <Code>.env</Code>。
           </p>
         </Method>
 
