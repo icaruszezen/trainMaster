@@ -284,6 +284,29 @@ def test_probe_request_ignored_while_detection_runs(platform, tmp_path):
         assert h.detector.calls == 1  # 检测结果清除了请求
 
 
+def test_restart_marks_node_detecting_without_second_detection(platform, tmp_path):
+    """重启后注册时检测还没完成：平台保留上次的结果并标记为正在检测（probe_requested），
+    节点忽略这个请求，不会再启动一次检测；结果上报后请求被清除。"""
+    old = {"status": "error", "issues": [{"code": "driver_too_old"}], "run": 0}
+    with platform.lock:
+        platform.nodes["node-key-1"] = {"node_id": 9, "environment": old, "probe_requested": False}
+    gate = threading.Event()
+    with Harness(tmp_path, platform.url, detector=FakeDetector(gate)) as h:
+        wait_until(lambda: (registered(platform) or {}).get("registrations"))
+        node = registered(platform)
+        assert node["probe_requested"] is True
+        assert node["environment"] is old  # 页面在“正在检测”之下仍显示上次的结果
+        wait_until(lambda: node.get("heartbeats", 0) >= 5)
+        assert h.detector.calls == 1 and h.hardware.count == 1
+        gate.set()
+        wait_until(lambda: node.get("environment_updates") == 1)
+        assert node["probe_requested"] is False
+        assert node["environment"]["run"] == 1
+        hb = node["heartbeats"]
+        wait_until(lambda: node["heartbeats"] >= hb + 3)
+        assert h.detector.calls == 1 and h.hardware.count == 1
+
+
 def test_probe_request_answered_by_result_finished_during_heartbeat(tmp_path):
     """检测在一次心跳请求进行期间完成：这次响应里的 probe_requested 由随后上报的结果回应。"""
     gate = threading.Event()
