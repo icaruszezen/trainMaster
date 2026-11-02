@@ -379,20 +379,69 @@ export function hasOnlineGpuNode(
   return nodes.some((node) => isOnline(node) && node.hardware.gpus.length > 0)
 }
 
-export type ServerGpuHint = {
-  /** driver_missing：只在 PCI 总线上看到显卡；no_gpu_node：驱动正常但没有 GPU 节点在线。 */
-  kind: "driver_missing" | "no_gpu_node"
-  gpuCount: number
+/**
+ * CUDA 版 PyTorch 最低需要的 NVIDIA 驱动：x86_64 上是
+ * trainer/trainmaster_trainer/torch_variants.txt 中最低的 min_driver（cu118）；
+ * ARM 服务器上只有 cu130 有 ARM 版，需要 580。驱动低于它时 make setup 只能选择
+ * CPU 训练节点，也不安装 NVIDIA Container Toolkit。修改变体表时同时核对这里。
+ */
+export const MIN_CUDA_DRIVER = "450.80.02"
+export const MIN_CUDA_DRIVER_ARM = "580"
+
+/** 平台服务器架构（runtime.GOARCH）上 CUDA 版 PyTorch 最低需要的驱动版本。 */
+export function minCudaDriver(arch: string | null | undefined) {
+  return arch === "arm64" || arch === "aarch64"
+    ? MIN_CUDA_DRIVER_ARM
+    : MIN_CUDA_DRIVER
 }
+
+function versionParts(version: string) {
+  const text = version.trim()
+  return /^\d+(?:\.\d+)*$/.test(text) ? text.split(".").map(Number) : null
+}
+
+/**
+ * 点分版本号按数字比较：`versionBelow("440.100", "450.80.02")` 为 true，
+ * 缺少的部分按 0（"580" 与 "580.0" 相同）。无法解析的版本号返回 false（不认为过旧）。
+ */
+export function versionBelow(version: string, minimum: string) {
+  const a = versionParts(version)
+  const b = versionParts(minimum)
+  if (!a || !b) {
+    return false
+  }
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0)
+    if (diff !== 0) {
+      return diff < 0
+    }
+  }
+  return false
+}
+
+export type ServerGpuHint =
+  | {
+      /** driver_missing：只在 PCI 总线上看到显卡；no_gpu_node：驱动正常但没有 GPU 节点在线。 */
+      kind: "driver_missing" | "no_gpu_node"
+      gpuCount: number
+    }
+  | {
+      /** 驱动版本低于任何 CUDA 版 PyTorch 的要求：先升级驱动。 */
+      kind: "driver_too_old"
+      gpuCount: number
+      driverVersion: string
+      /** 这台机器的架构上 CUDA 版 PyTorch 最低需要的驱动版本。 */
+      minDriver: string
+    }
 
 /**
  * 平台服务器上有 NVIDIA 显卡、但没有在线的 GPU 训练节点时，提示如何接入。
  * 已有 GPU 节点在线（可能就在这台机器上）、这台机器的训练节点有意关闭或选择了
  * CPU 模式（平台的 TM_TRAINER_MODE 为 off / cpu，或在线节点上报
- * `cpu_mode_selected`）时不提示。
+ * `cpu_mode_selected`）时不提示。驱动过旧时先提示升级驱动。
  */
 export function serverGpuHint(
-  server: Pick<ComputeServer, "nvidia"> & {
+  server: Pick<ComputeServer, "nvidia" | "arch"> & {
     node_registration: Pick<
       ComputeServer["node_registration"],
       "local_trainer_mode"
@@ -416,9 +465,13 @@ export function serverGpuHint(
   if (cpuModeSelected) {
     return null
   }
-  return {
-    kind:
-      server.nvidia.driver_version === null ? "driver_missing" : "no_gpu_node",
-    gpuCount,
+  const driverVersion = server.nvidia.driver_version
+  if (driverVersion === null) {
+    return { kind: "driver_missing", gpuCount }
   }
+  const minDriver = minCudaDriver(server.arch)
+  if (versionBelow(driverVersion, minDriver)) {
+    return { kind: "driver_too_old", gpuCount, driverVersion, minDriver }
+  }
+  return { kind: "no_gpu_node", gpuCount }
 }
