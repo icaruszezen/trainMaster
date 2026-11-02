@@ -97,7 +97,7 @@ usage() {
   --variant NAME           固定 PyTorch 变体（$(cuda_variant_names | sed 's/ / \/ /g')），
                            不按驱动与显卡自动选择。写入 TM_TRAINER_VARIANT，之后的 make setup /
                            make up 都沿用它；--variant auto 恢复自动选择
-  --server-url URL         平台地址（在其它机器上运行训练节点时），写入 TM_SERVER_URL
+  --server-url URL         平台地址（在其它机器上运行训练节点时；IPv4 地址或域名），写入 TM_SERVER_URL
   --token TOKEN            节点令牌，与平台 .env 中的 TM_NODE_TOKEN 相同，写入 TM_NODE_TOKEN
   --env-file PATH          要修改的 .env（默认仓库根目录的 .env；不存在时从 .env.example 复制）
   --no-docker-test         不运行 docker run --gpus all 验证，只检查 Docker 的配置
@@ -173,6 +173,11 @@ validate_args() {
 	esac
 	if [ -n "$SERVER_URL_ARG" ]; then
 		SERVER_URL_ARG="$(strip_trailing_slashes "$SERVER_URL_ARG")"
+		# 方括号中的 IPv6 地址（如页面以 http://[fd00::10]:8080 打开时生成的命令）：训练节点容器所在的
+		# compose 网络默认没有 IPv6，写入 .env 后节点也连不上平台
+		case "$SERVER_URL_ARG" in
+		*://\[* | *://*@\[*) usage_error "--server-url 不能使用 IPv6 地址：训练节点容器的 Docker 网络默认没有 IPv6，请改用平台的 IPv4 地址或域名" ;;
+		esac
 		valid_url "$SERVER_URL_ARG" || usage_error "--server-url 必须是 http:// 或 https:// 开头的地址（如 http://192.168.1.10:8080）"
 	fi
 	if [ -n "$TOKEN_ARG" ]; then
@@ -1456,23 +1461,28 @@ main() {
 	decide
 
 	# 8. 写入 .env
-	local old_profiles new_profiles server_url node_name host_name token remote=0
+	local old_profiles new_profiles server_url node_name prev_host host_name token remote=0 follow=0
 	old_profiles="$(env_get COMPOSE_PROFILES "$ENV_SOURCE" || true)"
 	new_profiles="$(merge_profiles "$old_profiles" "$RESULT")"
 	if [ -n "$MODE_ARG" ]; then set_key TM_TRAINER_MODE "$MODE_ARG"; fi
 	if [ -n "$VARIANT_ARG" ]; then set_key TM_TRAINER_VARIANT "$VARIANT_ARG"; fi
 	set_key COMPOSE_PROFILES "$new_profiles"
-	if [ "$RESULT" != off ]; then
-		set_key TM_TORCH_VARIANT "$VARIANT"
-		node_name="$(env_get TM_NODE_NAME "$ENV_SOURCE" || true)"
-		if [ -z "$node_name" ]; then
-			node_name="$(node_hostname)"
-			if [ -n "$node_name" ]; then set_key TM_NODE_NAME "$node_name"; fi
-		fi
+	if [ "$RESULT" != off ]; then set_key TM_TORCH_VARIANT "$VARIANT"; fi
+	host_name="$(node_hostname)"
+	# 节点名称为空时设为本机的主机名；仍是上次写入的主机名（等于原来的 TM_HOST_HOSTNAME）时跟随本机
+	# 当前的主机名（如把 .env 迁移到新服务器后，见 docs/deployment.md 第 6 节）。用户自己起的名字不变。
+	node_name="$(env_get TM_NODE_NAME "$ENV_SOURCE" || true)"
+	prev_host="$(env_get TM_HOST_HOSTNAME "$ENV_SOURCE" || true)"
+	if [ -z "$node_name" ]; then
+		if [ "$RESULT" != off ]; then follow=1; fi
+	elif [ "$node_name" = "$prev_host" ]; then
+		follow=1
+	fi
+	if [ "$follow" = 1 ] && [ -n "$host_name" ] && [ "$host_name" != "$node_name" ]; then
+		set_key TM_NODE_NAME "$host_name"
 	fi
 	# app 与训练节点容器的主机名（docker-compose.yml 中的 hostname）：每次都写入本机当前的主机名。
 	# 与 compose 中的服务名相同时留空（使用 compose 中的默认值），否则容器连不上同名的服务。
-	host_name="$(node_hostname)"
 	if [ -n "$host_name" ] && hostname_clashes_with_service "$host_name"; then
 		say "本机的主机名 $host_name 与 docker-compose.yml 中的服务名相同：用作容器的主机名时，容器中这个名字会指向容器自己。TM_HOST_HOSTNAME 留空，页面上的服务器主机名显示为 trainmaster，训练节点为 trainmaster-trainer"
 		if [ -n "$(env_get TM_HOST_HOSTNAME "$ENV_SOURCE" || true)" ]; then set_key TM_HOST_HOSTNAME ""; fi
