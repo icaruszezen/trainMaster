@@ -216,13 +216,16 @@ export type ComputeSummary = {
    * 只有部分显卡有实时数据时 total 小于 memoryTotalBytes。
    */
   memoryUsage: { used: number; total: number; gpus: number } | null
-  /** 在线节点中 CUDA 就绪的数量。 */
+  /** 在线节点中 CUDA 就绪的数量（不含正在重新检测的）。 */
   readyCount: number
-  /** 在线节点中环境异常的数量。 */
+  /** 在线节点中环境异常的数量（不含正在重新检测的）。 */
   problemCount: number
-  /** 在线节点中只能用 CPU 训练的数量。 */
+  /** 在线节点中只能用 CPU 训练的数量（不含正在重新检测的）。 */
   cpuOnlyCount: number
-  /** 在线节点中还没有完成第一次检测的数量。 */
+  /**
+   * 在线节点中正在检测的数量：还没有完成第一次检测，或正在重新检测（节点重新
+   * 启动、请求了重新检测；与节点卡片上的“正在重新检测”一致，不按上次的结果统计）。
+   */
   detectingCount: number
 }
 
@@ -259,7 +262,7 @@ export function summarizeNodes(nodes: readonly ComputeNode[]): ComputeSummary {
 
     summary.onlineCount += 1
     summary.gpuCount += gpus.length
-    switch (node.environment?.status) {
+    switch (isProbing(node) ? undefined : node.environment?.status) {
       case undefined:
         summary.detectingCount += 1
         break

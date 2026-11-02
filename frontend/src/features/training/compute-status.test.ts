@@ -390,6 +390,47 @@ describe("summarizeNodes", () => {
     })
   })
 
+  it("counts a node that is re-detecting as detecting, not by its last result", () => {
+    // After a restart the node registers without an environment: the server
+    // keeps the last one and marks the node probe_pending (badge 正在重新检测).
+    const redetecting = (
+      status: NodeEnvironment["status"],
+      overrides: Partial<ComputeNode> = {}
+    ) =>
+      withGpus([gpu(0)], {
+        probe_pending: true,
+        environment: environment({ status }),
+        ...overrides,
+      })
+
+    expect(
+      summarizeNodes([
+        redetecting("error", { id: 1 }),
+        redetecting("ready", { id: 2 }),
+        redetecting("cpu_only", { id: 3 }),
+      ])
+    ).toMatchObject({
+      onlineCount: 3,
+      gpuCount: 3,
+      readyCount: 0,
+      problemCount: 0,
+      cpuOnlyCount: 0,
+      detectingCount: 3,
+    })
+    expect(
+      dashboardComputeText(summarizeNodes([redetecting("error")]))
+    ).not.toContain("环境异常")
+    // An offline node cannot finish the detection: it is not counted online.
+    expect(
+      summarizeNodes([redetecting("error", { status: "offline" })])
+    ).toMatchObject({
+      onlineCount: 0,
+      problemCount: 0,
+      detectingCount: 0,
+      offlineGpuCount: 1,
+    })
+  })
+
   it("returns empty counts without nodes", () => {
     expect(summarizeNodes([])).toMatchObject({
       nodeCount: 0,
