@@ -37,6 +37,7 @@ var (
 	serverKeys        = []string{"hostname", "os", "arch", "kernel", "in_container", "uptime_seconds", "cpu", "memory", "load_average", "nvidia", "node_registration"}
 	serverCPUKeys     = []string{"model", "logical_cores", "physical_cores", "limit_cores", "usage_percent"}
 	serverMemoryKeys  = []string{"total_bytes", "available_bytes", "used_bytes", "limit_bytes"}
+	registrationKeys  = []string{"token_required", "heartbeat_interval_seconds", "offline_after_seconds", "local_trainer_mode"}
 	nodeRegisterKeys  = []string{"node_id", "heartbeat_interval_seconds", "server_time"}
 	nodeHeartbeatKeys = []string{"node_id", "heartbeat_interval_seconds", "probe_requested"}
 )
@@ -118,10 +119,12 @@ func testHost() *hostinfo.Host {
 func newComputeEnv(t *testing.T, token string, trustedProxies ...string) *computeEnv {
 	t.Helper()
 	db := dbtest.New(t)
-	return newComputeHandler(t, compute.Options{DB: db.Pool}, token, trustedProxies...)
+	return newComputeHandler(t, compute.Options{DB: db.Pool}, Options{NodeToken: token, TrustedProxies: trustedProxies})
 }
 
-func newComputeHandler(t *testing.T, o compute.Options, token string, trustedProxies ...string) *computeEnv {
+// newComputeHandler serves the compute API of compute service o with the
+// handler settings of api (NodeToken, TrustedProxies, LocalTrainerMode).
+func newComputeHandler(t *testing.T, o compute.Options, api Options) *computeEnv {
 	t.Helper()
 	st, err := storage.New(t.TempDir())
 	if err != nil {
@@ -130,8 +133,9 @@ func newComputeHandler(t *testing.T, o compute.Options, token string, trustedPro
 	log := slog.New(slog.DiscardHandler)
 	clock := &computeClock{t: time.Date(2026, 11, 2, 8, 0, 0, 0, time.UTC)}
 	o.Logger, o.HeartbeatInterval, o.Now = log, 10*time.Second, clock.Now
-	h := NewHandler(Options{Logger: log, DB: fakeDB{}, Storage: st, StartedAt: time.Now(), TrustedProxies: trustedProxies,
-		Compute: compute.NewService(o), Host: testHost(), NodeToken: token})
+	api.Logger, api.DB, api.Storage, api.StartedAt = log, fakeDB{}, st, time.Now()
+	api.Compute, api.Host = compute.NewService(o), testHost()
+	h := NewHandler(api)
 	return &computeEnv{apiEnv: &apiEnv{h: h, st: st}, clock: clock}
 }
 
@@ -172,7 +176,7 @@ func firstItem(t *testing.T, v any, what string) map[string]any {
 
 func TestComputeServerInfo(t *testing.T) {
 	// No database needed.
-	e := newComputeHandler(t, compute.Options{}, "")
+	e := newComputeHandler(t, compute.Options{}, Options{})
 	raw := want[map[string]any](t, e.do("GET", "/api/v1/compute/server", nil), 200)
 	wantKeys(t, "server", raw, serverKeys...)
 	wantKeys(t, "server cpu", object(t, raw["cpu"], "cpu"), serverCPUKeys...)
@@ -184,16 +188,30 @@ func TestComputeServerInfo(t *testing.T) {
 		t.Errorf("memory = %v", mem)
 	}
 	reg := object(t, raw["node_registration"], "node_registration")
-	wantKeys(t, "node_registration", reg, "token_required", "heartbeat_interval_seconds", "offline_after_seconds")
-	if reg["token_required"] != false || reg["heartbeat_interval_seconds"] != 10.0 || reg["offline_after_seconds"] != 35.0 {
+	wantKeys(t, "node_registration", reg, registrationKeys...)
+	// Without TM_TRAINER_MODE (e.g. outside docker compose) the mode of
+	// this machine's own training node is not known.
+	if reg["token_required"] != false || reg["heartbeat_interval_seconds"] != 10.0 || reg["offline_after_seconds"] != 35.0 ||
+		reg["local_trainer_mode"] != nil {
 		t.Errorf("node_registration = %v", reg)
 	}
 
 	// The browser endpoints never need the node token.
-	e = newComputeHandler(t, compute.Options{}, "0123456789abcdef")
+	e = newComputeHandler(t, compute.Options{}, Options{NodeToken: "0123456789abcdef"})
 	raw = want[map[string]any](t, e.do("GET", "/api/v1/compute/server", nil), 200)
 	if object(t, raw["node_registration"], "node_registration")["token_required"] != true {
 		t.Errorf("token_required should be true: %v", raw["node_registration"])
+	}
+
+	// The mode make setup chose for this machine's own node (TM_TRAINER_MODE).
+	for _, mode := range []string{"auto", "gpu", "cpu", "off"} {
+		e = newComputeHandler(t, compute.Options{}, Options{LocalTrainerMode: mode})
+		raw = want[map[string]any](t, e.do("GET", "/api/v1/compute/server", nil), 200)
+		reg = object(t, raw["node_registration"], "node_registration")
+		wantKeys(t, "node_registration", reg, registrationKeys...)
+		if reg["local_trainer_mode"] != mode {
+			t.Errorf("local_trainer_mode = %#v, want %q", reg["local_trainer_mode"], mode)
+		}
 	}
 }
 

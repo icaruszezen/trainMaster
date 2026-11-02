@@ -43,6 +43,10 @@ type Config struct {
 	// (TM_NODE_HEARTBEAT_INTERVAL); a node is offline after three missed
 	// ones plus 5 seconds.
 	NodeHeartbeatInterval time.Duration
+	// TrainerMode is TM_TRAINER_MODE, the mode make setup chose for the
+	// training node on this machine: auto, gpu, cpu or off (docker compose
+	// passes it from .env). Empty: not known, e.g. outside docker compose.
+	TrainerMode string
 }
 
 // Limits of the training node settings.
@@ -79,6 +83,9 @@ func (p DBParams) URL() string {
 }
 
 var sslModes = []string{"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+
+// trainerModes are the modes of make setup --mode (TM_TRAINER_MODE).
+var trainerModes = []string{"auto", "gpu", "cpu", "off"}
 
 // Load reads the configuration through getenv (normally os.Getenv) and
 // validates it. All problems are reported together.
@@ -173,6 +180,16 @@ func Load(getenv func(string) string) (*Config, error) {
 		fail("TM_NODE_HEARTBEAT_INTERVAL", "invalid duration %q (between 2s and 5m, e.g. 10s or 1m)", interval)
 	} else {
 		cfg.NodeHeartbeatInterval = d
+	}
+
+	// TM_TRAINER_MODE only tunes the compute page's hints, so a bad value
+	// never stops the service: like setup-compute.sh, which warns and goes
+	// on, it counts as auto.
+	if mode := get("TM_TRAINER_MODE", ""); mode != "" {
+		if !slices.Contains(trainerModes, mode) {
+			mode = "auto"
+		}
+		cfg.TrainerMode = mode
 	}
 
 	if len(problems) > 0 {

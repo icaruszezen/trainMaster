@@ -100,8 +100,9 @@ func run() error {
 		Compute: compute.NewService(compute.Options{
 			DB: db.Pool, Logger: log, HeartbeatInterval: cfg.NodeHeartbeatInterval,
 		}),
-		Host:      host,
-		NodeToken: cfg.NodeToken,
+		Host:             host,
+		NodeToken:        cfg.NodeToken,
+		LocalTrainerMode: cfg.TrainerMode,
 	}
 	if cfg.WebDir != "" {
 		h, err := web.New(cfg.WebDir)

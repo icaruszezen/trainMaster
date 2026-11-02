@@ -29,6 +29,7 @@ func TestLoadDefaults(t *testing.T) {
 		LogFormat:             "text",
 		NodeToken:             "",
 		NodeHeartbeatInterval: 10 * time.Second,
+		TrainerMode:           "",
 	}
 	if !reflect.DeepEqual(*cfg, want) {
 		t.Errorf("Load defaults\n got %+v\nwant %+v", *cfg, want)
@@ -179,6 +180,32 @@ func TestLoadNodeSettings(t *testing.T) {
 		cfg, err := Load(env(map[string]string{"TM_NODE_HEARTBEAT_INTERVAL": interval.value}))
 		if err != nil || cfg.NodeHeartbeatInterval != interval.want {
 			t.Errorf("TM_NODE_HEARTBEAT_INTERVAL=%q: %v, %v; want %v", interval.value, cfg, err, interval.want)
+		}
+	}
+}
+
+func TestLoadTrainerMode(t *testing.T) {
+	for _, tt := range []struct{ value, want string }{
+		{"", ""}, // not known
+		{"   ", ""},
+		{"auto", "auto"},
+		{"gpu", "gpu"},
+		{"cpu", "cpu"},
+		{"off", "off"},
+		{" off ", "off"},
+		// Anything else counts as auto, as in setup-compute.sh; it is
+		// never a startup error.
+		{"OFF", "auto"},
+		{"none", "auto"},
+		{"gpu,cpu", "auto"},
+	} {
+		cfg, err := Load(env(map[string]string{"TM_TRAINER_MODE": tt.value}))
+		if err != nil {
+			t.Errorf("TM_TRAINER_MODE=%q: %v", tt.value, err)
+			continue
+		}
+		if cfg.TrainerMode != tt.want {
+			t.Errorf("TM_TRAINER_MODE=%q: TrainerMode = %q, want %q", tt.value, cfg.TrainerMode, tt.want)
 		}
 	}
 }
