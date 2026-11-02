@@ -30,7 +30,7 @@ docker compose ps             # postgres 与 app 都应为 healthy；启用训�
 
 - `make setup` 的输出说明检测到的显卡、选择的 GPU / CPU 模式与 PyTorch 版本，以及不能使用 GPU 的原因与修复方法（如 `make up SETUP_ARGS="--install-toolkit"`）。
 - `make up` 分两步启动：先 `docker compose up -d --build postgres app`，再构建并启动启用的训练节点。训练节点镜像要下载数 GB 的 PyTorch，下载失败时 `make up` 只打印警告，平台照常启动；在 `.env` 中配置镜像源（第 7 节）后重新运行 `make up` 即可。
-- 不需要训练节点时：`make setup SETUP_ARGS="--mode off"`，之后的 `make up` 只启动 postgres 与 app。
+- 不需要训练节点时：`make up SETUP_ARGS="--mode off"`，模式写入 `.env`，之后的 `make up` 只启动 postgres 与 app（恢复：`make up SETUP_ARGS="--mode auto"`，见第 10.5 节）。
 - 没有 make 时可以直接 `docker compose up -d --build`：`.env.example` 中没有启用训练节点，只启动 postgres 与 app；需要训练节点时按第 10.4 节手动配置。注意它一次构建全部镜像，其中一个构建失败时不会启动或更新任何容器。
 
 > **数据目录放在哪里**：默认的 `./data/storage`、`./data/postgres` 位于 git 检出目录内，适合试用。正式部署建议在 `.env` 中把 `TM_HOST_STORAGE_DIR`、`TM_HOST_POSTGRES_DIR` 改为仓库之外的绝对路径（如 `/srv/trainmaster/storage`、`/srv/trainmaster/postgres`）。数据留在仓库内时，`git clean -x`（或 `-X`）这类清理命令会把 `./data` 连同所有图片一起删除，且没有任何提示。
@@ -78,11 +78,11 @@ docker compose --profile '*' down   # 停止并删除全部容器（即 make dow
 | `TM_DEV_DB_PORT` | `5432` | 仅开发：`docker-compose.dev.yml` 把 postgres 暴露到 `127.0.0.1` 的端口 |
 | `TM_NODE_TOKEN` | 空 | 节点令牌（16–256 个可见 ASCII 字符），平台与本机训练节点共用。平台设置后只接受携带它的训练节点；为空时 `make setup` 生成 32 个字符的随机令牌。其它机器上的训练节点填写同一个值 |
 | `TM_NODE_HEARTBEAT_INTERVAL` | `10s` | 平台要求训练节点发送心跳的间隔（2s–5m）；超过 3 × 间隔 + 5 秒没有心跳的节点显示为离线 |
-| `TM_TRAINER_MODE` | `auto` | 训练节点模式，`make setup` 读取：`auto`（显卡、驱动与 Docker 的 GPU 支持都正常时用 GPU，否则用 CPU）、`gpu` / `cpu`（强制）、`off`（不运行），见第 10 节。也传给训练节点容器：为 `cpu` 时节点知道是有意选择了 CPU |
-| `TM_TRAINER_VARIANT` | `auto` | 固定训练节点的 PyTorch 变体（`cu130` / `cu126` / `cu128` / `cu118`）；`auto` 时 `make setup` 按驱动与显卡选择。用 `make setup SETUP_ARGS="--variant cu126"` 写入 |
+| `TM_TRAINER_MODE` | `auto` | 训练节点模式，`make setup` 读取：`auto`（显卡、驱动与 Docker 的 GPU 支持都正常时用 GPU，否则用 CPU）、`gpu` / `cpu`（强制）、`off`（不运行），见第 10 节。也传给训练节点容器（为 `cpu` 时节点知道是有意选择了 CPU）与 app（页面据此知道本机的训练节点被关闭或有意使用 CPU，见 10.5） |
+| `TM_TRAINER_VARIANT` | `auto` | 固定训练节点的 PyTorch 变体（`cu130` / `cu126` / `cu128` / `cu118`）；`auto` 时 `make setup` 按驱动与显卡选择。用 `make setup SETUP_ARGS="--variant cu126"` 写入。也传给训练节点容器：固定了变体时，页面上的修复建议用 `--variant auto` 恢复自动选择，而不是再固定另一个变体 |
 | `COMPOSE_PROFILES` | 空 | docker compose 启用的 profile：`gpu` → `trainer` 服务，`cpu` → `trainer-cpu` 服务，都没有时不运行训练节点。由 `make setup` 写入，其中的其它 profile 会保留 |
 | `TM_TORCH_VARIANT` | `cu130`（`trainer-cpu` 为 `cpu`） | 训练节点镜像中的 PyTorch 变体（`cu130` / `cu126` / `cu128` / `cu118` / `cpu`，见第 10.3 节）。**`make setup` 每次运行（包括 `make up`）都按检测结果重新写入**，手动修改会被覆盖：要换变体请用 `--variant`（写入 `TM_TRAINER_VARIANT`），如 `make up SETUP_ARGS="--variant cu128"`。只有不用 `make setup` 的手动配置（第 10.4 节）才直接修改它，然后 `docker compose up -d --build` |
-| `TM_NODE_NAME` | 空 | 训练节点在平台上显示的名称；`make setup` 写入本机主机名，为空时为主机名 |
+| `TM_NODE_NAME` | 空 | 训练节点在平台上显示的名称，为空时为主机名。为空时 `make setup` 写入本机的主机名；它仍是 `make setup` 写入的主机名（等于原来的 `TM_HOST_HOSTNAME`）时跟随本机当前的主机名（如把 `.env` 迁移到新服务器后，见第 6 节），自己设置的名称不变 |
 | `TM_HOST_HOSTNAME` | 空 | 本机的主机名，`make setup` 每次写入。app 与训练节点容器以它作为主机名（compose 中的 `hostname`），页面上显示的服务器与节点主机名就是真实的机器名，重建容器后也不变；为空时 app 为 `trainmaster`、训练节点为 `trainmaster-trainer`。本机的主机名与 compose 中的服务名 `app`、`postgres` 相同（或第一个点之前的部分相同）时 `make setup` 把它留空：容器中这个名字会指向容器自己 |
 | `TM_SERVER_URL` | `http://app:8080` | 训练节点连接的平台地址；只在其它机器上运行训练节点时设置，如 `http://192.168.1.10:8080` |
 | `TM_HOST_TRAINER_DIR` | `./data/trainer` | 训练节点的状态目录（节点标识 `node-key`、心跳文件、Ultralytics 配置），挂载为容器内 `/var/lib/trainmaster`。训练节点还把 `TM_HOST_STORAGE_DIR` 挂载为 `/data`。不要拷贝到其它机器（见第 6 节） |
@@ -93,7 +93,7 @@ docker compose --profile '*' down   # 停止并删除全部容器（即 make dow
 | `TORCH_INDEX_URL` | 空（`https://download.pytorch.org/whl`） | 构建参数：PyTorch 官方索引（`cu126` / `cu128` / `cu118` / `cpu` 变体），自动拼接 `/<变体>` |
 | `TORCH_FIND_LINKS` | 空 | 构建参数：扁平目录形式的 PyTorch 镜像（如 `https://mirrors.aliyun.com/pytorch-wheels`），设置后代替 `TORCH_INDEX_URL`，自动拼接 `/<变体>/` |
 | `NVIDIA_TOOLKIT_REPO` | `https://nvidia.github.io/libnvidia-container` | `--install-toolkit` 使用的 NVIDIA Container Toolkit 软件源，可换成镜像站（见第 7 节） |
-| `TM_VERSION` / `TM_COMMIT` / `TM_BUILD_TIME` | 空 | 可选：写入镜像的版本信息；`make up` / `make docker-build` 会自动填入 git 提交号和构建时间 |
+| `TM_VERSION` / `TM_COMMIT` / `TM_BUILD_TIME` | 空 | 可选：写入镜像的版本信息；`make up` / `make docker-build` 自动填入 git 提交号，构建时间为该提交的提交时间（UTC；不是 git 检出时为当前时间）。代码没有变化时构建参数不变，`make up` 复用构建缓存，不会重建 app 镜像、重启 app |
 
 修改 `.env` 后执行 `make up`（或 `docker compose up -d`，构建参数需加 `--build`；其它机器上只运行训练节点时见第 10.6 节）使其生效。docker compose 优先使用 shell 中的同名环境变量，其次才是 `.env`；`make setup` 发现 `COMPOSE_PROFILES`、`TM_TORCH_VARIANT` 等在 shell 中设置了不同的值时会提醒。
 
@@ -127,6 +127,7 @@ docker compose --profile '*' down   # 停止并删除全部容器（即 make dow
 | `TM_TRUSTED_PROXIES` | 空 | 来自 `.env` | 受信任的反向代理（IP 或 CIDR，逗号分隔）；为空时忽略 `X-Forwarded-For` |
 | `TM_NODE_TOKEN` | 空 | 来自 `.env` | 训练节点令牌：设置后 `/api/v1/compute/agent/*` 必须带 `Authorization: Bearer <令牌>`。16–256 个可见 ASCII 字符，首尾不能有空白 |
 | `TM_NODE_HEARTBEAT_INTERVAL` | `10s` | 来自 `.env` | 训练节点的心跳间隔（Go duration，2s–5m）；离线判定为 3 × 间隔 + 5 秒 |
+| `TM_TRAINER_MODE` | 空 | 来自 `.env`，默认 `auto` | 本机训练节点的模式（`make setup` 的 `--mode`），只用于页面上的提示：`GET /api/v1/compute/server` 的 `node_registration.local_trainer_mode`。`auto` / `gpu` / `cpu` / `off` 之外的值按 `auto` 处理（不报错），未设置时为 null。启动时读取，修改后需要重新创建 app 容器（`make up`） |
 
 非法取值（如端口不是数字、未知的日志级别、过短的令牌）会在启动时报错退出，并列出所有有问题的变量。
 
@@ -141,6 +142,7 @@ docker compose --profile '*' down   # 停止并删除全部容器（即 make dow
 | `TM_NODE_NAME` | 主机名 | 来自 `.env` | 显示名称 |
 | `TM_TRAINER_SERVICE` | 空（按 `trainer` 处理） | `trainer` / `trainer-cpu` | 节点所在的 compose 服务，修复建议中的命令用它（如 `docker compose up -d --build trainer-cpu`）；裸机安装不设置 |
 | `TM_TRAINER_MODE` | `auto` | 来自 `.env` | `make setup` 的模式。为 `cpu` 时节点看到没有传入容器的显卡，给出“已选择 CPU 模式”的提示，而不是“显卡没有传入容器”的警告 |
+| `TM_TRAINER_VARIANT` | 空（不固定） | 来自 `.env`，默认 `auto` | `make setup --variant` 固定的 PyTorch 变体，`auto` 为不固定。固定时修复建议用 `--variant auto` 恢复自动选择，而不是再固定另一个变体 |
 | `TM_STATE_DIR` | `/var/lib/trainmaster` | `/var/lib/trainmaster` | 状态目录：节点标识 `node-key`、心跳文件、Ultralytics 配置；不可写时退回 `~/.local/state/trainmaster`（节点标识不能持久保存，日志中有提示） |
 | `TM_DATA_DIR` | `/data` | `/data` | 数据目录，上报其磁盘空间；不存在时使用状态目录 |
 | `TM_TORCH_VARIANT` | 空 | 镜像构建时的变体 | 已安装的 PyTorch 变体，用于诊断 |
@@ -191,13 +193,15 @@ docker compose logs -f app       # 确认迁移执行成功、服务正常
 
 - 数据库迁移在应用启动时自动执行，多实例同时启动也只会执行一次。
 - `make up` 会写入提交号与构建时间，并先重新检测计算资源（驱动升级后可能换用更新的 PyTorch 变体）。它先构建并启动 postgres 与 app，再构建训练节点镜像：PyTorch 变体不变时，体积最大的 PyTorch 层使用构建缓存；训练节点镜像构建失败时只警告，平台的升级不受影响。直接 `docker compose up -d --build` 则一次构建全部镜像，训练节点镜像构建失败时 app 也不会更新。
-- **从没有训练节点的版本升级**：`make up` 现在会运行 `make setup`，在 `.env` 中启用训练节点（有可用的显卡时为 GPU 版 `trainer`，否则为 `trainer-cpu`）并构建它的镜像，第一次需要下载 PyTorch（GPU 版数 GB）。国内网络先按第 7 节配置镜像源；不需要训练节点时先执行 `make setup SETUP_ARGS="--mode off"`。
+- **从没有训练节点的版本升级**：`make up` 现在会运行 `make setup`，在 `.env` 中启用训练节点（有可用的显卡时为 GPU 版 `trainer`，否则为 `trainer-cpu`）并构建它的镜像，第一次需要下载 PyTorch（GPU 版数 GB）。国内网络先按第 7 节配置镜像源；不需要训练节点时把第 3 步的 `make up` 换成 `make up SETUP_ARGS="--mode off"`。
 - 新旧版本的平台与训练节点可以混用一段时间（上报的数据允许未知字段），其它机器上的训练节点按第 10.6 节分别升级。
-- 迁移只向前，不提供自动回滚。需要回退版本时，先恢复升级前的数据库备份（第 6 节），再用保留的旧镜像启动，不要加 `--build`：
+- 迁移只向前，不提供自动回滚。需要回退版本时，先恢复升级前的数据库备份（第 6 节），再用保留的旧镜像启动 postgres 与 app（`--no-build`：不构建任何镜像）：
 
   ```bash
-  TM_IMAGE_TAG=rollback docker compose up -d
+  TM_IMAGE_TAG=rollback docker compose up -d --no-build postgres app
   ```
+
+  这只回退平台：训练节点继续使用当前的镜像（新旧版本的平台与训练节点可以混用，见上文）。不要省略服务名：启用了训练节点时 `TM_IMAGE_TAG=rollback` 也用于训练节点的镜像名，compose 会从当前代码构建并不存在的 `trainmaster-trainer:rollback-<变体>`（数 GB），构建失败时 app 也不会回退。
 - 升级 PostgreSQL 主版本（如 17 → 18）时数据目录格式不兼容，需要用 `pg_dump` 导出后在新版本中导入。
 
 ## 6. 备份与恢复
@@ -268,6 +272,7 @@ make up                          # 按新服务器重新检测显卡，更新 .e
 ```
 
 - 打包中没有训练节点的状态目录（`TM_HOST_TRAINER_DIR`）：新服务器上的训练节点作为新节点注册，旧服务器的节点记录显示为离线，可以在页面上删除。
+- `make up` 把新服务器的主机名写入 `TM_HOST_HOSTNAME`；`TM_NODE_NAME` 仍是旧服务器的主机名（`make setup` 写入的值）时也改为新服务器的主机名，新节点不会沿用旧服务器的名字，自己设置的名称不变。`.env` 由较早的版本写入、没有 `TM_HOST_HOSTNAME` 时不会自动修改，需要时在 `make up` 之前清空它：`sed -i 's/^TM_NODE_NAME=.*/TM_NODE_NAME=/' .env`。
 
 - `--numeric-owner` 保留文件的数字属主（postgres 数据目录的 uid 70 等）。
 - `-P` 保留绝对路径：数据目录在仓库之外（如 `/srv/trainmaster/...`）时，解压后回到新服务器上的相同位置。
@@ -402,7 +407,7 @@ server {
    - 无法连接 Docker（当前用户不在 `docker` 组、dockerd 正在重启等）：`.env` 中已有训练节点配置（`COMPOSE_PROFILES` 含 `gpu` 或 `cpu`）时沿用它；还没有时什么也不写，以退出码 1 结束，提示先解决 Docker 的连接问题（或用 `--mode gpu` / `--mode cpu` 直接指定）。
    - 驱动更新后还没有重启（`nvidia-smi` 报 `Driver/library version mismatch`）：原来是 GPU 时沿用 GPU 配置，不删除仍在运行的 GPU 训练节点，提示重启机器。
    - 原来是 GPU、`docker run --gpus all` 验证超时：只说明这次没有得到结果，沿用 GPU 配置。
-8. 写入 `.env`：只替换或追加 `COMPOSE_PROFILES`（保留其中的其它 profile，去掉 `gpu` / `cpu` 后按结果加入）、`TM_TORCH_VARIANT`、`TM_NODE_NAME`（为空时设为主机名）、`TM_HOST_HOSTNAME`（每次写入本机当前的主机名，app 与训练节点容器以它作为主机名；与服务名 `app`、`postgres` 相同时留空）、`TM_NODE_TOKEN`（为空时生成 32 个字符的随机令牌；`TM_SERVER_URL` 指向其它机器时不生成，见 10.6），以及通过参数指定的 `TM_TRAINER_MODE`、`TM_TRAINER_VARIANT`、`TM_SERVER_URL`。其它内容、注释与顺序保持不变，文件权限不变；追加的键放在一个注释标题下。输出中的令牌只显示前 4 个字符。
+8. 写入 `.env`：只替换或追加 `COMPOSE_PROFILES`（保留其中的其它 profile，去掉 `gpu` / `cpu` 后按结果加入）、`TM_TORCH_VARIANT`、`TM_NODE_NAME`（为空时设为主机名；仍是上次写入的主机名、即等于原来的 `TM_HOST_HOSTNAME` 时跟随本机当前的主机名）、`TM_HOST_HOSTNAME`（每次写入本机当前的主机名，app 与训练节点容器以它作为主机名；与服务名 `app`、`postgres` 相同时留空）、`TM_NODE_TOKEN`（为空时生成 32 个字符的随机令牌；`TM_SERVER_URL` 指向其它机器时不生成，见 10.6），以及通过参数指定的 `TM_TRAINER_MODE`、`TM_TRAINER_VARIANT`、`TM_SERVER_URL`。其它内容、注释与顺序保持不变，文件权限不变；追加的键放在一个注释标题下。输出中的令牌只显示前 4 个字符。
 9. 结果从 GPU 改为 CPU（或反过来，或改为 off）时，删除不再启用的那个训练节点容器，避免同一台机器上有两个节点。
 10. 输出中文摘要：显卡（名称、显存、计算能力）、驱动、Docker 的 GPU 支持、模式与变体及原因、下一步命令。
 
@@ -414,7 +419,7 @@ server {
 | `--install-toolkit` | Docker 不能使用显卡时安装并配置 NVIDIA Container Toolkit（需要 root 或 sudo）；已安装时只配置并重启 Docker；Docker 已经能使用显卡、没有显卡或不使用 GPU 时什么也不做，照常完成 |
 | `--yes` | 安装前不再询问 |
 | `--variant cu126` | 固定 PyTorch 变体，写入 `TM_TRAINER_VARIANT`，之后的 `make up` 沿用；`--variant auto` 恢复自动选择 |
-| `--server-url URL`、`--token TOKEN` | 在其它机器上运行训练节点时的平台地址与令牌（见 10.6） |
+| `--server-url URL`、`--token TOKEN` | 在其它机器上运行训练节点时的平台地址与令牌（见 10.6）。地址用平台的 IPv4 地址或域名：训练节点容器的 Docker 网络默认没有 IPv6，`http://[…]` 形式的 IPv6 地址会被拒绝 |
 | `--env-file PATH` | 修改其它位置的 `.env` |
 | `--no-docker-test` | 不运行 `docker run --gpus all` 验证，只检查 Docker 的配置 |
 | `--dry-run` | 只检测并打印将写入的内容：不修改任何文件，不安装任何软件 |
@@ -501,12 +506,17 @@ docker compose rm -s -f trainer        # 从 cpu 改为 gpu 时为 trainer-cpu
 
 ### 10.5 强制 CPU / 关闭训练节点
 
-- `make setup SETUP_ARGS="--mode cpu"`：始终使用 CPU 训练节点（如显卡留给其它程序使用）；
-- `make setup SETUP_ARGS="--mode off"`：不运行训练节点，`make up` 只启动 postgres 与 app；
-- `make setup SETUP_ARGS="--mode gpu"`：检查没有通过也使用 GPU 训练节点（只警告），用于 `make setup` 误判的环境；
-- `make setup SETUP_ARGS="--mode auto"`：恢复自动检测。
+- `make up SETUP_ARGS="--mode cpu"`：始终使用 CPU 训练节点（如显卡留给其它程序使用）；
+- `make up SETUP_ARGS="--mode off"`：不运行训练节点（删除本机的训练节点容器），之后的 `make up` 只启动 postgres 与 app；
+- `make up SETUP_ARGS="--mode gpu"`：检查没有通过也使用 GPU 训练节点（只警告），用于 `make setup` 误判的环境；
+- `make up SETUP_ARGS="--mode auto"`：恢复自动检测（关闭过训练节点时重新启动它）。
 
-模式写入 `.env` 的 `TM_TRAINER_MODE`，之后的 `make up` 都沿用它（也可以直接 `make up SETUP_ARGS="--mode cpu"`）。模式同时传给训练节点（compose 中的 `TM_TRAINER_MODE`）：有显卡的机器选择了 CPU 模式时，“计算资源”页面显示“已选择 CPU 模式”的提示，不再警告显卡没有传入容器，服务器卡片也不再提示没有 GPU 训练节点；改回自动检测：`make up SETUP_ARGS="--mode auto"`。
+模式写入 `.env` 的 `TM_TRAINER_MODE`，之后的 `make up` 都沿用它；只修改 `.env`、暂不启动时用 `make setup SETUP_ARGS="--mode …"`。模式同时传给训练节点与 app（compose 中的 `TM_TRAINER_MODE`）。app 只在启动时读取它，所以修改模式后用 `make up`（app 的环境变量变了，compose 会重新创建 app 容器），页面上的提示才会跟着变化：
+
+- 有显卡的机器选择了 CPU 模式：“计算资源”页面显示“已选择 CPU 模式”的提示，不再警告显卡没有传入容器，服务器卡片也不再提示没有 GPU 训练节点。
+- 关闭了训练节点（`off`）：服务器卡片不再提示没有 GPU 训练节点；“接入训练节点”中本机的命令变为 `make up SETUP_ARGS="--mode auto"`，删除节点时的说明也给出这条恢复命令。
+
+页面从 `GET /api/v1/compute/server` 的 `node_registration.local_trainer_mode` 得到模式；不是用 docker-compose.yml 运行 app（没有设置 `TM_TRAINER_MODE`）时它为 null，页面不按模式调整提示。
 
 ### 10.6 在其它 GPU 机器上运行训练节点
 
@@ -523,7 +533,7 @@ docker compose logs -f trainer
 - 按 `make setup` 最后输出的服务名启动：它选择 CPU 时为 `trainer-cpu`（`docker compose up -d --build trainer-cpu`）。Docker 还不能使用显卡时，加 `--install-toolkit` 让脚本安装 NVIDIA Container Toolkit：`make setup SETUP_ARGS="--install-toolkit"`，再启动它输出的服务（通常是 `docker compose up -d --build trainer`）。`--server-url` 与 `--token` 已写入 `.env`，之后的 `make setup` 不需要再加。
 - 只启动训练节点服务（指定服务名）：不要用 `make up` 或不带服务名的 `docker compose up -d`，它们会在这台机器上再启动一套 postgres 与 app。“计算资源”页面上给这类节点的修复建议也都是 `make setup …` 加 `docker compose up -d --build <服务>` 的形式（compose 通过 `TM_TRAINER_SERVICE` 告诉节点自己的服务名）。
 - `TM_SERVER_URL` 指向其它机器时，`make setup` 不会生成令牌（必须与平台相同）；平台设置了令牌而这里没有填写时，训练节点注册会失败（日志中为 401 / “节点令牌不正确”）。
-- `TM_SERVER_URL` 填平台的 IP 地址或平台机器的主机名，不要填这台机器自己的主机名：训练节点容器的主机名与本机相同（`TM_HOST_HOSTNAME`），在容器中这个名字指向容器自己（`make setup` 发现时会提醒）。
+- `TM_SERVER_URL` 填平台的 IPv4 地址或平台机器的主机名（不能用 IPv6 地址：训练节点容器的 Docker 网络默认没有 IPv6，`make setup` 会拒绝；以 IPv6 地址打开页面时，页面上命令中的平台地址是占位符，换成 IPv4 地址或域名），不要填这台机器自己的主机名：训练节点容器的主机名与本机相同（`TM_HOST_HOSTNAME`），在容器中这个名字指向容器自己（`make setup` 发现时会提醒）。
 - 平台在 HTTPS 反向代理之后时，填写代理的地址（如 `https://trainmaster.example.internal`）。
 - 用 `git clone` 接入新机器，不要从平台或其它节点拷贝整个部署目录：`./data/trainer` 中的节点标识会一起被拷贝，两台机器会成为同一个节点（见第 6 节）。
 - 升级：`git pull` 后再次执行 `make setup` 与 `docker compose up -d --build trainer`（或 `make setup` 输出的服务）。修改 `.env` 中的 `TM_TRAINER_SHM_SIZE` 等设置后：`docker compose up -d trainer`。
@@ -560,6 +570,8 @@ services:
 
 然后 `docker compose up -d trainer`，用 `docker compose exec trainer nvidia-smi -L` 确认容器中看到的显卡。
 
+裸机安装（第 10.7 节）时，在训练节点的配置文件（默认 `<安装目录>/trainer.env`；安装时用 `--env-file` 指定了其它文件时为该文件）中设置 `CUDA_VISIBLE_DEVICES=0,1`（`nvidia-smi -L` 中的序号：`install.sh` 写入了 `CUDA_DEVICE_ORDER=PCI_BUS_ID`，CUDA 的序号与它一致；也可以写 `GPU-…` UUID），然后 `sudo systemctl restart trainmaster-trainer`。新旧显卡混用、没有同时支持全部显卡的 PyTorch 变体时，“计算资源”页面建议的就是这种做法；用它排除了全部不受支持的显卡后，页面上对这些显卡只给出提示，不再警告。
+
 ### 10.9 国内镜像
 
 训练节点镜像的 Debian 软件源、PyPI、PyTorch 与 NVIDIA Container Toolkit 软件源都可以换成国内镜像（`DEBIAN_MIRROR`、`PIP_INDEX_URL`、`TORCH_FIND_LINKS`、`NVIDIA_TOOLKIT_REPO`），基础镜像 `python:3.12-slim-bookworm` 可以换成内网镜像仓库（`TRAINER_PYTHON_IMAGE`），见第 7 节。
@@ -573,10 +585,11 @@ services:
 | `--install-toolkit` 只打印了手动步骤，没有安装 | snap 版或 rootless 模式的 Docker、没有运行 systemd 的 WSL：脚本不能可靠地配置它们，按打印的步骤执行后重新运行 `make setup`，见 10.2 |
 | `make setup` 报“无法连接 Docker，无法判断训练节点能否使用显卡，没有写入 .env”并退出 | 当前用户不能访问 Docker：`sudo usermod -aG docker $USER` 后重新登录（或用 sudo 运行），确认 `docker info` 正常后重新运行。`.env` 中已有训练节点配置时 `make setup` 不报错，沿用原来的配置 |
 | `Failed to initialize NVML: Driver/library version mismatch` | 升级了驱动，但内核中还是旧版的驱动模块：重启机器（或卸载并重新加载 nvidia 内核模块）。`make setup` 与“计算资源”页面会给出同样的提示；重启前 `make setup` 沿用原来的 GPU 配置 |
-| 页面提示驱动过旧（`driver_too_old`），或 `make setup` 选择了 `cpu` 并说明驱动过旧 | 驱动低于镜像中 PyTorch 变体要求的最低版本（见 10.3）：升级驱动（推荐 580 或更新）后 `make up`（`make setup` 按当前驱动重新选择变体并重新构建）；或按页面建议换用驱动支持的变体：`make up SETUP_ARGS="--variant cu126"`（其它机器上：`make setup SETUP_ARGS="--variant cu126"`，再 `docker compose up -d --build trainer`）。不要直接修改 `.env` 中的 `TM_TORCH_VARIANT`，下次 `make up` 会把它改回去（见 3.1）。固定了变体（`TM_TRAINER_VARIANT`）时用 `--variant auto` 恢复自动选择 |
+| 页面提示驱动低于已安装的 PyTorch 变体的要求（`driver_too_old`） | 驱动低于镜像中 PyTorch 变体要求的最低版本（见 10.3）：升级驱动（推荐 580 或更新）后 `make up`（`make setup` 按当前驱动重新选择变体并重新构建）；或按页面建议换用驱动支持的变体：`make up SETUP_ARGS="--variant cu126"`（其它机器上：`make setup SETUP_ARGS="--variant cu126"`，再 `docker compose up -d --build trainer`）。不要直接修改 `.env` 中的 `TM_TORCH_VARIANT`，下次 `make up` 会把它改回去（见 3.1）。固定了变体（`TM_TRAINER_VARIANT`）时用 `--variant auto` 恢复自动选择 |
+| 页面提示宿主机 NVIDIA 驱动过旧、将使用 CPU 训练（`driver_too_old`），服务器卡片提示先升级驱动；或 `make setup` 选择了 `cpu` 并说明驱动过旧，加 `--install-toolkit` 时说“驱动不能使用 CUDA 版的 PyTorch”，不安装 | 宿主机的驱动低于所有 CUDA 版 PyTorch 的最低要求（x86_64 为 `cu118` 的 450.80.02，ARM 服务器为 `cu130` 的 580，见 10.3），只能运行 CPU 训练节点，安装 NVIDIA Container Toolkit 解决不了：升级 NVIDIA 驱动（推荐 580 或更新）并重启机器，然后 `make up SETUP_ARGS="--install-toolkit"`（安装 / 配置 Toolkit 并启动 GPU 训练节点；其它机器上：`make setup SETUP_ARGS="--install-toolkit"`，再启动它输出的服务）。裸机节点升级驱动后重新运行 `sudo trainer/scripts/install.sh` |
 | RTX 50 系列（Blackwell，计算能力 12.0）提示显卡架构不受支持（`arch_unsupported`），或训练时报 `no kernel image is available for execution on the device` | 只有 `cu128` 与 `cu130` 支持 RTX 50 系列：驱动 ≥ 580 时为 `cu130`，否则为 `cu128`（RTX 50 系列本身需要 570 或更新的驱动）。`make setup` 会自动选择；固定为 `cu126` / `cu118` 时用 `make up SETUP_ARGS="--variant auto"` 恢复 |
 | 训练时 DataLoader 报 `Bus error`、`unable to write to file </torch_…>` 或页面提示 `/dev/shm` 过小（`shm_small`） | 共享内存不足：调大 `.env` 中的 `TM_TRAINER_SHM_SIZE`（默认 `8gb`）后 `make up`（其它机器上：`docker compose up -d trainer`，CPU 训练节点为 `trainer-cpu`），或减少 DataLoader 的 workers |
-| 宿主机有显卡，页面提示显卡没有传入容器（`gpu_not_passed_through`） | 运行的是 `trainer-cpu`（Docker 不能使用显卡时 `make setup` 选择了 CPU），或 `trainer` 没有拿到显卡：`make up SETUP_ARGS="--install-toolkit"` 安装 / 配置 NVIDIA Container Toolkit 并启动 GPU 训练节点（需要 sudo；其它机器上用 `make setup SETUP_ARGS="--install-toolkit"` 再启动它输出的服务）。有意选择了 CPU 模式（`--mode cpu`）时页面只显示“已选择 CPU 模式”的提示 |
+| 宿主机有显卡，页面提示显卡没有传入容器（`gpu_not_passed_through`） | 运行的是 `trainer-cpu`（Docker 不能使用显卡时 `make setup` 选择了 CPU），或 `trainer` 没有拿到显卡：`make up SETUP_ARGS="--install-toolkit"` 安装 / 配置 NVIDIA Container Toolkit 并启动 GPU 训练节点（需要 sudo；其它机器上用 `make setup SETUP_ARGS="--install-toolkit"` 再启动它输出的服务）。有意选择了 CPU 模式（`--mode cpu`）时页面只显示“已选择 CPU 模式”的提示；宿主机驱动过旧、CUDA 版 PyTorch 都不能使用时页面提示的是驱动过旧，先升级驱动（见上面“宿主机 NVIDIA 驱动过旧”一行） |
 | `make setup` 提示没能验证 Docker 能否使用显卡（离线或无法访问镜像仓库） | 拉取 `TRAINER_PYTHON_IMAGE` 失败，只能按 Docker 的配置判断：配置镜像加速或内网镜像仓库（第 7 节），或先 `docker load` 导入该镜像，再运行 `make setup` |
 | 训练节点一直显示离线或没有出现 | `docker compose logs trainer` 查看：401 / “节点令牌不正确” → 平台与训练节点的 `TM_NODE_TOKEN` 不一致（修改 `.env` 后平台 `make up`，其它机器上的节点 `docker compose up -d trainer`）；连接失败 → 检查 `TM_SERVER_URL` 与防火墙 |
 | 两台机器在页面上显示为同一个节点（主机名、显卡在两台机器之间来回变化），平台日志中有“两台机器使用了同一个节点标识” | 拷贝了 `./data/trainer`（或克隆了装好训练节点的虚拟机），两台机器的 `node-key` 相同：在其中一台上删除状态目录中的 `node-key` 并重启训练节点，见第 6 节 |

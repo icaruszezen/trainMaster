@@ -214,7 +214,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 | 方法与路径 | 说明 |
 |---|---|
-| `GET /api/v1/compute/server` | 平台服务器自身：主机名（Docker 部署时为 compose 中 `hostname` 设置的宿主机主机名 `TM_HOST_HOSTNAME`）、系统与内核、是否在容器中、开机时长、CPU（型号、逻辑 / 物理核数、cgroup 限制、利用率）、内存、负载、NVIDIA 显卡（来自 `/proc/driver/nvidia` 或 PCI 设备，都没有时为 null），以及 `node_registration`（是否需要令牌、心跳间隔、离线判定时间） |
+| `GET /api/v1/compute/server` | 平台服务器自身：主机名（Docker 部署时为 compose 中 `hostname` 设置的宿主机主机名 `TM_HOST_HOSTNAME`）、系统与内核、是否在容器中、开机时长、CPU（型号、逻辑 / 物理核数、cgroup 限制、利用率）、内存、负载、NVIDIA 显卡（来自 `/proc/driver/nvidia` 或 PCI 设备，都没有时为 null），以及 `node_registration`（是否需要令牌、心跳间隔、离线判定时间，以及本机训练节点的模式 `local_trainer_mode`：`auto` / `gpu` / `cpu` / `off`，来自 compose 传给 app 的 `TM_TRAINER_MODE`，没有设置时为 null；页面据此在本机关闭了训练节点或选择了 CPU 模式时不提示“没有 GPU 训练节点”） |
 | `GET /api/v1/compute/nodes` | 训练节点列表 `{items, total}`：在线在前，再按名称（不区分大小写）与 ID 排序。每项带在线状态、硬件、CUDA 环境（尚未完成第一次检测时为 null）、最新指标与最近的指标历史 |
 | `GET /api/v1/compute/nodes/{nodeID}` | 单个节点；不存在时 404 `not_found` |
 | `DELETE /api/v1/compute/nodes/{nodeID}` | 删除节点记录与指标历史，返回 204；节点在线时 409 `conflict`（需先停止该节点上的训练节点服务） |
@@ -405,7 +405,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 ### 部署形态
 
-- **Docker**：镜像 `trainmaster-trainer:<TM_IMAGE_TAG>-<变体>`（构建上下文为 `trainer/`，变体即 `TM_TORCH_VARIANT`，换变体不会误用旧镜像；没有设置时 `trainer` 为 `cu130`，`trainer-cpu` 为 `cpu`）。`docker-compose.yml` 中的两个服务共用 `x-trainer` 定义：`trainer`（profile `gpu`，用 `deploy.resources.reservations.devices` 预留全部 NVIDIA 显卡）与 `trainer-cpu`（profile `cpu`）。没有设置 `COMPOSE_PROFILES` 时两者都不启动，部署仍只有 `postgres` 与 `app`。训练节点不依赖 `app`（没有 `depends_on`），在其它机器上可以只运行它，通过 `TM_SERVER_URL` 连接平台。compose 还通过环境变量告诉节点自己的服务名（`TM_TRAINER_SERVICE`：`trainer` / `trainer-cpu`）与 `make setup` 的模式（`TM_TRAINER_MODE`），节点据此给出修复建议；容器的主机名为宿主机的主机名（`hostname: ${TM_HOST_HOSTNAME}`，`make setup` 写入），不是每次重建都会变化的容器 ID，`app` 同样如此。
+- **Docker**：镜像 `trainmaster-trainer:<TM_IMAGE_TAG>-<变体>`（构建上下文为 `trainer/`，变体即 `TM_TORCH_VARIANT`，换变体不会误用旧镜像；没有设置时 `trainer` 为 `cu130`，`trainer-cpu` 为 `cpu`）。`docker-compose.yml` 中的两个服务共用 `x-trainer` 定义：`trainer`（profile `gpu`，用 `deploy.resources.reservations.devices` 预留全部 NVIDIA 显卡）与 `trainer-cpu`（profile `cpu`）。没有设置 `COMPOSE_PROFILES` 时两者都不启动，部署仍只有 `postgres` 与 `app`。训练节点不依赖 `app`（没有 `depends_on`），在其它机器上可以只运行它，通过 `TM_SERVER_URL` 连接平台。compose 还通过环境变量告诉节点自己的服务名（`TM_TRAINER_SERVICE`：`trainer` / `trainer-cpu`）、`make setup` 的模式（`TM_TRAINER_MODE`）与固定的 PyTorch 变体（`TM_TRAINER_VARIANT`，`auto` 为不固定），节点据此给出修复建议；`TM_TRAINER_MODE` 也传给 `app`（`GET /api/v1/compute/server` 的 `local_trainer_mode`，app 启动时读取）；容器的主机名为宿主机的主机名（`hostname: ${TM_HOST_HOSTNAME}`，`make setup` 写入），不是每次重建都会变化的容器 ID，`app` 同样如此。
 - **裸机**：`trainer/scripts/install.sh` 创建虚拟环境，安装匹配的 PyTorch 与 Ultralytics，写入配置文件，可注册为 systemd 服务。
 - 镜像中只有 PyTorch 的 pip 包自带的 CUDA 运行库，没有 CUDA Toolkit；宿主机需要 NVIDIA 驱动，使用 Docker 时还需要 NVIDIA Container Toolkit（容器启动时挂载驱动库与 `/dev/nvidia*`）。`deploy/scripts/setup-compute.sh`（`make setup`，`make up` 会先执行它）检测显卡、驱动与 Docker 的 GPU 支持，加 `--install-toolkit` 时安装 / 配置 Toolkit，并把结果写入 `.env`，见 [部署指南第 10 节](deployment.md#10-gpu-训练节点)。`make up` 先构建并启动 `postgres` 与 `app`，再构建并启动训练节点：训练节点镜像（数 GB 的 PyTorch）构建失败只警告，不影响平台。
 
@@ -422,10 +422,10 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 ### 检测与自检
 
-- **硬件**（快，在常驻进程中）：显卡用 NVML（nvidia-ml-py）探测，失败时回退解析 `nvidia-smi`；读取 `/proc/driver/nvidia/gpus` 判断“宿主机有显卡、但没有传入容器”。CPU、内存、磁盘与 `/dev/shm` 来自 psutil、`/etc/os-release` 与 cgroup。
+- **硬件**（快，在常驻进程中）：显卡用 NVML（nvidia-ml-py）探测，失败时回退解析 `nvidia-smi`；读取 `/proc/driver/nvidia/gpus` 判断“宿主机有显卡、但没有传入容器”，这时还从 `/proc/driver/nvidia/version` 读取宿主机的驱动版本：低于所有 CUDA 版 PyTorch 的最低驱动（x86_64 为 450.80.02，aarch64 为 `cu130` 的 580）时报告警告 `driver_too_old`（先升级驱动），而不是 `gpu_not_passed_through`（安装 NVIDIA Container Toolkit 解决不了）。CPU、内存、磁盘与 `/dev/shm` 来自 psutil、`/etc/os-release` 与 cgroup。
 - **CUDA 环境**（慢，在子进程中）：子进程 `python -m trainmaster_trainer.environment` 导入 torch / torchvision / ultralytics，收集版本与 CUDA 状态并自检，把原始结果以 JSON 输出给常驻进程：有 CUDA 时在每块可见的显卡上做一次矩阵乘法，再在 `cuda:0` 上用 `YOLO("yolo11n.yaml")`（从配置构建，不下载权重）做一次 1×3×320×320 前向推理（FP32，再试 FP16）；没有 CUDA 时在 CPU 上做同样的推理。放在子进程中，常驻进程不占用显存，导入失败或崩溃也不影响心跳。自检设置 `YOLO_OFFLINE=1`，不访问网络，超时为 `TM_SELF_TEST_TIMEOUT`（默认 300 秒）。面向用户的 `python -m trainmaster_trainer selftest [--json]` 启动同一个子进程，打印与硬件检测合并后的结果（与上报的 `environment` 相同），不是子进程的原始输出。
 - 检测在后台线程中运行，完成后随下一次心跳上报 `environment`，期间心跳照常。页面上的“重新检测”在平台上记下请求，节点在心跳响应中看到 `probe_requested` 后重新探测硬件并启动检测，上报新的 `environment` 时平台清除请求。检测正在进行时节点忽略 `probe_requested`（如重启后注册带来的请求），不会再启动一次。
-- 节点由硬件与子进程的结果生成 `status`（`ready`：GPU 可用且自检通过；`cpu_only`：没有可用的 GPU、CPU 自检通过；`error`：有错误级的问题）和按严重程度排序的 `issues`，如 `driver_too_old`、`arch_unsupported`、`torch_cpu_build`、`cuda_unavailable`、`gpu_not_passed_through`、`shm_small`、`cpu_mode_selected`（有意选择了 CPU 模式，提示级），每条带中文说明与修复建议。平台只校验长度，页面只展示说明与建议，新增问题类型不需要修改平台。
+- 节点由硬件与子进程的结果生成 `status`（`ready`：GPU 可用且自检通过；`cpu_only`：没有可用的 GPU、CPU 自检通过；`error`：有错误级的问题）和按严重程度排序的 `issues`，如 `driver_too_old`、`arch_unsupported`、`torch_cpu_build`、`cuda_unavailable`、`gpu_not_passed_through`、`shm_small`、`cpu_mode_selected`（有意选择了 CPU 模式，提示级），每条带中文说明与修复建议（提示级的问题可以没有修复建议）。新旧显卡混用时，裸机节点用 `CUDA_VISIBLE_DEVICES` 排除了全部不受支持的显卡后，`arch_unsupported` 降为没有修复建议的提示。平台只校验长度，页面只展示说明与建议，新增问题类型不需要修改平台。
 - 修复建议中的命令用反引号包住（页面显示为代码，整条建议就是一条命令时带复制按钮），并按节点的部署方式给出：平台所在机器上的 compose 节点（`TM_SERVER_URL` 的主机为 `app`）用 `make up` / `make up SETUP_ARGS="…"`；其它机器上的 compose 节点用 `make setup …` 加 `docker compose up -d --build <服务>`（服务名来自 `TM_TRAINER_SERVICE`），不会建议 `make up` 或不带服务名的 `docker compose up -d`（会在那台机器上再启动一套平台）；裸机节点用 `sudo trainer/scripts/install.sh --variant …`。换变体一律通过 `--variant`（`TM_TRAINER_VARIANT`），不建议直接修改每次都会被 `make setup` 改写的 `TM_TORCH_VARIANT`。
 - `python -m trainmaster_trainer probe` 打印完整的检测报告（JSON），不连接平台，便于排障。
 
