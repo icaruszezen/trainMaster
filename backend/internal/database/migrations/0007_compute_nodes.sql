@@ -20,8 +20,9 @@ CREATE TABLE compute_nodes (
     hardware           jsonb NOT NULL,             -- static hardware, replaced on every registration
     environment        jsonb,                      -- CUDA / PyTorch / YOLO check; NULL until the first one finished
     metrics            jsonb,                      -- latest live metrics
-    -- Set when a user asks the node to probe again; cleared by the next
-    -- heartbeat that carries an environment.
+    -- Set when a user asks the node to probe again, or when the node
+    -- registers without an environment (it started and is checking it);
+    -- cleared by the next heartbeat that carries an environment.
     probe_requested_at timestamptz,
     registered_at      timestamptz NOT NULL DEFAULT now(), -- last (re)start of the node
     last_seen_at       timestamptz NOT NULL DEFAULT now(), -- last registration or heartbeat

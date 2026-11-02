@@ -47,8 +47,9 @@ func validRequestID(id string) bool {
 	return true
 }
 
-// accessLog logs one line per request. Successful health probes are logged
-// at debug level to keep container logs readable.
+// accessLog logs one line per request. Health probes, and requests that
+// machines repeat every few seconds when they succeed, are logged at debug
+// level to keep container logs readable.
 func accessLog(log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +67,8 @@ func accessLog(log *slog.Logger) func(http.Handler) http.Handler {
 				level = slog.LevelError
 			case r.URL.Path == "/api/healthz" || r.URL.Path == "/api/readyz":
 				level = slog.LevelDebug
+			case status < 400 && isPolling(r):
+				level = slog.LevelDebug
 			}
 			log.LogAttrs(r.Context(), level, "http request",
 				slog.String("method", r.Method),
@@ -78,6 +81,22 @@ func accessLog(log *slog.Logger) func(http.Handler) http.Handler {
 			)
 		})
 	}
+}
+
+// isPolling reports whether r is one of the requests that are repeated
+// every few seconds: training node heartbeats (each node, all the time)
+// and the refreshes of the compute page (while it is open). Logged at info
+// level they would push everything else out of the rotated container logs
+// within days; node registrations and deletions are logged by package
+// compute, and rejected node tokens by requireNodeToken.
+func isPolling(r *http.Request) bool {
+	switch r.URL.Path {
+	case "/api/v1/compute/agent/heartbeat":
+		return r.Method == http.MethodPost
+	case "/api/v1/compute/nodes", "/api/v1/compute/server":
+		return r.Method == http.MethodGet
+	}
+	return false
 }
 
 // clientIP returns the address resolved by the ClientIPFromXFF middleware

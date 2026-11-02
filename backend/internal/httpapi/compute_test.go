@@ -209,7 +209,8 @@ func TestComputeNodeAPI(t *testing.T) {
 	}
 	id := int64(reg["node_id"].(float64))
 
-	// The list shows it online, with its hardware and the first metrics.
+	// The list shows it online, with its hardware and the first metrics;
+	// it is still checking its environment.
 	list := want[map[string]any](t, e.do("GET", "/api/v1/compute/nodes", nil), 200)
 	if list["total"] != 1.0 {
 		t.Fatalf("list = %v", list)
@@ -218,7 +219,7 @@ func TestComputeNodeAPI(t *testing.T) {
 	wantKeys(t, "node", node, nodeKeys...)
 	if node["id"] != float64(id) || node["node_key"] != "6f1c8a0e-node" || node["name"] != "gpu-server-01" ||
 		node["hostname"] != "gpu-server-01" || node["agent_version"] != "0.1.0" || node["address"] != "192.0.2.1" ||
-		node["status"] != "online" || node["probe_pending"] != false || node["environment"] != nil {
+		node["status"] != "online" || node["probe_pending"] != true || node["environment"] != nil {
 		t.Errorf("node = %v", node)
 	}
 	for _, k := range []string{"registered_at", "last_seen_at", "created_at"} {
@@ -248,21 +249,23 @@ func TestComputeNodeAPI(t *testing.T) {
 	}
 
 	// Heartbeats: the response follows the contract, metrics add history
-	// points and an environment is stored.
+	// points and an environment is stored, which completes the check.
 	e.clock.Advance(10 * time.Second)
 	hb := want[map[string]any](t, e.do("POST", "/api/v1/compute/agent/heartbeat",
 		`{"node_key": "6f1c8a0e-node", "metrics": `+testMetrics(50)+`, "environment": null, "hardware": null}`), 200)
 	wantKeys(t, "heartbeat response", hb, nodeHeartbeatKeys...)
-	if hb["node_id"] != float64(id) || hb["probe_requested"] != false || hb["heartbeat_interval_seconds"] != 10.0 {
+	if hb["node_id"] != float64(id) || hb["probe_requested"] != true || hb["heartbeat_interval_seconds"] != 10.0 {
 		t.Errorf("heartbeat response = %v", hb)
 	}
 	e.clock.Advance(10 * time.Second)
-	e.heartbeat(t, `{"node_key": "6f1c8a0e-node", "metrics": `+testMetrics(70)+`, "environment": `+testEnvironment+`}`)
+	if hb := e.heartbeat(t, `{"node_key": "6f1c8a0e-node", "metrics": `+testMetrics(70)+`, "environment": `+testEnvironment+`}`); hb.ProbeRequested {
+		t.Errorf("heartbeat with environment = %+v", hb)
+	}
 
 	node = want[map[string]any](t, e.do("GET", nodeURL(id, ""), nil), 200)
 	wantKeys(t, "node", node, nodeKeys...)
-	if node["last_seen_at"] != "2026-11-02T08:00:20Z" || node["registered_at"] != "2026-11-02T08:00:00Z" {
-		t.Errorf("times: %v %v", node["last_seen_at"], node["registered_at"])
+	if node["last_seen_at"] != "2026-11-02T08:00:20Z" || node["registered_at"] != "2026-11-02T08:00:00Z" || node["probe_pending"] != false {
+		t.Errorf("times: %v %v, probe_pending %v", node["last_seen_at"], node["registered_at"], node["probe_pending"])
 	}
 	env := object(t, node["environment"], "environment")
 	wantKeys(t, "environment", env, environmentKeys...)
@@ -356,15 +359,21 @@ func TestComputeNodeToken(t *testing.T) {
 
 func TestComputeReRegisterKeepsEnvironment(t *testing.T) {
 	e := newComputeEnv(t, "")
-	want[compute.RegisterResult](t, e.do("POST", "/api/v1/compute/agent/register",
-		registerBody("node-a", "a", testEnvironment, testMetrics(30))), 200)
-	e.clock.Advance(time.Minute)
-	// The node restarts and registers without environment and metrics.
 	id := want[compute.RegisterResult](t, e.do("POST", "/api/v1/compute/agent/register",
-		registerBody("node-a", "renamed", "null", "null")), 200).NodeID
+		registerBody("node-a", "a", testEnvironment, testMetrics(30))), 200).NodeID
+	if n := want[compute.Node](t, e.do("GET", nodeURL(id, ""), nil), 200); n.ProbePending {
+		t.Errorf("registered with an environment, but probe_pending")
+	}
+	e.clock.Advance(time.Minute)
+	// The node restarts and registers without environment and metrics:
+	// the old environment is kept and shown as being checked again.
+	if again := want[compute.RegisterResult](t, e.do("POST", "/api/v1/compute/agent/register",
+		registerBody("node-a", "renamed", "null", "null")), 200).NodeID; again != id {
+		t.Fatalf("re-registration got node %d, want %d", again, id)
+	}
 	n := want[compute.Node](t, e.do("GET", nodeURL(id, ""), nil), 200)
 	if n.Name != "renamed" || n.Environment == nil || n.Environment.TorchVariant != compute.Value("cu126") ||
-		n.Metrics == nil || n.Metrics.CPUPercent != compute.Value(30.0) {
+		n.Metrics == nil || n.Metrics.CPUPercent != compute.Value(30.0) || !n.ProbePending {
 		t.Errorf("node = %+v", n)
 	}
 	if !n.RegisteredAt.Equal(e.clock.Now()) || n.CreatedAt.Equal(e.clock.Now()) {
@@ -378,6 +387,10 @@ func TestComputeReRegisterKeepsEnvironment(t *testing.T) {
 func TestComputeProbeFlow(t *testing.T) {
 	e := newComputeEnv(t, "")
 	id := e.register(t, "node-a", "a")
+	// The node finishes the check it started with.
+	if hb := e.heartbeat(t, `{"node_key": "node-a", "environment": `+testEnvironment+`}`); hb.ProbeRequested {
+		t.Fatalf("heartbeat with environment = %+v", hb)
+	}
 
 	rec := e.do("POST", nodeURL(id, "/probe"), nil)
 	raw := want[map[string]any](t, rec, 202)

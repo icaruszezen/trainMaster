@@ -27,8 +27,10 @@ type Node struct {
 	Address      string `json:"address"` // client IP of the last registration or heartbeat; may be ""
 	AgentVersion string `json:"agent_version"`
 	Status       string `json:"status"` // StatusOnline or StatusOffline
-	// ProbePending: a user asked for a new probe and the node has not
-	// reported its result yet.
+	// ProbePending: a user asked for a new probe, or the node registered
+	// without an environment (it started and is checking it; Environment
+	// may still hold the result of its previous run), and the node has not
+	// reported the result yet.
 	ProbePending bool      `json:"probe_pending"`
 	RegisteredAt time.Time `json:"registered_at"` // last (re)start of the node
 	LastSeenAt   time.Time `json:"last_seen_at"`  // last registration or heartbeat (server clock)
@@ -38,7 +40,8 @@ type Node struct {
 	Environment *Environment `json:"environment"`
 	Metrics     *Metrics     `json:"metrics"`
 	// History holds the recent metrics, oldest first. It lives in memory
-	// only and starts empty after a server restart.
+	// only and starts empty after a server restart; when an offline node
+	// comes back, its first new sample starts it afresh.
 	History []HistoryPoint `json:"history"`
 }
 
@@ -222,7 +225,7 @@ type RegisterInput struct {
 	Hostname     string
 	AgentVersion string
 	Hardware     *Hardware    // required
-	Environment  *Environment // nil keeps the stored one
+	Environment  *Environment // nil keeps the stored one and requests a probe (the node is checking it)
 	Metrics      *Metrics     // nil keeps the stored one
 }
 
@@ -247,6 +250,9 @@ type HeartbeatResult struct {
 	NodeID                   int64   `json:"node_id"`
 	HeartbeatIntervalSeconds float64 `json:"heartbeat_interval_seconds"`
 	// ProbeRequested asks the node to probe its hardware and environment
-	// again and to report the result with a later heartbeat.
+	// again and to report the result with a later heartbeat. It is also
+	// true after a registration without an environment, until a heartbeat
+	// brings one; a node that is still detecting its environment (or has a
+	// result it has not sent yet) ignores it.
 	ProbeRequested bool `json:"probe_requested"`
 }
