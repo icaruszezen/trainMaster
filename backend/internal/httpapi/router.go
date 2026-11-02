@@ -11,7 +11,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/icaruszezen/trainmaster/backend/internal/compute"
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
+	"github.com/icaruszezen/trainmaster/backend/internal/hostinfo"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 )
@@ -43,6 +45,20 @@ type Options struct {
 	// Projects serves /api/v1/projects and the projects of a dataset. It
 	// requires Datasets; if either is nil, those routes are not mounted.
 	Projects *project.Service
+	// Compute serves /api/v1/compute (training nodes). If nil, those
+	// routes are not mounted.
+	Compute *compute.Service
+	// Host describes the server machine for GET /api/v1/compute/server,
+	// which is mounted only when Host and Compute are both set.
+	Host *hostinfo.Host
+	// NodeToken is the bearer token training nodes must send to
+	// /api/v1/compute/agent/* (TM_NODE_TOKEN). Empty: none is required.
+	NodeToken string
+	// LocalTrainerMode is the mode of the training node on the server
+	// machine (TM_TRAINER_MODE: auto, gpu, cpu or off), which
+	// GET /api/v1/compute/server reports so the page's hints for this
+	// machine fit it. Empty: not known (null).
+	LocalTrainerMode string
 }
 
 // plannedModules are API areas reserved for upcoming features. Each answers
@@ -61,12 +77,18 @@ type server struct {
 	storage   *storage.Storage
 	datasets  *dataset.Service
 	projects  *project.Service // nil unless datasets is set
+	compute   *compute.Service
+	host      *hostinfo.Host
+	nodeToken string
 	startedAt time.Time
+	// localTrainerMode is Options.LocalTrainerMode.
+	localTrainerMode string
 }
 
 // NewHandler returns the root HTTP handler.
 func NewHandler(o Options) http.Handler {
-	s := &server{log: o.Logger, db: o.DB, storage: o.Storage, datasets: o.Datasets, startedAt: o.StartedAt}
+	s := &server{log: o.Logger, db: o.DB, storage: o.Storage, datasets: o.Datasets, compute: o.Compute,
+		host: o.Host, nodeToken: o.NodeToken, localTrainerMode: o.LocalTrainerMode, startedAt: o.StartedAt}
 	if o.Datasets != nil {
 		s.projects = o.Projects
 	}
@@ -98,6 +120,9 @@ func NewHandler(o Options) http.Handler {
 			}
 			if s.projects != nil {
 				r.Route("/projects", s.projectRoutes)
+			}
+			if s.compute != nil {
+				r.Route("/compute", s.computeRoutes)
 			}
 
 			for _, p := range plannedModules {

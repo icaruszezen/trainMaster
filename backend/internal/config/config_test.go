@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -19,13 +20,16 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	want := Config{
-		HTTPAddr:    ":8080",
-		DataDir:     "./data",
-		WebDir:      "",
-		DatabaseURL: "postgres://trainmaster:trainmaster@localhost:5432/trainmaster?sslmode=disable",
-		AutoMigrate: true,
-		LogLevel:    slog.LevelInfo,
-		LogFormat:   "text",
+		HTTPAddr:              ":8080",
+		DataDir:               "./data",
+		WebDir:                "",
+		DatabaseURL:           "postgres://trainmaster:trainmaster@localhost:5432/trainmaster?sslmode=disable",
+		AutoMigrate:           true,
+		LogLevel:              slog.LevelInfo,
+		LogFormat:             "text",
+		NodeToken:             "",
+		NodeHeartbeatInterval: 10 * time.Second,
+		TrainerMode:           "",
 	}
 	if !reflect.DeepEqual(*cfg, want) {
 		t.Errorf("Load defaults\n got %+v\nwant %+v", *cfg, want)
@@ -88,6 +92,13 @@ func TestLoadInvalid(t *testing.T) {
 		{"TM_TRUSTED_PROXIES", "nginx"},
 		{"TM_TRUSTED_PROXIES", "10.0.0.0/33"},
 		{"TM_TRUSTED_PROXIES", "fe80::1%eth0"},
+		{"TM_NODE_HEARTBEAT_INTERVAL", "10"},
+		{"TM_NODE_HEARTBEAT_INTERVAL", "abc"},
+		{"TM_NODE_HEARTBEAT_INTERVAL", "1s"},
+		{"TM_NODE_HEARTBEAT_INTERVAL", "1999ms"},
+		{"TM_NODE_HEARTBEAT_INTERVAL", "5m1s"},
+		{"TM_NODE_HEARTBEAT_INTERVAL", "-10s"},
+		{"TM_NODE_HEARTBEAT_INTERVAL", "1h"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
@@ -137,6 +148,90 @@ func TestLoadTrustedProxies(t *testing.T) {
 	}
 	if want := []string{"172.18.0.1/32", "10.0.0.0/8", "::1/128"}; !reflect.DeepEqual(cfg.TrustedProxies, want) {
 		t.Errorf("TrustedProxies = %q, want %q", cfg.TrustedProxies, want)
+	}
+}
+
+func TestLoadNodeSettings(t *testing.T) {
+	for _, token := range []string{
+		strings.Repeat("a", 16),
+		strings.Repeat("Z", 256),
+		"s3cr3t-T0ken_with!symbols~#$%&'()*+,./:;<=>?@[]^{|}",
+		`quote"and\backslash-xx`,
+	} {
+		cfg, err := Load(env(map[string]string{"TM_NODE_TOKEN": token}))
+		if err != nil {
+			t.Errorf("token %q: %v", token, err)
+			continue
+		}
+		if cfg.NodeToken != token {
+			t.Errorf("NodeToken = %q, want %q (used as is)", cfg.NodeToken, token)
+		}
+	}
+	for _, interval := range []struct {
+		value string
+		want  time.Duration
+	}{
+		{"2s", 2 * time.Second},
+		{" 30s ", 30 * time.Second},
+		{"1m30s", 90 * time.Second},
+		{"5m", 5 * time.Minute},
+		{"2500ms", 2500 * time.Millisecond},
+	} {
+		cfg, err := Load(env(map[string]string{"TM_NODE_HEARTBEAT_INTERVAL": interval.value}))
+		if err != nil || cfg.NodeHeartbeatInterval != interval.want {
+			t.Errorf("TM_NODE_HEARTBEAT_INTERVAL=%q: %v, %v; want %v", interval.value, cfg, err, interval.want)
+		}
+	}
+}
+
+func TestLoadTrainerMode(t *testing.T) {
+	for _, tt := range []struct{ value, want string }{
+		{"", ""}, // not known
+		{"   ", ""},
+		{"auto", "auto"},
+		{"gpu", "gpu"},
+		{"cpu", "cpu"},
+		{"off", "off"},
+		{" off ", "off"},
+		// Anything else counts as auto, as in setup-compute.sh; it is
+		// never a startup error.
+		{"OFF", "auto"},
+		{"none", "auto"},
+		{"gpu,cpu", "auto"},
+	} {
+		cfg, err := Load(env(map[string]string{"TM_TRAINER_MODE": tt.value}))
+		if err != nil {
+			t.Errorf("TM_TRAINER_MODE=%q: %v", tt.value, err)
+			continue
+		}
+		if cfg.TrainerMode != tt.want {
+			t.Errorf("TM_TRAINER_MODE=%q: TrainerMode = %q, want %q", tt.value, cfg.TrainerMode, tt.want)
+		}
+	}
+}
+
+func TestLoadInvalidNodeToken(t *testing.T) {
+	for name, token := range map[string]string{
+		"too short":        strings.Repeat("a", 15),
+		"too long":         strings.Repeat("a", 257),
+		"inner space":      "abcdefgh ijklmnop",
+		"leading space":    " abcdefghijklmnop",
+		"trailing newline": "abcdefghijklmnop\n",
+		"only spaces":      strings.Repeat(" ", 20),
+		"tab":              "abcdefgh\tijklmnop",
+		"non-ASCII":        "abcdefghijklmnop令牌",
+		"DEL":              "abcdefghijklmnop\x7f",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(env(map[string]string{"TM_NODE_TOKEN": token}))
+			if err == nil || !strings.Contains(err.Error(), "TM_NODE_TOKEN") {
+				t.Fatalf("expected a TM_NODE_TOKEN error, got %v", err)
+			}
+			// Configuration errors are logged: they must not reveal the token.
+			if trimmed := strings.TrimSpace(token); trimmed != "" && strings.Contains(err.Error(), trimmed) {
+				t.Errorf("error reveals the token: %v", err)
+			}
+		})
 	}
 }
 

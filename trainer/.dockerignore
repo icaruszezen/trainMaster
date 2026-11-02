@@ -1,0 +1,16 @@
+# 训练节点镜像的构建上下文（trainer/）中不需要的内容。
+tests/
+scripts/tests/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.ruff_cache/
+**/*.egg-info/
+build/
+dist/
+.venv/
+venv/
+**/.env
+**/.env.*
+**/*.log
+**/.DS_Store

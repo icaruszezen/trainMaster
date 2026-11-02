@@ -1,0 +1,2 @@
+Nothing can be read (e.g. /proc and /sys are not mounted): every value
+except the runtime ones is unknown.

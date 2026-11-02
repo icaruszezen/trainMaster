@@ -46,6 +46,22 @@ describe("navigation config", () => {
     }
   })
 
+  it("lists the available features of every implemented module", () => {
+    for (const item of navItems.filter((i) => i.status === "ready")) {
+      if (item.id !== "dashboard") {
+        expect(item.features.length, item.id).toBeGreaterThan(0)
+      }
+    }
+  })
+
+  it("marks the compute module as implemented with its API", () => {
+    expect(getNavItem("compute")).toMatchObject({
+      status: "ready",
+      path: "/training/compute",
+      apiPath: "/api/v1/compute",
+    })
+  })
+
   it("looks up items by id", () => {
     expect(getNavItem("datasets").path).toBe("/datasets")
     expect(() => getNavItem("nope" as ModuleId)).toThrow()

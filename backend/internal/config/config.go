@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config is the validated service configuration.
@@ -35,7 +36,27 @@ type Config struct {
 	// X-Forwarded-For header is believed (TM_TRUSTED_PROXIES). Empty means
 	// the header is ignored and the TCP peer is the client.
 	TrustedProxies []string
+	// NodeToken is the bearer token training nodes must send to register
+	// and send heartbeats (TM_NODE_TOKEN). Empty: no token is required.
+	NodeToken string
+	// NodeHeartbeatInterval is how often training nodes send heartbeats
+	// (TM_NODE_HEARTBEAT_INTERVAL); a node is offline after three missed
+	// ones plus 5 seconds.
+	NodeHeartbeatInterval time.Duration
+	// TrainerMode is TM_TRAINER_MODE, the mode make setup chose for the
+	// training node on this machine: auto, gpu, cpu or off (docker compose
+	// passes it from .env). Empty: not known, e.g. outside docker compose.
+	TrainerMode string
 }
+
+// Limits of the training node settings.
+const (
+	minNodeTokenLength           = 16
+	maxNodeTokenLength           = 256
+	minNodeHeartbeatInterval     = 2 * time.Second
+	maxNodeHeartbeatInterval     = 5 * time.Minute
+	defaultNodeHeartbeatInterval = "10s"
+)
 
 // DBParams are the parts used to build a connection URL when
 // TM_DATABASE_URL is not set.
@@ -62,6 +83,9 @@ func (p DBParams) URL() string {
 }
 
 var sslModes = []string{"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+
+// trainerModes are the modes of make setup --mode (TM_TRAINER_MODE).
+var trainerModes = []string{"auto", "gpu", "cpu", "off"}
 
 // Load reads the configuration through getenv (normally os.Getenv) and
 // validates it. All problems are reported together.
@@ -141,10 +165,52 @@ func Load(getenv func(string) string) (*Config, error) {
 		cfg.TrustedProxies = proxies
 	}
 
+	// The token is compared byte for byte with what nodes send, so it is
+	// not trimmed; a value that would need trimming is rejected instead.
+	if token := getenv("TM_NODE_TOKEN"); token != "" {
+		if err := checkNodeToken(token); err != nil {
+			fail("TM_NODE_TOKEN", "%v", err)
+		} else {
+			cfg.NodeToken = token
+		}
+	}
+
+	interval := get("TM_NODE_HEARTBEAT_INTERVAL", defaultNodeHeartbeatInterval)
+	if d, err := time.ParseDuration(interval); err != nil || d < minNodeHeartbeatInterval || d > maxNodeHeartbeatInterval {
+		fail("TM_NODE_HEARTBEAT_INTERVAL", "invalid duration %q (between 2s and 5m, e.g. 10s or 1m)", interval)
+	} else {
+		cfg.NodeHeartbeatInterval = d
+	}
+
+	// TM_TRAINER_MODE only tunes the compute page's hints, so a bad value
+	// never stops the service: like setup-compute.sh, which warns and goes
+	// on, it counts as auto.
+	if mode := get("TM_TRAINER_MODE", ""); mode != "" {
+		if !slices.Contains(trainerModes, mode) {
+			mode = "auto"
+		}
+		cfg.TrainerMode = mode
+	}
+
 	if len(problems) > 0 {
 		return nil, errors.New("invalid configuration: " + strings.Join(problems, "; "))
 	}
 	return cfg, nil
+}
+
+// checkNodeToken validates TM_NODE_TOKEN: 16-256 printable ASCII
+// characters without spaces. The error never contains the token itself,
+// since configuration errors end up in logs.
+func checkNodeToken(token string) error {
+	if n := len(token); n < minNodeTokenLength || n > maxNodeTokenLength {
+		return fmt.Errorf("must be %d to %d characters long (got %d)", minNodeTokenLength, maxNodeTokenLength, n)
+	}
+	for i := 0; i < len(token); i++ {
+		if c := token[i]; c < 0x21 || c > 0x7e {
+			return fmt.Errorf("character %d is not allowed (use printable ASCII without spaces, e.g. letters and digits)", i+1)
+		}
+	}
+	return nil
 }
 
 func checkListenAddr(addr string) error {
