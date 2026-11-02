@@ -25,6 +25,7 @@ import { getNavItem, type ModuleId } from "@/config/navigation"
 import { datasetsQuery } from "@/features/datasets/api"
 import { projectsQuery } from "@/features/projects/api"
 import { SystemStatusCard } from "@/features/system/system-status-card"
+import { ComputeSummaryLink } from "@/features/training/compute-summary-link"
 import { formatNumber, formatPercent, percentOf } from "@/lib/format"
 
 /** 尚未开发的模块的统计项：对应模块完成后再接入真实数据。 */
@@ -91,7 +92,10 @@ export function DashboardPage() {
       </div>
 
       <div className="grid gap-4 xl:grid-cols-3">
-        <SystemStatusCard />
+        <div className="flex min-w-0 flex-col gap-4">
+          <SystemStatusCard className="flex-1" />
+          <ComputeSummaryLink />
+        </div>
         <Card className="xl:col-span-2">
           <CardHeader>
             <CardTitle>平台流程</CardTitle>
