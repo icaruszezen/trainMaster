@@ -1,0 +1,8 @@
+# 训练节点的开发与测试依赖：pip install -r requirements-dev.txt
+#
+# 测试不需要 torch / ultralytics（用假模块代替），所以这里只包含常驻进程本身的依赖，
+# 版本与 requirements.txt 一致（tests/test_requirements.py 会检查）。
+nvidia-ml-py==13.615.71
+psutil==7.2.2
+pytest==9.1.1
+ruff==0.17.3

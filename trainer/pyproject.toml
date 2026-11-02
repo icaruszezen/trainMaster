@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trainmaster-trainer"
+description = "trainMaster 训练节点：自动识别显卡、CPU 与 CUDA 环境并向平台注册、上报心跳"
+requires-python = ">=3.10"
+dynamic = ["version"]
+# 只列出常驻进程本身的依赖。torch / torchvision 由 scripts/install-torch.sh 按 CUDA 版本安装，
+# ultralytics 由 requirements.txt 安装；常驻进程不导入它们（只在环境检测子进程中导入）。
+dependencies = [
+    "nvidia-ml-py>=12.0.0",
+    "psutil>=5.8.0",
+]
+
+[project.scripts]
+trainmaster-trainer = "trainmaster_trainer.__main__:main"
+
+[tool.setuptools]
+packages = ["trainmaster_trainer"]
+
+[tool.setuptools.package-data]
+trainmaster_trainer = ["torch_variants.txt"]
+
+[tool.setuptools.dynamic]
+version = { attr = "trainmaster_trainer.__version__" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "C4", "RET", "PIE"]
+
+[tool.ruff.lint.pycodestyle]
+# 格式化按 100 列；中文按 2 列计算，提示文字较长的行放宽到 120 列。
+max-line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
