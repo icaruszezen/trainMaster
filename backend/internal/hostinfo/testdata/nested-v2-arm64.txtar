@@ -1,0 +1,28 @@
+The server runs as a systemd service on an arm64 cgroup v2 host
+(CPUQuota=50%, MemoryMax=1G): the limits are in the service's own cgroup,
+which /proc/self/cgroup names. arm64 /proc/cpuinfo has neither a model
+name nor core ids, and no blank lines between processors here.
+-- proc/sys/kernel/osrelease --
+6.1.0-rpi7-rpi-v8
+-- proc/meminfo --
+MemTotal:        8000000 kB
+-- proc/cpuinfo --
+processor	: 0
+BogoMIPS	: 108.00
+Features	: fp asimd evtstrm crc32 cpuid
+CPU implementer	: 0x41
+CPU part	: 0xd08
+processor	: 1
+BogoMIPS	: 108.00
+processor	: 2
+BogoMIPS	: 108.00
+processor	: 3
+BogoMIPS	: 108.00
+-- proc/self/cgroup --
+0::/system.slice/trainmaster.service
+-- sys/fs/cgroup/cgroup.controllers --
+cpuset cpu io memory pids
+-- sys/fs/cgroup/system.slice/trainmaster.service/cpu.max --
+50000 100000
+-- sys/fs/cgroup/system.slice/trainmaster.service/memory.max --
+1073741824

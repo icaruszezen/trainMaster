@@ -1,0 +1,23 @@
+A host with NVIDIA GPUs whose driver is not installed: /proc/driver/nvidia
+does not exist, but the PCI bus lists a VGA (0x0300) and a 3D (0x0302)
+controller from NVIDIA. The GPU's HDMI audio function (0x0403) and the
+Intel graphics are not NVIDIA GPUs.
+-- proc/meminfo --
+MemTotal:       32000000 kB
+MemAvailable:   30000000 kB
+-- sys/bus/pci/devices/0000:65:00.0/vendor --
+0x10de
+-- sys/bus/pci/devices/0000:65:00.0/class --
+0x030200
+-- sys/bus/pci/devices/0000:17:00.0/vendor --
+0x10DE
+-- sys/bus/pci/devices/0000:17:00.0/class --
+0x030000
+-- sys/bus/pci/devices/0000:17:00.1/vendor --
+0x10de
+-- sys/bus/pci/devices/0000:17:00.1/class --
+0x040300
+-- sys/bus/pci/devices/0000:00:02.0/vendor --
+0x8086
+-- sys/bus/pci/devices/0000:00:02.0/class --
+0x030000

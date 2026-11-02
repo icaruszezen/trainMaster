@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/buildinfo"
+	"github.com/icaruszezen/trainmaster/backend/internal/compute"
 	"github.com/icaruszezen/trainmaster/backend/internal/config"
 	"github.com/icaruszezen/trainmaster/backend/internal/database"
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
+	"github.com/icaruszezen/trainmaster/backend/internal/hostinfo"
 	"github.com/icaruszezen/trainmaster/backend/internal/httpapi"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
@@ -78,6 +80,15 @@ func run() error {
 	}
 	defer datasets.Stop()
 
+	// CPU utilization of this machine for the compute page, sampled in the
+	// background until shutdown.
+	host := hostinfo.New(hostinfo.Options{FS: hostinfo.SystemFS()})
+	host.Start(ctx)
+	defer host.Stop()
+
+	log.Info("training node registration",
+		"token_required", cfg.NodeToken != "", "heartbeat_interval", cfg.NodeHeartbeatInterval.String())
+
 	opts := httpapi.Options{
 		Logger:         log,
 		DB:             db,
@@ -86,6 +97,11 @@ func run() error {
 		TrustedProxies: cfg.TrustedProxies,
 		Datasets:       datasets,
 		Projects:       project.NewService(project.Options{DB: db.Pool, Logger: log}),
+		Compute: compute.NewService(compute.Options{
+			DB: db.Pool, Logger: log, HeartbeatInterval: cfg.NodeHeartbeatInterval,
+		}),
+		Host:      host,
+		NodeToken: cfg.NodeToken,
 	}
 	if cfg.WebDir != "" {
 		h, err := web.New(cfg.WebDir)

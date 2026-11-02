@@ -117,6 +117,8 @@ func TestErrorEnvelopes(t *testing.T) {
 		{"GET", "/api/v1/annotation/tasksx", 404, "not_found"},
 		// Without a dataset service the dataset routes are not mounted.
 		{"GET", "/api/v1/datasets", 404, "not_found"},
+		{"GET", "/api/v1/compute/nodes", 404, "not_found"},
+		{"GET", "/api/v1/compute/server", 404, "not_found"},
 		{"POST", "/api/healthz", 405, "method_not_allowed"},
 		{"DELETE", "/api/v1/system/info", 405, "method_not_allowed"},
 		{"PROPFIND", "/api/healthz", 405, "method_not_allowed"}, // unknown to chi
