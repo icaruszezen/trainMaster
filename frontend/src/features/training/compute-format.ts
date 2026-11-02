@@ -207,15 +207,23 @@ export function hintSegments(text: string): TextSegment[] {
   return segments
 }
 
+/** 平台地址中的主机占位符：通过 localhost 访问时，其它机器需要换成平台服务器的 IP 或域名。 */
+export const SERVER_HOST_PLACEHOLDER = "<平台服务器 IP>"
+
 /**
- * 节点接入说明中的平台地址：通过 IP / 域名访问时就是当前地址；
- * 通过 localhost 访问时其它机器无法使用，给出占位符。
+ * 节点接入说明中的平台地址：通过 IP / 域名访问时就是当前地址；通过 localhost
+ * 访问时其它机器无法使用，主机名换成占位符，协议与端口沿用当前地址（.env 中的
+ * TM_HTTP_PORT 不一定是 8080）。不知道地址时按默认部署的 8080 端口。
  */
 export function suggestServerUrl(location: {
   protocol: string
   host: string
   hostname: string
+  port: string
 }): string {
+  if (!location.host || !/^https?:$/.test(location.protocol)) {
+    return `http://${SERVER_HOST_PLACEHOLDER}:8080`
+  }
   const hostname = location.hostname.replace(/^\[|\]$/g, "").toLowerCase()
   const loopback =
     hostname === "localhost" ||
@@ -223,8 +231,9 @@ export function suggestServerUrl(location: {
     hostname === "::1" ||
     hostname === "0.0.0.0" ||
     /^127\./.test(hostname)
-  if (loopback || !location.host) {
-    return "http://<平台服务器 IP>:8080"
+  if (loopback) {
+    const port = location.port ? `:${location.port}` : ""
+    return `${location.protocol}//${SERVER_HOST_PLACEHOLDER}${port}`
   }
   return `${location.protocol}//${location.host}`
 }
