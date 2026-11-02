@@ -7,6 +7,7 @@ import type {
   ComputeNode,
   ComputeServer,
   EnvironmentIssue,
+  EnvironmentStatus,
   GpuMetrics,
   IssueLevel,
   SelfTestStatus,
@@ -18,9 +19,19 @@ export function isOnline(node: Pick<ComputeNode, "status">) {
   return node.status === "online"
 }
 
-/** 节点已请求重新检测、且还能完成检测（在线）。 */
+/**
+ * 节点正在重新检测、且还能完成检测（在线）：请求了重新检测，或节点刚刚重新
+ * 启动（注册时还没有检测结果，服务端保留上次的结果并标记为待检测）。
+ */
 export function isProbing(node: Pick<ComputeNode, "status" | "probe_pending">) {
   return node.probe_pending && isOnline(node)
+}
+
+/** 正在重新检测，页面上显示的还是上次的检测结果。 */
+export function isRedetecting(
+  node: Pick<ComputeNode, "status" | "probe_pending" | "environment">
+) {
+  return node.environment !== null && isProbing(node)
 }
 
 /** 加速器标记：“GPU × 2” / “仅 CPU”。 */
@@ -38,9 +49,13 @@ export type EnvironmentBadge = {
   description: string
 }
 
-/** 环境标记：CUDA 就绪 / CPU 模式 / 环境异常 / 正在检测。 */
+/**
+ * 环境标记：CUDA 就绪 / CPU 模式 / 环境异常 / 正在检测。重新检测时显示
+ * “正在重新检测”，上次的结果放在说明中：节点重启后（如按提示修复后）不再
+ * 把上次的“环境异常”当作当前状态显示。
+ */
 export function environmentBadge(
-  node: Pick<ComputeNode, "status" | "environment">
+  node: Pick<ComputeNode, "status" | "environment" | "probe_pending">
 ): EnvironmentBadge {
   const env = node.environment
   if (!env) {
@@ -56,7 +71,19 @@ export function environmentBadge(
           description: "节点离线前没有完成 CUDA 环境检测",
         }
   }
-  switch (env.status) {
+  const last = statusBadge(env.status)
+  if (isProbing(node)) {
+    return {
+      tone: "pending",
+      label: "正在重新检测",
+      description: `节点正在重新检测 CUDA 环境并运行 YOLO 自检，通常需要几十秒；上次检测的结果为“${last.label}”`,
+    }
+  }
+  return last
+}
+
+function statusBadge(status: EnvironmentStatus): EnvironmentBadge {
+  switch (status) {
     case "ready":
       return {
         tone: "ready",

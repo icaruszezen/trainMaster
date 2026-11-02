@@ -16,6 +16,7 @@ import {
   groupGpuModels,
   hasOnlineGpuNode,
   isProbing,
+  isRedetecting,
   nodeStatusText,
   serverGpuHint,
   sortIssues,
@@ -151,6 +152,39 @@ describe("node badges", () => {
     expect(
       environmentBadge(node({ environment: null, status: "offline" }))
     ).toMatchObject({ tone: "unknown", label: "未检测" })
+  })
+
+  it("shows re-detection over the previous result", () => {
+    // After a restart the server keeps the old environment and marks a
+    // probe as pending until the node reports the new one.
+    const restarted = node({
+      probe_pending: true,
+      environment: environment({ status: "error" }),
+    })
+    expect(isRedetecting(restarted)).toBe(true)
+    const badge = environmentBadge(restarted)
+    expect(badge).toMatchObject({ tone: "pending", label: "正在重新检测" })
+    expect(badge.description).toContain("上次检测的结果为“环境异常”")
+
+    // Not yet detected at all: the plain detecting badge.
+    expect(
+      isRedetecting(node({ probe_pending: true, environment: null }))
+    ).toBe(false)
+    expect(
+      environmentBadge(node({ probe_pending: true, environment: null }))
+    ).toMatchObject({ tone: "pending", label: "正在检测" })
+
+    // Offline nodes cannot detect: they keep their last result.
+    const offline = node({
+      status: "offline",
+      probe_pending: true,
+      environment: environment({ status: "error" }),
+    })
+    expect(isRedetecting(offline)).toBe(false)
+    expect(environmentBadge(offline)).toMatchObject({
+      tone: "error",
+      label: "环境异常",
+    })
   })
 
   it("treats a pending probe on an offline node as not probing", () => {
