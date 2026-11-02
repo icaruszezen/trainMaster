@@ -225,7 +225,7 @@ type RegisterInput struct {
 	Hostname     string
 	AgentVersion string
 	Hardware     *Hardware    // required
-	Environment  *Environment // nil keeps the stored one
+	Environment  *Environment // nil keeps the stored one and requests a probe (the node is checking it)
 	Metrics      *Metrics     // nil keeps the stored one
 }
 
@@ -250,6 +250,9 @@ type HeartbeatResult struct {
 	NodeID                   int64   `json:"node_id"`
 	HeartbeatIntervalSeconds float64 `json:"heartbeat_interval_seconds"`
 	// ProbeRequested asks the node to probe its hardware and environment
-	// again and to report the result with a later heartbeat.
+	// again and to report the result with a later heartbeat. It is also
+	// true after a registration without an environment, until a heartbeat
+	// brings one; a node that is still detecting its environment (or has a
+	// result it has not sent yet) ignores it.
 	ProbeRequested bool `json:"probe_requested"`
 }
