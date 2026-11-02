@@ -225,6 +225,19 @@ def test_state_dir_candidates(tmp_path):
     assert len(config.state_dir_candidates(candidates[1], home=str(tmp_path / "home"))) == 2
 
 
+def test_healthcheck_dirs_include_puid_temp_dir(tmp_path, monkeypatch):
+    # HEALTHCHECK 以 root 运行，训练节点以 PUID 运行：也查找 PUID 的临时目录。
+    monkeypatch.setattr(config.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+    configured = tmp_path / "configured"
+    dirs = config.healthcheck_dirs(configured, {"HOME": str(tmp_path / "home"), "PUID": "1000"})
+    assert dirs[:2] == config.state_dir_candidates(configured, home=str(tmp_path / "home"))[:2]
+    assert dirs[-1] == tmp_path / "tmp" / "trainmaster-1000"
+    assert tmp_path / "tmp" / f"trainmaster-{os.getuid()}" in dirs
+    # 没有 PUID、PUID 不是数字或与当前用户相同时不重复添加
+    for env in ({}, {"PUID": "abc"}, {"PUID": str(os.getuid())}):
+        assert config.healthcheck_dirs(configured, env) == config.state_dir_candidates(configured)
+
+
 def test_unwritable_state_dir_falls_back_to_home(tmp_path):
     blocker = tmp_path / "file"
     blocker.write_text("not a directory")

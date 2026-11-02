@@ -174,6 +174,21 @@ def state_dir_candidates(configured: Path, home: str | None = None) -> list[Path
     return out
 
 
+def healthcheck_dirs(configured: Path, env: Mapping[str, str]) -> list[Path]:
+    """healthcheck 查找心跳文件的目录：state_dir_candidates，再加上 PUID 的临时目录。
+
+    Docker 以 root 运行 HEALTHCHECK，而训练节点由 entrypoint 降权为 PUID 运行：状态目录不可写、
+    退回到临时目录时，目录名中是 PUID 而不是 0。
+    """
+    dirs = state_dir_candidates(configured, env.get("HOME"))
+    puid = env.get("PUID", "").strip()
+    if puid.isdigit():
+        extra = Path(tempfile.gettempdir()) / f"trainmaster-{int(puid)}"
+        if extra not in dirs:
+            dirs.append(extra)
+    return dirs
+
+
 def resolve_state_dir(
     configured: Path, *, home: str | None = None, create: bool = True
 ) -> tuple[Path, str | None]:

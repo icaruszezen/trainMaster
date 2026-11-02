@@ -188,9 +188,7 @@ def cmd_healthcheck() -> int:
     from .agent import check_heartbeat
 
     configured = Path(os.environ.get("TM_STATE_DIR", "").strip() or config_mod.DEFAULT_STATE_DIR)
-    ok, message = check_heartbeat(
-        config_mod.state_dir_candidates(configured, os.environ.get("HOME"))
-    )
+    ok, message = check_heartbeat(config_mod.healthcheck_dirs(configured, os.environ))
     print(message, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
 
