@@ -1,0 +1,487 @@
+import { describe, expect, it } from "vitest"
+
+import type {
+  ComputeNode,
+  EnvironmentIssue,
+  NodeEnvironment,
+  NodeGpu,
+} from "@/features/training/compute-api"
+import {
+  acceleratorLabel,
+  dashboardComputeText,
+  environmentBadge,
+  environmentFacts,
+  formatGpuModels,
+  gpuMetricsOf,
+  groupGpuModels,
+  isProbing,
+  nodeStatusText,
+  serverGpuHint,
+  sortIssues,
+  summarizeNodes,
+} from "@/features/training/compute-status"
+
+const GiB = 1024 ** 3
+
+function gpu(index: number, overrides: Partial<NodeGpu> = {}): NodeGpu {
+  return {
+    index,
+    uuid: `GPU-${index}`,
+    name: "NVIDIA GeForce RTX 4090",
+    memory_total_bytes: 24 * GiB,
+    compute_capability: "8.9",
+    pci_bus_id: `00000000:0${index + 1}:00.0`,
+    power_limit_watts: 450,
+    mig_enabled: false,
+    ...overrides,
+  }
+}
+
+function environment(
+  overrides: Partial<NodeEnvironment> = {}
+): NodeEnvironment {
+  return {
+    status: "ready",
+    accelerator: "cuda",
+    python_version: "3.12.7",
+    torch_version: "2.9.1+cu126",
+    torch_cuda_version: "12.6",
+    cudnn_version: "9.10.2",
+    torch_arch_list: ["sm_80", "sm_86", "sm_89", "sm_90"],
+    torchvision_version: "0.24.1+cu126",
+    ultralytics_version: "8.4.198",
+    torch_variant: "cu126",
+    recommended_variant: "cu126",
+    cuda_available: true,
+    cuda_device_count: 1,
+    self_test: {
+      status: "passed",
+      device: "cuda:0",
+      duration_ms: 1830,
+      message: "YOLO11n 前向推理正常",
+      detail: null,
+    },
+    issues: [],
+    probed_at: "2026-11-02T07:30:00Z",
+    ...overrides,
+  }
+}
+
+function node(overrides: Partial<ComputeNode> = {}): ComputeNode {
+  return {
+    id: 1,
+    node_key: "key-1",
+    name: "gpu-01",
+    hostname: "gpu-01",
+    address: "192.168.1.20",
+    agent_version: "0.1.0",
+    status: "online",
+    probe_pending: false,
+    registered_at: "2026-11-02T07:00:00Z",
+    last_seen_at: "2026-11-02T07:31:00Z",
+    created_at: "2026-11-01T07:00:00Z",
+    hardware: {
+      os: "Ubuntu 22.04.4 LTS",
+      kernel: "5.15.0-105-generic",
+      arch: "x86_64",
+      in_container: true,
+      cpu: {
+        model: "Intel(R) Xeon(R) Gold 6330 CPU @ 2.00GHz",
+        physical_cores: 28,
+        logical_cores: 56,
+        max_mhz: 3100,
+        limit_cores: null,
+      },
+      memory: { total_bytes: 128 * GiB, limit_bytes: null },
+      shm_bytes: 8 * GiB,
+      gpu_driver: {
+        driver_version: "550.54.15",
+        cuda_driver_version: "12.4",
+        nvml_version: "12.550.54.15",
+      },
+      gpus: [gpu(0)],
+      gpu_detection: { method: "nvml", error: null, host_gpu_count: 1 },
+    },
+    environment: environment(),
+    metrics: null,
+    history: [],
+    ...overrides,
+  }
+}
+
+function withGpus(gpus: NodeGpu[], overrides: Partial<ComputeNode> = {}) {
+  const base = node(overrides)
+  return { ...base, hardware: { ...base.hardware, gpus } }
+}
+
+function issue(
+  level: EnvironmentIssue["level"],
+  code: string
+): EnvironmentIssue {
+  return { level, code, message: code, hint: null }
+}
+
+describe("node badges", () => {
+  it("labels the accelerator", () => {
+    expect(acceleratorLabel(withGpus([gpu(0), gpu(1)]))).toBe("GPU × 2")
+    expect(acceleratorLabel(withGpus([]))).toBe("仅 CPU")
+  })
+
+  it("derives the environment badge from the status", () => {
+    expect(environmentBadge(node())).toMatchObject({
+      tone: "ready",
+      label: "CUDA 就绪",
+    })
+    expect(
+      environmentBadge(
+        node({ environment: environment({ status: "cpu_only" }) })
+      )
+    ).toMatchObject({ tone: "cpu", label: "CPU 模式" })
+    expect(
+      environmentBadge(node({ environment: environment({ status: "error" }) }))
+    ).toMatchObject({ tone: "error", label: "环境异常" })
+  })
+
+  it("shows detection in progress only while the node is online", () => {
+    expect(environmentBadge(node({ environment: null }))).toMatchObject({
+      tone: "pending",
+      label: "正在检测",
+    })
+    expect(
+      environmentBadge(node({ environment: null, status: "offline" }))
+    ).toMatchObject({ tone: "unknown", label: "未检测" })
+  })
+
+  it("treats a pending probe on an offline node as not probing", () => {
+    expect(isProbing(node({ probe_pending: true }))).toBe(true)
+    expect(isProbing(node({ probe_pending: true, status: "offline" }))).toBe(
+      false
+    )
+    expect(isProbing(node())).toBe(false)
+  })
+
+  it("describes the online status and the last heartbeat", () => {
+    const now = Date.parse("2026-11-02T07:34:30Z")
+    expect(nodeStatusText(node(), now)).toBe("在线")
+    expect(nodeStatusText(node({ status: "offline" }), now)).toBe(
+      "离线 · 最后心跳 3 分钟前"
+    )
+  })
+})
+
+describe("environmentFacts", () => {
+  it("lists the known versions in a fixed order", () => {
+    expect(environmentFacts(node())).toEqual([
+      { label: "PyTorch", value: "2.9.1+cu126" },
+      { label: "CUDA", value: "12.6" },
+      { label: "cuDNN", value: "9.10.2" },
+      { label: "Ultralytics", value: "8.4.198" },
+      { label: "驱动", value: "550.54.15" },
+      { label: "Python", value: "3.12.7" },
+    ])
+  })
+
+  it("skips missing values", () => {
+    const cpu = node({
+      environment: environment({
+        torch_cuda_version: null,
+        cudnn_version: null,
+        ultralytics_version: "  ",
+      }),
+    })
+    cpu.hardware.gpu_driver = null
+    expect(environmentFacts(cpu).map((fact) => fact.label)).toEqual([
+      "PyTorch",
+      "Python",
+    ])
+  })
+
+  it("shows the driver before the environment has been probed", () => {
+    expect(environmentFacts(node({ environment: null }))).toEqual([
+      { label: "驱动", value: "550.54.15" },
+    ])
+  })
+})
+
+describe("sortIssues", () => {
+  it("orders by severity and keeps the order within a level", () => {
+    const sorted = sortIssues([
+      issue("info", "no_gpu"),
+      issue("warning", "shm_small"),
+      issue("error", "arch_unsupported"),
+      issue("info", "mig_enabled"),
+      issue("error", "self_test_failed"),
+    ])
+    expect(sorted.map((item) => item.code)).toEqual([
+      "arch_unsupported",
+      "self_test_failed",
+      "shm_small",
+      "no_gpu",
+      "mig_enabled",
+    ])
+  })
+
+  it("does not modify the input", () => {
+    const issues = [issue("info", "a"), issue("error", "b")]
+    sortIssues(issues)
+    expect(issues.map((item) => item.code)).toEqual(["a", "b"])
+  })
+})
+
+describe("gpu models", () => {
+  it("groups by short name, most common first", () => {
+    const models = groupGpuModels([
+      "NVIDIA A100-SXM4-80GB",
+      "NVIDIA GeForce RTX 4090",
+      "NVIDIA GeForce RTX 4090",
+      "NVIDIA GeForce RTX 3090",
+    ])
+    expect(models).toEqual([
+      { name: "RTX 4090", count: 2 },
+      { name: "A100-SXM4-80GB", count: 1 },
+      { name: "RTX 3090", count: 1 },
+    ])
+    expect(formatGpuModels(models)).toBe(
+      "2 × RTX 4090、1 × A100-SXM4-80GB、1 × RTX 3090"
+    )
+    expect(formatGpuModels(models, 2)).toBe(
+      "2 × RTX 4090、1 × A100-SXM4-80GB 等 3 种"
+    )
+    expect(formatGpuModels([])).toBe("")
+  })
+})
+
+describe("summarizeNodes", () => {
+  it("counts only online nodes towards GPUs and environments", () => {
+    const nodes = [
+      withGpus([gpu(0), gpu(1)], {
+        id: 1,
+        metrics: {
+          cpu_percent: 12,
+          load_average: null,
+          memory_used_bytes: null,
+          memory_total_bytes: null,
+          disk_path: null,
+          disk_total_bytes: null,
+          disk_free_bytes: null,
+          gpus: [
+            {
+              index: 0,
+              utilization_percent: 90,
+              memory_used_bytes: 12 * GiB,
+              memory_total_bytes: 24 * GiB,
+              temperature_c: 70,
+              power_watts: 300,
+              fan_percent: 50,
+              process_count: 1,
+            },
+          ],
+        },
+      }),
+      withGpus([gpu(0, { name: "NVIDIA GeForce RTX 5090" })], {
+        id: 2,
+        environment: environment({ status: "error" }),
+      }),
+      withGpus([gpu(0)], {
+        id: 3,
+        status: "offline",
+        environment: environment({ status: "error" }),
+      }),
+      withGpus([], {
+        id: 4,
+        environment: environment({ status: "cpu_only" }),
+      }),
+      withGpus([], { id: 5, environment: null }),
+    ]
+
+    expect(summarizeNodes(nodes)).toEqual({
+      nodeCount: 5,
+      onlineCount: 4,
+      gpuCount: 3,
+      offlineGpuCount: 1,
+      gpuModels: [
+        { name: "RTX 4090", count: 2 },
+        { name: "RTX 5090", count: 1 },
+      ],
+      memoryTotalBytes: 72 * GiB,
+      // 只有一块卡有实时数据：比例按这块卡计算。
+      memoryUsage: { used: 12 * GiB, total: 24 * GiB },
+      readyCount: 1,
+      problemCount: 1,
+      cpuOnlyCount: 1,
+      detectingCount: 1,
+    })
+  })
+
+  it("falls back to the metrics total and ignores unknown sizes", () => {
+    const summary = summarizeNodes([
+      withGpus(
+        [
+          gpu(0, { memory_total_bytes: null }),
+          gpu(1, { memory_total_bytes: null }),
+        ],
+        {
+          metrics: {
+            cpu_percent: null,
+            load_average: null,
+            memory_used_bytes: null,
+            memory_total_bytes: null,
+            disk_path: null,
+            disk_total_bytes: null,
+            disk_free_bytes: null,
+            gpus: [
+              {
+                index: 0,
+                utilization_percent: null,
+                memory_used_bytes: 30 * GiB,
+                memory_total_bytes: 16 * GiB,
+                temperature_c: null,
+                power_watts: null,
+                fan_percent: null,
+                process_count: null,
+              },
+            ],
+          },
+        }
+      ),
+    ])
+    expect(summary.memoryTotalBytes).toBe(16 * GiB)
+    // 已用超过总量（异常数据）时按总量计。
+    expect(summary.memoryUsage).toEqual({ used: 16 * GiB, total: 16 * GiB })
+  })
+
+  it("returns empty counts without nodes", () => {
+    expect(summarizeNodes([])).toMatchObject({
+      nodeCount: 0,
+      onlineCount: 0,
+      gpuCount: 0,
+      gpuModels: [],
+      memoryTotalBytes: 0,
+      memoryUsage: null,
+    })
+  })
+
+  it("finds the metrics of a GPU by index", () => {
+    const metrics = {
+      index: 1,
+      utilization_percent: 5,
+      memory_used_bytes: null,
+      memory_total_bytes: null,
+      temperature_c: null,
+      power_watts: null,
+      fan_percent: null,
+      process_count: null,
+    }
+    const subject = node({
+      metrics: {
+        cpu_percent: null,
+        load_average: null,
+        memory_used_bytes: null,
+        memory_total_bytes: null,
+        disk_path: null,
+        disk_total_bytes: null,
+        disk_free_bytes: null,
+        gpus: [metrics],
+      },
+    })
+    expect(gpuMetricsOf(subject, 1)).toBe(metrics)
+    expect(gpuMetricsOf(subject, 0)).toBeUndefined()
+    expect(gpuMetricsOf(node(), 0)).toBeUndefined()
+  })
+})
+
+describe("dashboardComputeText", () => {
+  it("summarizes online nodes and GPU models", () => {
+    expect(
+      dashboardComputeText(summarizeNodes([withGpus([gpu(0), gpu(1)])]))
+    ).toBe("1 个节点在线 · 2 块 GPU（RTX 4090）")
+  })
+
+  it("lists at most two models", () => {
+    const text = dashboardComputeText(
+      summarizeNodes([
+        withGpus([
+          gpu(0),
+          gpu(1, { name: "NVIDIA A100-PCIE-40GB" }),
+          gpu(2, { name: "NVIDIA GeForce RTX 3090" }),
+        ]),
+      ])
+    )
+    expect(text).toBe("1 个节点在线 · 3 块 GPU（A100-PCIE-40GB、RTX 3090 等）")
+  })
+
+  it("mentions CPU-only nodes and problems", () => {
+    expect(
+      dashboardComputeText(
+        summarizeNodes([
+          withGpus([], { environment: environment({ status: "error" }) }),
+        ])
+      )
+    ).toBe("1 个节点在线 · 仅 CPU · 1 个环境异常")
+  })
+
+  it("handles no nodes and all nodes offline", () => {
+    expect(dashboardComputeText(summarizeNodes([]))).toBe("还没有训练节点")
+    expect(
+      dashboardComputeText(
+        summarizeNodes([
+          node({ status: "offline" }),
+          node({ id: 2, status: "offline" }),
+        ])
+      )
+    ).toBe("2 个节点均离线")
+  })
+})
+
+describe("serverGpuHint", () => {
+  const nvidia = {
+    driver_version: "550.54.15",
+    gpus: [
+      {
+        name: "NVIDIA GeForce RTX 4090",
+        uuid: "GPU-1",
+        bus_id: "0000:01:00.0",
+      },
+      {
+        name: "NVIDIA GeForce RTX 4090",
+        uuid: "GPU-2",
+        bus_id: "0000:02:00.0",
+      },
+    ],
+  }
+
+  it("hints when the server has GPUs but no GPU node is online", () => {
+    expect(serverGpuHint({ nvidia }, [])).toEqual({
+      kind: "no_gpu_node",
+      gpuCount: 2,
+    })
+    expect(
+      serverGpuHint({ nvidia }, [
+        withGpus([gpu(0)], { status: "offline" }),
+        withGpus([]),
+      ])
+    ).toEqual({ kind: "no_gpu_node", gpuCount: 2 })
+  })
+
+  it("asks for a driver when the GPUs are only visible on the PCI bus", () => {
+    expect(
+      serverGpuHint(
+        {
+          nvidia: {
+            driver_version: null,
+            gpus: [{ name: null, uuid: null, bus_id: "0000:01:00.0" }],
+          },
+        },
+        []
+      )
+    ).toEqual({ kind: "driver_missing", gpuCount: 1 })
+  })
+
+  it("stays quiet when a GPU node is online or the server has no GPU", () => {
+    expect(serverGpuHint({ nvidia }, [withGpus([gpu(0)])])).toBeNull()
+    expect(serverGpuHint({ nvidia: null }, [])).toBeNull()
+    expect(
+      serverGpuHint({ nvidia: { driver_version: "550.54.15", gpus: [] } }, [])
+    ).toBeNull()
+  })
+})
