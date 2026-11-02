@@ -139,7 +139,7 @@ services:
 
   # GPU 训练节点：COMPOSE_PROFILES=gpu。不依赖 app（depends_on），其它 GPU 机器上可以只运行它：
   #   docker compose up -d --build trainer
-  # 节点连不上平台时自己重试。只使用部分显卡见 docs/deployment.md（docker-compose.override.yml 中的 device_ids）。
+  # 节点连不上平台时自己重试。只使用部分显卡见 docs/deployment.md 第 10.8 节（docker-compose.override.yml 中的 device_ids）。
   trainer:
     <<: *trainer
     profiles: [gpu]

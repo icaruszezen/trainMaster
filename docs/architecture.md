@@ -1,6 +1,6 @@
 # 架构说明
 
-本文描述 trainMaster 的整体结构与约定（平台框架 + 已实现的数据集管理）。后续功能开发应遵循这里的约定；需要调整约定时，请同步更新本文。
+本文描述 trainMaster 的整体结构与约定（平台框架 + 已实现的数据集、项目、标注与计算资源）。后续功能开发应遵循这里的约定；需要调整约定时，请同步更新本文。
 
 ## 1. 组件总览
 
@@ -13,21 +13,26 @@ flowchart LR
             server["trainmaster（Go）<br/>/api/* JSON API<br/>其余路径：前端静态文件"]
         end
         pg[("postgres 容器<br/>PostgreSQL 17")]
-        trainer["trainer 容器（规划中）<br/>GPU 训练 worker"]
+        trainer["trainer / trainer-cpu 容器（可选）<br/>训练节点（Python）"]
     end
 
     storage[/"宿主机目录 ./data/storage<br/>（容器内 /data）"/]
     pgdata[/"宿主机目录 ./data/postgres"/]
+    gpu[/"NVIDIA 显卡<br/>（驱动 + NVIDIA Container Toolkit）"/]
+    remote["其它 GPU 机器上的训练节点<br/>（Docker 或裸机安装）"]
 
     browser -- "HTTP :8080" --> server
     server -- "SQL（元数据）" --> pg
     server -- "读写文件" --> storage
     pg --- pgdata
-    trainer -. "领取任务 / 上报进度（HTTP）" .-> server
-    trainer -. "读数据集、写模型与运行产物" .-> storage
+    trainer -- "注册 / 心跳（HTTP JSON，可选令牌）" --> server
+    remote -- "注册 / 心跳" --> server
+    trainer --- gpu
+    trainer -. "读数据集、写模型与运行产物（规划中）" .-> storage
 ```
 
 - **单镜像**：Go 服务同时提供 `/api` 下的 JSON API 和前端构建产物（`/app/web`），部署只需 `app` 与 `postgres` 两个容器。
+- **训练节点是独立的服务**：Python 训练节点（`trainer/`）运行在有显卡的机器上，主动向平台注册并上报心跳（见第 9 节）。同一台机器上由 compose 的 profile 启用（`gpu` → `trainer`，`cpu` → `trainer-cpu`，`make setup` 自动选择），也可以运行在其它机器上；没有训练节点时平台的其它功能不受影响。
 - **文件与元数据分离**：图片、模型权重等大文件以普通文件形式保存在宿主机目录；PostgreSQL 只保存元数据（记录、关系、状态）。两者都通过绑定挂载持久化。
 - **内网友好**：前端不依赖任何外部 CDN、在线字体或第三方服务。
 
@@ -44,6 +49,8 @@ flowchart LR
 | `internal/storage` | 数据目录布局、启动时创建与可写检查、磁盘用量、安全路径解析 |
 | `internal/dataset` | 数据集：命名规则、图片与 VOC 标注识别、压缩包解压、目录扫描、缩略图、导入任务执行器 |
 | `internal/project` | 项目：项目的增删改、项目与数据集的多对多关系、按数据集合计的统计与标签分布 |
+| `internal/compute` | 计算资源：训练节点的注册与心跳、上报数据的规范化与校验、在线状态判定、删除与重新检测、内存中的指标历史 |
+| `internal/hostinfo` | 平台服务器自身的 CPU、内存、负载、cgroup 限制与 NVIDIA 显卡（读 `/proc`、`/sys`，根目录可替换以便测试）；后台每 5 秒采样一次 CPU 利用率 |
 | `internal/httpapi` | chi 路由、中间件、统一 JSON 响应与错误信封、各 handler |
 | `internal/web` | 前端静态文件服务：SPA 回退、缓存头、禁止目录列表与路径穿越 |
 
@@ -83,13 +90,15 @@ flowchart LR
 | HTTP 状态 | code | 场景 |
 |---|---|---|
 | 400 | `bad_request` | 请求格式不正确（如 JSON 无法解析、参数类型错误） |
+| 401 | `unauthorized` | 配置了 `TM_NODE_TOKEN`，但训练节点的注册 / 心跳没有带正确的 `Authorization: Bearer <令牌>`（“节点令牌不正确”） |
 | 404 | `not_found` | 接口或资源不存在（未设置 `TM_WEB_DIR` 时，非 `/api` 路径也返回它） |
+| 404 | `unknown_node` | 心跳中的 `node_key` 尚未注册（或节点已被删除），训练节点收到后重新注册 |
 | 405 | `method_not_allowed` | 路径存在但不支持该方法（响应头 `Allow` 列出支持的方法） |
-| 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、标注文件不能在平台中修改等） |
+| 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、标注文件不能在平台中修改、删除在线的训练节点、重新检测离线的训练节点等） |
 | 409 | `annotation_conflict` | 保存 / 删除标注时，标注文件在 `base_version` 之后已被修改（他人在另一个窗口保存，或用其它工具改了文件）。客户端应重新读取图片详情，或带 `force: true` 覆盖 |
 | 409 | `annotation_unpatchable` | 保存标注时，已有的标注文件无法在保留其中平台不编辑的内容的情况下修改（极少见）；带 `regenerate: true` 时按平台的格式重新生成整个文件（`force: true` 只跳过版本检查，不会重新生成） |
 | 409 | `upload_offset_mismatch` | 分块上传的 `offset` 与服务端已接收的字节数不一致，客户端应重新获取任务后从 `received_bytes` 续传 |
-| 413 | `payload_too_large` | 请求体超过限制（单个分块 64 MiB，单次文件夹批量上传 256 MiB） |
+| 413 | `payload_too_large` | 请求体超过限制（单个分块 64 MiB，单次文件夹批量上传 256 MiB，训练节点的注册 / 心跳 1 MiB） |
 | 422 | `validation_failed` | 字段校验失败，`message` 说明具体问题（如数据集名称不合法） |
 | 422 | `unsupported_image` | 无法为该图片生成缩略图（格式不支持、文件损坏或像素过大），前端回退为原图或占位图 |
 | 500 | `internal_error` | 未预期的错误（handler panic 会被恢复并返回此错误） |
@@ -107,6 +116,7 @@ flowchart LR
 | `GET /api/v1/system/info` | 版本、运行时间、数据库与存储信息（工作台和存储管理页使用）。数据库不可用时仍返回 200，`database.status` 为 `unavailable` |
 | 数据集相关接口 | 见下方“数据集接口” |
 | 项目相关接口 | 见下方“项目接口” |
+| 计算资源相关接口 | 见下方“计算资源接口” |
 | `/api/v1/annotation/tasks`、`/api/v1/annotation/labels`、`/api/v1/training/jobs`、`/api/v1/evaluations`、`/api/v1/models` 及其子路径 | 预留给规划中的模块，任意方法均返回 `501 not_implemented` |
 
 `/api/readyz` 示例：
@@ -198,12 +208,33 @@ flowchart LR
 
 JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>` 请求时返回 `Cache-Control: private, max-age=31536000, immutable`（文件变化后版本号随之改变），否则为 `private, no-cache`。
 
+### 计算资源接口
+
+“计算资源”页面使用的接口与训练节点的注册 / 心跳（`/agent/*`）都在 `/api/v1/compute` 下（`internal/httpapi/compute.go`，业务逻辑在 `internal/compute`）。字段定义以前端 `frontend/src/features/training/` 中的类型为准，与后端 `internal/compute/types.go`、训练节点 `trainmaster_trainer` 保持一致。`{nodeID}` 必须是正整数，否则返回 404。
+
+| 方法与路径 | 说明 |
+|---|---|
+| `GET /api/v1/compute/server` | 平台服务器自身：主机名、系统与内核、是否在容器中、开机时长、CPU（型号、逻辑 / 物理核数、cgroup 限制、利用率）、内存、负载、NVIDIA 显卡（来自 `/proc/driver/nvidia` 或 PCI 设备，都没有时为 null），以及 `node_registration`（是否需要令牌、心跳间隔、离线判定时间） |
+| `GET /api/v1/compute/nodes` | 训练节点列表 `{items, total}`：在线在前，再按名称（不区分大小写）与 ID 排序。每项带在线状态、硬件、CUDA 环境（尚未完成第一次检测时为 null）、最新指标与最近的指标历史 |
+| `GET /api/v1/compute/nodes/{nodeID}` | 单个节点；不存在时 404 `not_found` |
+| `DELETE /api/v1/compute/nodes/{nodeID}` | 删除节点记录与指标历史，返回 204；节点在线时 409 `conflict`（需先停止该节点上的训练节点服务） |
+| `POST /api/v1/compute/nodes/{nodeID}/probe` | 请求节点重新检测硬件与 CUDA 环境，返回 202 与 `probe_pending: true` 的节点；节点离线时 409 `conflict` |
+| `POST /api/v1/compute/agent/register` | 节点注册：`{node_key, name, hostname?, agent_version?, hardware, environment?, metrics?}`，按 `node_key`（1–64 个 `A-Z a-z 0-9 . _ -` 字符）新建或更新，返回 `{node_id, heartbeat_interval_seconds, server_time}` |
+| `POST /api/v1/compute/agent/heartbeat` | 节点心跳：`{node_key, metrics?, environment?, hardware?}`，返回 `{node_id, heartbeat_interval_seconds, probe_requested}`；`node_key` 未注册时 404 `unknown_node` |
+
+- 配置了 `TM_NODE_TOKEN` 时，`/agent/*` 必须带 `Authorization: Bearer <令牌>`，否则返回 401 `unauthorized`（常量时间比较）；浏览器使用的其它接口不需要令牌（平台目前没有登录）。
+- 请求体上限 1 MiB（413 `payload_too_large`）。上报的 JSON 允许未知字段（新版节点配旧版平台）；数值为 NaN、无穷或负数时置为 null，过长的字符串与数组截断，不认识的枚举值归为保守的值（如 `status` → `error`、`accelerator` → `cpu`），偶尔异常的指标不会让心跳失败。存入数据库（表 `compute_nodes`，`hardware`、`environment`、`metrics` 为 jsonb）和返回的都是规范化之后的结构。
+- 注册请求中的 `environment` / `metrics` 为 null 时保留原值（节点重启后先上报硬件，CUDA 环境检测完成后再随心跳上报，页面不会闪烁）；心跳带有 `environment` 时清除重新检测的请求。
+- 节点的 `address` 是平台看到的客户端 IP（见“中间件”中的客户端 IP），可能为 `""`。
+
+协议、状态判定与检测方式见第 9 节。
+
 ### 中间件
 
 按执行顺序：
 
 1. **RequestID**：见上文。
-2. **客户端 IP**：只在设置了 `TM_TRUSTED_PROXIES`（反向代理的 IP / CIDR）时启用：对端是受信代理时，从右往左取 `X-Forwarded-For` 中第一个非受信地址作为客户端 IP。未设置时忽略该请求头，客户端 IP 就是 TCP 对端地址，无法伪造。目前只用于访问日志；以后用于操作审计等场景时，部署方必须只把真正的代理列入 `TM_TRUSTED_PROXIES`。
+2. **客户端 IP**：只在设置了 `TM_TRUSTED_PROXIES`（反向代理的 IP / CIDR）时启用：对端是受信代理时，从右往左取 `X-Forwarded-For` 中第一个非受信地址作为客户端 IP。未设置时忽略该请求头，客户端 IP 就是 TCP 对端地址，无法伪造。目前用于访问日志与训练节点的地址（`address`，只用于显示）；以后用于操作审计等场景时，部署方必须只把真正的代理列入 `TM_TRUSTED_PROXIES`。
 3. **访问日志**：method、path、status、bytes、duration_ms、client_ip、request_id。5xx（501 除外）记为 ERROR；健康检查记为 DEBUG，避免刷屏。
 4. **panic 恢复**：记录堆栈并返回 500 错误信封。
 
@@ -360,7 +391,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 因此迁移文件中**不要写 `BEGIN` / `COMMIT`**，也不能包含无法在事务中执行的语句（如 `CREATE INDEX CONCURRENTLY`）。
 - 迁移只向前：**已发布的迁移文件不要修改，也不要改名**，需要变更就新增一个文件。
 - 同一个版本号只能对应一个文件。执行器会比对 `schema_migrations` 中记录的文件名：数据库里已执行过的版本号在当前代码中对应另一个文件名时（典型情况是两个分支各自新增了 `0002_*.sql`，又共用一个开发数据库），启动直接失败并给出两个文件名，而不是悄悄跳过。此时给后合入的那个文件换一个新编号；开发数据库可以删掉 `data/postgres` 重建。
-- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表（见第 6 节“标注”）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
+- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表（见第 6 节“标注”）；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
 
 ## 8. 日志
 
@@ -368,12 +399,52 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 级别由 `TM_LOG_LEVEL` 控制（debug / info / warn / error）。
 - 日志字段名使用英文 snake_case；面向用户的提示（API 的 `message`、界面文案）使用中文。
 
-## 9. 训练节点规划（未实现）
+## 9. 训练节点
 
-训练需要 GPU 和 Python 生态（PyTorch / Ultralytics 等），计划作为**独立的 worker 服务**接入，而不是放进 Go 服务：
+训练需要 GPU 和 Python 生态（PyTorch / Ultralytics），因此作为**独立的服务**接入，而不是放进 Go 服务：训练节点（`trainer/`，Python 包 `trainmaster_trainer`）运行在每台 GPU 机器上，主动向平台注册并上报心跳。平台不连接节点，也不调度容器。
 
-- **镜像**：单独的 `trainer` 镜像（Python + CUDA），`docker-compose.yml` 末尾已以注释形式预留服务示例（`deploy.resources.reservations.devices` 使用 nvidia 驱动）。宿主机需安装 NVIDIA 驱动与 NVIDIA Container Toolkit。
-- **任务分发**：训练任务记录在 PostgreSQL 中；worker 主动通过 HTTP API 领取任务（服务端用 `SELECT … FOR UPDATE SKIP LOCKED` 保证一个任务只被一个 worker 领取），并定期上报心跳、进度、日志与指标。Go 服务不直接调度容器。
-- **数据交换**：worker 与 app 挂载同一个存储目录，从 `datasets/` 读取导出的训练集，把运行产物写入 `runs/`、最终权重写入 `models/`；训练节点在其他机器上时，通过 NFS 等共享存储挂载同一目录。
-- **扩展**：一台服务器可以运行多个 worker（每个绑定不同 GPU），也可以在其他 GPU 机器上单独部署 worker，“计算资源”页面将展示已注册节点与 GPU 状态。
-- 评估、批量推理、预标注等耗时任务也将复用同一套 worker 与任务队列机制。
+### 部署形态
+
+- **Docker**：镜像 `trainmaster-trainer:<TM_IMAGE_TAG>-<变体>`（构建上下文为 `trainer/`，变体即 `TM_TORCH_VARIANT`，换变体不会误用旧镜像）。`docker-compose.yml` 中的两个服务共用 `x-trainer` 定义：`trainer`（profile `gpu`，用 `deploy.resources.reservations.devices` 预留全部 NVIDIA 显卡）与 `trainer-cpu`（profile `cpu`）。没有设置 `COMPOSE_PROFILES` 时两者都不启动，部署仍只有 `postgres` 与 `app`。训练节点不依赖 `app`（没有 `depends_on`），在其它机器上可以只运行它，通过 `TM_SERVER_URL` 连接平台。
+- **裸机**：`trainer/scripts/install.sh` 创建虚拟环境，安装匹配的 PyTorch 与 Ultralytics，写入配置文件，可注册为 systemd 服务。
+- 镜像中只有 PyTorch 的 pip 包自带的 CUDA 运行库，没有 CUDA Toolkit；宿主机需要 NVIDIA 驱动，使用 Docker 时还需要 NVIDIA Container Toolkit（容器启动时挂载驱动库与 `/dev/nvidia*`）。`deploy/scripts/setup-compute.sh`（`make setup`，`make up` 会先执行它）检测显卡、驱动与 Docker 的 GPU 支持，必要时安装 Toolkit，并把结果写入 `.env`，见 [部署指南第 10 节](deployment.md#10-gpu-训练节点)。
+
+### 协议与状态
+
+接口见第 3 节“计算资源接口”。
+
+1. 节点第一次启动时在状态目录（容器内 `/var/lib/trainmaster`，宿主机 `TM_HOST_TRAINER_DIR`）中生成并保存 `node-key`（uuid4），以它作为身份：重启、重建容器后仍是同一个节点；删除状态目录后会作为新节点注册。
+2. 注册时带上硬件信息与第一份指标（CUDA 环境稍后上报）。平台不可达或返回 5xx 时指数退避重试（1 秒起，最长 60 秒，带抖动）；401 / 422 时记录清晰的错误并同样退避重试（配置可能稍后修正），不退出。
+3. 之后每 `heartbeat_interval_seconds`（平台的 `TM_NODE_HEARTBEAT_INTERVAL`，默认 10 秒，由注册与心跳的响应下发）发送一次心跳，带实时指标；收到 404 `unknown_node`（节点记录被删除）时重新注册，网络错误时退避，恢复后继续。
+4. 令牌：平台配置了 `TM_NODE_TOKEN` 时节点必须携带同一个值。同一台机器上的节点与平台读取同一个 `.env`（`make setup` 生成令牌）；其它机器上的节点配置平台的令牌。
+5. 在线 / 离线由平台按 `last_seen_at` 计算：超过 3 × 心跳间隔 + 5 秒（默认 35 秒）没有注册或心跳即为离线。节点记录保留到用户删除，在线的节点不能删除。
+6. 每次心跳成功后节点更新状态目录中的 `heartbeat` 文件，Docker HEALTHCHECK（`python -m trainmaster_trainer healthcheck`）据此判断节点是否正常。
+
+### 检测与自检
+
+- **硬件**（快，在常驻进程中）：显卡用 NVML（nvidia-ml-py）探测，失败时回退解析 `nvidia-smi`；读取 `/proc/driver/nvidia/gpus` 判断“宿主机有显卡、但没有传入容器”。CPU、内存、磁盘与 `/dev/shm` 来自 psutil、`/etc/os-release` 与 cgroup。
+- **CUDA 环境**（慢，在子进程中）：`python -m trainmaster_trainer selftest --json` 导入 torch / torchvision / ultralytics，收集版本与 CUDA 状态并自检：有 CUDA 时在每块可见的显卡上做一次矩阵乘法，再在 `cuda:0` 上用 `YOLO("yolo11n.yaml")`（从配置构建，不下载权重）做一次 1×3×320×320 前向推理（FP32，再试 FP16）；没有 CUDA 时在 CPU 上做同样的推理。放在子进程中，常驻进程不占用显存，导入失败或崩溃也不影响心跳。自检设置 `YOLO_OFFLINE=1`，不访问网络，超时为 `TM_SELF_TEST_TIMEOUT`（默认 300 秒）。
+- 检测在后台线程中运行，完成后随下一次心跳上报 `environment`，期间心跳照常。页面上的“重新检测”在平台上记下请求，节点在心跳响应中看到 `probe_requested` 后重新探测硬件并启动检测，上报新的 `environment` 时平台清除请求。
+- 节点由硬件与子进程的结果生成 `status`（`ready`：GPU 可用且自检通过；`cpu_only`：没有可用的 GPU、CPU 自检通过；`error`：有错误级的问题）和按严重程度排序的 `issues`，如 `driver_too_old`、`arch_unsupported`、`torch_cpu_build`、`cuda_unavailable`、`gpu_not_passed_through`、`shm_small`，每条带中文说明与修复建议。平台只校验长度，页面只展示说明与建议，新增问题类型不需要修改平台。
+- `python -m trainmaster_trainer probe` 打印完整的检测报告（JSON），不连接平台，便于排障。
+
+### PyTorch 变体
+
+`trainer/trainmaster_trainer/torch_variants.txt` 是唯一的数据源（变体名、torch / torchvision 版本、安装来源、CUDA 版本、最低驱动、编译的显卡架构）。bash（`trainer/scripts/lib/torch-variant.sh`，部署与裸机安装脚本使用）与 Python（`trainmaster_trainer.variants`，节点诊断与推荐变体）按同一规则选择，两边的测试覆盖同样的用例：
+
+1. 没有显卡或没有驱动 → `cpu`。
+2. 非 x86_64：aarch64 / arm64 且所有显卡的计算能力 ≥ 8.0、驱动不低于 `cu130` 的最低驱动 → `cu130`，否则 `cpu`；其它架构 → `cpu`。
+3. x86_64：按表中顺序（跳过 `cpu`）遍历驱动版本满足的变体，取第一个支持全部显卡的；没有时取支持显卡最多的（并列取靠前的），并记录不支持的计算能力；一个都不支持时为 `cpu`（区分“驱动过旧”和“显卡过旧”两种原因）。
+4. 架构覆盖：同一主版本、且次版本不小于构建的次版本（如 `86` 覆盖 RTX 40 系列的 8.9）；Jetson 的计算能力（5.3、6.2、7.2、8.7）只被完全相同的构建覆盖。旧版 `nvidia-smi` 查不到计算能力时按 7.5 估计。
+
+镜像的变体在构建时确定（`TM_TORCH_VARIANT`，`make setup` 写入 `.env`）。节点同时上报已安装的变体与按当前驱动和显卡推荐的变体：已安装的不能用时给出错误级的问题与重新构建的命令，能用但有更合适的（如驱动升级到 580 后可以换 `cu130`）时给出 `variant_upgrade_available` 提示。
+
+### 指标历史
+
+“计算资源”页面上的曲线来自最近的指标（每个节点最多 60 个点：CPU、内存与每块显卡的利用率和显存）。它们**只保存在 app 进程的内存中**（`internal/compute` 中按节点的环形缓冲），服务重启后清空，删除节点时一并删除；数据库只保存每个节点最新的一份 `hardware`、`environment` 与 `metrics`。因此与导入任务执行器一样，目前只支持单实例部署。
+
+### 后续工作
+
+- **训练任务调度**：训练任务记录在 PostgreSQL 中；节点主动通过 HTTP API 领取任务（服务端用 `SELECT … FOR UPDATE SKIP LOCKED` 保证一个任务只被一个节点领取），并上报进度、日志与指标。`/api/v1/training/jobs` 目前仍返回 501。
+- **数据交换**：节点与 app 挂载同一个存储目录（compose 中训练节点已把它挂载为 `/data`），从 `datasets/` 或 `exports/` 读取训练集，把运行产物写入 `runs/`、最终权重写入 `models/`；其它机器上的节点通过 NFS 等共享存储挂载同一目录。
+- 评估、批量推理、预标注等耗时任务也将复用同一套训练节点与任务队列机制。

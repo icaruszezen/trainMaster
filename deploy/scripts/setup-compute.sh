@@ -1328,7 +1328,7 @@ main() {
 		say "  make up    # 或 docker compose up -d --build"
 	fi
 	if [ "$RESULT" != off ] && [ "$DRY_RUN" = 0 ]; then
-		say "  首次构建训练节点镜像需要下载 PyTorch、Ultralytics 等依赖（GPU 版有数 GB），国内网络请先在 .env 中配置镜像（见 docs/deployment.md）"
+		say "  首次构建训练节点镜像需要下载 PyTorch、Ultralytics 等依赖（GPU 版有数 GB），国内网络请先在 .env 中配置镜像（见 docs/deployment.md 第 7 节）"
 		say "  启动后在平台的“模型训练 → 计算资源”页面查看节点、显卡与 CUDA 环境"
 	fi
 	return 0
