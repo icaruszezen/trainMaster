@@ -17,9 +17,10 @@ TM_DEV_DB_PORT ?= $(or $(call dotenv,TM_DEV_DB_PORT),5432)
 # 写入二进制/镜像的版本信息（docker compose 通过同名变量传给 Dockerfile）：环境变量优先，其次 .env。
 # 构建时间默认为当前提交（HEAD）的提交时间（UTC；不是 git 检出时为当前时间）：代码没有变化时构建参数不变，
 # make up 复用 Go 编译的构建缓存，app 镜像不变，compose 不会重启正在运行的 app（重启会中断正在进行的导入）。
+# log.showSignature=false：git 配置了它时，带签名的提交的 git log 输出中会多出验证签名的结果。
 TM_VERSION    ?= $(call dotenv,TM_VERSION)
 TM_COMMIT     ?= $(or $(call dotenv,TM_COMMIT),$(shell git rev-parse --short HEAD 2>/dev/null))
-TM_BUILD_TIME ?= $(or $(call dotenv,TM_BUILD_TIME),$(shell TZ=UTC git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ 2>/dev/null),$(shell date -u +%Y-%m-%dT%H:%M:%SZ))
+TM_BUILD_TIME ?= $(or $(call dotenv,TM_BUILD_TIME),$(shell TZ=UTC git -c log.showSignature=false log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ 2>/dev/null),$(shell date -u +%Y-%m-%dT%H:%M:%SZ))
 export TM_VERSION TM_COMMIT TM_BUILD_TIME
 
 # 训练节点（trainer/）的测试与检查使用的 Python 虚拟环境，make test-trainer / lint-trainer 自动创建。

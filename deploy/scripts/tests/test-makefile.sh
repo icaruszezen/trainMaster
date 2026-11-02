@@ -188,13 +188,35 @@ if command -v git >/dev/null 2>&1; then
 	GIT_REPO="$WORK/git-repo"
 	mkdir -p "$GIT_REPO"
 	cp "$ROOT/Makefile" "$GIT_REPO/"
+	# 提交带签名（假的 gpg），仓库配置了 log.showSignature=true：git log 的输出中多出验证签名的结果，
+	# 构建时间不能受它影响（GitHub 网页上合并的提交都带签名；多出的文字会让 -ldflags 出错）
+	FAKE_GPG="$WORK/gpg"
+	cat >"$FAKE_GPG" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+*" --verify "*)
+	echo "gpg: Signature made by test key" >&2
+	echo "[GNUPG:] GOODSIG 0123456789ABCDEF test <test@example.com>"
+	;;
+*)
+	cat >/dev/null
+	printf '[GNUPG:] BEGIN_SIGNING H8\n[GNUPG:] SIG_CREATED D 1 8 00 1 0123456789ABCDEF\n' >&2
+	printf -- '-----BEGIN PGP SIGNATURE-----\n\nZmFrZQ==\n-----END PGP SIGNATURE-----\n'
+	;;
+esac
+EOF
+	chmod +x "$FAKE_GPG"
 	if ! (
 		unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 		cd "$GIT_REPO" &&
 			git -c init.defaultBranch=main init -q &&
+			git config gpg.format openpgp &&
+			git config gpg.program "$FAKE_GPG" &&
+			git config user.signingkey test &&
 			git add Makefile &&
 			GIT_AUTHOR_DATE="2026-01-01T00:00:00+00:00" GIT_COMMITTER_DATE="2026-03-04T05:06:07+08:00" \
-				git -c user.name=test -c user.email=test@example.com -c commit.gpgsign=false commit -q -m test
+				git -c user.name=test -c user.email=test@example.com -c commit.gpgsign=true commit -q -m test &&
+			git config log.showSignature true
 	) >"$WORK/git.log" 2>&1; then
 		fail "无法创建临时 git 仓库：$(cat "$WORK/git.log")"
 	fi
