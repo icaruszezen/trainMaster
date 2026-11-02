@@ -49,6 +49,8 @@ class Deployment:
     pinned_variant: str | None = None  # TM_TRAINER_VARIANT：make setup --variant 固定的变体
     python: str = field(default_factory=lambda: sys.executable or "python3")  # 裸机：解释器
     prefix: str = field(default_factory=lambda: sys.prefix)  # 裸机：install.sh 的安装目录
+    # 裸机：训练节点的 CUDA_VISIBLE_DEVICES（没有设置时为 None），见 visible_gpus
+    cuda_visible_devices: str | None = None
 
 
 def _code(command: str) -> str:
@@ -178,6 +180,8 @@ class Fixes:
         usable：受支持的显卡的 NVML 序号。裸机上 NVML 序号就是 nvidia-smi 的序号，CUDA 按 PCI 总线顺序
         编号（CUDA_DEVICE_ORDER=PCI_BUS_ID，install.sh 写入 trainer.env）时 CUDA_VISIBLE_DEVICES 用同样的序号；
         容器中已经限制了显卡时 NVML 序号与宿主机的不同，所以只指向文档。
+        裸机的配置文件是 systemd 服务的 EnvironmentFile，install.sh --env-file 可以指定其它路径，训练节点
+        看不到它，所以只写默认路径。
         """
         if self.container:
             return (
@@ -186,7 +190,8 @@ class Fixes:
             )
         ids = ",".join(str(i) for i in usable)
         return (
-            f"训练只使用受支持的显卡：在 {self.prefix}/trainer.env 中设置 "
+            f"训练只使用受支持的显卡：在训练节点的配置文件（默认 {self.prefix}/trainer.env，"
+            "安装时用 --env-file 指定了其它文件时为该文件）中设置 "
             + _code(f"CUDA_VISIBLE_DEVICES={ids}")
             + "，然后重启训练节点（systemd 服务："
             + _code("sudo systemctl restart trainmaster-trainer")
@@ -230,6 +235,46 @@ def gpu_label(gpu: Mapping[str, Any]) -> str:
     cc = gpu.get("compute_capability")
     name = gpu.get("name") or "NVIDIA GPU"
     return f"{gpu.get('index', '?')} 号 {name}" + (f"（计算能力 {cc}）" if cc else "")
+
+
+def visible_gpus(
+    gpus: Sequence[Mapping[str, Any]], cuda_visible_devices: str | None
+) -> list[Mapping[str, Any]]:
+    """CUDA_VISIBLE_DEVICES 允许 PyTorch 使用的显卡（NVML 不受它影响，总是列出全部显卡）。
+
+    每一项是 NVML 序号（CUDA 按 PCI 总线顺序编号时与 NVML 相同：install.sh 写入、child_env 默认设置
+    CUDA_DEVICE_ORDER=PCI_BUS_ID），或 GPU-、MIG- 开头的 UUID（可以只写开头部分）。新格式的 MIG UUID
+    看不出属于哪块显卡，按开启了 MIG 的显卡都可见处理。与 CUDA 相同，遇到无法识别的项时忽略它及之后的
+    各项。没有设置时全部可见。
+    """
+    if cuda_visible_devices is None:
+        return list(gpus)
+    indices: set[int] = set()
+    prefixes: list[str] = []
+    any_mig = False
+    for token in (t.strip() for t in cuda_visible_devices.split(",")):
+        if re.fullmatch(r"[0-9]+", token):
+            indices.add(int(token))
+        elif token.startswith("GPU-"):
+            prefixes.append(token)
+        elif token.startswith("MIG-"):
+            parent = token[len("MIG-") :].split("/", 1)[0]  # 旧格式：MIG-GPU-<UUID>/<GI>/<CI>
+            if parent.startswith("GPU-"):
+                prefixes.append(parent)
+            else:
+                any_mig = True
+        else:
+            break
+
+    def listed(g: Mapping[str, Any]) -> bool:
+        uuid = g.get("uuid") or ""
+        return (
+            g.get("index") in indices
+            or any(uuid.startswith(p) for p in prefixes)
+            or (any_mig and g.get("mig_enabled") is not False)
+        )
+
+    return [g for g in gpus if listed(g)]
 
 
 def recommend(hardware: Mapping[str, Any], table: Sequence[Variant] | None = None) -> Selection:
@@ -401,8 +446,15 @@ def build_environment(
     gpus: list[Mapping[str, Any]] = list(hardware.get("gpus") or [])
     driver = (hardware.get("gpu_driver") or {}).get("driver_version")
     container = bool(hardware.get("in_container"))
-    fixes = Fixes(deployment or Deployment(), container, table)
-    selection = recommend(hardware, table)
+    deployment = deployment or Deployment()
+    fixes = Fixes(deployment, container, table)
+    # 裸机上 CUDA_VISIBLE_DEVICES 排除的显卡不用于训练：不按它们推荐变体，不支持它们时只作提示（容器中
+    # 由 device_ids 限制显卡，NVML 也看不到没有分配的显卡）。全部被排除时 CUDA 不可用（另有问题报告），
+    # 仍按全部显卡推荐。
+    usable = gpus if container else visible_gpus(gpus, deployment.cuda_visible_devices)
+    selection = recommend(
+        {**hardware, "gpus": usable} if usable and len(usable) < len(gpus) else hardware, table
+    )
     rec = selection.variant
 
     torch_version = raw.get("torch_version")
@@ -512,11 +564,13 @@ def build_environment(
                 f"sm_{a}" for a in (installed_info.archs if installed_info else ())
             ]
             if effective_archs:
-                bad = []
+                unsupported = []
                 for g in gpus:
                     cc = variants_mod.cc_to_int(str(g.get("compute_capability") or ""))
                     if cc is not None and not arch_covers(cc, effective_archs):
-                        bad.append(g)
+                        unsupported.append(g)
+                bad = [g for g in unsupported if g in usable]
+                excluded = [g for g in unsupported if g not in usable]
                 if bad:
                     message = (
                         f"已安装的 PyTorch {torch_version} 不支持显卡 "
@@ -528,19 +582,32 @@ def build_environment(
                         issues.append(
                             issue("error", "arch_unsupported", message, fixes.variant(rec))
                         )
-                    elif len(bad) < len(gpus):
+                    elif len(bad) < len(usable):
                         # 没有同时支持全部显卡的变体，但其它显卡可以训练（自检会跳过不支持的显卡）。
                         issues.append(
                             issue(
                                 "warning",
                                 "arch_unsupported",
                                 message + "，这些显卡不能用于训练",
-                                fixes.exclude_gpus([g.get("index") for g in gpus if g not in bad]),
+                                fixes.exclude_gpus(
+                                    [g.get("index") for g in usable if g not in bad]
+                                ),
                             )
                         )
                     else:
                         blocking = True
                         issues.append(issue("error", "arch_unsupported", message, None))
+                elif excluded:
+                    # 不支持的显卡都已用 CUDA_VISIBLE_DEVICES 排除（如按 exclude_gpus 的建议）：只作提示。
+                    issues.append(
+                        issue(
+                            "info",
+                            "arch_unsupported",
+                            f"已安装的 PyTorch {torch_version} 不支持显卡 "
+                            + "、".join(gpu_label(g) for g in excluded)
+                            + "，已通过 CUDA_VISIBLE_DEVICES 排除，不用于训练",
+                        )
+                    )
 
             if driver_ok and not cuda_available:
                 blocking = True

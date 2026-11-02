@@ -651,7 +651,8 @@ def test_mixed_gpus_bare_metal_hint_uses_cuda_visible_devices():
         torch_variant="cu130",
     )
     hint = only(env, "arch_unsupported")["hint"]
-    assert "/opt/trainmaster-trainer/trainer.env" in hint
+    # 配置文件可能是 install.sh --env-file 指定的其它文件：只说默认路径
+    assert "配置文件（默认 /opt/trainmaster-trainer/trainer.env，" in hint and "--env-file" in hint
     assert "`CUDA_VISIBLE_DEVICES=0`" in hint
     assert "`sudo systemctl restart trainmaster-trainer`" in hint
     # 不支持的显卡排在前面时给出其余显卡的序号
@@ -661,6 +662,106 @@ def test_mixed_gpus_bare_metal_hint_uses_cuda_visible_devices():
         torch_variant="cu130",
     )
     assert "`CUDA_VISIBLE_DEVICES=1,2`" in only(env, "arch_unsupported")["hint"]
+
+
+def bare(cuda_visible_devices: str | None) -> Deployment:
+    return Deployment(
+        python=BARE.python, prefix=BARE.prefix, cuda_visible_devices=cuda_visible_devices
+    )
+
+
+@pytest.mark.parametrize("visible", ["0", "GPU-0", " 0 ", "0,-1,1", "MIG-GPU-0/1/0"])
+def test_bare_metal_cuda_visible_devices_clears_mixed_gpu_warning(visible):
+    # 按上一条提示在 trainer.env 中设置了 CUDA_VISIBLE_DEVICES=0：NVML 仍列出两块显卡，
+    # 但 1080 Ti 已被排除，不再警告（否则每次检测都重复同样的警告与提示）。
+    env = env_of(
+        hw([gpu(0, **RTX5090), gpu(1, **GTX1080TI)], container=False),
+        raw(count=1),
+        torch_variant="cu130",
+        deployment=bare(visible),
+    )
+    assert codes(env) == ["arch_unsupported"]
+    issue = env["issues"][0]
+    assert issue["level"] == "info" and issue["hint"] is None
+    assert "1 号 NVIDIA GeForce GTX 1080 Ti" in issue["message"] and "5090" not in issue["message"]
+    assert "已通过 CUDA_VISIBLE_DEVICES 排除" in issue["message"]
+    assert env["status"] == "ready" and env["recommended_variant"] == "cu130"
+
+
+def test_bare_metal_cuda_visible_devices_listing_every_gpu_still_warns():
+    env = env_of(
+        hw([gpu(0, **RTX5090), gpu(1, **GTX1080TI)], container=False),
+        raw(count=2),
+        torch_variant="cu130",
+        deployment=bare("0,1"),
+    )
+    issue = only(env, "arch_unsupported")
+    assert issue["level"] == "warning" and "`CUDA_VISIBLE_DEVICES=0`" in issue["hint"]
+
+
+def test_bare_metal_cuda_visible_devices_hint_lists_only_visible_supported_gpus():
+    gpus = [gpu(0, **GTX1080TI), gpu(1, **RTX5090), gpu(2, **RTX5090), gpu(3, **RTX5090)]
+    env = env_of(
+        hw(gpus, container=False), raw(count=3), torch_variant="cu130", deployment=bare("0,1,3")
+    )
+    issue = only(env, "arch_unsupported")
+    assert issue["level"] == "warning" and "`CUDA_VISIBLE_DEVICES=1,3`" in issue["hint"]
+
+
+def test_cuda_visible_devices_only_matters_on_bare_metal():
+    # 容器中由 device_ids 限制显卡（NVML 也看不到没有分配的显卡），不看 CUDA_VISIBLE_DEVICES。
+    env = env_of(
+        hw([gpu(0, **RTX5090), gpu(1, **GTX1080TI)]),
+        raw(count=2),
+        torch_variant="cu130",
+        deployment=Deployment(cuda_visible_devices="0"),
+    )
+    assert only(env, "arch_unsupported")["level"] == "warning"
+
+
+def test_bare_metal_visible_gpus_decide_the_recommendation():
+    # 只让 1080 Ti 训练：推荐支持它的 cu126，而不是按两块显卡选出的 cu130。
+    hardware = hw([gpu(0, **RTX5090), gpu(1, **GTX1080TI)], container=False)
+    env = env_of(hardware, raw(count=1), torch_variant="cu130", deployment=bare("1"))
+    assert env["recommended_variant"] == "cu126"
+    issue = only(env, "arch_unsupported")
+    assert issue["level"] == "error" and "1 号 NVIDIA GeForce GTX 1080 Ti" in issue["message"]
+    assert "`sudo trainer/scripts/install.sh --variant cu126`" in issue["hint"]
+    # 装好 cu126 之后：5090 已被排除，只作提示，也不再建议换回 cu130。
+    env = env_of(
+        hardware,
+        raw(torch="2.14.1+cu126", cuda="12.6", archs=CU126_ARCHS, count=1),
+        torch_variant="cu126",
+        deployment=bare("1"),
+    )
+    assert codes(env) == ["arch_unsupported"]
+    issue = env["issues"][0]
+    assert issue["level"] == "info" and "0 号 NVIDIA GeForce RTX 5090" in issue["message"]
+    assert env["status"] == "ready"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, [0, 1, 2]),
+        ("2,0", [0, 2]),  # CUDA 中的顺序不影响哪些显卡可见
+        ("GPU-aaaa", [0]),  # UUID 可以只写开头部分
+        ("GPU-bbbb-2222", [1]),
+        ("1,GPU-cccc", [1, 2]),
+        ("MIG-GPU-cccc-3333/1/0", [2]),  # 旧格式的 MIG UUID 包含所在显卡的 UUID
+        ("MIG-5f3b9c4e-0000", [2]),  # 新格式：开启了 MIG 的显卡
+        ("0,x,1", [0]),  # 与 CUDA 相同，忽略无法识别的项及之后的各项
+        ("-1", []),
+        ("", []),
+    ],
+)
+def test_visible_gpus(value, expected):
+    gpus = [
+        gpu(0, uuid="GPU-aaaa-1111"),
+        gpu(1, uuid="GPU-bbbb-2222"),
+        gpu(2, uuid="GPU-cccc-3333", mig_enabled=True),
+    ]
+    assert [g["index"] for g in issues.visible_gpus(gpus, value)] == expected
 
 
 def test_mixed_gpus_on_wrong_variant_is_still_an_error():

@@ -421,7 +421,8 @@ def child_env(
 
 
 def deployment_from(cfg: Config) -> issues_mod.Deployment:
-    """由配置得到部署方式（修复建议中的命令按它生成）；裸机安装时解释器与安装目录就是当前的 Python。"""
+    """由配置得到部署方式（修复建议中的命令按它生成）；裸机安装时解释器与安装目录就是当前的 Python，
+    CUDA_VISIBLE_DEVICES（trainer.env 中设置，检测子进程与训练继承它）决定哪些显卡用于训练。"""
     return issues_mod.Deployment(
         server_url=cfg.server_url,
         service=cfg.trainer_service,
@@ -429,6 +430,7 @@ def deployment_from(cfg: Config) -> issues_mod.Deployment:
         pinned_variant=cfg.trainer_variant,
         python=sys.executable or "python3",
         prefix=sys.prefix,
+        cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
     )
 
 

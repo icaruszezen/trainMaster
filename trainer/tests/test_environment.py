@@ -412,6 +412,14 @@ def test_detect_builds_hints_for_the_deployment(tmp_path: Path):
     assert env["status"] == "cpu_only"
 
 
+def test_deployment_reads_cuda_visible_devices(tmp_path: Path, monkeypatch):
+    cfg = Config(server_url="http://192.168.1.10:8080", state_dir=tmp_path)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert environment.deployment_from(cfg).cuda_visible_devices is None
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,2")
+    assert environment.deployment_from(cfg).cuda_visible_devices == "0,2"
+
+
 def test_detect_passes_the_host_driver_version(tmp_path: Path):
     # 显卡没有传入容器、宿主机驱动过旧：提示升级驱动，而不是安装 NVIDIA Container Toolkit。
     cmd = script(tmp_path, f"import json\nprint(json.dumps({GOOD_RAW!r}))\n")
