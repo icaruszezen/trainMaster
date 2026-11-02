@@ -19,6 +19,7 @@ import { LoadError } from "@/features/datasets/load-error"
 import { computeNodesQuery } from "@/features/training/compute-api"
 import {
   formatGpuModels,
+  memoryStat,
   summarizeNodes,
   type ComputeSummary,
 } from "@/features/training/compute-status"
@@ -32,12 +33,7 @@ import { NodeDetailsDialog } from "@/features/training/node-details-dialog"
 import { RefreshStatus } from "@/features/training/refresh-status"
 import { ServerCard } from "@/features/training/server-card"
 import { useNow } from "@/hooks/use-now"
-import {
-  formatBytes,
-  formatNumber,
-  formatPercent,
-  percentOf,
-} from "@/lib/format"
+import { formatNumber, formatPercent } from "@/lib/format"
 
 export function ComputePage() {
   const nodes = useQuery(computeNodesQuery)
@@ -163,8 +159,7 @@ function ComputeStats({
 
   const offline = summary.nodeCount - summary.onlineCount
   const models = formatGpuModels(summary.gpuModels)
-  const usage = summary.memoryUsage
-  const usedPercent = usage ? percentOf(usage.used, usage.total) : 0
+  const memory = memoryStat(summary)
 
   return (
     <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
@@ -197,29 +192,15 @@ function ComputeStats({
               : "没有在线的 GPU")}
         </span>
       </StatCard>
-      <StatCard
-        title="显存"
-        icon={MemoryStick}
-        value={
-          summary.gpuCount > 0 ? formatBytes(summary.memoryTotalBytes) : "—"
-        }
-      >
-        {usage ? (
-          <>
-            <Progress
-              value={usedPercent}
-              className="h-1.5"
-              aria-label={`显存已用 ${formatPercent(usedPercent)}`}
-            />
-            <span className="tabular-nums">
-              已用 {formatBytes(usage.used)}（{formatPercent(usedPercent)}）
-            </span>
-          </>
-        ) : (
-          <span>
-            {summary.gpuCount > 0 ? "暂无实时数据" : "在线节点的显存合计"}
-          </span>
+      <StatCard title="显存" icon={MemoryStick} value={memory.value}>
+        {memory.percent !== null && (
+          <Progress
+            value={memory.percent}
+            className="h-1.5"
+            aria-label={`显存已用 ${formatPercent(memory.percent)}`}
+          />
         )}
+        <span className="tabular-nums">{memory.detail}</span>
       </StatCard>
       <StatCard
         title="CUDA 环境"

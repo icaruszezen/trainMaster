@@ -17,6 +17,7 @@ import {
   hasOnlineGpuNode,
   isProbing,
   isRedetecting,
+  memoryStat,
   nodeStatusText,
   serverGpuHint,
   sortIssues,
@@ -340,7 +341,7 @@ describe("summarizeNodes", () => {
       ],
       memoryTotalBytes: 72 * GiB,
       // 只有一块卡有实时数据：比例按这块卡计算。
-      memoryUsage: { used: 12 * GiB, total: 24 * GiB },
+      memoryUsage: { used: 12 * GiB, total: 24 * GiB, gpus: 1 },
       readyCount: 1,
       problemCount: 1,
       cpuOnlyCount: 1,
@@ -382,7 +383,11 @@ describe("summarizeNodes", () => {
     ])
     expect(summary.memoryTotalBytes).toBe(16 * GiB)
     // 已用超过总量（异常数据）时按总量计。
-    expect(summary.memoryUsage).toEqual({ used: 16 * GiB, total: 16 * GiB })
+    expect(summary.memoryUsage).toEqual({
+      used: 16 * GiB,
+      total: 16 * GiB,
+      gpus: 1,
+    })
   })
 
   it("returns empty counts without nodes", () => {
@@ -422,6 +427,82 @@ describe("summarizeNodes", () => {
     expect(gpuMetricsOf(subject, 1)).toBe(metrics)
     expect(gpuMetricsOf(subject, 0)).toBeUndefined()
     expect(gpuMetricsOf(node(), 0)).toBeUndefined()
+  })
+})
+
+describe("memoryStat", () => {
+  const live = (index: number, used: number) => ({
+    index,
+    utilization_percent: null,
+    memory_used_bytes: used,
+    memory_total_bytes: null,
+    temperature_c: null,
+    power_watts: null,
+    fan_percent: null,
+    process_count: null,
+  })
+  const withMetrics = (gpus: NodeGpu[], metrics: ReturnType<typeof live>[]) =>
+    withGpus(gpus, {
+      metrics: {
+        cpu_percent: null,
+        load_average: null,
+        memory_used_bytes: null,
+        memory_total_bytes: null,
+        disk_path: null,
+        disk_total_bytes: null,
+        disk_free_bytes: null,
+        gpus: metrics,
+      },
+    })
+
+  it("shows the usage against the total it is shown with", () => {
+    const stat = memoryStat(
+      summarizeNodes([
+        withMetrics([gpu(0), gpu(1)], [live(0, 12 * GiB), live(1, 12 * GiB)]),
+      ])
+    )
+    expect(stat).toEqual({
+      value: "48 GB",
+      percent: 50,
+      detail: "已用 24 GB（50%）",
+    })
+  })
+
+  it("does not put a partial usage under the full total", () => {
+    // Two 24 GB cards, only one with live data: 50% would be wrong for 48 GB.
+    const stat = memoryStat(
+      summarizeNodes([withMetrics([gpu(0), gpu(1)], [live(0, 12 * GiB)])])
+    )
+    expect(stat).toEqual({
+      value: "48 GB",
+      percent: null,
+      detail: "已用 12 GB（1 块有实时数据）",
+    })
+  })
+
+  it("shows a dash instead of 0 B when no size is known", () => {
+    const stat = memoryStat(
+      summarizeNodes([
+        withGpus([
+          gpu(0, { memory_total_bytes: null }),
+          gpu(1, { memory_total_bytes: null }),
+        ]),
+      ])
+    )
+    expect(stat).toEqual({ value: "—", percent: null, detail: "显存大小未知" })
+  })
+
+  it("explains an empty or not yet measured total", () => {
+    expect(memoryStat(summarizeNodes([]))).toEqual({
+      value: "—",
+      percent: null,
+      detail: "在线节点的显存合计",
+    })
+    expect(memoryStat(summarizeNodes([withGpus([gpu(0)])]))).toEqual({
+      value: "24 GB",
+      percent: null,
+      detail: "暂无实时数据",
+    })
   })
 })
 

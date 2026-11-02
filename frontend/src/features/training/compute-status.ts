@@ -13,7 +13,13 @@ import type {
   SelfTestStatus,
 } from "@/features/training/compute-api"
 import { shortenGpuName } from "@/features/training/compute-format"
-import { formatRelativeTime } from "@/lib/format"
+import {
+  formatBytes,
+  formatNumber,
+  formatPercent,
+  formatRelativeTime,
+  percentOf,
+} from "@/lib/format"
 
 export function isOnline(node: Pick<ComputeNode, "status">) {
   return node.status === "online"
@@ -203,10 +209,13 @@ export type ComputeSummary = {
   offlineGpuCount: number
   /** 在线显卡按型号汇总。 */
   gpuModels: GpuModelCount[]
-  /** 在线显卡的显存合计（未知的不计入）。 */
+  /** 在线显卡的显存合计（未知的不计入）；全部未知时为 0。 */
   memoryTotalBytes: number
-  /** 有实时数据的在线显卡的已用 / 总显存；都没有实时数据时为 null。 */
-  memoryUsage: { used: number; total: number } | null
+  /**
+   * 有实时数据的在线显卡的已用 / 总显存与显卡数；都没有实时数据时为 null。
+   * 只有部分显卡有实时数据时 total 小于 memoryTotalBytes。
+   */
+  memoryUsage: { used: number; total: number; gpus: number } | null
   /** 在线节点中 CUDA 就绪的数量。 */
   readyCount: number
   /** 在线节点中环境异常的数量。 */
@@ -239,7 +248,7 @@ export function summarizeNodes(nodes: readonly ComputeNode[]): ComputeSummary {
   const names: string[] = []
   let used = 0
   let usedTotal = 0
-  let hasUsage = false
+  let usedGpus = 0
 
   for (const node of nodes) {
     const { gpus } = node.hardware
@@ -275,15 +284,62 @@ export function summarizeNodes(nodes: readonly ComputeNode[]): ComputeSummary {
         if (knownBytes(metrics?.memory_used_bytes) && total > 0) {
           used += Math.min(metrics.memory_used_bytes, total)
           usedTotal += total
-          hasUsage = true
+          usedGpus += 1
         }
       }
     }
   }
 
   summary.gpuModels = groupGpuModels(names)
-  summary.memoryUsage = hasUsage ? { used, total: usedTotal } : null
+  summary.memoryUsage =
+    usedGpus > 0 ? { used, total: usedTotal, gpus: usedGpus } : null
   return summary
+}
+
+export type MemoryStat = {
+  /** 大号数值：在线显卡的显存合计，全部未知时为“—”。 */
+  value: string
+  /** 进度条的比例；没有与合计对应的实时数据时为 null（不显示进度条）。 */
+  percent: number | null
+  /** 底部说明。 */
+  detail: string
+}
+
+/**
+ * 顶部“显存”统计：合计与已用使用同一组显卡。只有部分显卡有实时数据时不显示
+ * 比例（它只对这几块卡成立，与合计放在一起会误导），说明有几块卡有数据。
+ */
+export function memoryStat(
+  summary: Pick<ComputeSummary, "gpuCount" | "memoryTotalBytes" | "memoryUsage">
+): MemoryStat {
+  const total = summary.memoryTotalBytes
+  const usage = summary.memoryUsage
+  const value = total > 0 ? formatBytes(total) : "—"
+  if (!usage) {
+    return {
+      value,
+      percent: null,
+      detail:
+        summary.gpuCount === 0
+          ? "在线节点的显存合计"
+          : total > 0
+            ? "暂无实时数据"
+            : "显存大小未知",
+    }
+  }
+  if (usage.total < total) {
+    return {
+      value,
+      percent: null,
+      detail: `已用 ${formatBytes(usage.used)}（${formatNumber(usage.gpus)} 块有实时数据）`,
+    }
+  }
+  const percent = percentOf(usage.used, usage.total)
+  return {
+    value,
+    percent,
+    detail: `已用 ${formatBytes(usage.used)}（${formatPercent(percent)}）`,
+  }
 }
 
 /** 工作台上的一行摘要，如 “1 个节点在线 · 2 块 GPU（RTX 4090）”。 */
