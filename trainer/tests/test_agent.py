@@ -73,11 +73,12 @@ class FakeDetector:
 class FakeHardware:
     def __init__(self) -> None:
         self.count = 0
+        self.extra: dict[str, Any] = {}  # 加到 hardware 中的其它字段
 
     def __call__(self) -> HardwareProbe:
         self.count += 1
         return HardwareProbe(
-            hardware={"os": "Test OS", "gpus": [], "probe": self.count},
+            hardware={"os": "Test OS", "gpus": [], "probe": self.count, **self.extra},
             gpu=gpu.GpuProbe(None, [], {"method": "none", "error": None, "host_gpu_count": None}),
             device_nodes=[],
             host_driver_version="440.100",
@@ -411,6 +412,23 @@ def test_detector_crash_reports_error_environment(platform, tmp_path):
         env = node["environment"]
         assert env["status"] == "error"
         assert "boom" in env["self_test"]["message"]
+
+
+def test_detector_crash_keeps_the_probe_diagnostics(platform, tmp_path):
+    # 检测出错时的结果同样按探测到的诊断信息判断：显卡没有传入容器、宿主机驱动 440.100 过旧时
+    # 提示升级驱动，而不是安装 NVIDIA Container Toolkit。
+    h = Harness(tmp_path, platform.url, detector=FakeDetector(error=RuntimeError("boom")))
+    h.hardware.extra = {
+        "arch": "x86_64",
+        "in_container": True,
+        "gpu_detection": {"method": "none", "error": None, "host_gpu_count": 1},
+    }
+    with h:
+        node = wait_until(lambda: registered(platform))
+        # 检测很快出错：结果可能在注册时就已上报，也可能在之后的心跳中上报
+        env = wait_until(lambda: node.get("environment"))
+        codes = [i["code"] for i in env["issues"]]
+    assert "driver_too_old" in codes and "gpu_not_passed_through" not in codes
 
 
 def test_unexpected_client_error_does_not_stop_loop(platform, tmp_path, caplog):

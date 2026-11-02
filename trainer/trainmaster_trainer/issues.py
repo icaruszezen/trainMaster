@@ -244,16 +244,17 @@ def visible_gpus(
 
     每一项是 NVML 序号（CUDA 按 PCI 总线顺序编号时与 NVML 相同：install.sh 写入、child_env 默认设置
     CUDA_DEVICE_ORDER=PCI_BUS_ID），或 GPU-、MIG- 开头的 UUID（可以只写开头部分）。新格式的 MIG UUID
-    看不出属于哪块显卡，按开启了 MIG 的显卡都可见处理。与 CUDA 相同，遇到无法识别的项时忽略它及之后的
-    各项。没有设置时全部可见。
+    看不出属于哪块显卡，按开启了 MIG 的显卡都可见处理。与 CUDA 相同，遇到无法识别的项（包括没有这块
+    显卡的序号）时忽略它及之后的各项。没有设置时全部可见。
     """
     if cuda_visible_devices is None:
         return list(gpus)
+    known = {g.get("index") for g in gpus}
     indices: set[int] = set()
     prefixes: list[str] = []
     any_mig = False
     for token in (t.strip() for t in cuda_visible_devices.split(",")):
-        if re.fullmatch(r"[0-9]+", token):
+        if re.fullmatch(r"[0-9]+", token) and int(token) in known:
             indices.add(int(token))
         elif token.startswith("GPU-"):
             prefixes.append(token)

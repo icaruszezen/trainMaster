@@ -230,11 +230,15 @@ class Agent:
             )
         except Exception as exc:
             log.exception("environment detection failed")
+            # 诊断信息同样交给它：否则如宿主机驱动过旧时会改报“显卡没有传入容器”（建议安装 Toolkit）。
             env = issues_mod.build_environment(
                 probe.hardware,
                 failure_raw(f"环境检测出错：{type(exc).__name__}: {exc}"),
                 torch_variant=self.config.torch_variant,
                 probed_at=utc_now(),
+                device_nodes=probe.device_nodes,
+                pci_gpu_count=probe.pci_gpu_count,
+                host_driver_version=probe.host_driver_version,
                 deployment=self.deployment,
             )
         if self._stop.is_set():

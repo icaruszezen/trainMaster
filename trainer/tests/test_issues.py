@@ -751,6 +751,8 @@ def test_bare_metal_visible_gpus_decide_the_recommendation():
         ("MIG-GPU-cccc-3333/1/0", [2]),  # 旧格式的 MIG UUID 包含所在显卡的 UUID
         ("MIG-5f3b9c4e-0000", [2]),  # 新格式：开启了 MIG 的显卡
         ("0,x,1", [0]),  # 与 CUDA 相同，忽略无法识别的项及之后的各项
+        ("0,5,1", [0]),  # 没有 5 号显卡：同样忽略它及之后的各项
+        ("3,1", []),
         ("-1", []),
         ("", []),
     ],
