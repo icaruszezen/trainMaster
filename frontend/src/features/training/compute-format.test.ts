@@ -14,6 +14,7 @@ import {
   formatUsage,
   formatWatts,
   hintSegments,
+  serverUrlPlaceholderReason,
   shortenCpuModel,
   shortenGpuName,
   suggestServerUrl,
@@ -313,6 +314,48 @@ describe("suggestServerUrl", () => {
         port: "",
       })
     ).toBe("https://<平台服务器 IP>")
+  })
+
+  it("replaces an IPv6 host, which the trainer containers cannot reach", () => {
+    // The compose network has no IPv6 by default, and make setup rejects it.
+    const ipv6 = {
+      protocol: "http:",
+      host: "[fd00::10]:8080",
+      hostname: "[fd00::10]",
+      port: "8080",
+    }
+    expect(suggestServerUrl(ipv6)).toBe("http://<平台服务器 IP>:8080")
+    expect(serverUrlPlaceholderReason(ipv6)).toBe("ipv6")
+    expect(
+      suggestServerUrl({
+        protocol: "https:",
+        host: "[2001:db8::1]",
+        hostname: "[2001:db8::1]",
+        port: "",
+      })
+    ).toBe("https://<平台服务器 IP>")
+  })
+
+  it("says why the address is a placeholder", () => {
+    const at = (hostname: string) => ({
+      protocol: "http:",
+      host: `${hostname}:8080`,
+      hostname,
+      port: "8080",
+    })
+    expect(serverUrlPlaceholderReason(at("192.168.1.10"))).toBeNull()
+    expect(serverUrlPlaceholderReason(at("ai.example.com"))).toBeNull()
+    expect(serverUrlPlaceholderReason(at("localhost"))).toBe("local")
+    // The IPv6 loopback address is a local address first.
+    expect(serverUrlPlaceholderReason(at("[::1]"))).toBe("local")
+    expect(
+      serverUrlPlaceholderReason({
+        protocol: "file:",
+        host: "",
+        hostname: "",
+        port: "",
+      })
+    ).toBe("local")
   })
 
   it("falls back to the default port when the address is unknown", () => {

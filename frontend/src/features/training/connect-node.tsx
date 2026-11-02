@@ -20,6 +20,7 @@ import { CommandBlock } from "@/features/training/command-block"
 import { computeServerQuery } from "@/features/training/compute-api"
 import {
   SERVER_HOST_PLACEHOLDER,
+  serverUrlPlaceholderReason,
   suggestServerUrl,
 } from "@/features/training/compute-format"
 import {
@@ -37,8 +38,11 @@ function useConnectInfo() {
   return {
     tokenRequired,
     serverUrl,
-    /** 通过 localhost 访问页面：命令中的平台地址是占位符。 */
-    serverUrlIsPlaceholder: serverUrl.includes(SERVER_HOST_PLACEHOLDER),
+    /**
+     * 通过 localhost（local）或 IPv6 地址（ipv6）访问页面：命令中的平台地址是
+     * 占位符；为 null 时是当前地址。
+     */
+    placeholderReason: serverUrlPlaceholderReason(window.location),
     /** 平台服务器上的训练节点用 --mode off 关闭了：本机的命令恢复自动选择。 */
     localOff: localTrainerMode === "off",
     commands: connectCommands({ serverUrl, tokenRequired, localTrainerMode }),
@@ -101,16 +105,25 @@ function TokenNote({ tokenRequired }: { tokenRequired: boolean }) {
   )
 }
 
-function ServerUrlNote() {
+function ServerUrlNote({ reason }: { reason: "local" | "ipv6" }) {
   return (
     <p className="flex items-start gap-2 rounded-md border bg-muted/40 px-3 py-2 text-left text-xs text-muted-foreground">
       <Globe className="mt-px size-3.5 shrink-0" />
-      <span>
-        当前通过本机地址访问平台，其它机器不能使用：把命令中的{" "}
-        <Code>{SERVER_HOST_PLACEHOLDER}</Code> 换成平台服务器在局域网中的 IP
-        或域名，端口按实际填写（部署机 <Code>.env</Code> 中的{" "}
-        <Code>TM_HTTP_PORT</Code>）。
-      </span>
+      {reason === "ipv6" ? (
+        <span>
+          当前通过 IPv6 地址访问平台，训练节点容器的 Docker 网络默认没有
+          IPv6：把命令中的 <Code>{SERVER_HOST_PLACEHOLDER}</Code>{" "}
+          换成平台服务器的 IPv4 地址或域名，端口按实际填写（部署机{" "}
+          <Code>.env</Code> 中的 <Code>TM_HTTP_PORT</Code>）。
+        </span>
+      ) : (
+        <span>
+          当前通过本机地址访问平台，其它机器不能使用：把命令中的{" "}
+          <Code>{SERVER_HOST_PLACEHOLDER}</Code> 换成平台服务器在局域网中的 IP
+          或域名，端口按实际填写（部署机 <Code>.env</Code> 中的{" "}
+          <Code>TM_HTTP_PORT</Code>）。
+        </span>
+      )}
     </p>
   )
 }
@@ -140,7 +153,7 @@ function RemoteStartNote() {
 
 /** 空状态中的简要说明：三种接入方式各自的命令。 */
 export function ConnectMethodsBrief() {
-  const { commands, tokenRequired, serverUrlIsPlaceholder, localOff } =
+  const { commands, tokenRequired, placeholderReason, localOff } =
     useConnectInfo()
 
   return (
@@ -171,7 +184,13 @@ export function ConnectMethodsBrief() {
       </ol>
       <div className="grid gap-1 text-xs text-muted-foreground">
         <p>
-          {serverUrlIsPlaceholder ? (
+          {placeholderReason === "ipv6" ? (
+            <>
+              把 <Code>{SERVER_HOST_PLACEHOLDER}</Code>{" "}
+              换成其它机器能访问的平台服务器 IPv4 地址或域名（训练节点容器的
+              Docker 网络默认没有 IPv6），端口按实际填写。
+            </>
+          ) : placeholderReason ? (
             <>
               把 <Code>{SERVER_HOST_PLACEHOLDER}</Code>{" "}
               换成其它机器能访问的平台服务器 IP 或域名，端口按实际填写。
@@ -253,7 +272,7 @@ function ConnectNodeContent() {
     commands,
     tokenRequired,
     heartbeatSeconds,
-    serverUrlIsPlaceholder,
+    placeholderReason,
     localOff,
   } = useConnectInfo()
 
@@ -340,7 +359,7 @@ function ConnectNodeContent() {
       </ol>
 
       <div className="grid gap-2">
-        {serverUrlIsPlaceholder && <ServerUrlNote />}
+        {placeholderReason && <ServerUrlNote reason={placeholderReason} />}
         <TokenNote tokenRequired={tokenRequired} />
       </div>
     </>

@@ -207,22 +207,29 @@ export function hintSegments(text: string): TextSegment[] {
   return segments
 }
 
-/** 平台地址中的主机占位符：通过 localhost 访问时，其它机器需要换成平台服务器的 IP 或域名。 */
+/**
+ * 平台地址中的主机占位符：通过 localhost 或 IPv6 地址访问时，需要换成平台服务器的
+ * IP（IPv4）或域名。
+ */
 export const SERVER_HOST_PLACEHOLDER = "<平台服务器 IP>"
 
-/**
- * 节点接入说明中的平台地址：通过 IP / 域名访问时就是当前地址；通过 localhost
- * 访问时其它机器无法使用，主机名换成占位符，协议与端口沿用当前地址（.env 中的
- * TM_HTTP_PORT 不一定是 8080）。不知道地址时按默认部署的 8080 端口。
- */
-export function suggestServerUrl(location: {
+type PageLocation = {
   protocol: string
   host: string
   hostname: string
   port: string
-}): string {
+}
+
+/**
+ * 接入说明中的平台地址为什么不能直接用当前地址：local 为本机地址（localhost
+ * 等，其它机器无法使用；不知道地址时也按它处理），ipv6 为 IPv6 地址（训练节点
+ * 容器的 Docker 网络默认没有 IPv6，make setup 也不接受）。可以直接使用时为 null。
+ */
+export function serverUrlPlaceholderReason(
+  location: PageLocation
+): "local" | "ipv6" | null {
   if (!location.host || !/^https?:$/.test(location.protocol)) {
-    return `http://${SERVER_HOST_PLACEHOLDER}:8080`
+    return "local"
   }
   const hostname = location.hostname.replace(/^\[|\]$/g, "").toLowerCase()
   const loopback =
@@ -232,6 +239,22 @@ export function suggestServerUrl(location: {
     hostname === "0.0.0.0" ||
     /^127\./.test(hostname)
   if (loopback) {
+    return "local"
+  }
+  return location.hostname.startsWith("[") ? "ipv6" : null
+}
+
+/**
+ * 节点接入说明中的平台地址：通过 IPv4 地址 / 域名访问时就是当前地址；通过
+ * localhost 或 IPv6 地址访问时（见 serverUrlPlaceholderReason）主机名换成占位符，
+ * 协议与端口沿用当前地址（.env 中的 TM_HTTP_PORT 不一定是 8080）。不知道地址时
+ * 按默认部署的 8080 端口。
+ */
+export function suggestServerUrl(location: PageLocation): string {
+  if (!location.host || !/^https?:$/.test(location.protocol)) {
+    return `http://${SERVER_HOST_PLACEHOLDER}:8080`
+  }
+  if (serverUrlPlaceholderReason(location)) {
     const port = location.port ? `:${location.port}` : ""
     return `${location.protocol}//${SERVER_HOST_PLACEHOLDER}${port}`
   }
