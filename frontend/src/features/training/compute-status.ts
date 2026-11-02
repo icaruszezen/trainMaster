@@ -283,6 +283,16 @@ export function dashboardComputeText(summary: ComputeSummary): string {
   return parts.join(" · ")
 }
 
+/** 训练节点在 TM_TRAINER_MODE=cpu（用户选择了 CPU 模式）的 GPU 机器上上报的问题。 */
+export const CPU_MODE_SELECTED = "cpu_mode_selected"
+
+/** 有在线的 GPU 训练节点（可能就在平台服务器上）。 */
+export function hasOnlineGpuNode(
+  nodes: readonly Pick<ComputeNode, "status" | "hardware">[]
+) {
+  return nodes.some((node) => isOnline(node) && node.hardware.gpus.length > 0)
+}
+
 export type ServerGpuHint = {
   /** driver_missing：只在 PCI 总线上看到显卡；no_gpu_node：驱动正常但没有 GPU 节点在线。 */
   kind: "driver_missing" | "no_gpu_node"
@@ -291,17 +301,23 @@ export type ServerGpuHint = {
 
 /**
  * 平台服务器上有 NVIDIA 显卡、但没有在线的 GPU 训练节点时，提示如何接入。
- * 已有 GPU 节点在线（可能就在这台机器上）时不提示。
+ * 已有 GPU 节点在线（可能就在这台机器上），或在线节点说明是有意选择了 CPU
+ * 模式（`cpu_mode_selected`）时不提示。
  */
 export function serverGpuHint(
   server: Pick<ComputeServer, "nvidia">,
-  nodes: readonly Pick<ComputeNode, "status" | "hardware">[]
+  nodes: readonly Pick<ComputeNode, "status" | "hardware" | "environment">[]
 ): ServerGpuHint | null {
   const gpuCount = server.nvidia?.gpus.length ?? 0
-  if (!server.nvidia || gpuCount === 0) {
+  if (!server.nvidia || gpuCount === 0 || hasOnlineGpuNode(nodes)) {
     return null
   }
-  if (nodes.some((node) => isOnline(node) && node.hardware.gpus.length > 0)) {
+  const cpuModeSelected = nodes.some(
+    (node) =>
+      isOnline(node) &&
+      node.environment?.issues.some((issue) => issue.code === CPU_MODE_SELECTED)
+  )
+  if (cpuModeSelected) {
     return null
   }
   return {

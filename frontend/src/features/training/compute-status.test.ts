@@ -14,6 +14,7 @@ import {
   formatGpuModels,
   gpuMetricsOf,
   groupGpuModels,
+  hasOnlineGpuNode,
   isProbing,
   nodeStatusText,
   serverGpuHint,
@@ -483,5 +484,44 @@ describe("serverGpuHint", () => {
     expect(
       serverGpuHint({ nvidia: { driver_version: "550.54.15", gpus: [] } }, [])
     ).toBeNull()
+  })
+
+  it("stays quiet when an online node runs in the chosen CPU mode", () => {
+    const cpuMode = (overrides: Partial<ComputeNode> = {}) =>
+      withGpus([], {
+        environment: environment({
+          status: "cpu_only",
+          issues: [issue("info", "cpu_mode_selected")],
+        }),
+        ...overrides,
+      })
+
+    expect(serverGpuHint({ nvidia }, [cpuMode()])).toBeNull()
+    // Only online nodes count: an old offline record does not hide the hint.
+    expect(serverGpuHint({ nvidia }, [cpuMode({ status: "offline" })])).toEqual(
+      { kind: "no_gpu_node", gpuCount: 2 }
+    )
+    // A CPU node that did not choose CPU mode (e.g. no toolkit) keeps it.
+    expect(
+      serverGpuHint({ nvidia }, [
+        withGpus([], {
+          environment: environment({
+            status: "cpu_only",
+            issues: [issue("warning", "gpu_not_passed_through")],
+          }),
+        }),
+      ])
+    ).toEqual({ kind: "no_gpu_node", gpuCount: 2 })
+  })
+})
+
+describe("hasOnlineGpuNode", () => {
+  it("looks for an online node with GPUs", () => {
+    expect(hasOnlineGpuNode([withGpus([gpu(0)])])).toBe(true)
+    expect(hasOnlineGpuNode([withGpus([gpu(0)], { status: "offline" })])).toBe(
+      false
+    )
+    expect(hasOnlineGpuNode([withGpus([])])).toBe(false)
+    expect(hasOnlineGpuNode([])).toBe(false)
   })
 })
