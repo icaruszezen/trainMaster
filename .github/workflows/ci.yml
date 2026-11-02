@@ -77,10 +77,50 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  trainer:
+    name: Trainer (Python ${{ matrix.python }}) & scripts
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12：镜像中的版本；3.10：requires-python 的下限（裸机安装时使用系统 Python，如 Ubuntu 22.04）
+        python: ["3.12", "3.10"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: trainer/requirements-dev.txt
+      # 不安装 torch / ultralytics：测试用假的 NVML / torch 模块，不需要 GPU 与网络
+      - name: pip install
+        run: python -m pip install -r trainer/requirements-dev.txt shellcheck-py==0.11.0.1
+      - name: ruff check
+        working-directory: trainer
+        run: ruff check .
+      - name: ruff format --check
+        working-directory: trainer
+        run: ruff format --check .
+      - name: pytest
+        working-directory: trainer
+        run: python -m pytest
+      - name: shellcheck
+        if: matrix.python == '3.12'
+        run: shellcheck -x $(git ls-files '*.sh')
+      # 假的 nvidia-smi / docker / 包管理器，不改动 runner 本身
+      - name: bash tests
+        if: matrix.python == '3.12'
+        run: |
+          for t in trainer/scripts/tests/test-*.sh deploy/scripts/tests/test-*.sh; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done
+
   docker:
     name: Docker image
     runs-on: ubuntu-latest
-    needs: [backend, frontend]
+    needs: [backend, frontend, trainer]
     steps:
       - uses: actions/checkout@v4
       - name: docker build (no push)
@@ -89,3 +129,20 @@ jobs:
             --build-arg COMMIT="${GITHUB_SHA::7}" \
             --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             -t trainmaster:ci .
+      # runner 没有 GPU：构建 CPU 版训练节点镜像（构建时已运行一次 CPU 自检），再冒烟检查 probe 的输出
+      - name: docker build trainer (cpu, no push)
+        run: docker build --build-arg TORCH_VARIANT=cpu -t trainmaster-trainer:ci-cpu trainer
+      - name: trainer probe
+        run: |
+          docker run --rm trainmaster-trainer:ci-cpu python -m trainmaster_trainer probe > probe.json
+          jq '{agent_version, environment: (.environment | {status, accelerator, torch_version, torch_variant, ultralytics_version, self_test: .self_test.status})}' probe.json
+          jq -e '.environment.status == "cpu_only" and .environment.torch_variant == "cpu" and .environment.self_test.status == "passed"' probe.json > /dev/null
+      # 不设置 COMPOSE_PROFILES 时只有 postgres 与 app；gpu / cpu 分别加入 trainer / trainer-cpu
+      - name: docker compose config
+        run: |
+          for profiles in "" gpu cpu; do
+            echo "COMPOSE_PROFILES=${profiles:-（未设置）}"
+            COMPOSE_PROFILES="$profiles" docker compose config -q
+            COMPOSE_PROFILES="$profiles" docker compose config --services
+          done
+          TM_REQUIRE_DOCKER=1 bash deploy/scripts/tests/test-compose.sh
