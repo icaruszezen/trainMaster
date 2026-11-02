@@ -191,7 +191,10 @@ function DeleteNodeForm({
           trainer
           服务还在运行，恢复连接后节点就会自动重新注册。要永久移除，先在那台机器上停止训练节点：Docker
           部署运行 <Command>docker compose stop trainer</Command>（CPU 节点为{" "}
-          <Command>trainer-cpu</Command>），直接安装的运行{" "}
+          <Command>trainer-cpu</Command>；平台所在的机器上之后的{" "}
+          <Command>make up</Command> 会再次启动它，改用{" "}
+          <Command>make setup SETUP_ARGS="--mode off"</Command>
+          ），直接安装的运行{" "}
           <Command>sudo systemctl disable --now trainmaster-trainer</Command>。
         </AlertDialogDescription>
       </AlertDialogHeader>

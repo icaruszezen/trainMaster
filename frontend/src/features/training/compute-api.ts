@@ -68,7 +68,10 @@ export type NodeHardware = {
 
 export type IssueLevel = "error" | "warning" | "info"
 
-/** 环境检测发现的问题；前端只展示 message / hint，不需要认识每个 code。 */
+/**
+ * 环境检测发现的问题；前端只展示 message / hint，不需要认识每个 code（只有
+ * `cpu_mode_selected` 用来隐藏平台服务器卡片上的 GPU 提示，见 serverGpuHint）。
+ */
 export type EnvironmentIssue = {
   level: IssueLevel
   code: string
