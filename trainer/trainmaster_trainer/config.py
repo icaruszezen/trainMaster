@@ -134,11 +134,11 @@ def parse_service(raw: str) -> str:
     return name
 
 
-def parse_mode(raw: str) -> str:
-    mode = raw.strip().lower()
-    if mode not in TRAINER_MODES:
-        raise ValueError(f"未知的模式 {raw!r}（{'、'.join(TRAINER_MODES)}）")
-    return mode
+def parse_mode(raw: str) -> str | None:
+    """TM_TRAINER_MODE。与 make setup 相同：只认 auto / gpu / cpu / off（区分大小写），其它值按 auto
+    处理（make setup 每次运行时会警告），不让只用于修复建议的设置阻止训练节点启动。"""
+    mode = raw.strip()
+    return mode if mode in TRAINER_MODES else None
 
 
 def parse_log_level(raw: str) -> int:
@@ -264,15 +264,10 @@ def load(
         except ValueError as exc:
             fail("TM_TRAINER_SERVICE", exc)
 
-    mode: str | None = None
-    if _clean(env, "TM_TRAINER_MODE"):
-        try:
-            mode = parse_mode(env["TM_TRAINER_MODE"])
-        except ValueError as exc:
-            fail("TM_TRAINER_MODE", exc)
+    mode = parse_mode(env.get("TM_TRAINER_MODE", ""))
 
-    # make setup 把无效的值按自动选择处理，这里同样不报错；auto 表示没有固定。
-    pinned = _clean(env, "TM_TRAINER_VARIANT").lower()
+    # make setup 把无效的值（包括大小写不同的变体名）按自动选择处理，这里同样不报错；auto 表示没有固定。
+    pinned = _clean(env, "TM_TRAINER_VARIANT")
 
     level = logging.INFO
     if _clean(env, "TM_LOG_LEVEL"):

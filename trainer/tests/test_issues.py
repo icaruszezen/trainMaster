@@ -298,6 +298,34 @@ def test_torchvision_missing():
     env = env_of(hw(), cpu_raw(torchvision=None, torchvision_error="ImportError: libc10.so"))
     issue = only(env, "torch_missing")
     assert "torchvision" in issue["message"] and "libc10.so" in issue["message"]
+    # 重新构建即可，不固定变体（make setup 不接受 --variant cpu）
+    assert issue["hint"] == "重新构建训练节点镜像：`make up`"
+
+
+@pytest.mark.parametrize(
+    ("hardware", "deployment", "hint"),
+    [
+        (
+            hw(),
+            Deployment(server_url=REMOTE_URL, service="trainer-cpu"),
+            "重新构建训练节点镜像：`make setup` 然后 `docker compose up -d --build trainer-cpu`",
+        ),
+        (
+            hw(container=False),
+            BARE,
+            "重新运行安装脚本（在 trainMaster 仓库目录中运行）："
+            "`sudo trainer/scripts/install.sh --variant cpu`",
+        ),
+    ],
+)
+def test_torchvision_missing_on_cpu_node_reinstalls_same_variant(hardware, deployment, hint):
+    env = env_of(
+        hardware,
+        cpu_raw(torchvision=None, torchvision_error="ImportError: x"),
+        torch_variant="cpu",
+        deployment=deployment,
+    )
+    assert only(env, "torch_missing")["hint"] == hint
 
 
 def test_ultralytics_missing():
@@ -623,8 +651,16 @@ def test_mixed_gpus_bare_metal_hint_uses_cuda_visible_devices():
         torch_variant="cu130",
     )
     hint = only(env, "arch_unsupported")["hint"]
-    assert "/opt/trainmaster-trainer/trainer.env" in hint and "CUDA_VISIBLE_DEVICES" in hint
-    assert hint.endswith("`sudo systemctl restart trainmaster-trainer`")
+    assert "/opt/trainmaster-trainer/trainer.env" in hint
+    assert "`CUDA_VISIBLE_DEVICES=0`" in hint
+    assert "`sudo systemctl restart trainmaster-trainer`" in hint
+    # 不支持的显卡排在前面时给出其余显卡的序号
+    env = env_of(
+        hw([gpu(0, **GTX1080TI), gpu(1, **RTX5090), gpu(2, **RTX5090)], container=False),
+        raw(count=3),
+        torch_variant="cu130",
+    )
+    assert "`CUDA_VISIBLE_DEVICES=1,2`" in only(env, "arch_unsupported")["hint"]
 
 
 def test_mixed_gpus_on_wrong_variant_is_still_an_error():
@@ -788,13 +824,14 @@ def test_pinned_variant_suggests_auto():
 
 
 def test_pinned_variant_equal_to_recommendation_needs_no_variant_argument():
+    # 固定的就是推荐的变体，但镜像是用其它变体构建的（如手动修改了 TM_TORCH_VARIANT）：重新构建即可。
     env = env_of(
-        hw([gpu()]),
-        raw(torchvision=None, torchvision_error="ImportError: x"),
-        torch_variant="cu130",
+        hw([gpu(**RTX5090)]),
+        raw(torch="2.14.1+cu126", cuda="12.6", archs=CU126_ARCHS),
+        torch_variant="cu126",
         deployment=Deployment(pinned_variant="cu130"),
     )
-    assert only(env, "torch_missing")["hint"] == "重新构建镜像（PyTorch 变体 cu130）：`make up`"
+    assert only(env, "arch_unsupported")["hint"] == "重新构建镜像（PyTorch 变体 cu130）：`make up`"
 
 
 # ---- 选择了 CPU 模式（TM_TRAINER_MODE=cpu）----

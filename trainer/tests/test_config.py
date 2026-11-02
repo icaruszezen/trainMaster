@@ -68,7 +68,7 @@ def test_compose_deployment_settings(tmp_path):
         base_env(
             tmp_path,
             TM_TRAINER_SERVICE=" trainer-cpu ",
-            TM_TRAINER_MODE="CPU",
+            TM_TRAINER_MODE=" cpu ",
             TM_TRAINER_VARIANT=" cu126 ",
         )
     )
@@ -81,10 +81,17 @@ def test_compose_deployment_settings(tmp_path):
 
 def test_invalid_compose_deployment_settings(tmp_path):
     with pytest.raises(ConfigError) as info:
-        config.load(base_env(tmp_path, TM_TRAINER_SERVICE="train er", TM_TRAINER_MODE="fast"))
+        config.load(base_env(tmp_path, TM_TRAINER_SERVICE="train er"))
     message = str(info.value)
     assert "TM_TRAINER_SERVICE" in message and "compose 服务名" in message
-    assert "TM_TRAINER_MODE" in message and "auto、gpu、cpu、off" in message
+
+
+@pytest.mark.parametrize("value", ["fast", "CPU", "Auto"])
+def test_invalid_trainer_mode_is_auto_like_make_setup(tmp_path, value):
+    # make setup 只认 auto / gpu / cpu / off（区分大小写），其它值警告后按 auto 处理：
+    # 训练节点同样按 auto 处理，不因为只用于修复建议的设置而无法启动。
+    assert config.load(base_env(tmp_path, TM_TRAINER_MODE=value)).trainer_mode is None
+    assert config.load(base_env(tmp_path, TM_TRAINER_MODE="off")).trainer_mode == "off"
 
 
 def test_server_url_required_for_run(tmp_path):

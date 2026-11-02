@@ -145,10 +145,15 @@ class Fixes:
             )
         return f"改用 PyTorch 变体 {variant} 重新构建镜像：" + self.setup(f"--variant {variant}")
 
-    def reinstall(self) -> str:
+    def reinstall(self, variant: str | None = None) -> str:
+        """重新安装（变体不变）：Docker 重新构建镜像，make setup 按原来的规则（自动选择或固定的变体）
+        选择变体；裸机重新运行安装脚本，指定 variant 时安装该变体。
+
+        不用 make setup --variant：它会固定变体，而且不接受 cpu（CPU 训练节点由 --mode cpu 选择）。
+        """
         if self.container:
             return "重新构建训练节点镜像：" + self.setup()
-        return "重新运行安装脚本" + self.install()
+        return "重新运行安装脚本" + self.install(variant)
 
     def after_driver(self, *, toolkit: bool = False) -> str:
         """安装或升级 NVIDIA 驱动之后：重新检测并以 GPU 模式启动（Docker），或重新运行安装脚本（裸机）。"""
@@ -167,17 +172,25 @@ class Fixes:
             )
         return _code(f"{shlex.quote(self.python)} -m trainmaster_trainer selftest")
 
-    def exclude_gpus(self) -> str:
-        """只把受支持的显卡交给训练节点（新旧显卡混用、没有同时支持全部显卡的 PyTorch 变体时）。"""
+    def exclude_gpus(self, usable: Sequence[Any]) -> str:
+        """只把受支持的显卡交给训练节点（新旧显卡混用、没有同时支持全部显卡的 PyTorch 变体时）。
+
+        usable：受支持的显卡的 NVML 序号。裸机上 NVML 序号就是 nvidia-smi 的序号，CUDA 按 PCI 总线顺序
+        编号（CUDA_DEVICE_ORDER=PCI_BUS_ID，install.sh 写入 trainer.env）时 CUDA_VISIBLE_DEVICES 用同样的序号；
+        容器中已经限制了显卡时 NVML 序号与宿主机的不同，所以只指向文档。
+        """
         if self.container:
             return (
                 "只把受支持的显卡分配给训练节点：在 docker-compose.override.yml 中设置 device_ids"
                 "（见 docs/deployment.md 第 10.8 节），然后运行 " + self.restart()
             )
+        ids = ",".join(str(i) for i in usable)
         return (
-            f"训练只使用受支持的显卡：在 {self.prefix}/trainer.env 中把 CUDA_VISIBLE_DEVICES "
-            "设置为这些显卡的序号（如 0），然后运行 "
+            f"训练只使用受支持的显卡：在 {self.prefix}/trainer.env 中设置 "
+            + _code(f"CUDA_VISIBLE_DEVICES={ids}")
+            + "，然后重启训练节点（systemd 服务："
             + _code("sudo systemctl restart trainmaster-trainer")
+            + "）"
         )
 
 
@@ -406,7 +419,7 @@ def build_environment(
                     "error",
                     "torch_missing",
                     f"无法导入 torchvision：{_first_line(raw.get('torchvision_error')) or '未安装'}",
-                    fixes.variant(installed or rec),
+                    fixes.reinstall(installed or rec),
                 )
             )
         if raw.get("ultralytics_error") or raw.get("ultralytics_version") is None:
@@ -502,7 +515,7 @@ def build_environment(
                                 "warning",
                                 "arch_unsupported",
                                 message + "，这些显卡不能用于训练",
-                                fixes.exclude_gpus(),
+                                fixes.exclude_gpus([g.get("index") for g in gpus if g not in bad]),
                             )
                         )
                     else:
