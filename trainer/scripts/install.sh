@@ -2,9 +2,11 @@
 # 在不使用 Docker 的机器上安装 trainMaster 训练节点（裸机安装）：
 #   检测 nvidia-smi → 按驱动与显卡选择 PyTorch 变体 → 创建虚拟环境 → 安装 PyTorch（install-torch.sh）
 #   → 安装 requirements.txt 与训练节点 → 写入配置文件 → 自检 → 可选生成并启用 systemd 服务。
-# 可以重复运行：已有的虚拟环境会复用，PyTorch 变体变化时自动重新安装。
+# 可以重复运行：已有的虚拟环境会复用，PyTorch 变体变化时自动重新安装；已有的配置文件中的平台地址、令牌、
+# 节点名称、目录与其它手动添加的设置沿用，已安装的 systemd 服务会更新并重启。
 #
 # 用法：sudo trainer/scripts/install.sh --server-url http://192.168.1.10:8080 --token <令牌> --systemd
+# 之后更换变体：sudo trainer/scripts/install.sh --variant cu128
 #
 # 环境变量：
 #   PIP_INDEX_URL / TORCH_INDEX_URL / TORCH_FIND_LINKS  PyPI 与 PyTorch 镜像（见 install-torch.sh）
@@ -29,7 +31,7 @@ usage() {
 在本机安装 trainMaster 训练节点（不使用 Docker）：自动检测显卡与驱动，安装匹配的 CUDA 版
 PyTorch 与 Ultralytics，写入配置文件，并可注册为 systemd 服务开机自启。
 
-必填：
+必填（首次安装）：
   --server-url URL    平台地址，例如 http://192.168.1.10:8080
 
 选项：
@@ -40,11 +42,16 @@ PyTorch 与 Ultralytics，写入配置文件，并可注册为 systemd 服务开
   --python PY         创建虚拟环境使用的 Python（需要 3.10 或更新，默认 python3）
   --state-dir DIR     状态目录：节点标识与心跳文件（默认 /var/lib/trainmaster）
   --data-dir DIR      数据目录：上报其磁盘空间（默认 /data，不存在时使用状态目录）
-  --env-file FILE     配置文件路径（默认 <prefix>/trainer.env，权限 600）
+  --env-file FILE     配置文件路径（默认为已安装的服务使用的配置文件，没有时为 <prefix>/trainer.env；
+                      权限 600）
   --systemd           生成并启用 systemd 服务 trainmaster-trainer（需要 root）
   --user USER         运行训练节点的用户（默认 root）；状态目录的属主会改为该用户
   --dry-run           只打印检测结果和将要执行的步骤，不做任何修改
   -h, --help          显示本帮助
+
+重新运行时（配置文件已存在），没有指定的 --server-url、--token、--name、--state-dir、--data-dir
+沿用配置文件中的值，其它手动添加的设置原样保留；本安装目录的 systemd 服务已经安装时，
+即使不加 --systemd 也会更新并重启它（没有指定 --user 时沿用服务中的运行用户）。
 EOF
 }
 
@@ -63,8 +70,8 @@ name=""
 variant=""
 prefix="/opt/trainmaster-trainer"
 python=""
-state_dir="/var/lib/trainmaster"
-data_dir="/data"
+state_dir="" # 没有指定时沿用配置文件中的值，再没有时为 /var/lib/trainmaster
+data_dir=""  # 同上，默认 /data
 env_file=""
 systemd=0
 run_user=""
@@ -142,25 +149,12 @@ is_visible_ascii() {
 	[[ "$1" =~ ^[!-~]+$ ]]
 }
 
-[ -n "$server_url" ] || {
-	usage >&2
-	die 2 "缺少 --server-url（平台地址，例如 http://192.168.1.10:8080）"
+trim() { # trim <文本>：去掉首尾空白
+	local s="$1"
+	s="${s#"${s%%[![:space:]]*}"}"
+	s="${s%"${s##*[![:space:]]}"}"
+	printf '%s' "$s"
 }
-if has_control_chars "$server_url" || [[ ! "$server_url" =~ ^https?://[^[:space:]/?#@]+(/[^[:space:]?#]*)?$ ]]; then
-	die 2 "--server-url 不合法：$server_url（应为 http://主机:端口，不能包含用户名、查询参数或空格）"
-fi
-while [ "${server_url%/}" != "$server_url" ]; do server_url="${server_url%/}"; done
-
-if [ -n "$token" ] && { ! is_visible_ascii "$token" || [ "${#token}" -gt 256 ]; }; then
-	die 2 "--token 只能包含可见的 ASCII 字符（不能有空格或中文），最多 256 个字符"
-fi
-
-if [ -z "$name" ]; then
-	name="$(uname -n 2>/dev/null || true)"
-	[ -n "$name" ] || name="trainer"
-elif has_control_chars "$name"; then
-	die 2 "--name 不能包含换行等控制字符"
-fi
 
 check_dir() { # check_dir <选项> <路径>：绝对路径，不含控制字符（写入配置文件时会加引号）
 	case "$2" in
@@ -182,10 +176,133 @@ check_unit_path() { # check_unit_path <选项> <路径>：写入 systemd 服务�
 while [ "${prefix%/}" != "$prefix" ]; do prefix="${prefix%/}"; done
 [ -n "$prefix" ] || die 2 "--prefix 不能是根目录"
 check_unit_path --prefix "$prefix"
+
+unit_dir="${TM_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+unit_file="$unit_dir/$SERVICE_NAME"
+venv_python="$prefix/bin/python"
+# 本安装目录的 systemd 服务是否已经安装（服务文件由本脚本生成，ExecStart 指向本安装目录）
+unit_installed=0
+if [ -f "$unit_file" ] &&
+	grep -qxF "ExecStart=$venv_python -m trainmaster_trainer run" "$unit_file" 2>/dev/null; then
+	unit_installed=1
+fi
+
+# 没有指定 --env-file 时，已安装的服务使用的配置文件优先（首次安装时可能用 --env-file 指定了其它路径）
+if [ -z "$env_file" ] && [ "$unit_installed" = 1 ]; then
+	env_file="$(sed -n 's/^EnvironmentFile=-\{0,1\}//p' "$unit_file" | tail -n 1)"
+fi
 [ -n "$env_file" ] || env_file="$prefix/trainer.env"
 check_unit_path --env-file "$env_file"
+
+# ---- 沿用已有的配置 ----
+# 重新运行（如训练节点修复建议中的 sudo trainer/scripts/install.sh --variant cu128）时，没有指定的平台地址、
+# 令牌、节点名称与目录沿用已有配置文件中的值，不会清空令牌或把目录改回默认值；其它设置原样保留。
+
+# 本脚本管理的配置项（其余的赋值行原样保留）
+MANAGED_KEYS="TM_SERVER_URL TM_NODE_TOKEN TM_NODE_NAME TM_TORCH_VARIANT TM_STATE_DIR TM_DATA_DIR CUDA_DEVICE_ORDER"
+
+# env_unquote <值>：去掉配置文件中值的引号。本脚本写入双引号格式（见 env_quote），也接受单引号与不加引号的值；
+# 只解析，不执行配置文件中的任何内容。
+env_unquote() {
+	local v="$1" out="" c
+	case "$v" in
+	\"*\")
+		v="${v:1:${#v}-2}"
+		while [ -n "$v" ]; do
+			c="${v:0:1}"
+			if [ "$c" = "\\" ] && [ "${#v}" -ge 2 ]; then
+				c="${v:1:1}"
+				v="${v:2}"
+			else
+				v="${v:1}"
+			fi
+			out+="$c"
+		done
+		v="$out"
+		;;
+	\'*\') v="${v:1:${#v}-2}" ;;
+	esac
+	printf '%s' "$v"
+}
+
+cuda_order=""
+reused=()
+extra_settings=() # 配置文件中其它的设置（手动添加的 TM_LOG_LEVEL、CUDA_VISIBLE_DEVICES 等）
+declare -A from_file=()
+if [ -f "$env_file" ] && [ ! -r "$env_file" ]; then
+	if [ "$dry_run" = 0 ]; then
+		die 1 "无法读取已有的配置文件 $env_file（请用 sudo 运行）"
+	fi
+	info "无法读取已有的配置文件 $env_file，预览中不沿用其中的设置（实际安装请用 sudo 运行）"
+elif [ -f "$env_file" ]; then
+	while IFS= read -r line || [ -n "$line" ]; do
+		line="$(trim "${line%$'\r'}")"
+		case "$line" in "" | "#"*) continue ;; esac
+		line="${line#export }"
+		key="${line%%=*}"
+		[[ "$line" == *=* && "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+		if [[ " $MANAGED_KEYS " == *" $key "* ]]; then
+			from_file[$key]="$(env_unquote "$(trim "${line#*=}")")"
+		else
+			extra_settings+=("$line")
+		fi
+	done <"$env_file"
+fi
+reuse() { # reuse <变量名> <配置项>：参数没有指定时使用配置文件中的值
+	if [ -z "${!1}" ] && [ -n "${from_file[$2]:-}" ]; then
+		printf -v "$1" '%s' "${from_file[$2]}"
+		[ "$2" = CUDA_DEVICE_ORDER ] || reused+=("$2")
+	fi
+}
+reuse server_url TM_SERVER_URL
+reuse token TM_NODE_TOKEN
+reuse name TM_NODE_NAME
+reuse state_dir TM_STATE_DIR
+reuse data_dir TM_DATA_DIR
+reuse cuda_order CUDA_DEVICE_ORDER
+
+# 本安装目录的 systemd 服务已经安装：与 --systemd 相同，更新并重启它；没有指定 --user 时沿用其中的
+# 运行用户（加不加 --systemd 都一样，重新生成的服务不会改回 root）。
+systemd_found=0
+if [ "$unit_installed" = 1 ]; then
+	if [ "$systemd" = 0 ]; then
+		systemd=1
+		systemd_found=1
+	fi
+	if [ -z "$run_user" ]; then
+		run_user="$(sed -n 's/^User=//p' "$unit_file" | tail -n 1)"
+	fi
+fi
+
+[ -n "$server_url" ] || {
+	usage >&2
+	die 2 "缺少 --server-url（平台地址，例如 http://192.168.1.10:8080）"
+}
+if has_control_chars "$server_url" || [[ ! "$server_url" =~ ^https?://[^[:space:]/?#@]+(/[^[:space:]?#]*)?$ ]]; then
+	die 2 "--server-url 不合法：$server_url（应为 http://主机:端口，不能包含用户名、查询参数或空格）"
+fi
+while [ "${server_url%/}" != "$server_url" ]; do server_url="${server_url%/}"; done
+
+if [ -n "$token" ] && { ! is_visible_ascii "$token" || [ "${#token}" -gt 256 ]; }; then
+	die 2 "--token 只能包含可见的 ASCII 字符（不能有空格或中文），最多 256 个字符"
+fi
+
+if [ -z "$name" ]; then
+	name="$(uname -n 2>/dev/null || true)"
+	[ -n "$name" ] || name="trainer"
+elif has_control_chars "$name"; then
+	die 2 "--name 不能包含换行等控制字符"
+fi
+
+[ -n "$state_dir" ] || state_dir="/var/lib/trainmaster"
+[ -n "$data_dir" ] || data_dir="/data"
 check_dir --state-dir "$state_dir"
 check_dir --data-dir "$data_dir"
+# CUDA 按 PCI 总线顺序给显卡编号，与 nvidia-smi / 训练节点上报的显卡序号一致
+[ -n "$cuda_order" ] || cuda_order="PCI_BUS_ID"
+if has_control_chars "$cuda_order"; then
+	die 2 "配置文件中的 CUDA_DEVICE_ORDER 不能包含换行等控制字符"
+fi
 
 if [ -n "$run_user" ] && [[ ! "$run_user" =~ ^[A-Za-z_][A-Za-z0-9._-]*\$?$ ]]; then
 	die 2 "--user 不是合法的用户名：$run_user"
@@ -196,9 +313,12 @@ if [ -n "$variant" ] && ! tm_variant_field "$variant" torch >/dev/null; then
 	die 2 "未知的变体 $variant（可选：$variant_names）"
 fi
 
-unit_dir="${TM_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
-unit_file="$unit_dir/$SERVICE_NAME"
-venv_python="$prefix/bin/python"
+if [ "${#reused[@]}" -gt 0 ]; then
+	info "沿用配置文件 $env_file 中的 ${reused[*]}"
+fi
+if [ "$systemd_found" = 1 ]; then
+	info "已安装 systemd 服务 $unit_file：安装后更新并重启它"
+fi
 
 # ---- 检测显卡 ----
 
@@ -207,13 +327,6 @@ gpu_ccs=()
 driver=""
 cc_assumed=0
 smi_error=""
-
-trim() { # trim <文本>：去掉首尾空白
-	local s="$1"
-	s="${s#"${s%%[![:space:]]*}"}"
-	s="${s%"${s##*[![:space:]]}"}"
-	printf '%s' "$s"
-}
 
 detect_gpus() {
 	local smi="${TM_NVIDIA_SMI:-nvidia-smi}" out with_cc=1 line n gpu_name drv cc mem
@@ -316,13 +429,19 @@ env_content() { # env_content <令牌的显示形式>
 	cat <<EOF
 # trainMaster 训练节点配置（由 trainer/scripts/install.sh 生成，可手动修改，修改后重启服务）。
 # 格式同时兼容 systemd 的 EnvironmentFile 与 shell：set -a; . $env_file; set +a
+# 重新运行 install.sh 时，没有通过参数指定的值沿用这里的设置，手动添加的其它设置也会保留（注释除外）。
 TM_SERVER_URL=$(env_quote "$server_url")
 TM_NODE_TOKEN=$1
 TM_NODE_NAME=$(env_quote "$name")
 TM_TORCH_VARIANT=$(env_quote "$variant")
 TM_STATE_DIR=$(env_quote "$state_dir")
 TM_DATA_DIR=$(env_quote "$data_dir")
+# CUDA 按 PCI 总线顺序给显卡编号，与 nvidia-smi 的序号一致
+CUDA_DEVICE_ORDER=$(env_quote "$cuda_order")
 EOF
+	if [ "${#extra_settings[@]}" -gt 0 ]; then
+		printf '%s\n' "${extra_settings[@]}"
+	fi
 }
 
 unit_content() {
@@ -373,6 +492,9 @@ if [ "$dry_run" = 0 ]; then
 	if [ "$systemd" = 1 ]; then
 		command -v systemctl >/dev/null 2>&1 || die 1 "找不到 systemctl：本机没有使用 systemd，请去掉 --systemd 并按结尾的说明手动运行"
 		if [ ! -d "$unit_dir" ] || [ ! -w "$unit_dir" ]; then
+			if [ "$systemd_found" = 1 ]; then
+				die 1 "已安装 systemd 服务 $unit_file，更新并重启它需要 root 权限（请用 sudo 运行）"
+			fi
 			die 1 "无法写入 $unit_dir：--systemd 需要 root 权限（请用 sudo 运行）"
 		fi
 	fi

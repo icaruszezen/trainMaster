@@ -25,6 +25,8 @@ class FakePlatform:
         self.interval: Any = interval
         self.mode = "up"
         self.clear_probe_on_environment = True
+        # 注册时没有带检测结果（节点刚启动、检测还在进行）：保留原来的结果并标记为“正在检测”。
+        self.request_probe_on_register = True
         self.nodes: dict[str, dict[str, Any]] = {}
         self.requests: list[dict[str, Any]] = []
         self.lock = threading.Lock()
@@ -115,6 +117,8 @@ class FakePlatform:
             node["name"] = body.get("name")
             if body.get("environment") is not None:
                 node["environment"] = body["environment"]
+            elif self.request_probe_on_register:
+                node["probe_requested"] = True
             if body.get("metrics") is not None:
                 node["metrics"] = body["metrics"]
             return {

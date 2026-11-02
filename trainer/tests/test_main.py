@@ -194,6 +194,18 @@ def test_healthcheck_finds_fallback_state_dir(tmp_path):
     assert proc.returncode == 0, proc.stderr
 
 
+def test_healthcheck_finds_temp_state_dir_of_puid(tmp_path):
+    # Docker 以 root 运行 HEALTHCHECK；训练节点以 PUID 运行并退回到了 /tmp/trainmaster-<PUID>。
+    tmp = tmp_path / "tmp"
+    fallback = tmp / "trainmaster-4321"
+    fallback.mkdir(parents=True)
+    (fallback / "heartbeat").write_text(json.dumps({"unix": time.time(), "interval_seconds": 10}))
+    proc = run_cli(tmp_path, "healthcheck", TMPDIR=str(tmp))
+    assert proc.returncode == 1
+    proc = run_cli(tmp_path, "healthcheck", TMPDIR=str(tmp), PUID="4321")
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_version_and_help(capsys):
     with pytest.raises(SystemExit) as info:
         cli.main(["--version"])

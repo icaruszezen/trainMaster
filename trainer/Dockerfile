@@ -71,8 +71,11 @@ RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod 0755 /usr/local/bin/e
 # NVIDIA_DRIVER_CAPABILITIES：让 NVIDIA Container Toolkit 挂载 CUDA（compute）与 nvidia-smi / NVML（utility）。
 # NVIDIA_VISIBLE_DEVICES 不在这里设置，由 compose 的 GPU 设备预留决定使用哪些显卡。
 # HOME 指向状态目录：降权后的 PUID 在镜像中没有对应的用户与家目录。
+# CUDA_DEVICE_ORDER：CUDA 默认把最快的显卡排在前面，按 PCI 总线顺序编号才与 nvidia-smi / NVML 的序号
+# （页面上的“N 号”显卡、device_ids）一致。
 ENV TM_TORCH_VARIANT=${TORCH_VARIANT} \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
     YOLO_OFFLINE=1 \
     TM_STATE_DIR=/var/lib/trainmaster \
     HOME=/var/lib/trainmaster

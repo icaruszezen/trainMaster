@@ -21,11 +21,15 @@ class Err:
 
 NOT_SUPPORTED = Err(pynvml.NVML_ERROR_NOT_SUPPORTED)
 GPU_IS_LOST = Err(pynvml.NVML_ERROR_GPU_IS_LOST)
+# 驱动的 libnvidia-ml 比 nvidia-ml-py 旧：不带版本号的函数抛出 NVMLLibraryMismatchError（不是 NVMLError）。
+LIBRARY_MISMATCH = object()
 
 
 def _value(v: Any) -> Any:
     if isinstance(v, Err):
         raise pynvml.NVMLError(v.code)
+    if v is LIBRARY_MISMATCH:
+        raise pynvml.NVMLLibraryMismatchError("Unversioned function called (fake)")
     return v
 
 
@@ -63,7 +67,7 @@ def make_nvml(
     devices = devices if devices is not None else [rtx4090()]
     mod = types.ModuleType("pynvml")
     for name in dir(pynvml):
-        if name.startswith(("NVML_", "NVMLError")):
+        if name.startswith(("NVML_", "NVMLError", "NVMLLibraryMismatchError")):
             setattr(mod, name, getattr(pynvml, name))
     state = {"init": 0, "shutdown": 0}
     mod.state = state  # type: ignore[attr-defined]
@@ -122,6 +126,7 @@ def make_nvml(
         "nvmlDeviceGetPowerUsage": field("power"),
         "nvmlDeviceGetFanSpeed": field("fan"),
         "nvmlDeviceGetComputeRunningProcesses": field("procs"),
+        "nvmlDeviceGetComputeRunningProcesses_v2": field("procs_v2"),
     }
     for name, fn in funcs.items():
         if name not in missing:
@@ -190,6 +195,7 @@ def make_torch(
     init_error: BaseException | None = None,
     matmul_nan_on: int | None = None,
     autocast_error: BaseException | None = None,
+    capabilities: list[tuple[int, int]] | None = None,
 ) -> types.ModuleType:
     """一个只实现自检用到的接口的 torch；calls 记录调用顺序。"""
     import warnings
@@ -215,12 +221,17 @@ def make_torch(
     def synchronize(i: int) -> None:
         calls.append(f"synchronize {i}")
 
+    def get_device_capability(i: int) -> tuple[int, int]:
+        caps = capabilities or []
+        return caps[i] if i < len(caps) else (8, 9)  # 没有指定时按 RTX 4090（8.9）处理
+
     torch.cuda = types.SimpleNamespace(  # type: ignore[attr-defined]
         is_available=is_available,
         device_count=lambda: device_count,
         get_arch_list=lambda: list(arch_list or []),
         init=init,
         synchronize=synchronize,
+        get_device_capability=get_device_capability,
     )
 
     def randn(*shape: int, device: str = "cpu") -> FakeTensor:

@@ -32,6 +32,10 @@ _LOG_LEVELS = {
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
 _DURATION = re.compile(r"(\d+(?:\.\d+)?)\s*(s|m)?")
+# make setup 的训练节点模式（deploy/scripts/setup-compute.sh --mode）。
+TRAINER_MODES = ("auto", "gpu", "cpu", "off")
+# compose 服务名（TM_TRAINER_SERVICE）：字母、数字开头，之后可以有 . _ -。
+_SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 class ConfigError(ValueError):
@@ -49,6 +53,12 @@ class Config:
     self_test: bool = True
     self_test_timeout: float = DEFAULT_SELF_TEST_TIMEOUT
     log_level: int = logging.INFO
+    # 以下三项由 docker-compose.yml 传入，只用于生成修复建议中的命令：
+    # 所在的 compose 服务（trainer / trainer-cpu）、make setup 保存的模式（TM_TRAINER_MODE）
+    # 与固定的 PyTorch 变体（TM_TRAINER_VARIANT，没有固定时为 None）。
+    trainer_service: str | None = None
+    trainer_mode: str | None = None
+    trainer_variant: str | None = None
     # 状态目录不可写、退回到其它目录时的说明（启动时记录 WARNING）。
     state_dir_warning: str | None = field(default=None, compare=False)
 
@@ -117,6 +127,20 @@ def parse_timeout(raw: str) -> float:
     return seconds
 
 
+def parse_service(raw: str) -> str:
+    name = raw.strip()
+    if not _SERVICE.fullmatch(name):
+        raise ValueError(f"{raw!r} 不是合法的 compose 服务名（如 trainer、trainer-cpu）")
+    return name
+
+
+def parse_mode(raw: str) -> str | None:
+    """TM_TRAINER_MODE。与 make setup 相同：只认 auto / gpu / cpu / off（区分大小写），其它值按 auto
+    处理（make setup 每次运行时会警告），不让只用于修复建议的设置阻止训练节点启动。"""
+    mode = raw.strip()
+    return mode if mode in TRAINER_MODES else None
+
+
 def parse_log_level(raw: str) -> int:
     level = _LOG_LEVELS.get(raw.strip().lower())
     if level is None:
@@ -148,6 +172,21 @@ def state_dir_candidates(configured: Path, home: str | None = None) -> list[Path
         if c not in out:
             out.append(c)
     return out
+
+
+def healthcheck_dirs(configured: Path, env: Mapping[str, str]) -> list[Path]:
+    """healthcheck 查找心跳文件的目录：state_dir_candidates，再加上 PUID 的临时目录。
+
+    Docker 以 root 运行 HEALTHCHECK，而训练节点由 entrypoint 降权为 PUID 运行：状态目录不可写、
+    退回到临时目录时，目录名中是 PUID 而不是 0。
+    """
+    dirs = state_dir_candidates(configured, env.get("HOME"))
+    puid = env.get("PUID", "").strip()
+    if puid.isdigit():
+        extra = Path(tempfile.gettempdir()) / f"trainmaster-{int(puid)}"
+        if extra not in dirs:
+            dirs.append(extra)
+    return dirs
 
 
 def resolve_state_dir(
@@ -218,6 +257,18 @@ def load(
         except ValueError as exc:
             fail("TM_SELF_TEST_TIMEOUT", exc)
 
+    service: str | None = None
+    if _clean(env, "TM_TRAINER_SERVICE"):
+        try:
+            service = parse_service(env["TM_TRAINER_SERVICE"])
+        except ValueError as exc:
+            fail("TM_TRAINER_SERVICE", exc)
+
+    mode = parse_mode(env.get("TM_TRAINER_MODE", ""))
+
+    # make setup 把无效的值（包括大小写不同的变体名）按自动选择处理，这里同样不报错；auto 表示没有固定。
+    pinned = _clean(env, "TM_TRAINER_VARIANT")
+
     level = logging.INFO
     if _clean(env, "TM_LOG_LEVEL"):
         try:
@@ -247,5 +298,8 @@ def load(
         self_test=self_test,
         self_test_timeout=timeout,
         log_level=level,
+        trainer_service=service,
+        trainer_mode=mode,
+        trainer_variant=pinned if pinned and pinned != "auto" else None,
         state_dir_warning=warning,
     )

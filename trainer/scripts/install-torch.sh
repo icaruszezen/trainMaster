@@ -9,7 +9,8 @@
 #   --dry-run  只打印将要执行的 pip 命令，不安装也不验证
 #
 # 环境变量：
-#   PIP_INDEX_URL     PyPI 或其镜像，默认 https://pypi.org/simple。source=pypi 的变体与所有依赖从这里安装
+#   PIP_INDEX_URL     PyPI 或其镜像。source=pypi 的变体与所有依赖从这里安装；没有设置时使用 pip 自己的配置
+#                     （pip.conf 中的镜像，没有时为 https://pypi.org/simple）
 #   TORCH_INDEX_URL   PyTorch 官方索引（PEP 503）的基础地址，默认 https://download.pytorch.org/whl，
 #                     实际使用 <TORCH_INDEX_URL>/<variant>
 #   TORCH_FIND_LINKS  扁平目录形式的 PyTorch 镜像基础地址（如 https://mirrors.aliyun.com/pytorch-wheels），
@@ -92,7 +93,8 @@ if [ -z "$python" ]; then
 	fi
 fi
 
-pip_index="${PIP_INDEX_URL:-https://pypi.org/simple}"
+# PIP_INDEX_URL 没有设置时不传 --index-url：命令行参数会覆盖 pip.conf，裸机上配置好的 PyPI 镜像就用不上了。
+pip_index="${PIP_INDEX_URL:-}"
 torch_index="${TORCH_INDEX_URL:-https://download.pytorch.org/whl}"
 find_links="${TORCH_FIND_LINKS:-}"
 
@@ -100,15 +102,21 @@ pip_cmd=("$python" -m pip install)
 case "$source" in
 pypi)
 	# PyPI 上的 Linux 版 torch 就是该 CUDA 版本的构建，版本号不带后缀。
-	pip_cmd+=(--index-url "$pip_index" "torch==$torch_version" "torchvision==$torchvision_version")
+	if [ -n "$pip_index" ]; then pip_cmd+=(--index-url "$pip_index"); fi
+	pip_cmd+=("torch==$torch_version" "torchvision==$torchvision_version")
 	;;
 pytorch)
 	if [ -n "$find_links" ]; then
-		# 扁平目录镜像只有 torch / torchvision 的 wheel，其余依赖（nvidia-* 运行库等）从 PIP_INDEX_URL 安装。
-		pip_cmd+=(--index-url "$pip_index" --find-links "${find_links%/}/$variant/")
-	else
+		# 扁平目录镜像只有 torch / torchvision 的 wheel，其余依赖（nvidia-* 运行库等）从 PyPI（或其镜像）安装。
+		if [ -n "$pip_index" ]; then pip_cmd+=(--index-url "$pip_index"); fi
+		pip_cmd+=(--find-links "${find_links%/}/$variant/")
+	elif [ -n "$pip_index" ]; then
 		# 官方索引也提供全部依赖；加上 PIP_INDEX_URL 作为备用，镜像索引缺少某个依赖时也能装上。
 		pip_cmd+=(--index-url "${torch_index%/}/$variant" --extra-index-url "$pip_index")
+	else
+		# 没有指定 PyPI 镜像：pip 配置的索引（pip.conf 中的镜像或 PyPI）仍是主索引，依赖优先从那里下载；
+		# 带 +<变体> 后缀的 torch / torchvision 只在 PyTorch 索引中，从那里安装。
+		pip_cmd+=(--extra-index-url "${torch_index%/}/$variant")
 	fi
 	pip_cmd+=("torch==$torch_version+$variant" "torchvision==$torchvision_version+$variant")
 	;;
@@ -171,7 +179,7 @@ got_vision="${current[2]:-}"
 if ! matches "$got_torch" "$got_cuda" "$got_vision"; then
 	echo "install-torch: 安装结果与变体 $variant 不一致：" >&2
 	echo "  torch $got_torch（应为 $torch_version），torch.version.cuda 为 $got_cuda（应为 $expected_cuda），torchvision $got_vision（应为 $torchvision_version）" >&2
-	echo "  通常是镜像源中没有对应的构建、pip 改装了其它版本。请检查 PIP_INDEX_URL、TORCH_INDEX_URL、TORCH_FIND_LINKS 的设置。" >&2
+	echo "  通常是镜像源中没有对应的构建、pip 改装了其它版本。请检查 PIP_INDEX_URL、TORCH_INDEX_URL、TORCH_FIND_LINKS 与 pip 配置（pip.conf）中的镜像。" >&2
 	exit 1
 fi
 echo "install-torch: 已安装 torch $got_torch（CUDA ${got_cuda/#None/无}）、torchvision $got_vision"

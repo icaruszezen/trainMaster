@@ -60,6 +60,40 @@ def test_full_configuration(tmp_path):
     assert cfg.log_level == logging.DEBUG
 
 
+def test_compose_deployment_settings(tmp_path):
+    cfg = config.load(base_env(tmp_path))
+    assert cfg.trainer_service is None and cfg.trainer_mode is None
+    assert cfg.trainer_variant is None
+    cfg = config.load(
+        base_env(
+            tmp_path,
+            TM_TRAINER_SERVICE=" trainer-cpu ",
+            TM_TRAINER_MODE=" cpu ",
+            TM_TRAINER_VARIANT=" cu126 ",
+        )
+    )
+    assert cfg.trainer_service == "trainer-cpu"
+    assert cfg.trainer_mode == "cpu"
+    assert cfg.trainer_variant == "cu126"
+    # auto 表示没有固定变体
+    assert config.load(base_env(tmp_path, TM_TRAINER_VARIANT="auto")).trainer_variant is None
+
+
+def test_invalid_compose_deployment_settings(tmp_path):
+    with pytest.raises(ConfigError) as info:
+        config.load(base_env(tmp_path, TM_TRAINER_SERVICE="train er"))
+    message = str(info.value)
+    assert "TM_TRAINER_SERVICE" in message and "compose 服务名" in message
+
+
+@pytest.mark.parametrize("value", ["fast", "CPU", "Auto"])
+def test_invalid_trainer_mode_is_auto_like_make_setup(tmp_path, value):
+    # make setup 只认 auto / gpu / cpu / off（区分大小写），其它值警告后按 auto 处理：
+    # 训练节点同样按 auto 处理，不因为只用于修复建议的设置而无法启动。
+    assert config.load(base_env(tmp_path, TM_TRAINER_MODE=value)).trainer_mode is None
+    assert config.load(base_env(tmp_path, TM_TRAINER_MODE="off")).trainer_mode == "off"
+
+
 def test_server_url_required_for_run(tmp_path):
     with pytest.raises(ConfigError) as info:
         config.load(base_env(tmp_path), require_server=True)
@@ -196,6 +230,19 @@ def test_state_dir_candidates(tmp_path):
     assert len(candidates) == 3
     # 配置值与退回目录相同时不重复
     assert len(config.state_dir_candidates(candidates[1], home=str(tmp_path / "home"))) == 2
+
+
+def test_healthcheck_dirs_include_puid_temp_dir(tmp_path, monkeypatch):
+    # HEALTHCHECK 以 root 运行，训练节点以 PUID 运行：也查找 PUID 的临时目录。
+    monkeypatch.setattr(config.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+    configured = tmp_path / "configured"
+    dirs = config.healthcheck_dirs(configured, {"HOME": str(tmp_path / "home"), "PUID": "1000"})
+    assert dirs[:2] == config.state_dir_candidates(configured, home=str(tmp_path / "home"))[:2]
+    assert dirs[-1] == tmp_path / "tmp" / "trainmaster-1000"
+    assert tmp_path / "tmp" / f"trainmaster-{os.getuid()}" in dirs
+    # 没有 PUID、PUID 不是数字或与当前用户相同时不重复添加
+    for env in ({}, {"PUID": "abc"}, {"PUID": str(os.getuid())}):
+        assert config.healthcheck_dirs(configured, env) == config.state_dir_candidates(configured)
 
 
 def test_unwritable_state_dir_falls_back_to_home(tmp_path):

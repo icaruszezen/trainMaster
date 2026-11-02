@@ -18,7 +18,7 @@ fails=0
 run_entry() { # run_entry <参数…>：输出存入 out，退出码存入 code
 	set +e
 	out="$(env PATH="$tmp/bin:$PATH" PUID="${PUID:-$(id -u)}" PGID="${PGID:-$(id -g)}" \
-		TM_STATE_DIR="$tmp/state" sh "$entrypoint" "$@" 2>&1)"
+		TM_STATE_DIR="$tmp/state" TM_DEV_DIR="${TM_DEV_DIR:-$tmp/no-dev}" sh "$entrypoint" "$@" 2>&1)"
 	code=$?
 	set -e
 }
@@ -63,6 +63,43 @@ if [ "$uid" = 0 ]; then
 	check "drop privileges" "python -m trainmaster_trainer probe uid=1234" "$out"
 	check "state dir owner" "1234:2345" "$(stat -c %u:%g "$tmp/state")"
 	check "not recursive" "0:0" "$(stat -c %u:%g "$tmp/state/sub")"
+
+	# 不继承 root 的附加组
+	PUID=1234 PGID=2345 run_entry id -G
+	check "no supplementary groups" "2345" "$out"
+
+	# /dev/nvidia* 对所有用户开放（默认）：不需要附加组
+	mkdir -p "$tmp/dev"
+	for dev in nvidiactl nvidia-uvm nvidia0; do
+		: >"$tmp/dev/$dev"
+		chmod 666 "$tmp/dev/$dev"
+	done
+	TM_DEV_DIR="$tmp/dev" PUID=1234 PGID=2345 run_entry id -G
+	check "world-accessible devices" "2345" "$out"
+
+	# 设备只对属组开放（NVreg_DeviceFileMode=0660、NVreg_DeviceFileGID=video）：加入该组
+	chgrp 3456 "$tmp/dev/nvidiactl" "$tmp/dev/nvidia0"
+	chmod 660 "$tmp/dev/nvidiactl" "$tmp/dev/nvidia0"
+	: >"$tmp/dev/nvidia1"
+	chgrp 2345 "$tmp/dev/nvidia1"
+	chmod 660 "$tmp/dev/nvidia1"
+	TM_DEV_DIR="$tmp/dev" PUID=1234 PGID=2345 run_entry id -G
+	check "device group added" "2345 3456" "$out"
+
+	# 只允许 root 访问：不加入 root 组，给出提示
+	chgrp 0 "$tmp/dev/nvidiactl" "$tmp/dev/nvidia0"
+	TM_DEV_DIR="$tmp/dev" PUID=1234 PGID=2345 run_entry id -G
+	check "root-only device exit code" 0 "$code"
+	case "$out" in
+	*"只允许 root 访问"*) ;;
+	*) check "root-only device warning" "只允许 root 访问" "$out" ;;
+	esac
+	check "root group not added" "2345" "$(printf '%s\n' "$out" | tail -n 1)"
+
+	# 以 root 运行（PUID=0）：能访问所有设备，不提示
+	TM_DEV_DIR="$tmp/dev" PUID=0 PGID=2345 run_entry id -G
+	check "root puid exit code" 0 "$code"
+	check "root puid no warning" "2345" "$out"
 fi
 
 if [ "$fails" -gt 0 ]; then

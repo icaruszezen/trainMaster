@@ -131,15 +131,28 @@ class NvmlSession:
         return getattr(exc, "value", None) == code
 
     def call(self, name: str, *args: Any) -> Any:
-        """调用 NVML 函数；函数不存在（旧版 nvidia-ml-py）或返回 NVML 错误时为 None。"""
+        """调用 NVML 函数；函数不存在（旧版 nvidia-ml-py）或返回 NVML 错误时为 None。
+
+        驱动的 libnvidia-ml 比 nvidia-ml-py 旧时，不带版本号的函数（如 nvmlDeviceGetComputeRunningProcesses
+        调用的 _v3 只有 R510 起的驱动才有）抛出 NVMLLibraryMismatchError，它不是 NVMLError 的子类，同样按
+        该字段不可用处理，不影响其它字段。
+        """
         fn = getattr(self.nvml, name, None)
         if fn is None:
             return None
+        mismatch = getattr(self.nvml, "NVMLLibraryMismatchError", self.nvml.NVMLError)
         try:
             return fn(*args)
-        except self.nvml.NVMLError as exc:
+        except (self.nvml.NVMLError, mismatch) as exc:
             log.debug("%s failed: %s", name, exc)
             return None
+
+    def process_count(self, handle: Any) -> int | None:
+        """正在使用该显卡的计算进程数。旧驱动没有 _v3 时退回 _v2（R450 起都有）。"""
+        processes = self.call("nvmlDeviceGetComputeRunningProcesses", handle)
+        if processes is None:
+            processes = self.call("nvmlDeviceGetComputeRunningProcesses_v2", handle)
+        return len(processes) if isinstance(processes, (list, tuple)) else None
 
     def driver_info(self) -> dict[str, Any] | None:
         driver = _text(self.call("nvmlSystemGetDriverVersion"))
@@ -202,7 +215,6 @@ class NvmlSession:
         util = self.call("nvmlDeviceGetUtilizationRates", handle)
         memory = self.call("nvmlDeviceGetMemoryInfo", handle)
         temp_sensor = getattr(self.nvml, "NVML_TEMPERATURE_GPU", 0)
-        processes = self.call("nvmlDeviceGetComputeRunningProcesses", handle)
         return {
             "index": index,
             "utilization_percent": _int_or_none(getattr(util, "gpu", None)),
@@ -213,7 +225,7 @@ class NvmlSession:
             ),
             "power_watts": _watts(self.call("nvmlDeviceGetPowerUsage", handle)),
             "fan_percent": _int_or_none(self.call("nvmlDeviceGetFanSpeed", handle)),
-            "process_count": len(processes) if isinstance(processes, (list, tuple)) else None,
+            "process_count": self.process_count(handle),
         }
 
 

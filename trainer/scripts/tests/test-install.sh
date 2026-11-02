@@ -63,10 +63,12 @@ fake_smi() {
 	printf '%s' "$path"
 }
 
-dry() { # dry <nvidia-smi> <参数…>：以 --dry-run 运行 install.sh
+dry() { # dry <nvidia-smi> <参数…>：以 --dry-run 运行 install.sh（不读取本机已安装的 systemd 服务）
 	local smi="$1"
 	shift
-	run_cmd env TM_NVIDIA_SMI="$smi" TM_MACHINE="${MACHINE:-x86_64}" bash "$install" --dry-run "$@"
+	run_cmd env -u PIP_INDEX_URL -u TORCH_INDEX_URL -u TORCH_FIND_LINKS TM_NVIDIA_SMI="$smi" \
+		TM_MACHINE="${MACHINE:-x86_64}" TM_SYSTEMD_UNIT_DIR="${UNIT_DIR:-$tmp/no-units}" \
+		bash "$install" --dry-run "$@"
 }
 
 URL=http://10.0.0.5:8080
@@ -85,9 +87,9 @@ run_cmd bash "$install" --help
 expect_code "help" 0
 contains "help" "用法：install.sh --server-url URL"
 
-run_cmd bash "$install"
-expect_code "no args" 2
-contains "no args" "缺少 --server-url"
+run_cmd bash "$install" --prefix "$tmp/none"
+expect_code "no server url" 2
+contains "no server url" "缺少 --server-url"
 
 run_cmd bash "$install" --server-url "$URL" --bogus
 expect_code "unknown option" 2
@@ -158,7 +160,9 @@ contains "4090" "驱动：580.82.07"
 contains "4090" "推荐的 PyTorch 变体：cu130 —— 驱动 580.82.07 支持 CUDA 13.0"
 contains "4090" "+ python3 -m venv /opt/trainmaster-trainer"
 contains "4090" "install-torch.sh cu130 --python /opt/trainmaster-trainer/bin/python"
-contains "4090" "--index-url https://pypi.org/simple torch==2.14.1 torchvision==0.29.1"
+# 没有设置 PIP_INDEX_URL：不传 --index-url，pip.conf 中的镜像仍然有效
+contains "4090" "-m pip install torch==2.14.1 torchvision==0.29.1"
+not_contains "4090" "--index-url"
 contains "4090" "== 配置文件 /opt/trainmaster-trainer/trainer.env（权限 600）=="
 contains "4090" 'TM_SERVER_URL="http://10.0.0.5:8080"'
 contains "4090" 'TM_NODE_TOKEN="<已隐藏，共 20 个字符>"'
@@ -166,6 +170,7 @@ contains "4090" 'TM_NODE_NAME="机房 \"A\" \$HOME \`x\` \\n"'
 contains "4090" 'TM_TORCH_VARIANT="cu130"'
 contains "4090" 'TM_STATE_DIR="/var/lib/trainmaster"'
 contains "4090" 'TM_DATA_DIR="/data"'
+contains "4090" 'CUDA_DEVICE_ORDER="PCI_BUS_ID"'
 contains "4090" "以上为预览（--dry-run），没有做任何修改。"
 not_contains "4090" "$token"
 not_contains "4090" "systemctl"
@@ -173,7 +178,7 @@ not_contains "4090" "systemctl"
 dry "$smi_3090_550" --server-url "$URL" --prefix /srv/tm
 expect_code "3090 driver 550" 0
 contains "3090 driver 550" "推荐的 PyTorch 变体：cu126"
-contains "3090 driver 550" "--index-url https://download.pytorch.org/whl/cu126 --extra-index-url https://pypi.org/simple torch==2.14.1+cu126 torchvision==0.29.1+cu126"
+contains "3090 driver 550" "-m pip install --extra-index-url https://download.pytorch.org/whl/cu126 torch==2.14.1+cu126 torchvision==0.29.1+cu126"
 contains "3090 driver 550" "== 配置文件 /srv/tm/trainer.env"
 contains "3090 driver 550" "+ /srv/tm/bin/python -m pip install --no-deps --force-reinstall $(dirname "$scripts")"
 contains "3090 driver 550" 'TM_NODE_TOKEN=""'
@@ -232,7 +237,7 @@ contains "key=value" 'TM_DATA_DIR="/srv/data"'
 contains "key=value" "== 配置文件 /etc/trainmaster.env"
 contains "key=value" "+ mkdir -p /srv/state"
 
-dry "$no_smi" --server-url "$URL" --systemd --env-file /etc/trainmaster.env
+UNIT_DIR=/etc/systemd/system dry "$no_smi" --server-url "$URL" --systemd --env-file /etc/trainmaster.env
 expect_code "systemd" 0
 contains "systemd" "== systemd 服务 /etc/systemd/system/trainmaster-trainer.service =="
 contains "systemd" "EnvironmentFile=/etc/trainmaster.env"
@@ -249,27 +254,111 @@ expect_code "systemd user" 0
 contains "systemd user" "User=svc-train"
 contains "systemd user" "+ chown svc-train: /var/lib/trainmaster"
 
+# ---- 重新运行：沿用已有的配置文件与 systemd 服务 ----
+
+existing_env="$tmp/existing.env"
+cat >"$existing_env" <<'EOF'
+# 旧的注释
+TM_SERVER_URL="http://10.0.0.9:8080"
+TM_NODE_TOKEN="tok-\$abc\"def"
+TM_NODE_NAME='机房 B'
+TM_TORCH_VARIANT="cu126"
+TM_STATE_DIR=/srv/tm-state
+TM_DATA_DIR="/srv/tm-data"
+export TM_LOG_LEVEL=debug
+CUDA_VISIBLE_DEVICES="0"
+EOF
+dry "$no_smi" --env-file "$existing_env" --variant cu128
+expect_code "reuse env" 0
+contains "reuse env" "沿用配置文件 $existing_env 中的 TM_SERVER_URL TM_NODE_TOKEN TM_NODE_NAME TM_STATE_DIR TM_DATA_DIR"
+contains "reuse env" 'TM_SERVER_URL="http://10.0.0.9:8080"'
+contains "reuse env" 'TM_NODE_TOKEN="<已隐藏，共 12 个字符>"'
+contains "reuse env" 'TM_NODE_NAME="机房 B"'
+contains "reuse env" 'TM_TORCH_VARIANT="cu128"'
+contains "reuse env" 'TM_STATE_DIR="/srv/tm-state"'
+contains "reuse env" 'TM_DATA_DIR="/srv/tm-data"'
+contains "reuse env" 'CUDA_DEVICE_ORDER="PCI_BUS_ID"'
+contains "reuse env" $'\nTM_LOG_LEVEL=debug\nCUDA_VISIBLE_DEVICES="0"'
+contains "reuse env" "+ mkdir -p /srv/tm-state"
+not_contains "reuse env" "旧的注释"
+not_contains "reuse env" "systemctl"
+
+# 参数优先于配置文件
+dry "$no_smi" --env-file "$existing_env" --server-url "$URL" --name gpu-02 --state-dir /srv/other
+contains "reuse override" "沿用配置文件 $existing_env 中的 TM_NODE_TOKEN TM_DATA_DIR"
+contains "reuse override" 'TM_SERVER_URL="http://10.0.0.5:8080"'
+contains "reuse override" 'TM_NODE_NAME="gpu-02"'
+contains "reuse override" 'TM_STATE_DIR="/srv/other"'
+
+# 配置文件中没有平台地址时仍然需要 --server-url
+printf 'TM_NODE_TOKEN="x"\n' >"$tmp/no-url.env"
+dry "$no_smi" --env-file "$tmp/no-url.env"
+expect_code "reuse without url" 2
+contains "reuse without url" "缺少 --server-url"
+
+# 已安装本安装目录的 systemd 服务：不加 --systemd 也更新并重启它，沿用运行用户
+mkdir -p "$tmp/units-default" "$tmp/units-other"
+printf '[Service]\nUser=svc-train\nEnvironmentFile=/opt/trainmaster-trainer/trainer.env\nExecStart=/opt/trainmaster-trainer/bin/python -m trainmaster_trainer run\n' \
+	>"$tmp/units-default/trainmaster-trainer.service"
+UNIT_DIR="$tmp/units-default" dry "$no_smi" --server-url "$URL"
+expect_code "systemd found" 0
+contains "systemd found" "已安装 systemd 服务 $tmp/units-default/trainmaster-trainer.service：安装后更新并重启它"
+contains "systemd found" "User=svc-train"
+contains "systemd found" "+ systemctl restart trainmaster-trainer.service"
+# 加上 --systemd 时同样沿用运行用户；--user 优先
+UNIT_DIR="$tmp/units-default" dry "$no_smi" --server-url "$URL" --systemd
+expect_code "systemd found explicit" 0
+contains "systemd found explicit" "User=svc-train"
+not_contains "systemd found explicit" "已安装 systemd 服务"
+UNIT_DIR="$tmp/units-default" dry "$no_smi" --server-url "$URL" --user other-user
+contains "systemd found user override" "User=other-user"
+not_contains "systemd found user override" "User=svc-train"
+# 首次安装用 --env-file 指定了其它配置文件：重新运行时从已安装的服务中找到它
+mkdir -p "$tmp/units-envfile"
+printf '[Service]\nEnvironmentFile=%s\nExecStart=/opt/trainmaster-trainer/bin/python -m trainmaster_trainer run\n' \
+	"$existing_env" >"$tmp/units-envfile/trainmaster-trainer.service"
+UNIT_DIR="$tmp/units-envfile" dry "$no_smi" --variant cu128
+expect_code "unit env file" 0
+contains "unit env file" "沿用配置文件 $existing_env 中的 TM_SERVER_URL TM_NODE_TOKEN"
+contains "unit env file" "== 配置文件 $existing_env（权限 600）=="
+contains "unit env file" "EnvironmentFile=$existing_env"
+contains "unit env file" "+ systemctl restart trainmaster-trainer.service"
+# 其它安装目录的服务不受影响
+printf '[Service]\nExecStart=/srv/other/bin/python -m trainmaster_trainer run\n' >"$tmp/units-other/trainmaster-trainer.service"
+UNIT_DIR="$tmp/units-other" dry "$no_smi" --server-url "$URL"
+expect_code "other unit" 0
+not_contains "other unit" "systemctl"
+not_contains "other unit" "已安装 systemd 服务"
+
 # ---- install-torch.sh --dry-run ----
 
 torch_dry() { # torch_dry <参数…>
 	run_cmd env -u PIP_INDEX_URL -u TORCH_INDEX_URL -u TORCH_FIND_LINKS "$@"
 }
 
+# 没有设置 PIP_INDEX_URL 时不传 --index-url（命令行参数会覆盖 pip.conf 中的镜像）
 torch_dry bash "$install_torch" cu130 --python py --dry-run
 expect_code "torch cu130" 0
-contains "torch cu130" "+ py -m pip install --index-url https://pypi.org/simple torch==2.14.1 torchvision==0.29.1"
+contains "torch cu130" "+ py -m pip install torch==2.14.1 torchvision==0.29.1"
 
 torch_dry PIP_INDEX_URL=https://mirrors.example.com/pypi/simple bash "$install_torch" cu130 --python py --dry-run
-contains "torch pip mirror" "--index-url https://mirrors.example.com/pypi/simple torch==2.14.1"
+contains "torch pip mirror" "+ py -m pip install --index-url https://mirrors.example.com/pypi/simple torch==2.14.1"
 
+# PyTorch 索引作为额外索引：pip 配置的索引仍是主索引
 torch_dry bash "$install_torch" cu118 --python=py --dry-run
-contains "torch cu118" "+ py -m pip install --index-url https://download.pytorch.org/whl/cu118 --extra-index-url https://pypi.org/simple torch==2.7.1+cu118 torchvision==0.22.1+cu118"
+contains "torch cu118" "+ py -m pip install --extra-index-url https://download.pytorch.org/whl/cu118 torch==2.7.1+cu118 torchvision==0.22.1+cu118"
+
+torch_dry PIP_INDEX_URL=https://mirrors.example.com/pypi/simple bash "$install_torch" cu126 --python py --dry-run
+contains "torch cu126 pip mirror" "+ py -m pip install --index-url https://download.pytorch.org/whl/cu126 --extra-index-url https://mirrors.example.com/pypi/simple torch==2.14.1+cu126"
 
 torch_dry TORCH_INDEX_URL=https://torch.example.com/whl/ bash "$install_torch" cu128 --python py --dry-run
-contains "torch index" "--index-url https://torch.example.com/whl/cu128 --extra-index-url https://pypi.org/simple torch==2.11.0+cu128 torchvision==0.26.0+cu128"
+contains "torch index" "+ py -m pip install --extra-index-url https://torch.example.com/whl/cu128 torch==2.11.0+cu128 torchvision==0.26.0+cu128"
 
 torch_dry TORCH_FIND_LINKS=https://mirrors.example.com/pytorch-wheels/ PIP_INDEX_URL=https://mirrors.example.com/pypi/simple bash "$install_torch" cu126 --python py --dry-run
 contains "torch find-links" "--index-url https://mirrors.example.com/pypi/simple --find-links https://mirrors.example.com/pytorch-wheels/cu126/ torch==2.14.1+cu126 torchvision==0.29.1+cu126"
+
+torch_dry TORCH_FIND_LINKS=https://mirrors.example.com/pytorch-wheels bash "$install_torch" cu126 --python py --dry-run
+contains "torch find-links without pip mirror" "+ py -m pip install --find-links https://mirrors.example.com/pytorch-wheels/cu126/ torch==2.14.1+cu126"
 
 torch_dry bash "$install_torch" cpu --python py --dry-run
 contains "torch cpu" "（变体 cpu，CUDA 无）"
@@ -358,6 +447,7 @@ check "env token" "$token" "$(env_value "$tmp/venv1/trainer.env" TM_NODE_TOKEN)"
 check "env url" "$URL" "$(env_value "$tmp/venv1/trainer.env" TM_SERVER_URL)"
 check "env variant" cpu "$(env_value "$tmp/venv1/trainer.env" TM_TORCH_VARIANT)"
 check "env state dir" "$tmp/venv1-state" "$(env_value "$tmp/venv1/trainer.env" TM_STATE_DIR)"
+check "env cuda order" PCI_BUS_ID "$(env_value "$tmp/venv1/trainer.env" CUDA_DEVICE_ORDER)"
 unit="$tmp/units/trainmaster-trainer.service"
 [ -f "$unit" ] || fail "real install: unit file not written"
 check "unit mode" 644 "$(stat -c %a "$unit")"
@@ -371,22 +461,46 @@ for expected in "-m venv $tmp/venv1" "-m pip install --upgrade pip" "-m pip inst
 done
 [ -z "$(find "$tmp/venv1" "$tmp/units" -name '.*' -newer "$tmp/bin/fakepy")" ] || fail "real install: temporary files left behind"
 
-# 再次运行：复用虚拟环境，变体不变时不卸载 torch
-real venv1 --server-url "$URL" --token "$token"
+# 再次运行（训练节点修复建议中的命令）：只指定变体。复用虚拟环境，变体不变时不卸载 torch；
+# 平台地址、令牌、名称、目录与手动添加的设置沿用，已安装的 systemd 服务更新并重启。
+printf 'TM_LOG_LEVEL="debug"\nexport CUDA_VISIBLE_DEVICES=0\n' >>"$tmp/venv1/trainer.env"
+rerun() {
+	: >"$tmp/venv1.log"
+	run_cmd env PATH="$tmp/bin:$PATH" FAKE_LOG="$tmp/venv1.log" FAKE_TORCH="$tmp/venv1.torch" \
+		TM_NVIDIA_SMI="$no_smi" TM_MACHINE=x86_64 TM_SYSTEMD_UNIT_DIR="$tmp/units" \
+		bash "$install" --prefix "$tmp/venv1" --variant cpu
+}
+rerun
 expect_code "rerun" 0
 contains "rerun" "复用已有的虚拟环境 $tmp/venv1"
+contains "rerun" "沿用配置文件 $tmp/venv1/trainer.env 中的 TM_SERVER_URL TM_NODE_TOKEN TM_NODE_NAME TM_STATE_DIR TM_DATA_DIR"
+contains "rerun" "已安装 systemd 服务 $tmp/units/trainmaster-trainer.service：安装后更新并重启它"
+contains "rerun" "训练节点已作为 systemd 服务运行"
 not_contains "rerun" "卸载已安装的 torch"
-contains "rerun" "手动运行训练节点："
+not_contains "rerun" "$token"
+check "rerun token" "$token" "$(env_value "$tmp/venv1/trainer.env" TM_NODE_TOKEN)"
+check "rerun name" "$weird_name" "$(env_value "$tmp/venv1/trainer.env" TM_NODE_NAME)"
+check "rerun url" "$URL" "$(env_value "$tmp/venv1/trainer.env" TM_SERVER_URL)"
+check "rerun state dir" "$tmp/venv1-state" "$(env_value "$tmp/venv1/trainer.env" TM_STATE_DIR)"
+check "rerun data dir" "$tmp" "$(env_value "$tmp/venv1/trainer.env" TM_DATA_DIR)"
+check "rerun log level" debug "$(env_value "$tmp/venv1/trainer.env" TM_LOG_LEVEL)"
+check "rerun visible devices" 0 "$(env_value "$tmp/venv1/trainer.env" CUDA_VISIBLE_DEVICES)"
+check "rerun env file mode" 600 "$(stat -c %a "$tmp/venv1/trainer.env")"
+grep -qx "systemctl restart trainmaster-trainer.service" "$tmp/venv1.log" || fail "rerun: service not restarted"
+first="$(cat "$tmp/venv1/trainer.env")"
+rerun
+check "rerun is stable" "$first" "$(cat "$tmp/venv1/trainer.env")"
 
 # 自检失败不影响安装结果，但给出提示
 FAKE_SELFTEST=1 real venv1 --server-url "$URL"
 expect_code "selftest failed" 0
 contains "selftest failed" "安装完成，但自检发现问题"
 
-# 装上的 torch 与变体不一致（例如镜像源给了 CUDA 版）时失败
+# 装上的 torch 与变体不一致（例如镜像源给了 CUDA 版）时失败；其它安装目录不会接管已有的 systemd 服务
 FAKE_CUDA=12.6 real venv2 --server-url "$URL"
 expect_code "torch mismatch" 1
 contains "torch mismatch" "安装结果与变体 cpu 不一致"
+not_contains "torch mismatch" "已安装 systemd 服务"
 
 # 安装目录已存在但不是虚拟环境
 mkdir -p "$tmp/notvenv"
