@@ -80,7 +80,7 @@
 
 - **自动识别硬件**：显卡型号、显存、计算能力、驱动与 CUDA 版本，CPU 型号与核数、内存、数据盘与 `/dev/shm`；实时显示每块显卡的利用率、显存、温度、功率，以及 CPU 与内存占用和最近的变化曲线（曲线只保存在平台服务的内存中，重启后清空）。
 - **自动准备 YOLO 的 CUDA 环境**：按驱动与显卡自动选择 PyTorch 的 CUDA 版本（见下表），训练节点镜像中预装对应的 PyTorch、torchvision 与 Ultralytics；CUDA 运行库随 PyTorch 安装，宿主机只需要 NVIDIA 驱动。节点启动后检测 CUDA 是否可用，在每块显卡上做一次计算并用 YOLO11n 做一次前向推理（不下载权重、不访问外网）；驱动过旧、显卡架构不受支持、显卡没有传入容器等问题会在页面上给出原因与修复命令，修复后可以在页面上“重新检测”。
-- **自动配置 Docker 的显卡**：`make setup`（`make up` 会先自动执行它）检测显卡、驱动，并实际运行一次 `docker run --gpus all … nvidia-smi -L` 验证 Docker 能否使用显卡，据此在 `.env` 中启用 GPU 或 CPU 训练节点、选好 PyTorch 版本、生成节点令牌。Docker 还不能使用显卡时，`make setup SETUP_ARGS=--install-toolkit` 按发行版（apt / dnf / yum / zypper）安装并配置 NVIDIA Container Toolkit——每条需要 root 的命令都先列出并确认。
+- **自动配置 Docker 的显卡**：`make setup`（`make up` 会先自动执行它）检测显卡、驱动，并实际运行一次 `docker run --gpus all … nvidia-smi -L` 验证 Docker 能否使用显卡，据此在 `.env` 中启用 GPU 或 CPU 训练节点、选好 PyTorch 版本、生成节点令牌。Docker 还不能使用显卡时，`make up SETUP_ARGS="--install-toolkit"` 按发行版（apt / dnf / yum / zypper）安装并配置 NVIDIA Container Toolkit（已安装时只配置并重启 Docker，Docker 已能使用显卡时什么也不做），再启动 GPU 训练节点——每条需要 root 的命令都先列出并确认；snap 版、rootless 模式的 Docker 与没有 systemd 的 WSL 给出手动步骤。
 - **平台服务器**：页面同时显示平台所在机器的 CPU、内存、负载与检测到的 NVIDIA 显卡；机器上有显卡但还没有 GPU 训练节点在线时会给出提示。
 
 PyTorch 版本的选择规则（变体表 [`trainer/trainmaster_trainer/torch_variants.txt`](trainer/trainmaster_trainer/torch_variants.txt)）：按下表顺序，取第一个**驱动版本满足、且支持全部显卡**的变体；一个都不满足时使用 CPU 版。
@@ -99,8 +99,8 @@ PyTorch 版本的选择规则（变体表 [`trainer/trainmaster_trainer/torch_va
 
 | 方式 | 做法 |
 |---|---|
-| 平台所在机器（Docker） | `make setup && make up`：有可用的显卡时启动 GPU 训练节点（`trainer` 服务），否则启动 CPU 训练节点（`trainer-cpu`） |
-| 其它 GPU 机器（Docker） | 克隆本仓库，`make setup SETUP_ARGS="--server-url http://<平台IP>:8080 --token <令牌>"`（令牌即平台 `.env` 中的 `TM_NODE_TOKEN`），再按输出的提示只启动训练节点：`docker compose up -d --build trainer`（CPU 时为 `trainer-cpu`） |
+| 平台所在机器（Docker） | `make up`（先自动执行 `make setup`）：有可用的显卡时启动 GPU 训练节点（`trainer` 服务），否则启动 CPU 训练节点（`trainer-cpu`）；Docker 还不能使用显卡时用 `make up SETUP_ARGS="--install-toolkit"` |
+| 其它 GPU 机器（Docker） | 克隆本仓库，`make setup SETUP_ARGS="--server-url http://<平台IP>:8080 --token <令牌>"`（令牌即平台 `.env` 中的 `TM_NODE_TOKEN`），再只启动训练节点：`docker compose up -d --build trainer`（按 `make setup` 最后输出的服务名，选择 CPU 时为 `trainer-cpu`；需要时加 `--install-toolkit` 让脚本安装 NVIDIA Container Toolkit）。不要在这台机器上运行 `make up`，它会再启动一套平台 |
 | 不用 Docker | `sudo trainer/scripts/install.sh --server-url http://<平台IP>:8080 --token <令牌> --systemd`：安装到虚拟环境并注册为 systemd 服务 |
 
 完整说明（手动配置、只使用部分显卡、国内镜像、常见问题）见 [部署文档 · GPU 训练节点](docs/deployment.md#10-gpu-训练节点)。训练任务的排队与调度将在后续迭代中实现。
@@ -120,16 +120,16 @@ PyTorch 版本的选择规则（变体表 [`trainer/trainmaster_trainer/torch_va
 
 ## 快速开始（Docker 部署）
 
-需要 Docker Engine 24+ 与 Docker Compose v2。使用 GPU 训练还需要 NVIDIA 驱动与 NVIDIA Container Toolkit（`make setup` 会检查，加 `SETUP_ARGS=--install-toolkit` 可自动安装）。
+需要 Docker Engine 24+ 与 Docker Compose v2。使用 GPU 训练还需要 NVIDIA 驱动与 NVIDIA Container Toolkit（`make setup` 会检查，`make up SETUP_ARGS="--install-toolkit"` 可自动安装）。
 
 ```bash
 git clone https://github.com/icaruszezen/trainMaster.git && cd trainMaster
 cp .env.example .env          # 按需修改端口、数据目录、数据库密码、PUID/PGID
 make setup                    # 检测显卡、驱动与 Docker 的 GPU 支持，把训练节点配置写入 .env
-make up                       # 构建并启动（会先再执行一次 make setup），等同 docker compose up -d --build
+make up                       # 再执行一次 make setup，然后先构建并启动 postgres 与 app，再构建并启动训练节点
 ```
 
-`make setup` 的输出会说明检测到的显卡、选择的 GPU / CPU 模式与 PyTorch 版本，以及不能使用 GPU 的原因与修复方法。没有 `make`（如 Windows）时直接 `docker compose up -d --build`：此时不启动训练节点，需要时按 [部署文档第 10 节](docs/deployment.md#10-gpu-训练节点) 在 `.env` 中手动配置。训练节点镜像包含 PyTorch 与 CUDA 运行库，第一次构建需要下载数 GB。
+`make setup` 的输出会说明检测到的显卡、选择的 GPU / CPU 模式与 PyTorch 版本，以及不能使用 GPU 的原因与修复方法。训练节点镜像构建失败（如下载 PyTorch 超时）时 `make up` 只警告，平台照常启动。`make down` 停止并删除全部容器（包括各个 profile 中的训练节点）。没有 `make`（如 Windows）时直接 `docker compose up -d --build`：此时不启动训练节点，需要时按 [部署文档第 10 节](docs/deployment.md#10-gpu-训练节点) 在 `.env` 中手动配置。训练节点镜像包含 PyTorch 与 CUDA 运行库，第一次构建需要下载数 GB。
 
 启动完成后打开 <http://localhost:8080>（或 `http://<服务器IP>:<TM_HTTP_PORT>`）。
 
@@ -158,7 +158,7 @@ data/
 │   ├── exports/       # 导出的训练集（YOLO / VOC / COCO）、打包导出与报告
 │   ├── cache/         # 缩略图等可再生缓存（可随时删除，无需备份）
 │   └── tmp/           # 上传、解压等临时文件
-└── trainer/           # 训练节点的状态目录（TM_HOST_TRAINER_DIR）：节点标识 node-key、心跳文件
+└── trainer/           # 训练节点的状态目录（TM_HOST_TRAINER_DIR）：节点标识 node-key、心跳文件。不要拷贝到其它机器
 ```
 
 - **数据库只存元数据**（数据集、图片索引、导入记录等），图片和模型等大文件都在 `storage/` 下，可以直接用文件管理器、`rsync` 等工具查看和备份。
@@ -187,7 +187,7 @@ rsync -a --delete --exclude /cache/ --exclude /tmp/ "$BACKUP/storage/" "$STORAGE
 docker compose start app
 ```
 
-迁移到新服务器时先 `docker compose down`，再把 `.env` 与**两个数据目录**（`TM_HOST_STORAGE_DIR` 和 `TM_HOST_POSTGRES_DIR`，默认都在 `./data` 下）用 `sudo tar --numeric-owner` 打包拷贝过去，详见 [部署文档第 6 节](docs/deployment.md#6-备份与恢复)。直接拷贝 PostgreSQL 数据目录要求新旧环境的 PostgreSQL 主版本一致（当前为 17）；跨版本请使用 `pg_dump` / `pg_restore`。
+迁移到新服务器时先 `make down`，再把 `.env` 与**两个数据目录**（`TM_HOST_STORAGE_DIR` 和 `TM_HOST_POSTGRES_DIR`，默认都在 `./data` 下）用 `sudo tar --numeric-owner` 打包拷贝过去，详见 [部署文档第 6 节](docs/deployment.md#6-备份与恢复)。直接拷贝 PostgreSQL 数据目录要求新旧环境的 PostgreSQL 主版本一致（当前为 17）；跨版本请使用 `pg_dump` / `pg_restore`。
 
 ## 本地开发
 
