@@ -1373,7 +1373,7 @@ run_setup
 expect_rc 0
 expect_env TM_NODE_NAME old-server
 expect_env TM_HOST_HOSTNAME new-server
-# 关闭训练节点时不为空的 TM_NODE_NAME 写入主机名（与之前相同）
+# 关闭训练节点时，空的 TM_NODE_NAME 保持为空，不写入主机名（与之前相同）
 new_case "node name empty with mode off"
 with_toolkit
 printf 'TM_NODE_NAME=\nTM_HOST_HOSTNAME=old-server\n' >"$ENV"
