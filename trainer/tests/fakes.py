@@ -195,6 +195,7 @@ def make_torch(
     init_error: BaseException | None = None,
     matmul_nan_on: int | None = None,
     autocast_error: BaseException | None = None,
+    capabilities: list[tuple[int, int]] | None = None,
 ) -> types.ModuleType:
     """一个只实现自检用到的接口的 torch；calls 记录调用顺序。"""
     import warnings
@@ -220,12 +221,17 @@ def make_torch(
     def synchronize(i: int) -> None:
         calls.append(f"synchronize {i}")
 
+    def get_device_capability(i: int) -> tuple[int, int]:
+        caps = capabilities or []
+        return caps[i] if i < len(caps) else (8, 9)  # 没有指定时按 RTX 4090（8.9）处理
+
     torch.cuda = types.SimpleNamespace(  # type: ignore[attr-defined]
         is_available=is_available,
         device_count=lambda: device_count,
         get_arch_list=lambda: list(arch_list or []),
         init=init,
         synchronize=synchronize,
+        get_device_capability=get_device_capability,
     )
 
     def randn(*shape: int, device: str = "cpu") -> FakeTensor:

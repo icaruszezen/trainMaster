@@ -124,15 +124,44 @@ def _forward(torch: Any, net: Any, x: Any, label: str) -> None:
         raise RuntimeError(f"{label}: output contains NaN or Inf")
 
 
+def unsupported_devices(torch: Any, cuda_count: int) -> dict[int, str]:
+    """已安装的 PyTorch 没有为其编译代码的 GPU：{CUDA 序号: 计算能力}。无法判断时视为都支持。"""
+    try:
+        arch_list = [str(a) for a in torch.cuda.get_arch_list()]
+    except Exception as exc:
+        log.debug("get_arch_list failed: %s", exc)
+        return {}
+    if not arch_list:
+        return {}
+    out: dict[int, str] = {}
+    for i in range(cuda_count):
+        try:
+            major, minor = (int(v) for v in torch.cuda.get_device_capability(i))
+        except Exception as exc:
+            log.debug("get_device_capability(%d) failed: %s", i, exc)
+            continue
+        if not issues_mod.arch_covers(major * 10 + minor, arch_list):
+            out[i] = f"{major}.{minor}"
+    return out
+
+
 def run_self_test(torch: Any, ultralytics: Any, cuda_count: int) -> dict[str, Any]:
-    """执行自检。有 CUDA 时先在每块 GPU 上做小矩阵乘法，再在 cuda:0 上做 YOLO 前向推理（FP32 与 FP16）；
-    没有 CUDA 时在 CPU 上做前向推理。不访问网络、不下载权重。"""
-    device = "cuda:0" if cuda_count > 0 else "cpu"
+    """执行自检。有 CUDA 时先在每块 GPU 上做小矩阵乘法，再在第一块 GPU 上做 YOLO 前向推理（FP32 与 FP16）；
+    没有 CUDA 时在 CPU 上做前向推理。不访问网络、不下载权重。
+
+    新旧显卡混用时，已安装的 PyTorch 不支持的显卡（如 cu130 与计算能力 6.1 的显卡）不参加自检，
+    其余显卡照常测试，结果中注明跳过了哪些；全部都不支持时照常测试，报告实际的错误。
+    """
+    skipped = unsupported_devices(torch, cuda_count) if cuda_count > 0 else {}
+    devices = [i for i in range(cuda_count) if i not in skipped]
+    if not devices:
+        devices, skipped = list(range(cuda_count)), {}
+    device = f"cuda:{devices[0]}" if devices else "cpu"
     start = time.monotonic()
     stage = "初始化"
     try:
         torch.manual_seed(0)
-        for i in range(cuda_count):
+        for i in devices:
             stage = f"GPU {i} 矩阵乘法"
             a = torch.randn(256, 256, device=f"cuda:{i}")
             b = a @ a
@@ -168,9 +197,14 @@ def run_self_test(torch: Any, ultralytics: Any, cuda_count: int) -> dict[str, An
         }
 
     if cuda_count > 0:
-        message = f"{YOLO_LABEL} 前向推理正常（{cuda_count} 块 GPU，{precision}）"
+        message = f"{YOLO_LABEL} 前向推理正常（{len(devices)} 块 GPU，{precision}）"
         if fp16_error:
             message += f"；FP16 不可用：{fp16_error}"[:200]
+        if skipped:
+            message += (
+                "；跳过已安装的 PyTorch 不支持的 "
+                + "、".join(f"GPU {i}（计算能力 {cc}）" for i, cc in skipped.items())
+            )[:200]
     else:
         message = f"{YOLO_LABEL} 前向推理正常（CPU）"
     return {
@@ -374,6 +408,8 @@ def child_env(
     env.setdefault("YOLO_VERBOSE", "False")
     env["PYTHONUNBUFFERED"] = "1"
     env["TM_SELF_TEST"] = "true" if self_test else "false"
+    # CUDA 默认把最快的显卡排在前面；按 PCI 总线顺序编号才与 NVML / nvidia-smi（页面上的 N 号显卡）一致。
+    env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     # 从源码目录运行（python -m trainmaster_trainer）时让子进程也能导入本包；
     # 已安装到 site-packages 时不需要，也不要把 site-packages 放进 PYTHONPATH（会排在标准库之前）。
     pkg_parent = str(Path(__file__).resolve().parent.parent)

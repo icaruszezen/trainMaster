@@ -90,6 +90,68 @@ def test_collect_cuda_two_gpus(monkeypatch):
     assert "enter autocast cuda float16" in torch.calls
 
 
+@pytest.mark.parametrize(
+    ("capabilities", "tested", "device", "skipped"),
+    [
+        # RTX 5090 + GTX 1080 Ti，cu130 不支持 6.1：只测 5090
+        ([(12, 0), (6, 1)], [0], "cuda:0", "GPU 1（计算能力 6.1）"),
+        # 不支持的显卡排在前面：YOLO 在第一块受支持的显卡上运行
+        ([(6, 1), (12, 0)], [1], "cuda:1", "GPU 0（计算能力 6.1）"),
+    ],
+)
+def test_collect_skips_gpus_the_build_does_not_support(
+    monkeypatch, capabilities, tested, device, skipped
+):
+    torch = make_torch(
+        version="2.14.1",
+        cuda="13.0",
+        available=True,
+        device_count=2,
+        arch_list=["sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"],
+        capabilities=capabilities,
+    )
+    install(monkeypatch, torch, make_torchvision("0.29.1"), make_ultralytics(torch.calls))
+    result = collect()
+    assert result["cuda_device_count"] == 2
+    st = result["self_test"]
+    assert st["status"] == "passed"
+    assert st["device"] == device
+    assert st["message"] == (
+        f"YOLO11n 前向推理正常（1 块 GPU，FP16）；跳过已安装的 PyTorch 不支持的 {skipped}"
+    )
+    assert [c for c in torch.calls if c.startswith("randn")] == [f"randn cuda:{i}" for i in tested]
+    assert torch.calls.count(f"forward {device}") == 2
+
+
+def test_collect_tests_every_gpu_when_none_is_supported(monkeypatch):
+    # 全部不支持时照常测试，让自检报告实际的错误（no kernel image）。
+    torch = make_torch(
+        version="2.14.1",
+        cuda="13.0",
+        available=True,
+        device_count=1,
+        arch_list=["sm_75", "sm_120"],
+        capabilities=[(6, 1)],
+    )
+    install(monkeypatch, torch, make_torchvision("0.29.1"), make_ultralytics(torch.calls))
+    st = collect()["self_test"]
+    assert st["device"] == "cuda:0"
+    assert "randn cuda:0" in torch.calls
+    assert "跳过" not in st["message"]
+
+
+def test_unsupported_devices_unknown_without_arch_list():
+    torch = make_torch(available=True, device_count=2, arch_list=[], capabilities=[(3, 0), (3, 0)])
+    assert environment.unsupported_devices(torch, 2) == {}
+
+    def broken(i):
+        raise RuntimeError("no capability")
+
+    torch = make_torch(available=True, device_count=1, arch_list=["sm_80"])
+    torch.cuda.get_device_capability = broken
+    assert environment.unsupported_devices(torch, 1) == {}
+
+
 def test_collect_fp16_unavailable_still_passes(monkeypatch):
     torch = make_torch(
         version="2.7.1+cu118",
@@ -515,6 +577,13 @@ def test_child_env_pythonpath_for_source_checkout(tmp_path: Path):
     again = environment.child_env(tmp_path, False, base=env)
     assert again["PYTHONPATH"] == env["PYTHONPATH"]
     assert again["TM_SELF_TEST"] == "false"
+
+
+def test_child_env_orders_cuda_devices_like_nvml(tmp_path: Path):
+    # CUDA 序号与 NVML / nvidia-smi 的序号（页面上的 N 号显卡）一致；用户设置的值保留。
+    assert environment.child_env(tmp_path, True, base={})["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    env = environment.child_env(tmp_path, True, base={"CUDA_DEVICE_ORDER": "FASTEST_FIRST"})
+    assert env["CUDA_DEVICE_ORDER"] == "FASTEST_FIRST"
 
 
 def test_summarize_exception_keeps_tail():
