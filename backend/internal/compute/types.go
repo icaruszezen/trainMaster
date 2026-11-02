@@ -27,8 +27,10 @@ type Node struct {
 	Address      string `json:"address"` // client IP of the last registration or heartbeat; may be ""
 	AgentVersion string `json:"agent_version"`
 	Status       string `json:"status"` // StatusOnline or StatusOffline
-	// ProbePending: a user asked for a new probe and the node has not
-	// reported its result yet.
+	// ProbePending: a user asked for a new probe, or the node registered
+	// without an environment (it started and is checking it; Environment
+	// may still hold the result of its previous run), and the node has not
+	// reported the result yet.
 	ProbePending bool      `json:"probe_pending"`
 	RegisteredAt time.Time `json:"registered_at"` // last (re)start of the node
 	LastSeenAt   time.Time `json:"last_seen_at"`  // last registration or heartbeat (server clock)

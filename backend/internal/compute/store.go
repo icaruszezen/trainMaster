@@ -93,19 +93,22 @@ func decodeStored[T any](data []byte) (*T, error) {
 }
 
 // upsertNode stores a registration and returns the node ID. A known
-// node_key updates its row: environment and metrics only when given, and
-// probe_requested_at stays as it is.
+// node_key updates its row: environment and metrics only when given. A
+// registration without an environment (the node started and is checking
+// it) marks a probe as requested until a heartbeat brings the result; one
+// with an environment leaves probe_requested_at as it is.
 func upsertNode(ctx context.Context, q querier, in RegisterInput, address string, hardware, environment, metrics []byte,
 	now time.Time) (int64, error) {
 	var id int64
 	err := q.QueryRow(ctx, `INSERT INTO compute_nodes AS n (node_key, name, hostname, address, agent_version,
-			hardware, environment, metrics, registered_at, last_seen_at, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $9, $9)
+			hardware, environment, metrics, probe_requested_at, registered_at, last_seen_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $7::jsonb IS NULL THEN $9::timestamptz END, $9, $9, $9, $9)
 		ON CONFLICT (node_key) DO UPDATE SET
 			name = EXCLUDED.name, hostname = EXCLUDED.hostname, address = EXCLUDED.address,
 			agent_version = EXCLUDED.agent_version, hardware = EXCLUDED.hardware,
 			environment = coalesce(EXCLUDED.environment, n.environment),
 			metrics = coalesce(EXCLUDED.metrics, n.metrics),
+			probe_requested_at = coalesce(EXCLUDED.probe_requested_at, n.probe_requested_at),
 			registered_at = EXCLUDED.registered_at, last_seen_at = EXCLUDED.last_seen_at,
 			updated_at = EXCLUDED.updated_at
 		RETURNING id`,

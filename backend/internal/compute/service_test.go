@@ -117,8 +117,9 @@ func TestServiceRegisterListHeartbeat(t *testing.T) {
 		t.Fatalf("List = %+v, %v", nodes, err)
 	}
 	n := nodes[0]
+	// Registered without an environment: the node is checking it.
 	if n.ID != res.NodeID || n.NodeKey != "node-a" || n.Name != "gpu-server-01" || n.Hostname != "gpu-server-01 .lan" ||
-		n.Address != "192.0.2.10" || n.AgentVersion != "0.1.0" || n.Status != StatusOnline || n.ProbePending {
+		n.Address != "192.0.2.10" || n.AgentVersion != "0.1.0" || n.Status != StatusOnline || !n.ProbePending {
 		t.Errorf("node = %+v", n)
 	}
 	if !n.RegisteredAt.Equal(start) || !n.LastSeenAt.Equal(start) || !n.CreatedAt.Equal(start) {
@@ -134,19 +135,22 @@ func TestServiceRegisterListHeartbeat(t *testing.T) {
 		t.Errorf("history = %+v", n.History)
 	}
 
-	// Heartbeats move last_seen_at and add history points.
+	// Heartbeats move last_seen_at and add history points; the first
+	// environment completes the check.
 	e.clock.Advance(10 * time.Second)
 	hb, err := e.svc.Heartbeat(ctx, HeartbeatInput{NodeKey: "node-a", Metrics: sampleMetrics(50)}, "192.0.2.11")
-	if err != nil || hb.NodeID != res.NodeID || hb.HeartbeatIntervalSeconds != 10 || hb.ProbeRequested {
+	if err != nil || hb.NodeID != res.NodeID || hb.HeartbeatIntervalSeconds != 10 || !hb.ProbeRequested {
 		t.Fatalf("Heartbeat = %+v, %v", hb, err)
 	}
 	e.clock.Advance(10 * time.Second)
-	if _, err := e.svc.Heartbeat(ctx, HeartbeatInput{NodeKey: "node-a", Environment: sampleEnvironment("cu126")}, "192.0.2.11"); err != nil {
-		t.Fatal(err)
+	hb, err = e.svc.Heartbeat(ctx, HeartbeatInput{NodeKey: "node-a", Environment: sampleEnvironment("cu126")}, "192.0.2.11")
+	if err != nil || hb.ProbeRequested {
+		t.Fatalf("Heartbeat with environment = %+v, %v", hb, err)
 	}
 	n = e.get(t, res.NodeID)
-	if !n.LastSeenAt.Equal(start.Add(20*time.Second)) || !n.RegisteredAt.Equal(start) || n.Address != "192.0.2.11" {
-		t.Errorf("after heartbeats: last seen %v, registered %v, address %q", n.LastSeenAt, n.RegisteredAt, n.Address)
+	if !n.LastSeenAt.Equal(start.Add(20*time.Second)) || !n.RegisteredAt.Equal(start) || n.Address != "192.0.2.11" || n.ProbePending {
+		t.Errorf("after heartbeats: last seen %v, registered %v, address %q, probe pending %v",
+			n.LastSeenAt, n.RegisteredAt, n.Address, n.ProbePending)
 	}
 	if n.Environment == nil || n.Environment.TorchVariant != Value("cu126") || n.Environment.Issues == nil {
 		t.Errorf("environment = %+v", n.Environment)
@@ -255,9 +259,13 @@ func TestServiceReRegisterKeepsEnvironment(t *testing.T) {
 	e := newServiceEnv(t)
 	ctx := context.Background()
 	first := e.register(t, "node-a", "old-name", sampleEnvironment("cu126"), sampleMetrics(20))
+	if n := e.get(t, first.NodeID); n.ProbePending {
+		t.Error("a registration with an environment left a probe pending")
+	}
 
 	// The node restarts: it registers its hardware without an environment
-	// (that follows later); the stored one stays to avoid flicker.
+	// (that follows later); the stored one stays to avoid flicker, marked
+	// as being checked again.
 	e.clock.Advance(time.Minute)
 	restart := e.clock.Now()
 	res, err := e.svc.Register(ctx, RegisterInput{NodeKey: "node-a", Name: "new-name", AgentVersion: "0.2.0",
@@ -278,14 +286,30 @@ func TestServiceReRegisterKeepsEnvironment(t *testing.T) {
 	if n.Environment == nil || n.Environment.TorchVariant != Value("cu126") || n.Metrics == nil || n.Metrics.CPUPercent != Value(20.0) {
 		t.Errorf("environment = %+v, metrics = %+v", n.Environment, n.Metrics)
 	}
+	if !n.ProbePending {
+		t.Error("a registration without an environment should mark the stored one as being checked again")
+	}
 	if len(n.History) != 1 {
 		t.Errorf("history = %+v", n.History)
+	}
+	// Heartbeats tell the node, which ignores it while it is detecting.
+	e.clock.Advance(10 * time.Second)
+	if hb, err := e.svc.Heartbeat(ctx, HeartbeatInput{NodeKey: "node-a", Metrics: sampleMetrics(30)}, ""); err != nil || !hb.ProbeRequested {
+		t.Fatalf("heartbeat = %+v, %v; want probe_requested", hb, err)
+	}
+	// The new result completes the check.
+	e.clock.Advance(10 * time.Second)
+	if hb, err := e.svc.Heartbeat(ctx, HeartbeatInput{NodeKey: "node-a", Environment: sampleEnvironment("cu128")}, ""); err != nil || hb.ProbeRequested {
+		t.Fatalf("heartbeat with environment = %+v, %v; want the request cleared", hb, err)
+	}
+	if n = e.get(t, res.NodeID); n.ProbePending || n.Environment.TorchVariant != Value("cu128") {
+		t.Errorf("after the check: probe pending %v, environment %+v", n.ProbePending, n.Environment)
 	}
 
 	// An environment in the registration replaces the stored one.
 	e.register(t, "node-a", "new-name", sampleEnvironment("cu130"), nil)
-	if n = e.get(t, res.NodeID); n.Environment.TorchVariant != Value("cu130") {
-		t.Errorf("environment = %+v", n.Environment)
+	if n = e.get(t, res.NodeID); n.Environment.TorchVariant != Value("cu130") || n.ProbePending {
+		t.Errorf("environment = %+v, probe pending %v", n.Environment, n.ProbePending)
 	}
 	if nodes, _ := e.svc.List(ctx); len(nodes) != 1 {
 		t.Errorf("%d nodes after re-registering", len(nodes))
@@ -339,8 +363,9 @@ func TestServiceProbe(t *testing.T) {
 	if err != nil || !hb.ProbeRequested {
 		t.Fatalf("heartbeat = %+v, %v; want probe_requested", hb, err)
 	}
-	// A registration does not clear the request.
-	e.register(t, "node-a", "a", nil, nil)
+	// A registration does not clear the request, even with an environment
+	// (the node may have detected it before the request).
+	e.register(t, "node-a", "a", sampleEnvironment("cu126"), nil)
 	if n = e.get(t, res.NodeID); !n.ProbePending {
 		t.Error("registration cleared the probe request")
 	}
