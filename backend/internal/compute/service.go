@@ -111,7 +111,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput, address string
 	if err != nil {
 		return RegisterResult{}, err
 	}
-	id, err := upsertNode(ctx, s.db, in, address, hw, env, m, now)
+	id, prior, err := upsertNode(ctx, s.db, in, address, hw, env, m, now)
 	if err != nil {
 		return RegisterResult{}, fmt.Errorf("register compute node: %w", err)
 	}
@@ -120,7 +120,27 @@ func (s *Service) Register(ctx context.Context, in RegisterInput, address string
 	}
 	s.log.Info("compute node registered", "node_id", id, "name", in.Name, "address", address,
 		"agent_version", in.AgentVersion, "gpus", len(hardware.GPUs))
+	if s.sharedNodeKey(prior, in.Hostname, now) {
+		s.log.Warn("compute node registered from another host while it was online: two machines may share one node key",
+			"node_id", id, "name", in.Name, "hostname", in.Hostname, "address", address,
+			"previous_hostname", prior.Hostname, "previous_address", prior.Address,
+			"hint", "两台机器使用了同一个节点标识，页面上只会显示为一个节点。删除其中一台的 <状态目录>/node-key"+
+				"（Docker 部署默认为 data/trainer/node-key，直接安装默认为 /var/lib/trainmaster/node-key）并重启它的训练节点服务，"+
+				"它会作为新节点注册；只是修改了主机名时可以忽略")
+	}
 	return RegisterResult{NodeID: id, HeartbeatIntervalSeconds: s.interval.Seconds(), ServerTime: now}, nil
+}
+
+// sharedNodeKey reports whether a registration from hostname looks like a
+// second machine using the node_key of prior: the node was still online
+// (another agent sent a heartbeat moments ago) and reported another
+// hostname. This happens when data/trainer is copied to another machine
+// or a VM is cloned, which clones the node identity. Compose sets the
+// trainer container's hostname to the machine's, so recreating the
+// container is not suspected; neither is a node without a hostname.
+func (s *Service) sharedNodeKey(prior *priorNode, hostname string, now time.Time) bool {
+	return prior != nil && isOnline(now, prior.LastSeenAt, s.OfflineAfter()) &&
+		prior.Hostname != "" && hostname != "" && !strings.EqualFold(prior.Hostname, hostname)
 }
 
 // Heartbeat records a heartbeat from address. A node_key that is not

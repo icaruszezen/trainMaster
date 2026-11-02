@@ -1,6 +1,7 @@
 package compute
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -313,6 +314,73 @@ func TestServiceReRegisterKeepsEnvironment(t *testing.T) {
 	}
 	if nodes, _ := e.svc.List(ctx); len(nodes) != 1 {
 		t.Errorf("%d nodes after re-registering", len(nodes))
+	}
+}
+
+func TestServiceWarnsAboutSharedNodeKey(t *testing.T) {
+	e := newServiceEnv(t)
+	ctx := context.Background()
+	var buf bytes.Buffer
+	e.svc.log = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	register := func(hostname, address string) int64 {
+		t.Helper()
+		res, err := e.svc.Register(ctx, RegisterInput{NodeKey: "cloned", Name: "gpu", Hostname: hostname,
+			Hardware: sampleHardware("NVIDIA GeForce RTX 4090")}, address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.NodeID
+	}
+	warnings := func() []map[string]any {
+		t.Helper()
+		var out []map[string]any
+		for line := range strings.Lines(buf.String()) {
+			var m map[string]any
+			if err := json.Unmarshal([]byte(line), &m); err != nil {
+				t.Fatalf("log line %q: %v", line, err)
+			}
+			out = append(out, m)
+		}
+		buf.Reset()
+		return out
+	}
+
+	id := register("gpu-a", "192.0.2.1")
+	// The same machine restarts its trainer (compose keeps the hostname).
+	e.clock.Advance(5 * time.Second)
+	register("GPU-A", "192.0.2.1")
+	e.clock.Advance(5 * time.Second)
+	register("gpu-a", "192.0.2.1")
+	if w := warnings(); len(w) != 0 {
+		t.Fatalf("restarts logged %v", w)
+	}
+
+	// A second machine with a copy of the node-key starts while the first
+	// is online.
+	e.clock.Advance(e.svc.OfflineAfter())
+	if again := register("gpu-b", "192.0.2.2"); again != id {
+		t.Fatalf("got node %d, want %d", again, id)
+	}
+	w := warnings()
+	if len(w) != 1 {
+		t.Fatalf("warnings = %v, want one", w)
+	}
+	if w[0]["level"] != "WARN" || w[0]["node_id"] != float64(id) || w[0]["hostname"] != "gpu-b" || w[0]["address"] != "192.0.2.2" ||
+		w[0]["previous_hostname"] != "gpu-a" || w[0]["previous_address"] != "192.0.2.1" ||
+		!strings.Contains(w[0]["hint"].(string), "两台机器使用了同一个节点标识") || !strings.Contains(w[0]["hint"].(string), "node-key") {
+		t.Errorf("warning = %v", w[0])
+	}
+
+	// Not suspected: a node that was offline (moved, or renamed while
+	// stopped), or one that does not report its hostname.
+	e.clock.Advance(e.svc.OfflineAfter() + time.Microsecond)
+	register("gpu-c", "192.0.2.3")
+	e.clock.Advance(time.Second)
+	register("", "192.0.2.3")
+	e.clock.Advance(time.Second)
+	register("gpu-c", "192.0.2.3")
+	if w := warnings(); len(w) != 0 {
+		t.Errorf("logged %v", w)
 	}
 }
 

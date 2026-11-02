@@ -18,7 +18,7 @@ import (
 
 // Server describes the machine.
 type Server struct {
-	Hostname      string    `json:"hostname"` // os.Hostname() (inside a container: the container's)
+	Hostname      string    `json:"hostname"` // os.Hostname(); compose gives the app container the host's (TM_HOST_HOSTNAME)
 	OS            string    `json:"os"`       // runtime.GOOS
 	Arch          string    `json:"arch"`     // runtime.GOARCH
 	Kernel        *string   `json:"kernel"`
