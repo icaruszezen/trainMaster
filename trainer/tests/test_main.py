@@ -149,6 +149,42 @@ def test_probe_does_not_create_node_key(tmp_path):
     assert not (tmp_path / "state" / "node-key").exists()
 
 
+def test_detect_passes_the_probe_diagnostics(tmp_path, monkeypatch):
+    # probe / selftest 与训练节点一样把只用于诊断的探测结果交给检测（如显卡没有传入容器、宿主机驱动
+    # 过旧时提示升级驱动，而不是安装 NVIDIA Container Toolkit）。
+    import signal
+
+    from trainmaster_trainer import environment, gpu, hardware
+    from trainmaster_trainer.config import Config
+
+    probe = hardware.HardwareProbe(
+        hardware={"gpus": []},
+        gpu=gpu.GpuProbe(None, [], {"method": "none", "error": None, "host_gpu_count": 1}),
+        device_nodes=["nvidiactl"],
+        pci_gpu_count=1,
+        host_driver_version="440.100",
+    )
+    seen: dict[str, Any] = {}
+
+    def detect(self, hw, **kw):
+        seen.update(kw, hardware=hw)
+        return {"status": "cpu_only"}
+
+    monkeypatch.setattr(hardware, "probe", lambda: probe)
+    monkeypatch.setattr(environment.EnvironmentDetector, "detect", detect)
+    old_handler = signal.getsignal(signal.SIGTERM)
+    try:
+        assert cli._detect(Config(state_dir=tmp_path)) == (probe, {"status": "cpu_only"})
+    finally:
+        signal.signal(signal.SIGTERM, old_handler)
+    assert seen == {
+        "hardware": probe.hardware,
+        "device_nodes": ["nvidiactl"],
+        "pci_gpu_count": 1,
+        "host_driver_version": "440.100",
+    }
+
+
 def test_invalid_config_exits_2(tmp_path):
     proc = run_cli(tmp_path, "probe", TM_LOG_LEVEL="loud")
     assert proc.returncode == 2
