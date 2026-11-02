@@ -305,6 +305,24 @@ expect_code "systemd found" 0
 contains "systemd found" "已安装 systemd 服务 $tmp/units-default/trainmaster-trainer.service：安装后更新并重启它"
 contains "systemd found" "User=svc-train"
 contains "systemd found" "+ systemctl restart trainmaster-trainer.service"
+# 加上 --systemd 时同样沿用运行用户；--user 优先
+UNIT_DIR="$tmp/units-default" dry "$no_smi" --server-url "$URL" --systemd
+expect_code "systemd found explicit" 0
+contains "systemd found explicit" "User=svc-train"
+not_contains "systemd found explicit" "已安装 systemd 服务"
+UNIT_DIR="$tmp/units-default" dry "$no_smi" --server-url "$URL" --user other-user
+contains "systemd found user override" "User=other-user"
+not_contains "systemd found user override" "User=svc-train"
+# 首次安装用 --env-file 指定了其它配置文件：重新运行时从已安装的服务中找到它
+mkdir -p "$tmp/units-envfile"
+printf '[Service]\nEnvironmentFile=%s\nExecStart=/opt/trainmaster-trainer/bin/python -m trainmaster_trainer run\n' \
+	"$existing_env" >"$tmp/units-envfile/trainmaster-trainer.service"
+UNIT_DIR="$tmp/units-envfile" dry "$no_smi" --variant cu128
+expect_code "unit env file" 0
+contains "unit env file" "沿用配置文件 $existing_env 中的 TM_SERVER_URL TM_NODE_TOKEN"
+contains "unit env file" "== 配置文件 $existing_env（权限 600）=="
+contains "unit env file" "EnvironmentFile=$existing_env"
+contains "unit env file" "+ systemctl restart trainmaster-trainer.service"
 # 其它安装目录的服务不受影响
 printf '[Service]\nExecStart=/srv/other/bin/python -m trainmaster_trainer run\n' >"$tmp/units-other/trainmaster-trainer.service"
 UNIT_DIR="$tmp/units-other" dry "$no_smi" --server-url "$URL"

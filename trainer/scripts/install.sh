@@ -42,15 +42,16 @@ PyTorch 与 Ultralytics，写入配置文件，并可注册为 systemd 服务开
   --python PY         创建虚拟环境使用的 Python（需要 3.10 或更新，默认 python3）
   --state-dir DIR     状态目录：节点标识与心跳文件（默认 /var/lib/trainmaster）
   --data-dir DIR      数据目录：上报其磁盘空间（默认 /data，不存在时使用状态目录）
-  --env-file FILE     配置文件路径（默认 <prefix>/trainer.env，权限 600）
+  --env-file FILE     配置文件路径（默认为已安装的服务使用的配置文件，没有时为 <prefix>/trainer.env；
+                      权限 600）
   --systemd           生成并启用 systemd 服务 trainmaster-trainer（需要 root）
   --user USER         运行训练节点的用户（默认 root）；状态目录的属主会改为该用户
+  --dry-run           只打印检测结果和将要执行的步骤，不做任何修改
+  -h, --help          显示本帮助
 
 重新运行时（配置文件已存在），没有指定的 --server-url、--token、--name、--state-dir、--data-dir
 沿用配置文件中的值，其它手动添加的设置原样保留；本安装目录的 systemd 服务已经安装时，
-即使不加 --systemd 也会更新并重启它（--user 沿用服务中的设置）。
-  --dry-run           只打印检测结果和将要执行的步骤，不做任何修改
-  -h, --help          显示本帮助
+即使不加 --systemd 也会更新并重启它（没有指定 --user 时沿用服务中的运行用户）。
 EOF
 }
 
@@ -175,12 +176,23 @@ check_unit_path() { # check_unit_path <选项> <路径>：写入 systemd 服务�
 while [ "${prefix%/}" != "$prefix" ]; do prefix="${prefix%/}"; done
 [ -n "$prefix" ] || die 2 "--prefix 不能是根目录"
 check_unit_path --prefix "$prefix"
-[ -n "$env_file" ] || env_file="$prefix/trainer.env"
-check_unit_path --env-file "$env_file"
 
 unit_dir="${TM_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 unit_file="$unit_dir/$SERVICE_NAME"
 venv_python="$prefix/bin/python"
+# 本安装目录的 systemd 服务是否已经安装（服务文件由本脚本生成，ExecStart 指向本安装目录）
+unit_installed=0
+if [ -f "$unit_file" ] &&
+	grep -qxF "ExecStart=$venv_python -m trainmaster_trainer run" "$unit_file" 2>/dev/null; then
+	unit_installed=1
+fi
+
+# 没有指定 --env-file 时，已安装的服务使用的配置文件优先（首次安装时可能用 --env-file 指定了其它路径）
+if [ -z "$env_file" ] && [ "$unit_installed" = 1 ]; then
+	env_file="$(sed -n 's/^EnvironmentFile=-\{0,1\}//p' "$unit_file" | tail -n 1)"
+fi
+[ -n "$env_file" ] || env_file="$prefix/trainer.env"
+check_unit_path --env-file "$env_file"
 
 # ---- 沿用已有的配置 ----
 # 重新运行（如训练节点修复建议中的 sudo trainer/scripts/install.sh --variant cu128）时，没有指定的平台地址、
@@ -249,12 +261,14 @@ reuse state_dir TM_STATE_DIR
 reuse data_dir TM_DATA_DIR
 reuse cuda_order CUDA_DEVICE_ORDER
 
-# 本安装目录的 systemd 服务已经安装：与 --systemd 相同，更新并重启它，沿用其中的运行用户。
+# 本安装目录的 systemd 服务已经安装：与 --systemd 相同，更新并重启它；没有指定 --user 时沿用其中的
+# 运行用户（加不加 --systemd 都一样，重新生成的服务不会改回 root）。
 systemd_found=0
-if [ "$systemd" = 0 ] && [ -f "$unit_file" ] &&
-	grep -qxF "ExecStart=$venv_python -m trainmaster_trainer run" "$unit_file" 2>/dev/null; then
-	systemd=1
-	systemd_found=1
+if [ "$unit_installed" = 1 ]; then
+	if [ "$systemd" = 0 ]; then
+		systemd=1
+		systemd_found=1
+	fi
 	if [ -z "$run_user" ]; then
 		run_user="$(sed -n 's/^User=//p' "$unit_file" | tail -n 1)"
 	fi

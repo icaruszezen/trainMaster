@@ -18,6 +18,8 @@ warn() { echo "entrypoint: $*" >&2; }
 # NVreg_DeviceFileGID（如 video 组）时，容器中保留宿主机设备文件的权限与属组，需要加入该组才能使用显卡。
 nvidia_groups() {
 	groups=""
+	# 以 root 运行（PUID=0）时可以访问所有设备，不需要附加组，也不需要提示
+	[ "$PUID" != 0 ] || return 0
 	for dev in "$DEV_DIR"/nvidiactl "$DEV_DIR"/nvidia-uvm "$DEV_DIR"/nvidia[0-9]*; do
 		[ -e "$dev" ] || continue
 		mode="$(stat -c %A "$dev" 2>/dev/null)" || continue

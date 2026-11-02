@@ -95,6 +95,11 @@ if [ "$uid" = 0 ]; then
 	*) check "root-only device warning" "只允许 root 访问" "$out" ;;
 	esac
 	check "root group not added" "2345" "$(printf '%s\n' "$out" | tail -n 1)"
+
+	# 以 root 运行（PUID=0）：能访问所有设备，不提示
+	TM_DEV_DIR="$tmp/dev" PUID=0 PGID=2345 run_entry id -G
+	check "root puid exit code" 0 "$code"
+	check "root puid no warning" "2345" "$out"
 fi
 
 if [ "$fails" -gt 0 ]; then
