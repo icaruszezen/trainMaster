@@ -87,9 +87,10 @@ export function NodeCard({
       aria-labelledby={titleId}
       className={cn(
         "flex min-w-0 flex-col rounded-xl border bg-card text-card-foreground shadow-sm",
-        // 离线节点整体变淡；悬停或键盘聚焦时恢复，方便阅读与操作。
+        // 离线节点：用虚线边框与“离线 / 离线前”标记说明，只淡化进度条与折线图
+        // 这些图形；文字不变淡，保持足够的对比度（WCAG AA）。
         !online &&
-          "opacity-70 transition-opacity focus-within:opacity-100 hover:opacity-100"
+          "border-dashed shadow-none [&_[data-slot=progress]]:opacity-50 [&_[data-slot=sparkline]]:opacity-50"
       )}
     >
       <header className="flex items-start gap-3 p-4 sm:px-6 sm:pt-5">
