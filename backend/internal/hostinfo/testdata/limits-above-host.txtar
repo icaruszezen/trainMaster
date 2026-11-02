@@ -1,0 +1,21 @@
+Docker container on a cgroup v2 host with limits that are not below what
+the host has (8 CPUs on a 2-CPU host, 64 GiB on an 8 GB host): reported as
+no limit.
+-- .dockerenv --
+-- proc/meminfo --
+MemTotal:       8000000 kB
+MemAvailable:   7000000 kB
+-- proc/cpuinfo --
+processor	: 0
+model name	: Intel(R) Core(TM) i3-7100U CPU @ 2.40GHz
+
+processor	: 1
+model name	: Intel(R) Core(TM) i3-7100U CPU @ 2.40GHz
+-- proc/self/cgroup --
+0::/
+-- sys/fs/cgroup/cgroup.controllers --
+cpu memory
+-- sys/fs/cgroup/cpu.max --
+800000 100000
+-- sys/fs/cgroup/memory.max --
+68719476736

@@ -1,0 +1,26 @@
+Docker container on a cgroup v1 host without limits: no CFS quota (-1) and
+the "unlimited" memory value. No NVIDIA GPU anywhere (the PCI bus has an
+Intel VGA controller and an NVIDIA network device that is not a GPU).
+-- .dockerenv --
+-- proc/meminfo --
+MemTotal:       8000000 kB
+MemAvailable:   7000000 kB
+-- proc/cpuinfo --
+processor	: 0
+model name	: Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz
+physical id	: 0
+core id		: 0
+-- sys/fs/cgroup/cpu/cpu.cfs_quota_us --
+-1
+-- sys/fs/cgroup/cpu/cpu.cfs_period_us --
+100000
+-- sys/fs/cgroup/memory/memory.limit_in_bytes --
+9223372036854771712
+-- sys/bus/pci/devices/0000:00:02.0/vendor --
+0x8086
+-- sys/bus/pci/devices/0000:00:02.0/class --
+0x030000
+-- sys/bus/pci/devices/0000:b3:00.0/vendor --
+0x10de
+-- sys/bus/pci/devices/0000:b3:00.0/class --
+0x020000

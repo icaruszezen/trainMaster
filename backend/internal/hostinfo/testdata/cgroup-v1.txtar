@@ -1,0 +1,41 @@
+Podman container on a cgroup v1 host: CPU quota 1.5 cores, memory limit
+2 GiB. The NVIDIA open kernel module is loaded; its one GPU is not
+initialized yet (masked UUID) and its information file lacks the bus
+location, so the directory name stands in.
+-- run/.containerenv --
+engine="podman-4.9.3"
+-- proc/sys/kernel/osrelease --
+6.8.0-45-generic
+-- proc/uptime --
+12.99 40.00
+-- proc/loadavg --
+3.10 2.05 1.00 2/900 31337
+-- proc/meminfo --
+MemTotal:       65536000 kB
+MemAvailable:   60000000 kB
+-- proc/cpuinfo --
+processor	: 0
+model name	: AMD EPYC 7763 64-Core Processor
+physical id	: 0
+core id		: 0
+
+processor	: 1
+model name	: AMD EPYC 7763 64-Core Processor
+physical id	: 0
+core id		: 1
+
+-- sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us --
+150000
+-- sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us --
+100000
+-- sys/fs/cgroup/memory/memory.limit_in_bytes --
+2147483648
+-- proc/driver/nvidia/version --
+NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.65.06  Release Build  (dvs-builder@U16-I3-B03-4-3)  Sun Jul 27 07:09:29 UTC 2025
+GCC version:  gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04)
+-- proc/driver/nvidia/gpus/0000:3b:00.0/information --
+Model: 		 NVIDIA A100-SXM4-80GB
+IRQ:   		 211
+GPU UUID: 	 GPU-????????-????-????-????-????????????
+Video BIOS: 	 ??.??.??.??.??
+Bus Type: 	 PCIe

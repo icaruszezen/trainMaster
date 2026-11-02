@@ -1,0 +1,14 @@
+The server runs directly on a cgroup v2 host, in a login session cgroup
+without limits ("max"). The root cgroup has no cpu.max or memory.max files
+at all. Nothing NVIDIA.
+-- proc/meminfo --
+MemTotal:       8000000 kB
+MemAvailable:   7000000 kB
+-- proc/self/cgroup --
+0::/user.slice/user-1000.slice/session-1.scope
+-- sys/fs/cgroup/cgroup.controllers --
+cpuset cpu io memory pids
+-- sys/fs/cgroup/user.slice/user-1000.slice/session-1.scope/cpu.max --
+max 100000
+-- sys/fs/cgroup/user.slice/user-1000.slice/session-1.scope/memory.max --
+max
