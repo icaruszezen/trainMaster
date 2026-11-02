@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -312,6 +313,56 @@ func TestRecoverer(t *testing.T) {
 	}
 	if body := decode[errorBody](t, rec); body.Error.Code != "internal_error" {
 		t.Errorf("error = %+v", body.Error)
+	}
+}
+
+func TestAccessLogLevels(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	for _, tt := range []struct {
+		method, path string
+		status       int
+		want         string
+	}{
+		{"GET", "/api/v1/datasets", 200, "INFO"},
+		{"GET", "/api/v1/datasets", 404, "INFO"},
+		{"GET", "/api/v1/models", 501, "INFO"}, // planned module
+		{"GET", "/api/healthz", 200, "DEBUG"},
+		{"GET", "/api/readyz", 503, "ERROR"},
+		// Node heartbeats and the refreshes of the compute page, while
+		// they succeed.
+		{"POST", "/api/v1/compute/agent/heartbeat", 200, "DEBUG"},
+		{"GET", "/api/v1/compute/nodes", 200, "DEBUG"},
+		{"GET", "/api/v1/compute/server", 200, "DEBUG"},
+		{"POST", "/api/v1/compute/agent/heartbeat", 401, "INFO"},
+		{"POST", "/api/v1/compute/agent/heartbeat", 404, "INFO"}, // unknown_node: the node registers again
+		{"POST", "/api/v1/compute/agent/heartbeat", 422, "INFO"},
+		{"POST", "/api/v1/compute/agent/heartbeat", 500, "ERROR"},
+		{"GET", "/api/v1/compute/nodes", 500, "ERROR"},
+		// Everything else on the compute API stays at info.
+		{"POST", "/api/v1/compute/agent/register", 200, "INFO"},
+		{"GET", "/api/v1/compute/agent/heartbeat", 405, "INFO"},
+		{"DELETE", "/api/v1/compute/nodes", 405, "INFO"},
+		{"GET", "/api/v1/compute/nodes/3", 200, "INFO"},
+		{"DELETE", "/api/v1/compute/nodes/3", 204, "INFO"},
+		{"POST", "/api/v1/compute/nodes/3/probe", 202, "INFO"},
+	} {
+		buf.Reset()
+		h := accessLog(log)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(tt.status)
+		}))
+		serve(h, tt.method, tt.path)
+		var line struct {
+			Level, Msg, Method, Path string
+			Status                   int
+		}
+		if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+			t.Fatalf("%s %s: log %q: %v", tt.method, tt.path, buf.String(), err)
+		}
+		if line.Level != tt.want || line.Msg != "http request" || line.Method != tt.method || line.Path != tt.path ||
+			line.Status != tt.status {
+			t.Errorf("%s %s %d: logged %+v, want level %s", tt.method, tt.path, tt.status, line, tt.want)
+		}
 	}
 }
 
