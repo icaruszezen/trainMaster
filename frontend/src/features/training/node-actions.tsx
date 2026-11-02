@@ -1,4 +1,4 @@
-import { useRef } from "react"
+import { useRef, type ReactNode } from "react"
 import { useMutation } from "@tanstack/react-query"
 import { Ellipsis, FileSearch, RefreshCw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
@@ -187,8 +187,12 @@ function DeleteNodeForm({
           删除节点“{node.name}”？
         </AlertDialogTitle>
         <AlertDialogDescription>
-          只删除平台中的节点记录与最近的指标历史，不影响那台机器上的文件。节点的
-          trainer 服务重新启动后会自动重新注册。
+          只删除平台中的节点记录与最近的指标历史，不影响那台机器上的文件。只要那台机器上的
+          trainer
+          服务还在运行，恢复连接后节点就会自动重新注册。要永久移除，先在那台机器上停止训练节点：Docker
+          部署运行 <Command>docker compose stop trainer</Command>（CPU 节点为{" "}
+          <Command>trainer-cpu</Command>），直接安装的运行{" "}
+          <Command>sudo systemctl disable --now trainmaster-trainer</Command>。
         </AlertDialogDescription>
       </AlertDialogHeader>
       {online && (
@@ -215,5 +219,13 @@ function DeleteNodeForm({
         </Button>
       </AlertDialogFooter>
     </>
+  )
+}
+
+function Command({ children }: { children: ReactNode }) {
+  return (
+    <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.8125rem] break-all text-foreground">
+      {children}
+    </code>
   )
 }
