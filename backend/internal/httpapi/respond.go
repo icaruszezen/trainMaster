@@ -18,7 +18,9 @@ import (
 // Error codes shared by all endpoints.
 const (
 	codeBadRequest            = "bad_request"            // 400: malformed request (JSON, query parameter, multipart)
+	codeUnauthorized          = "unauthorized"           // 401: a training node sent no or the wrong TM_NODE_TOKEN
 	codeNotFound              = "not_found"              // 404
+	codeUnknownNode           = "unknown_node"           // 404: heartbeat for a node_key that is not registered (any more); the node registers again
 	codeMethodNotAllowed      = "method_not_allowed"     // 405
 	codeConflict              = "conflict"               // 409: the current state does not allow the operation
 	codeUploadOffsetMismatch  = "upload_offset_mismatch" // 409: chunk offset differs from the bytes received so far
