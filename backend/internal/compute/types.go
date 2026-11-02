@@ -38,7 +38,8 @@ type Node struct {
 	Environment *Environment `json:"environment"`
 	Metrics     *Metrics     `json:"metrics"`
 	// History holds the recent metrics, oldest first. It lives in memory
-	// only and starts empty after a server restart.
+	// only and starts empty after a server restart; when an offline node
+	// comes back, its first new sample starts it afresh.
 	History []HistoryPoint `json:"history"`
 }
 

@@ -3,6 +3,7 @@ package compute
 import (
 	"slices"
 	"sync"
+	"time"
 )
 
 // MaxHistoryPoints is how many metrics samples are kept per node: ten
@@ -13,23 +14,29 @@ const MaxHistoryPoints = 60
 // It is safe for concurrent use. Points are never modified once appended,
 // so the slices it returns may share them.
 type History struct {
-	mu    sync.Mutex
-	nodes map[int64]*ring
+	mu     sync.Mutex
+	maxGap time.Duration
+	nodes  map[int64]*ring
 }
 
 // ring holds the last MaxHistoryPoints samples of one node; points[start]
-// is the oldest of the n stored.
+// is the oldest of the n stored, and newest is the latest time among them.
 type ring struct {
 	points   [MaxHistoryPoints]HistoryPoint
 	start, n int
+	newest   time.Time
 }
 
-// NewHistory returns an empty History.
-func NewHistory() *History {
-	return &History{nodes: make(map[int64]*ring)}
+// NewHistory returns an empty History. A sample that comes more than
+// maxGap after the newest stored one of its node (the node was offline in
+// between) starts the history of that node afresh, so samples from before
+// and after an outage are never shown as one continuous curve.
+func NewHistory(maxGap time.Duration) *History {
+	return &History{maxGap: maxGap, nodes: make(map[int64]*ring)}
 }
 
-// Append adds a sample of a node, dropping its oldest one when full.
+// Append adds a sample of a node, dropping its oldest one when full, or
+// all of them after a gap longer than maxGap.
 func (h *History) Append(nodeID int64, p HistoryPoint) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -37,6 +44,12 @@ func (h *History) Append(nodeID int64, p HistoryPoint) {
 	if r == nil {
 		r = &ring{}
 		h.nodes[nodeID] = r
+	}
+	if r.n > 0 && p.T.Sub(r.newest) > h.maxGap {
+		r.start, r.n = 0, 0
+	}
+	if r.n == 0 || p.T.After(r.newest) {
+		r.newest = p.T
 	}
 	if r.n < MaxHistoryPoints {
 		r.points[(r.start+r.n)%MaxHistoryPoints] = p

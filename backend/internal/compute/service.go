@@ -52,13 +52,15 @@ type Service struct {
 
 // NewService creates a Service.
 func NewService(o Options) *Service {
-	s := &Service{db: o.DB, log: o.Logger, interval: o.HeartbeatInterval, clock: o.Now, history: NewHistory()}
+	s := &Service{db: o.DB, log: o.Logger, interval: o.HeartbeatInterval, clock: o.Now}
 	if s.interval <= 0 {
 		s.interval = DefaultHeartbeatInterval
 	}
 	if s.clock == nil {
 		s.clock = time.Now
 	}
+	// A node that was offline in between starts a new curve.
+	s.history = NewHistory(s.OfflineAfter())
 	return s
 }
 

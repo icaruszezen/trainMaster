@@ -292,6 +292,38 @@ func TestServiceReRegisterKeepsEnvironment(t *testing.T) {
 	}
 }
 
+func TestServiceHistoryAfterOutage(t *testing.T) {
+	e := newServiceEnv(t)
+	ctx := context.Background()
+	res := e.register(t, "node-a", "a", nil, sampleMetrics(1))
+	e.clock.Advance(10 * time.Second)
+	if _, err := e.svc.Heartbeat(ctx, HeartbeatInput{NodeKey: "node-a", Metrics: sampleMetrics(2)}, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// The machine is shut down overnight; meanwhile its card keeps its
+	// last samples.
+	e.clock.Advance(12 * time.Hour)
+	if n := e.get(t, res.NodeID); n.Status != StatusOffline || len(n.History) != 2 {
+		t.Fatalf("offline node: status %s, %d history points", n.Status, len(n.History))
+	}
+	// In the morning its curve starts afresh instead of joining last
+	// night's samples.
+	e.register(t, "node-a", "a", nil, sampleMetrics(3))
+	n := e.get(t, res.NodeID)
+	if len(n.History) != 1 || n.History[0].CPUPercent != Value(3.0) || !n.History[0].T.Equal(e.clock.Now()) {
+		t.Errorf("history after the outage = %+v", n.History)
+	}
+	// A heartbeat late by up to the offline threshold continues it.
+	e.clock.Advance(e.svc.OfflineAfter())
+	if _, err := e.svc.Heartbeat(ctx, HeartbeatInput{NodeKey: "node-a", Metrics: sampleMetrics(4)}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if n = e.get(t, res.NodeID); len(n.History) != 2 || n.History[1].CPUPercent != Value(4.0) {
+		t.Errorf("history = %+v", n.History)
+	}
+}
+
 func TestServiceProbe(t *testing.T) {
 	e := newServiceEnv(t)
 	ctx := context.Background()
