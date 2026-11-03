@@ -26,7 +26,19 @@ func (e *apiEnv) registerFolder(t *testing.T, name string, files map[string]stri
 		}
 	}
 	ds := want[dataset.Dataset](t, e.do("POST", "/api/v1/datasets", map[string]any{"name": name, "directory": name}), 201)
-	if job := e.waitImport(t, ds.ID, ds.ActiveImport.ID); job.Status != dataset.StatusSucceeded {
+	var job dataset.Import
+	if ds.ActiveImport != nil {
+		job = e.waitImport(t, ds.ID, ds.ActiveImport.ID)
+	} else {
+		// The import runner can finish scanning a few small files before
+		// the response reads the dataset back; the scan is its only job.
+		jobs := want[List[dataset.Import]](t, e.do("GET", fmt.Sprintf("/api/v1/datasets/%d/imports", ds.ID), nil), 200).Items
+		if len(jobs) != 1 {
+			t.Fatalf("imports = %+v", jobs)
+		}
+		job = jobs[0]
+	}
+	if job.Status != dataset.StatusSucceeded {
 		t.Fatalf("scan = %+v", job)
 	}
 	return ds
