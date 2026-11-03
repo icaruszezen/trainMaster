@@ -9,9 +9,10 @@ import (
 // client can act on is an *Error wrapping one of these, so callers can
 // branch with errors.Is and show Error.Message to the user.
 var (
-	ErrNotFound = errors.New("not found")
-	ErrInvalid  = errors.New("invalid input") // a field value is not acceptable
-	ErrConflict = errors.New("conflict")      // the current state does not allow it
+	ErrNotFound  = errors.New("not found")
+	ErrInvalid   = errors.New("invalid input")      // a field value is not acceptable
+	ErrConflict  = errors.New("conflict")           // the current state does not allow it
+	ErrHasModels = errors.New("project has models") // a project with models cannot be deleted (a conflict too)
 )
 
 // Error is a user-facing error. Message is written in Chinese and is shown

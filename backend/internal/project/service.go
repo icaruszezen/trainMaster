@@ -1,7 +1,8 @@
 // Package project implements project management: a project groups the
-// datasets of one inspection task (and, later, its training jobs and
-// models). Projects are metadata in PostgreSQL only; a dataset can belong
-// to any number of projects.
+// datasets of one inspection task, its models (package model keeps them;
+// a project only reports their number and latest version) and, later, its
+// training jobs. Projects are metadata in PostgreSQL only; a dataset can
+// belong to any number of projects, a model to exactly one.
 package project
 
 import (
@@ -67,9 +68,17 @@ func (s *Service) decorate(ctx context.Context, ps []Project) error {
 	if err != nil {
 		return fmt.Errorf("load project covers: %w", err)
 	}
+	models, err := queryModelStats(ctx, s.db, ids)
+	if err != nil {
+		return fmt.Errorf("load project models: %w", err)
+	}
 	for i := range ps {
 		if c := covers[ps[i].ID]; c != nil {
 			ps[i].Covers = c
+		}
+		if m, ok := models[ps[i].ID]; ok {
+			latest := m.latest
+			ps[i].ModelCount, ps[i].LatestModel = m.count, &latest
 		}
 	}
 	return nil
@@ -172,14 +181,31 @@ func (s *Service) UpdateProject(ctx context.Context, id int64, in UpdateProjectI
 }
 
 // DeleteProject deletes a project. Its datasets are kept; they only leave
-// the project.
+// the project. A project with models cannot be deleted (ErrHasModels):
+// package model deletes them first, with their files. Uploads of models
+// into the project that are still in progress go with it.
 func (s *Service) DeleteProject(ctx context.Context, id int64) error {
-	tag, err := s.db.Exec(ctx, "DELETE FROM projects WHERE id = $1", id)
+	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		// The lock waits for models being added to the project (they lock
+		// its row to allocate their version) and keeps new ones out.
+		var found bool
+		if err := tx.QueryRow(ctx, "SELECT true FROM projects WHERE id = $1 FOR UPDATE", id).Scan(&found); errors.Is(err, pgx.ErrNoRows) {
+			return errProjectNotFound
+		} else if err != nil {
+			return err
+		}
+		n, err := countModels(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			return &Error{Kind: ErrHasModels, Message: fmt.Sprintf("项目中有 %d 个模型，请先删除模型，或选择同时删除模型", n)}
+		}
+		_, err = tx.Exec(ctx, "DELETE FROM projects WHERE id = $1", id)
+		return err
+	})
 	if err != nil {
 		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return errProjectNotFound
 	}
 	s.log.Info("project deleted", "project_id", id)
 	return nil

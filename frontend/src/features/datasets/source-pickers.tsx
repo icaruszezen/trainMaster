@@ -44,7 +44,7 @@ import {
 } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
-type DropzoneProps = {
+export type DropzoneProps = {
   icon: LucideIcon
   title: string
   hint: ReactNode
@@ -60,7 +60,7 @@ type DropzoneProps = {
  * 拖放区域。整个区域可点击选择；键盘用户使用其中的按钮。
  * 用计数器跟踪 dragenter / dragleave，避免经过子元素时高亮闪烁。
  */
-function Dropzone({
+export function Dropzone({
   icon: Icon,
   title,
   hint,
@@ -162,7 +162,8 @@ function Dropzone({
   )
 }
 
-function SelectedSource({
+/** 已选择的文件 / 文件夹：图标、名称与大小，右侧可以移除。 */
+export function SelectedSource({
   icon: Icon,
   title,
   meta,
@@ -179,8 +180,10 @@ function SelectedSource({
   disabled?: boolean
   children?: ReactNode
 }) {
+  // 列宽用 minmax(0,1fr)：默认的 auto 列以不换行的名称为最小宽度，
+  // 过长的文件名不会截断，而是把卡片（以及对话框）撑宽。
   return (
-    <div className="grid gap-4 rounded-xl border bg-muted/30 p-4">
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-4 rounded-xl border bg-muted/30 p-4">
       <div className="flex items-center gap-3">
         <div className="flex size-10 shrink-0 items-center justify-center rounded-lg border bg-background text-muted-foreground">
           <Icon className="size-5" />

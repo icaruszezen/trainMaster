@@ -18,7 +18,9 @@ import (
 // the training nodes; the nodes themselves register and send heartbeats
 // under /agent, with the TM_NODE_TOKEN bearer token when one is set. The
 // JSON shapes are defined by the types in internal/compute and
-// internal/hostinfo; this file maps HTTP onto compute.Service.
+// internal/hostinfo; this file maps HTTP onto compute.Service. The task
+// calls of the nodes (claiming and executing model conversions) are under
+// /agent too; their handlers are in models.go.
 
 func (s *server) computeRoutes(r chi.Router) {
 	if s.host != nil {
@@ -36,6 +38,9 @@ func (s *server) computeRoutes(r chi.Router) {
 		r.Use(s.requireNodeToken)
 		r.Post("/register", s.registerComputeNode)
 		r.Post("/heartbeat", s.computeNodeHeartbeat)
+		if s.models != nil {
+			s.agentTaskRoutes(r)
+		}
 	})
 }
 

@@ -23,6 +23,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton"
 import { getNavItem, type ModuleId } from "@/config/navigation"
 import { datasetsQuery } from "@/features/datasets/api"
+import { modelsQuery } from "@/features/models/api"
 import { projectsQuery } from "@/features/projects/api"
 import { SystemStatusCard } from "@/features/system/system-status-card"
 import { ComputeSummaryLink } from "@/features/training/compute-summary-link"
@@ -32,7 +33,6 @@ import { formatNumber, formatPercent, percentOf } from "@/lib/format"
 const plannedStats: { title: string; icon: LucideIcon }[] = [
   { title: "标注任务", icon: ListChecks },
   { title: "训练任务", icon: Rocket },
-  { title: "模型", icon: Boxes },
 ]
 
 const workflow: { moduleId: ModuleId; title: string; description: string }[] = [
@@ -64,7 +64,7 @@ const workflow: { moduleId: ModuleId; title: string; description: string }[] = [
   {
     moduleId: "models",
     title: "模型发布",
-    description: "管理模型版本，导出并发布",
+    description: "按项目管理模型版本，下载 PT 或 ONNX",
   },
 ]
 
@@ -79,6 +79,7 @@ export function DashboardPage() {
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-3">
         <ProjectStat />
         <DatasetStats />
+        <ModelStat />
         {plannedStats.map((stat) => (
           <StatCard
             key={stat.title}
@@ -163,6 +164,35 @@ function ProjectStat() {
         className="inline-flex items-center gap-1 self-start underline-offset-4 hover:text-foreground hover:underline"
       >
         {data.total > 0 ? "查看全部" : "创建项目"}
+        <ArrowRight className="size-3" />
+      </Link>
+    </StatCard>
+  )
+}
+
+/** 模型数量，数据来自模型仓库。 */
+function ModelStat() {
+  const { data, isPending } = useQuery(modelsQuery())
+
+  // 后台刷新失败时保留已加载的数字。
+  if (data === undefined) {
+    return (
+      <StatCard
+        title="模型"
+        icon={Boxes}
+        value={isPending ? <Skeleton className="h-8 w-16" /> : "—"}
+      >
+        {isPending ? "正在加载…" : "无法获取数据"}
+      </StatCard>
+    )
+  }
+  return (
+    <StatCard title="模型" icon={Boxes} value={formatNumber(data.total)}>
+      <Link
+        to="/models"
+        className="inline-flex items-center gap-1 self-start underline-offset-4 hover:text-foreground hover:underline"
+      >
+        {data.total > 0 ? "查看全部" : "上传模型"}
         <ArrowRight className="size-3" />
       </Link>
     </StatCard>

@@ -190,6 +190,21 @@ func encodeSections(h *Hardware, e *Environment, m *Metrics) (hw, env, metrics [
 	return hw, env, metrics, nil
 }
 
+// NodeID returns the ID of the node registered with nodeKey, for the task
+// calls of the node agent (which identify the node by its key). A node_key
+// that is not registered (any more) is ErrUnknownNode: the node should
+// register again.
+func (s *Service) NodeID(ctx context.Context, nodeKey string) (int64, error) {
+	if err := validateNodeKey(nodeKey); err != nil {
+		return 0, err
+	}
+	id, err := nodeIDByKey(ctx, s.db, nodeKey)
+	if err != nil && !errors.Is(err, errUnknownNode) {
+		return 0, fmt.Errorf("look up compute node: %w", err)
+	}
+	return id, err
+}
+
 // List returns all nodes: online ones first, then by name (ignoring case)
 // and ID.
 func (s *Service) List(ctx context.Context) ([]Node, error) {

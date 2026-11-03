@@ -36,6 +36,8 @@ run_entry probe
 check "probe" "python -m trainmaster_trainer probe uid=$uid" "$out"
 run_entry selftest --json
 check "selftest --json" "python -m trainmaster_trainer selftest --json uid=$uid" "$out"
+run_entry export --weights /tmp/best.pt --imgsz 640
+check "export" "python -m trainmaster_trainer export --weights /tmp/best.pt --imgsz 640 uid=$uid" "$out"
 run_entry healthcheck
 check "healthcheck" "python -m trainmaster_trainer healthcheck uid=$uid" "$out"
 run_entry --version

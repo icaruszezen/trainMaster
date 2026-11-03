@@ -8,7 +8,8 @@ description = "trainMaster 训练节点：自动识别显卡、CPU 与 CUDA 环�
 requires-python = ">=3.10"
 dynamic = ["version"]
 # 只列出常驻进程本身的依赖。torch / torchvision 由 scripts/install-torch.sh 按 CUDA 版本安装，
-# ultralytics 由 requirements.txt 安装；常驻进程不导入它们（只在环境检测子进程中导入）。
+# ultralytics 与 onnx / onnxslim / onnxruntime 由 requirements.txt 安装；常驻进程不导入它们
+# （只在环境检测与模型转换的子进程中导入）。
 dependencies = [
     "nvidia-ml-py>=12.0.0",
     "psutil>=5.8.0",

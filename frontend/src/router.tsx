@@ -13,6 +13,7 @@ import { DatasetVersionsPage } from "@/features/datasets/dataset-versions-page"
 import { DatasetsPage } from "@/features/datasets/datasets-page"
 import { EvaluationsPage } from "@/features/evaluation/evaluations-page"
 import { InferencePage } from "@/features/models/inference-page"
+import { ModelDetailPage } from "@/features/models/model-detail-page"
 import { ModelsPage } from "@/features/models/models-page"
 import { ProjectDetailPage } from "@/features/projects/project-detail-page"
 import { ProjectsPage } from "@/features/projects/projects-page"
@@ -67,9 +68,11 @@ export const routes: RouteObject[] = [
             path: item.path,
             Component: pages[item.id],
           })),
-          // 模块的子页面。静态路径优先于动态参数，/datasets/versions 仍是数据版本页。
+          // 模块的子页面。静态路径优先于动态参数，/datasets/versions 仍是数据版本页，
+          // /models/inference 仍是推理测试页。
           { path: "/projects/:projectId", Component: ProjectDetailPage },
           { path: "/datasets/:datasetId", Component: DatasetDetailPage },
+          { path: "/models/:modelId", Component: ModelDetailPage },
           {
             path: "/annotation/workspace/:datasetId",
             Component: AnnotationEditorPage,

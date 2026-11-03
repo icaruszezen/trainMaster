@@ -14,6 +14,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/compute"
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 	"github.com/icaruszezen/trainmaster/backend/internal/hostinfo"
+	"github.com/icaruszezen/trainmaster/backend/internal/model"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 )
@@ -48,6 +49,11 @@ type Options struct {
 	// Compute serves /api/v1/compute (training nodes). If nil, those
 	// routes are not mounted.
 	Compute *compute.Service
+	// Models serves /api/v1/models (the model repository) and the models
+	// of a project. The conversion tasks of the training nodes
+	// (/api/v1/compute/agent/tasks, /model-exports) also need Compute,
+	// which identifies the nodes. If nil, those routes are not mounted.
+	Models *model.Service
 	// Host describes the server machine for GET /api/v1/compute/server,
 	// which is mounted only when Host and Compute are both set.
 	Host *hostinfo.Host
@@ -68,7 +74,6 @@ var plannedModules = []string{
 	"/annotation/labels",
 	"/training/jobs",
 	"/evaluations",
-	"/models",
 }
 
 type server struct {
@@ -78,6 +83,7 @@ type server struct {
 	datasets  *dataset.Service
 	projects  *project.Service // nil unless datasets is set
 	compute   *compute.Service
+	models    *model.Service
 	host      *hostinfo.Host
 	nodeToken string
 	startedAt time.Time
@@ -88,7 +94,8 @@ type server struct {
 // NewHandler returns the root HTTP handler.
 func NewHandler(o Options) http.Handler {
 	s := &server{log: o.Logger, db: o.DB, storage: o.Storage, datasets: o.Datasets, compute: o.Compute,
-		host: o.Host, nodeToken: o.NodeToken, localTrainerMode: o.LocalTrainerMode, startedAt: o.StartedAt}
+		models: o.Models, host: o.Host, nodeToken: o.NodeToken, localTrainerMode: o.LocalTrainerMode,
+		startedAt: o.StartedAt}
 	if o.Datasets != nil {
 		s.projects = o.Projects
 	}
@@ -123,6 +130,9 @@ func NewHandler(o Options) http.Handler {
 			}
 			if s.compute != nil {
 				r.Route("/compute", s.computeRoutes)
+			}
+			if s.models != nil {
+				r.Route("/models", s.modelRoutes)
 			}
 
 			for _, p := range plannedModules {

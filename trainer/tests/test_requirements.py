@@ -38,10 +38,30 @@ def _version_tuple(text: str) -> tuple[int, ...]:
 
 def test_runtime_requirements():
     runtime = pins(TRAINER_DIR / "requirements.txt")
-    assert set(runtime) == {"ultralytics", "nvidia-ml-py", "psutil"}
+    assert set(runtime) == {
+        "ultralytics",
+        "nvidia-ml-py",
+        "psutil",
+        "onnx",
+        "onnxslim",
+        "onnxruntime",
+    }
     assert runtime["ultralytics"] == "8.4.198"
     # torch / torchvision 由 install-torch.sh 按变体安装，不能出现在这里
     assert "torch" not in runtime and "torchvision" not in runtime
+
+
+def test_onnx_export_requirements():
+    # 节点离线运行（YOLO_OFFLINE=1），ultralytics 不会自动安装导出 ONNX 需要的包：
+    # 版本必须满足 ultralytics 8.4.198 导出时的检查（onnx>=1.12.0,<2.0.0、onnxslim>=0.1.82、onnxruntime）。
+    runtime = pins(TRAINER_DIR / "requirements.txt")
+    assert (1, 12) <= _version_tuple(runtime["onnx"]) < (2,)
+    assert _version_tuple(runtime["onnxslim"]) >= (0, 1, 82)
+    assert runtime["onnx"] == "1.23.2"
+    assert runtime["onnxslim"] == "0.1.98"
+    assert runtime["onnxruntime"] == "1.23.2"
+    # 不能用 onnxruntime-gpu：转换在 CPU 上进行，GPU 版的 wheel 只支持部分 CUDA 版本与架构
+    assert "onnxruntime-gpu" not in runtime
 
 
 def test_dev_requirements_match_runtime():
@@ -49,6 +69,7 @@ def test_dev_requirements_match_runtime():
     dev = pins(TRAINER_DIR / "requirements-dev.txt")
     assert {"pytest", "ruff"} <= set(dev)
     assert "torch" not in dev and "ultralytics" not in dev  # 测试不安装 torch
+    assert "onnx" not in dev and "onnxruntime" not in dev  # 转换子进程的测试同样用假模块
     for name in ("nvidia-ml-py", "psutil"):
         assert dev[name] == runtime[name], name
 

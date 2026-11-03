@@ -4,6 +4,9 @@ import { describe, expect, it } from "vitest"
 import { navItems } from "@/config/navigation"
 import { DatasetDetailPage } from "@/features/datasets/dataset-detail-page"
 import { DatasetVersionsPage } from "@/features/datasets/dataset-versions-page"
+import { InferencePage } from "@/features/models/inference-page"
+import { ModelDetailPage } from "@/features/models/model-detail-page"
+import { ModelsPage } from "@/features/models/models-page"
 import { ProjectDetailPage } from "@/features/projects/project-detail-page"
 import { NotFoundPage } from "@/pages/not-found-page"
 import { pages, routes } from "@/router"
@@ -46,8 +49,17 @@ describe("routes", () => {
     expect(leaf("/projects/7")?.handle).toBeUndefined()
   })
 
+  it("routes model ids to the model detail page without shadowing inference", () => {
+    expect(leafComponent("/models")).toBe(ModelsPage)
+    expect(leafComponent("/models/5")).toBe(ModelDetailPage)
+    expect(leafComponent("/models/inference")).toBe(InferencePage)
+    expect(leafComponent("/models/5/extra")).toBe(NotFoundPage)
+    expect(leaf("/models/5")?.handle).toBeUndefined()
+  })
+
   it("marks only the 404 route as not found", () => {
-    expect(leaf("/models/inferense")?.handle).toEqual({ notFound: true })
+    expect(leaf("/models/5/extra")?.handle).toEqual({ notFound: true })
+    expect(leaf("/annotation/labelz")?.handle).toEqual({ notFound: true })
     for (const item of navItems) {
       expect(leaf(item.path)?.handle, item.path).toBeUndefined()
     }

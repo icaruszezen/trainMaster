@@ -61,6 +61,17 @@ func queryNodes(ctx context.Context, q querier) ([]nodeRow, error) {
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (nodeRow, error) { return scanRow(row) })
 }
 
+// nodeIDByKey returns the ID of the node with nodeKey; errUnknownNode if
+// there is none.
+func nodeIDByKey(ctx context.Context, q querier, nodeKey string) (int64, error) {
+	var id int64
+	err := q.QueryRow(ctx, "SELECT id FROM compute_nodes WHERE node_key = $1", nodeKey).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, errUnknownNode
+	}
+	return id, err
+}
+
 func nodeExists(ctx context.Context, q querier, id int64) (bool, error) {
 	var exists bool
 	err := q.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM compute_nodes WHERE id = $1)", id).Scan(&exists)

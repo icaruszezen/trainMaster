@@ -17,7 +17,8 @@ import (
 
 var (
 	projectKeys = []string{"id", "name", "description", "dataset_count", "image_count", "annotated_count",
-		"empty_count", "invalid_count", "object_count", "total_bytes", "covers", "created_at", "updated_at"}
+		"empty_count", "invalid_count", "object_count", "total_bytes", "covers", "model_count", "latest_model",
+		"created_at", "updated_at"}
 	coverKeys        = []string{"dataset_id", "id", "version"}
 	projectLabelKeys = []string{"name", "object_count", "image_count", "dataset_count"}
 )
@@ -181,6 +182,10 @@ func TestProjectAPI(t *testing.T) {
 	}
 	if l := want[List[project.Project]](t, e.do("GET", "/api/v1/projects?q=其", nil), 200); l.Total != 1 || l.Items[0].ID != other.ID {
 		t.Errorf("search = %+v", l)
+	}
+	// PostgreSQL text cannot hold these.
+	for _, q := range []string{"%00", "a%FF", "%C3"} {
+		wantError(t, e.do("GET", "/api/v1/projects?q="+q, nil), 400, codeBadRequest, "参数 q 无效")
 	}
 
 	// Delete: the datasets stay.

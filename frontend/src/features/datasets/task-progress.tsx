@@ -1,4 +1,8 @@
+import type { ReactNode } from "react"
+
 import { Progress } from "@/components/ui/progress"
+import { etaSeconds } from "@/features/datasets/upload-plan"
+import { formatBytes, formatDuration, percentOf } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
 /**
@@ -36,5 +40,42 @@ export function TaskProgress({
       aria-label={`${label} ${Math.round(value)}%`}
       className={cn("h-1.5", className)}
     />
+  )
+}
+
+/**
+ * 上传中的进度：进度条，下面是“已上传 / 总大小 · 速度 · 剩余时间”。
+ * `children` 插在大小之后（如文件夹上传的文件数，以“· ”开头）。
+ */
+export function TransferProgress({
+  uploadedBytes,
+  totalBytes,
+  speed,
+  children,
+}: {
+  uploadedBytes: number
+  totalBytes: number
+  /** 字节/秒，0 表示未知。 */
+  speed: number
+  children?: ReactNode
+}) {
+  const remaining = etaSeconds(totalBytes - uploadedBytes, speed)
+  return (
+    <>
+      <TaskProgress
+        value={percentOf(uploadedBytes, totalBytes)}
+        label="上传进度"
+      />
+      <p className="flex flex-wrap gap-x-1 text-xs text-muted-foreground tabular-nums">
+        <span>
+          {formatBytes(uploadedBytes)} / {formatBytes(totalBytes)}
+        </span>
+        {children}
+        {speed > 0 && <span>· {formatBytes(speed)}/s</span>}
+        {remaining !== null && (
+          <span>· 剩余 {formatDuration(Math.ceil(remaining))}</span>
+        )}
+      </p>
+    </>
   )
 }

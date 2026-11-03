@@ -400,14 +400,16 @@ def _tail(text: str | bytes | None, limit: int = MAX_DETAIL) -> str | None:
 
 
 def child_env(
-    state_dir: Path, self_test: bool, base: Mapping[str, str] | None = None
+    state_dir: Path, self_test: bool | None, base: Mapping[str, str] | None = None
 ) -> dict[str, str]:
+    """子进程（环境检测、模型转换）的环境变量。self_test 为 None 时不设置 TM_SELF_TEST（转换子进程不需要）。"""
     env = dict(os.environ if base is None else base)
     env["YOLO_OFFLINE"] = "1"
     env["YOLO_CONFIG_DIR"] = str(state_dir / "ultralytics")
     env.setdefault("YOLO_VERBOSE", "False")
     env["PYTHONUNBUFFERED"] = "1"
-    env["TM_SELF_TEST"] = "true" if self_test else "false"
+    if self_test is not None:
+        env["TM_SELF_TEST"] = "true" if self_test else "false"
     # CUDA 默认把最快的显卡排在前面；按 PCI 总线顺序编号才与 NVML / nvidia-smi（页面上的 N 号显卡）一致。
     env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     # 从源码目录运行（python -m trainmaster_trainer）时让子进程也能导入本包；

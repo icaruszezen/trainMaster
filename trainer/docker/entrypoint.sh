@@ -43,10 +43,10 @@ nvidia_groups() {
 }
 
 # 只给出子命令时补全为 python -m trainmaster_trainer <子命令>，
-# 例如 docker compose run --rm trainer probe、docker run … selftest --json。
+# 例如 docker compose run --rm trainer probe、docker run … selftest --json、… export --weights x.pt。
 case "${1:-}" in
 	"") set -- python -m trainmaster_trainer run ;;
-	run | probe | selftest | healthcheck | -*) set -- python -m trainmaster_trainer "$@" ;;
+	run | probe | selftest | export | healthcheck | -*) set -- python -m trainmaster_trainer "$@" ;;
 esac
 
 for id in "$PUID" "$PGID"; do

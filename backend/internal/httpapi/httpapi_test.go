@@ -130,7 +130,9 @@ func TestErrorEnvelopes(t *testing.T) {
 		{"GET", "/api/v1/annotation/labels", 501, "not_implemented"},
 		{"GET", "/api/v1/training/jobs", 501, "not_implemented"},
 		{"DELETE", "/api/v1/evaluations/3/report", 501, "not_implemented"},
-		{"PATCH", "/api/v1/models", 501, "not_implemented"},
+		// Without a model service the model routes are not mounted.
+		{"PATCH", "/api/v1/models", 404, "not_found"},
+		{"GET", "/api/v1/models/1", 404, "not_found"},
 		// Without a web directory, non-API paths are JSON 404s too.
 		{"GET", "/", 404, "not_found"},
 		{"GET", "/datasets/versions", 404, "not_found"},
@@ -178,7 +180,7 @@ func TestUnknownMethodOnWebPathReachesWebHandler(t *testing.T) {
 }
 
 func TestNotImplementedMessage(t *testing.T) {
-	rec := serve(newTestHandler(t, fakeDB{}, nil), http.MethodGet, "/api/v1/models")
+	rec := serve(newTestHandler(t, fakeDB{}, nil), http.MethodGet, "/api/v1/training/jobs")
 	if got, want := rec.Body.String(), `{"error":{"code":"not_implemented","message":"该功能尚未实现"}}`+"\n"; got != want {
 		t.Errorf("body = %s, want %s", got, want)
 	}

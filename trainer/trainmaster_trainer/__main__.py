@@ -1,8 +1,9 @@
-"""命令行入口：python -m trainmaster_trainer [run|probe|selftest|healthcheck]
+"""命令行入口：python -m trainmaster_trainer [run|probe|selftest|export|healthcheck]
 
-run          注册到平台并持续上报心跳（默认；需要 TM_SERVER_URL）
+run          注册到平台并持续上报心跳、执行平台的任务（默认；需要 TM_SERVER_URL）
 probe        打印完整的检测报告（硬件、CUDA 环境、实时指标，JSON），不连接平台，便于排障
 selftest     检测 CUDA / PyTorch / YOLO 环境并执行自检；--json 输出 Environment
+export       在本机把 pt 转换为 ONNX（与平台的转换任务使用同一个子进程），不连接平台，便于排障
 healthcheck  最近一次心跳是否及时（Docker HEALTHCHECK 使用）
 """
 
@@ -187,6 +188,117 @@ def cmd_selftest(as_json: bool) -> int:
     return 1 if env.get("status") == "error" else 0
 
 
+_POSTPROCESS_TEXT = {
+    "raw": "原始输出（raw）",
+    "nms": "嵌入 NMS（nms）",
+    "end2end": "端到端（end2end）",
+}
+
+
+def parse_imgsz(raw: str) -> tuple[int, int]:
+    """--imgsz：640（正方形）或 高x宽 / 高,宽（如 480x640）；每边 32–4096 且是 32 的倍数（与平台相同）。"""
+    parts = [p.strip() for p in raw.lower().replace(",", "x").replace("×", "x").split("x")]
+    if len(parts) not in (1, 2) or not all(p.isdigit() for p in parts):
+        raise argparse.ArgumentTypeError(f"{raw!r} 不是合法的输入尺寸（如 640 或 480x640）")
+    values = [int(p) for p in parts]
+    if any(not 32 <= v <= 4096 or v % 32 for v in values):
+        raise argparse.ArgumentTypeError(f"{raw!r}：每边应在 32–4096 之间且是 32 的倍数")
+    return (values[0], values[-1])
+
+
+def parse_opset(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if not 11 <= value <= 21:
+        raise argparse.ArgumentTypeError(f"{raw!r}：opset 应为 11–21 的整数（不指定时自动选择）")
+    return value
+
+
+def _shape(shape: Any) -> str:
+    return "[" + ", ".join(str(d) for d in shape) + "]" if isinstance(shape, list) else str(shape)
+
+
+def format_export(outcome: dict[str, Any]) -> str:
+    """export 的中文摘要。"""
+    if not outcome.get("ok"):
+        lines = [f"转换失败：{outcome.get('error')}"]
+        if outcome.get("detail"):
+            lines.append("  错误详情：")
+            lines.extend("    " + line for line in str(outcome["detail"]).splitlines())
+        return "\n".join(lines)
+    result = outcome.get("result") or {}
+    path = outcome.get("onnx_path")
+    try:
+        size = f"{Path(str(path)).stat().st_size / (1 << 20):.1f} MB，"
+    except OSError:
+        size = ""
+    duration = result.get("duration_ms")
+    took = f"用时 {duration / 1000:.1f} 秒" if isinstance(duration, (int, float)) else "完成"
+    lines = [f"转换成功：{path}（{size}{took}）"]
+    for label, key in (("输入", "inputs"), ("输出", "outputs")):
+        for item in result.get(key) or []:
+            lines.append(
+                f"  {label}：{item.get('name')} {_shape(item.get('shape'))} {item.get('type')}"
+            )
+    if result.get("end2end"):
+        postprocess = "end2end"
+    elif result.get("nms"):
+        postprocess = "nms"
+    else:
+        postprocess = "raw"
+    facts = [f"opset {result.get('opset')}", _POSTPROCESS_TEXT[postprocess]]
+    facts.append("动态尺寸" if result.get("dynamic") else "固定尺寸")
+    if result.get("verified"):
+        facts.append(f"已用 ONNX Runtime {result.get('onnxruntime_version')} 验证")
+    else:
+        facts.append("未验证（没有安装 onnxruntime）")
+    lines.append("  " + " · ".join(facts))
+    versions = [
+        f"{name} {result[key]}"
+        for name, key in (
+            ("Ultralytics", "ultralytics_version"),
+            ("PyTorch", "torch_version"),
+            ("onnx", "onnx_version"),
+        )
+        if result.get(key)
+    ]
+    if versions:
+        lines.append("  版本：" + " · ".join(versions))
+    return "\n".join(lines)
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    cfg = _load_config()
+    if cfg is None:
+        return 2
+    setup_logging(_quiet_level(cfg))
+    from .model_export import ExportProcess, ExportSpec
+
+    spec = ExportSpec(
+        weights=str(Path(args.weights).resolve()),
+        output=str(Path(args.output).resolve()) if args.output else None,
+        task=args.task,
+        imgsz=args.imgsz,
+        dynamic=args.dynamic,
+        postprocess=args.postprocess,
+        opset=args.opset,
+    )
+    # Ctrl+C / docker stop 时结束转换子进程（run 收到 KeyboardInterrupt 会终止它）。
+    signal.signal(signal.SIGTERM, _raise_interrupt)
+    try:
+        outcome = ExportProcess(state_dir=cfg.state_dir, timeout=cfg.export_timeout).run(spec)
+    except KeyboardInterrupt:
+        return 130
+    if args.json:
+        outcome.pop("cancelled", None)
+        print(json.dumps(outcome, ensure_ascii=False, indent=2))
+    else:
+        print(format_export(outcome), file=sys.stdout if outcome["ok"] else sys.stderr)
+    return 0 if outcome["ok"] else 1
+
+
 def cmd_healthcheck() -> int:
     from .agent import check_heartbeat
 
@@ -199,14 +311,43 @@ def cmd_healthcheck() -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m trainmaster_trainer",
-        description="trainMaster 训练节点：自动识别显卡、CPU 与 CUDA 环境，向平台注册并上报心跳。",
+        description="trainMaster 训练节点：自动识别显卡、CPU 与 CUDA 环境，向平台注册并上报心跳，"
+        "执行平台的任务（如模型的 ONNX 转换）。",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="命令")
-    sub.add_parser("run", help="注册到平台并持续上报心跳（默认）")
+    sub.add_parser("run", help="注册到平台并持续上报心跳、执行平台的任务（默认）")
     sub.add_parser("probe", help="打印硬件、CUDA 环境与实时指标（JSON），不连接平台")
     selftest = sub.add_parser("selftest", help="检测 CUDA / PyTorch / YOLO 环境并执行自检")
     selftest.add_argument("--json", action="store_true", help="以 JSON 输出检测结果（Environment）")
+    export = sub.add_parser(
+        "export",
+        help="在本机把 pt 转换为 ONNX（与平台的转换任务相同），不连接平台",
+        description="在本机把 Ultralytics 的 pt 模型转换为 ONNX（在 CPU 上，离线），打印转换结果。"
+        "与平台的转换任务使用同一个子进程，便于排查转换失败的原因。",
+    )
+    export.add_argument("--weights", required=True, metavar="PT", help="要转换的 pt 文件")
+    export.add_argument(
+        "--imgsz",
+        type=parse_imgsz,
+        metavar="尺寸",
+        help="输入尺寸：640 或 高x宽（如 480x640）；默认为模型训练时的尺寸",
+    )
+    export.add_argument(
+        "--postprocess",
+        choices=("raw", "nms", "end2end"),
+        help="后处理方式：raw 原始输出、nms 嵌入 NMS、end2end 端到端（YOLOv10 / YOLO26）；"
+        "默认端到端模型为 end2end，其余为 raw",
+    )
+    export.add_argument("--dynamic", action="store_true", help="动态输入尺寸（batch、高、宽）")
+    export.add_argument(
+        "--opset", type=parse_opset, metavar="N", help="ONNX opset（11–21），默认自动"
+    )
+    export.add_argument("--task", help="模型任务（detect、segment 等），默认从模型文件读取")
+    export.add_argument(
+        "--output", metavar="ONNX", help="输出文件，默认与 pt 文件同目录、同名的 .onnx"
+    )
+    export.add_argument("--json", action="store_true", help="以 JSON 输出转换结果")
     sub.add_parser("healthcheck", help="检查最近一次心跳是否及时（Docker HEALTHCHECK 使用）")
     return parser
 
@@ -220,6 +361,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_probe()
     if command == "selftest":
         return cmd_selftest(args.json)
+    if command == "export":
+        return cmd_export(args)
     return cmd_healthcheck()
 
 

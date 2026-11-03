@@ -63,6 +63,8 @@ x-trainer: &trainer
     # make setup --variant 固定的 PyTorch 变体（auto 为自动选择）：固定时节点的修复建议用 --variant auto
     # 恢复自动选择，而不是再固定另一个变体
     TM_TRAINER_VARIANT: ${TM_TRAINER_VARIANT:-auto}
+    # 单次模型转换（pt → ONNX）的时间上限，留空为 15 分钟
+    TM_EXPORT_TIMEOUT: ${TM_EXPORT_TIMEOUT:-}
     TM_DATA_DIR: /data
     TM_LOG_LEVEL: ${TM_LOG_LEVEL:-info}
     # 容器以 root 启动，修正状态目录属主后以 PUID:PGID 运行（与 app 相同，才能读写 /data 中的文件）

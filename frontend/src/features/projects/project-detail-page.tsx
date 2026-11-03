@@ -2,6 +2,7 @@ import { useEffect, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import {
   ArrowLeft,
+  ArrowRight,
   Boxes,
   Database,
   FolderSearch,
@@ -29,6 +30,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { watchImport } from "@/features/datasets/import-watch"
 import { LoadError } from "@/features/datasets/load-error"
+import { yoloVersionLabel } from "@/features/models/yolo-versions"
 import {
   projectDatasetsQuery,
   projectLabelsQuery,
@@ -206,6 +208,9 @@ function ProjectDetail({ id }: { id: number }) {
           </TabsTrigger>
           <TabsTrigger value="models" className="px-3">
             模型
+            <span className="text-xs text-muted-foreground tabular-nums">
+              {formatNumber(project.model_count)}
+            </span>
           </TabsTrigger>
         </TabsList>
         <TabsContent value="datasets">
@@ -218,7 +223,7 @@ function ProjectDetail({ id }: { id: number }) {
           <ProjectLabels query={labels} />
         </TabsContent>
         <TabsContent value="models">
-          <ProjectModels />
+          <ProjectModels project={project} />
         </TabsContent>
       </Tabs>
 
@@ -318,8 +323,26 @@ function ProjectStats({ project }: { project: Project }) {
           <span>空标注 {formatNumber(project.empty_count)}</span>
         </span>
       </StatCard>
-      <StatCard title="模型" value="—" icon={Boxes}>
-        <span>模型仓库上线后显示</span>
+      <StatCard
+        title="模型"
+        value={formatNumber(project.model_count)}
+        icon={Boxes}
+      >
+        {project.latest_model ? (
+          <Link
+            to={`/models/${project.latest_model.id}`}
+            className="inline-flex min-w-0 items-center gap-1 self-start underline-offset-4 hover:text-foreground hover:underline"
+            title={formatDateTime(project.latest_model.created_at)}
+          >
+            <span className="truncate">
+              最新 v{project.latest_model.version} ·{" "}
+              {yoloVersionLabel(project.latest_model.yolo_version)}
+            </span>
+            <ArrowRight className="size-3 shrink-0" />
+          </Link>
+        ) : (
+          <span>还没有模型</span>
+        )}
       </StatCard>
     </div>
   )
