@@ -1,4 +1,7 @@
-/** YOLO 类别顺序的输入：文本框（每行一个）、读取 classes.txt、编号预览与校验提示。 */
+/**
+ * YOLO 类别顺序的输入：文本框（每行一个）、读取 classes.txt、编号预览与校验提示。
+ * 编号预览也单独用于只读的类别顺序（项目的类别列表）。
+ */
 import { useId, useRef, useState, type ReactNode, type Ref } from "react"
 import { FileText, Info, RotateCcw } from "lucide-react"
 
@@ -63,7 +66,6 @@ export function ClassListField({
     fileError ??
     (result.error && (!blank || showRequired) ? result.error : null)
   const { classes } = result
-  const hidden = classes.length - PREVIEW_LIMIT
 
   const change = (next: string) => {
     setFileError(null)
@@ -161,40 +163,58 @@ export function ClassListField({
           </p>
         )
       )}
-      {!error && classes.length > 0 && (
-        <div className="grid gap-1.5">
-          <p className="text-xs text-muted-foreground tabular-nums">
-            共 {formatNumber(classes.length)} 个类别（编号 0–
-            {formatNumber(classes.length - 1)}）
-          </p>
-          <ul
-            className="flex max-h-32 flex-wrap gap-1.5 overflow-y-auto"
-            aria-label="类别编号"
-          >
-            {classes.slice(0, PREVIEW_LIMIT).map((name, index) => (
-              <li key={index} className="max-w-full">
-                <Badge
-                  variant="outline"
-                  className="max-w-48 font-normal"
-                  title={`${index} ${name}`}
-                >
-                  <span className="font-mono text-muted-foreground tabular-nums">
-                    {index}
-                  </span>
-                  <span className="truncate">{name}</span>
-                </Badge>
-              </li>
-            ))}
-            {hidden > 0 && (
-              <li>
-                <Badge variant="secondary" className="font-normal">
-                  还有 {formatNumber(hidden)} 个
-                </Badge>
-              </li>
-            )}
-          </ul>
-        </div>
-      )}
+      {!error && classes.length > 0 && <ClassIdPreview classes={classes} />}
     </Field>
+  )
+}
+
+/**
+ * 类别编号预览：类别数、编号范围与前 {@link PREVIEW_LIMIT} 个类别的编号。
+ * `action` 显示在类别数的同一行末尾（如“在项目中修改”的链接）。
+ */
+export function ClassIdPreview({
+  classes,
+  action,
+}: {
+  classes: readonly string[]
+  action?: ReactNode
+}) {
+  const hidden = classes.length - PREVIEW_LIMIT
+  return (
+    <div className="grid gap-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+        <p className="text-xs text-muted-foreground tabular-nums">
+          共 {formatNumber(classes.length)} 个类别（编号 0–
+          {formatNumber(classes.length - 1)}）
+        </p>
+        {action}
+      </div>
+      <ul
+        className="flex max-h-32 flex-wrap gap-1.5 overflow-y-auto"
+        aria-label="类别编号"
+      >
+        {classes.slice(0, PREVIEW_LIMIT).map((name, index) => (
+          <li key={index} className="max-w-full">
+            <Badge
+              variant="outline"
+              className="max-w-48 font-normal"
+              title={`${index} ${name}`}
+            >
+              <span className="font-mono text-muted-foreground tabular-nums">
+                {index}
+              </span>
+              <span className="truncate">{name}</span>
+            </Badge>
+          </li>
+        ))}
+        {hidden > 0 && (
+          <li>
+            <Badge variant="secondary" className="font-normal">
+              还有 {formatNumber(hidden)} 个
+            </Badge>
+          </li>
+        )}
+      </ul>
+    </div>
   )
 }

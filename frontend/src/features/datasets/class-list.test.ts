@@ -6,6 +6,7 @@ import {
   compareClassesWithLabels,
   decodeClassFile,
   defaultClassOrder,
+  defaultOrderIndex,
   parseClassList,
   readClassFile,
   toClassListText,
@@ -123,29 +124,76 @@ describe("defaultClassOrder", () => {
     ).toEqual(["Crack", "dent", "划痕"])
   })
 
-  it("keeps a base order and appends the other labels", () => {
-    expect(
-      defaultClassOrder(
-        [{ name: "dent" }, { name: "Crack" }, { name: "划痕" }],
-        ["划痕", "hole", "dent"]
-      )
-    ).toEqual(["划痕", "hole", "dent", "Crack"])
-  })
-
-  it("keeps the imported order first, then the class list, then the labels", () => {
+  it("keeps the imported order first, then the other labels by name", () => {
     expect(
       defaultClassOrder(
         [{ name: "dog" }, { name: "car" }, { name: "bird" }, { name: "ant" }],
-        ["person", "car", "dog"], // YOLO import: ids 0, 1, 2 stay
-        ["car", "cat", "person", "bird"] // class list in the workspace
+        ["person", "car", "dog"] // YOLO import: ids 0, 1, 2 stay
       )
-    ).toEqual(["person", "car", "dog", "cat", "bird", "ant"])
+    ).toEqual(["person", "car", "dog", "ant", "bird"])
   })
 
-  it("skips missing bases", () => {
+  it("keeps the first position of a repeated name", () => {
+    expect(defaultClassOrder([{ name: "b" }], ["b", "a", "b"])).toEqual([
+      "b",
+      "a",
+    ])
+  })
+
+  it("treats a missing or empty import as no import", () => {
+    const labels = [{ name: "b" }, { name: "a" }]
+    expect(defaultClassOrder(labels, undefined)).toEqual(["a", "b"])
+    expect(defaultClassOrder(labels, [])).toEqual(["a", "b"])
+    expect(defaultClassOrder([])).toEqual([])
+  })
+})
+
+describe("defaultOrderIndex", () => {
+  it("has no default without projects", () => {
+    expect(defaultOrderIndex([])).toBe(-1)
+  })
+
+  it("uses the only project, even before its list is known or when empty", () => {
+    expect(defaultOrderIndex([["a", "b"]])).toBe(0)
+    expect(defaultOrderIndex([undefined])).toBe(0)
+    expect(defaultOrderIndex([[]])).toBe(0)
+  })
+
+  it("picks the first of several projects with the same order", () => {
     expect(
-      defaultClassOrder([{ name: "b" }, { name: "a" }], undefined, ["b"])
-    ).toEqual(["b", "a"])
+      defaultOrderIndex([
+        ["a", "b"],
+        ["a", "b"],
+        ["a", "b"],
+      ])
+    ).toBe(0)
+  })
+
+  it("lets the user choose when the orders differ", () => {
+    expect(
+      defaultOrderIndex([
+        ["a", "b"],
+        ["b", "a"],
+      ])
+    ).toBe(-1)
+    expect(
+      defaultOrderIndex([
+        ["a", "b"],
+        ["a", "b", "c"],
+      ])
+    ).toBe(-1)
+    expect(defaultOrderIndex([["a"], ["A"]])).toBe(-1)
+  })
+
+  it("ignores projects without a class list", () => {
+    expect(defaultOrderIndex([[], ["a", "b"], [], ["a", "b"]])).toBe(1)
+    expect(defaultOrderIndex([[], ["a"]])).toBe(1)
+    expect(defaultOrderIndex([[], []])).toBe(-1)
+  })
+
+  it("waits until every list is known", () => {
+    expect(defaultOrderIndex([["a"], undefined])).toBe(-1)
+    expect(defaultOrderIndex([undefined, []])).toBe(-1)
   })
 })
 

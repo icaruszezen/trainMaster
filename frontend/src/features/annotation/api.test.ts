@@ -122,9 +122,13 @@ describe("applySavedDetail", () => {
     const client = new QueryClient()
     const invalidate = vi.spyOn(client, "invalidateQueries")
     client.setQueryData(annotationKeys.image(1, 2), detail("annotated", ["a"]))
+    client.setQueryData(datasetKeys.labels(1), { items: [], total: 0 })
+    const labelsInvalidated = () =>
+      client.getQueryState(datasetKeys.labels(1))?.isInvalidated
 
     await applySavedDetail(client, 1, detail("annotated", ["a"]))
     expect(invalidate).not.toHaveBeenCalled()
+    expect(labelsInvalidated()).toBe(false)
     expect(client.getQueryData(datasetKeys.image(1, 2))).toEqual(
       detail("annotated", ["a"])
     )
@@ -133,6 +137,8 @@ describe("applySavedDetail", () => {
     expect(invalidate).toHaveBeenCalledWith({
       queryKey: datasetKeys.detail(1),
     })
+    // 数据集的标签统计（标注时的候选类别）随之刷新，新输入的类别成为候选。
+    expect(labelsInvalidated()).toBe(true)
   })
 
   it("is not replaced by a read that started before the request", async () => {

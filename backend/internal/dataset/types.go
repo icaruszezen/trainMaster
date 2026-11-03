@@ -163,13 +163,6 @@ type ImageNeighbors struct {
 	Total    int  `json:"total"` // matching images
 }
 
-// Class is an entry of a dataset's class list: the labels offered when
-// annotating, in order.
-type Class struct {
-	Name  string `json:"name"`
-	Color string `json:"color"` // "#rrggbb", or "" for the color derived from the name
-}
-
 // Label is one label of a dataset with its totals.
 type Label struct {
 	Name        string `json:"name"`

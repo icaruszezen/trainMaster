@@ -35,6 +35,9 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuShortcut,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Input } from "@/components/ui/input"
@@ -57,6 +60,7 @@ import {
 import type { ImageAdjustments } from "@/features/annotation/annotation-canvas"
 import type { SaverState } from "@/features/annotation/autosave"
 import { focusCanvas, type Tool } from "@/features/annotation/shortcuts"
+import type { DatasetProjectRef } from "@/features/datasets/api"
 import { formatNumber } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -103,6 +107,8 @@ function ToolButton({
 type EditorToolbarProps = {
   datasetId: number
   datasetName: string
+  /** 数据集所属的项目：类别列表在项目页面中管理。 */
+  projects: DatasetProjectRef[]
   fileName: string
   path: string
   /** 当前图片在筛选结果中的位置（从 0 开始），不满足筛选条件时为 null。 */
@@ -139,7 +145,6 @@ type EditorToolbarProps = {
   canClearFile: boolean
   onClearFile: () => void
   onReload: () => void
-  onManageClasses: () => void
   onHelp: () => void
   onOpenImages: () => void
   onOpenPanel: () => void
@@ -271,7 +276,7 @@ export function EditorToolbar(props: EditorToolbarProps) {
           <Redo2 />
         </ToolButton>
         <Separator />
-        {/* 手机上用双指缩放与缩放比例菜单，省出宽度给“类别与目标”按钮。 */}
+        {/* 手机上用双指缩放与缩放比例菜单，省出宽度给“目标与图片信息”按钮。 */}
         <ToolButton
           label="缩小"
           keys={["-"]}
@@ -329,7 +334,7 @@ export function EditorToolbar(props: EditorToolbarProps) {
         <ViewPopover view={props.view} onChange={props.onViewChange} />
         <div className="ml-auto flex items-center gap-1 md:hidden">
           <MoreMenu {...props} />
-          <ToolButton label="类别与目标" onClick={props.onOpenPanel}>
+          <ToolButton label="目标与图片信息" onClick={props.onOpenPanel}>
             <PanelRight />
           </ToolButton>
         </div>
@@ -348,7 +353,7 @@ export function EditorToolbar(props: EditorToolbarProps) {
             <Keyboard />
           </ToolButton>
           <ToolButton
-            label="类别与目标"
+            label="目标与图片信息"
             onClick={props.onOpenPanel}
             className="lg:hidden"
           >
@@ -616,10 +621,7 @@ function MoreMenu(props: EditorToolbarProps) {
           删除标注文件
         </DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={props.onManageClasses}>
-          <Tags />
-          管理类别
-        </DropdownMenuItem>
+        <ManageClassesItem projects={props.projects} />
         <DropdownMenuItem onSelect={props.onReload}>
           <RefreshCw />
           重新读取标注文件
@@ -631,6 +633,62 @@ function MoreMenu(props: EditorToolbarProps) {
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
+  )
+}
+
+const classesPath = (projectId: number) => `/projects/${projectId}?tab=classes`
+
+/**
+ * 前往项目页面的“类别”：类别列表属于项目（训练时按它的顺序导出 YOLO），在那里
+ * 管理；数据集属于几个项目时选择其中一个。离开前照常先保存这张图片（见标注
+ * 工作台的 useBlocker）。
+ */
+function ManageClassesItem({ projects }: { projects: DatasetProjectRef[] }) {
+  if (projects.length === 0) {
+    return (
+      <DropdownMenuItem disabled>
+        <Tags />
+        <span className="grid">
+          在项目中管理类别
+          <span className="text-xs text-muted-foreground">
+            数据集未纳入项目
+          </span>
+        </span>
+      </DropdownMenuItem>
+    )
+  }
+  if (projects.length === 1) {
+    const [project] = projects
+    return (
+      <DropdownMenuItem asChild>
+        <Link to={classesPath(project.id)}>
+          <Tags />
+          <span className="grid min-w-0">
+            在项目中管理类别
+            <span className="truncate text-xs text-muted-foreground">
+              {project.name}
+            </span>
+          </span>
+        </Link>
+      </DropdownMenuItem>
+    )
+  }
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger>
+        <Tags />
+        在项目中管理类别
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent className="max-w-64">
+        {projects.map((project) => (
+          <DropdownMenuItem key={project.id} asChild>
+            <Link to={classesPath(project.id)}>
+              <span className="truncate">{project.name}</span>
+            </Link>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
   )
 }
 

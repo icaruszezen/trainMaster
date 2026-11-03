@@ -49,3 +49,9 @@ type Label struct {
 	ImageCount   int    `json:"image_count"`
 	DatasetCount int    `json:"dataset_count"` // datasets with at least one object of the label
 }
+
+// Class is an entry of a project's class list.
+type Class struct {
+	Name  string `json:"name"`
+	Color string `json:"color"` // "#rrggbb", or "" for the color derived from the name
+}

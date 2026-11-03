@@ -54,14 +54,17 @@ export function AnnotationWorkspacePage() {
     <>
       <PageHeader
         title="标注工作台"
-        description="选择一个数据集，按固定顺序逐张画矩形框。标注保存为数据集文件夹中与图片同名的 VOC（.xml）文件，可以继续用 LabelImg 等工具打开。"
+        description="选择一个数据集，按固定顺序逐张画矩形框，画好后选择类别：候选依次是数据集所属项目的类别列表和数据集中已有的类别。标注保存为数据集文件夹中与图片同名的 VOC（.xml）文件，可以继续用 LabelImg 等工具打开。"
       />
       <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm text-muted-foreground">
         <span className="flex items-center gap-1.5">
           <Kbd>W</Kbd> 画框
         </span>
         <span className="flex items-center gap-1.5">
-          <Kbd>1</Kbd>–<Kbd>9</Kbd> 切换类别
+          <Kbd>Enter</Kbd> 确定类别（默认沿用上一个）
+        </span>
+        <span className="flex items-center gap-1.5">
+          <Kbd>1</Kbd>–<Kbd>9</Kbd> 切换类别（项目的类别列表在前）
         </span>
         <span className="flex items-center gap-1.5">
           <Kbd>A</Kbd> / <Kbd>D</Kbd> 上一张 / 下一张（自动保存）

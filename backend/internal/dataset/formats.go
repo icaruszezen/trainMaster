@@ -79,7 +79,7 @@ func NormalizeClasses(raw []string) ([]string, error) {
 	seen := make(map[string]int, len(raw))
 	for i, name := range raw {
 		name = strings.TrimSpace(name)
-		if problem := classNameProblem(name); problem != "" {
+		if problem := ClassNameProblem(name); problem != "" {
 			return invalid("第 %d 个类别%s", i+1, problem)
 		}
 		if j, dup := seen[name]; dup {
@@ -91,9 +91,9 @@ func NormalizeClasses(raw []string) ([]string, error) {
 	return out, nil
 }
 
-// classNameProblem says what is wrong with a trimmed class name, as the
+// ClassNameProblem says what is wrong with a trimmed class name, as the
 // end of a sentence about it ("名称为空"), or returns "" for a valid name.
-func classNameProblem(name string) string {
+func ClassNameProblem(name string) string {
 	switch {
 	case name == "":
 		return "名称为空"

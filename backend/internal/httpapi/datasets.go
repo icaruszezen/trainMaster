@@ -36,9 +36,6 @@ func (s *server) datasetRoutes(r chi.Router) {
 		r.Get("/images/{imageID}/neighbors", s.getImageNeighbors)
 		r.Put("/images/{imageID}/annotation", s.saveImageAnnotation)
 		r.Delete("/images/{imageID}/annotation", s.deleteImageAnnotation)
-		r.Get("/classes", s.listDatasetClasses)
-		r.Put("/classes", s.setDatasetClasses)
-		r.Post("/classes", s.addDatasetClass)
 		r.Get("/labels", s.listDatasetLabels)
 		r.Post("/scan", s.scanDataset)
 		r.Get("/imports", s.listDatasetImports)
@@ -52,6 +49,7 @@ func (s *server) datasetRoutes(r chi.Router) {
 		r.Get("/exports/{token}", s.downloadDatasetExport)
 		if s.projects != nil {
 			r.Put("/projects", s.setDatasetProjects)
+			r.Get("/classes", s.listDatasetClasses)
 		}
 	})
 }
@@ -727,8 +725,13 @@ func (s *server) cancelDatasetImport(w http.ResponseWriter, r *http.Request) {
 // ---- downloads ----
 
 type createExportRequest struct {
-	Format  string   `json:"format"`
-	Classes []string `json:"classes"`
+	Format string `json:"format"`
+	// YOLO only, one of the two: ProjectID names a project of the dataset
+	// whose class list gives the class ids (the order of its classes);
+	// Classes is an order given by hand (for a dataset in no project).
+	// With both, ProjectID wins; other formats ignore them.
+	ProjectID *int64   `json:"project_id"`
+	Classes   []string `json:"classes"`
 }
 
 type exportResponse struct {
@@ -746,7 +749,22 @@ func (s *server) createDatasetExport(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	t, err := s.datasets.CreateExport(r.Context(), id, dataset.ExportInput{Format: req.Format, Classes: req.Classes})
+	in := dataset.ExportInput{Format: req.Format, Classes: req.Classes}
+	if req.Format == dataset.FormatYOLO && req.ProjectID != nil {
+		// Datasets have no class order of their own: the class ids come
+		// from the class list of one of the dataset's projects.
+		if s.projects == nil {
+			notFoundMessage(w, "项目不存在")
+			return
+		}
+		classes, err := s.projects.ExportClasses(r.Context(), *req.ProjectID, id)
+		if err != nil {
+			s.projectError(w, r, err)
+			return
+		}
+		in.Classes = classes
+	}
+	t, err := s.datasets.CreateExport(r.Context(), id, in)
 	if err != nil {
 		s.datasetError(w, r, err)
 		return

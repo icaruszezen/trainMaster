@@ -114,14 +114,14 @@ export async function readClassFile(file: Blob): Promise<string> {
 const byCodePoint = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 
 /**
- * 下载为 YOLO 时的默认类别顺序：先依次沿用 `bases` 中的顺序（如最近一次
- * YOLO 导入的类别顺序，类别编号与导入时一致；再是标注工作台类别列表中的
- * 其它类别），重复的只取第一次出现的位置；数据集中其余的标签按名称（码点）
- * 排在后面。
+ * 不属于任何项目的数据集下载为 YOLO 时的默认类别顺序：先沿用 `imported`（最近
+ * 一次 YOLO 导入的类别顺序，类别编号与导入时一致；重复的只取第一次出现的
+ * 位置），数据集中其余的标签按名称（码点）排在后面。属于项目的数据集使用
+ * 项目的类别列表，不用它。
  */
 export function defaultClassOrder(
   labels: readonly Pick<DatasetLabel, "name">[],
-  ...bases: (readonly string[] | undefined)[]
+  imported?: readonly string[]
 ) {
   const order: string[] = []
   const known = new Set<string>()
@@ -131,15 +131,51 @@ export function defaultClassOrder(
       order.push(name)
     }
   }
-  for (const base of bases) {
-    base?.forEach(add)
-  }
+  imported?.forEach(add)
   labels
     .map((label) => label.name)
     .filter((name) => !known.has(name))
     .sort(byCodePoint)
     .forEach(add)
   return order
+}
+
+const sameOrder = (a: readonly string[], b: readonly string[]) =>
+  a.length === b.length && a.every((name, index) => name === b[index])
+
+/**
+ * 属于项目的数据集下载为 YOLO 时，默认使用哪个项目的类别顺序。`orders` 依次是
+ * 各项目类别列表中的类别名称，还没读到（或读取失败）的为 `undefined`；返回
+ * 其中的下标，没有默认时为 -1，由用户选择。
+ *
+ * 只属于一个项目时就是它（类别列表为空时也是，页面上提示去设置）。属于多个
+ * 项目时，只有都读到了、且有类别列表的项目顺序完全相同（选哪个下载结果都
+ * 一样）时，才默认选其中第一个：顺序不同时替用户选一个，类别编号就可能与
+ * 训练时所用项目的不一致，而且不容易察觉。
+ */
+export function defaultOrderIndex(
+  orders: readonly (readonly string[] | undefined)[]
+) {
+  if (orders.length === 1) {
+    return 0
+  }
+  let found = -1
+  let first: readonly string[] = []
+  for (const [index, order] of orders.entries()) {
+    if (order === undefined) {
+      return -1
+    }
+    if (order.length === 0) {
+      continue
+    }
+    if (found < 0) {
+      found = index
+      first = order
+    } else if (!sameOrder(first, order)) {
+      return -1
+    }
+  }
+  return found
 }
 
 /**

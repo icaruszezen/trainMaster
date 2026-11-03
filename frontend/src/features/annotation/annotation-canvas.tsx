@@ -154,12 +154,16 @@ type AnnotationCanvasProps = {
   tool: Tool
   readOnly: boolean
   colorFor: (name: string) => string
+  /** 显示框；隐藏（H）时框也不能点中、拖动。 */
   showBoxes: boolean
   showLabels: boolean
-  /** 隐藏的类别：不显示、不能点中。 */
-  hiddenClasses: ReadonlySet<string>
   /** 正在悬停的框（如在目标列表中），突出显示。 */
   highlight: string | null
+  /**
+   * 刚画好、正在选择类别的框（选好后才加入，见类别选择框）：与正在画的框一样
+   * 用虚线显示，选择时看得到框住了什么。
+   */
+  pendingBox?: Box | null
   adjustments: ImageAdjustments
   /** 切换图片时沿用的视口（同尺寸的图片保持缩放与位置）。 */
   initialViewport: Viewport | null
@@ -196,8 +200,8 @@ export function AnnotationCanvas({
   colorFor,
   showBoxes,
   showLabels,
-  hiddenClasses,
   highlight,
+  pendingBox,
   adjustments,
   initialViewport,
   onViewportChange,
@@ -286,7 +290,7 @@ export function AnnotationCanvas({
     }
     const onWheel = (event: WheelEvent) => {
       if (inOverlay(event.target)) {
-        // 浮层（如类别列表）照常滚动；捏合（Ctrl+滚轮）仍不缩放整个页面。
+        // 浮层（如类别选择框）照常滚动；捏合（Ctrl+滚轮）仍不缩放整个页面。
         if (event.ctrlKey) {
           event.preventDefault()
         }
@@ -445,17 +449,15 @@ export function AnnotationCanvas({
     },
   }))
 
-  const visible = (object: EditorObject) =>
-    showBoxes && !hiddenClasses.has(object.name)
+  // 可以点中的框：隐藏所有框时没有。
+  const hittable = (list: EditorObject[]) => (showBoxes ? list : [])
 
   const selectedObject =
     selected === null
       ? undefined
       : objects.find((object) => object.uid === selected)
   const editableSelection =
-    !readOnly && selectedObject && visible(selectedObject)
-      ? selectedObject
-      : undefined
+    !readOnly && showBoxes && selectedObject ? selectedObject : undefined
 
   const local = (event: { clientX: number; clientY: number }) => {
     const rect = containerRef.current?.getBoundingClientRect()
@@ -541,9 +543,9 @@ export function AnnotationCanvas({
     const point = toImage(viewport, screen)
 
     // 两次单击画框的第二次单击：松开时完成（见 onPointerUp）。按下时就完成的话，
-    // 弹出的类别选择框（类别列表为空时）刚获得焦点，随后的 mousedown 就把焦点
-    // 移回画布、关掉了它，框也随之丢弃。按下同样取消（触屏与触控笔在上面已经
-    // 取消，见 cancelsPointerDown）。
+    // 画好框后弹出的类别选择框刚获得焦点，随后的 mousedown 就把焦点移回画布、
+    // 关掉了它，框也随之丢弃。按下同样取消（触屏与触控笔在上面已经取消，见
+    // cancelsPointerDown）。
     if (drag?.kind === "draw" && drag.click && canDraw) {
       event.preventDefault()
       element.setPointerCapture(event.pointerId)
@@ -586,9 +588,8 @@ export function AnnotationCanvas({
       return
     }
 
-    const boxes = objects.map((object) => (visible(object) ? object : null))
     const candidates = hitCandidates(
-      boxes,
+      hittable(objects),
       point,
       HIT_TOLERANCE / viewport.scale
     ).map((index) => objects[index].uid)
@@ -797,8 +798,11 @@ export function AnnotationCanvas({
       return
     }
     const point = toImage(viewport, local(event))
-    const boxes = objects.map((object) => (visible(object) ? object : null))
-    const [index] = hitCandidates(boxes, point, HIT_TOLERANCE / viewport.scale)
+    const [index] = hitCandidates(
+      hittable(objects),
+      point,
+      HIT_TOLERANCE / viewport.scale
+    )
     if (index === undefined) {
       setUserViewport(null)
     } else {
@@ -824,6 +828,8 @@ export function AnnotationCanvas({
     drag?.kind === "draw" && imageSize
       ? boxFromPoints(drag.anchor, drag.current, imageSize)
       : null
+  // 虚线框：正在画的框，或画好后正在选择类别的框（开始画下一个框时选择框已关闭）。
+  const outlineBox = drawBox ?? pendingBox ?? null
 
   const hoverImage = viewport && hover ? toImage(viewport, hover) : null
   const hoverHandle =
@@ -833,11 +839,8 @@ export function AnnotationCanvas({
   const hoverUid =
     viewport && hoverImage && !drag && tool !== "rect"
       ? (() => {
-          const boxes = shownObjects.map((object) =>
-            visible(object) ? object : null
-          )
           const [index] = hitCandidates(
-            boxes,
+            hittable(shownObjects),
             hoverImage,
             HIT_TOLERANCE / viewport.scale
           )
@@ -894,8 +897,8 @@ export function AnnotationCanvas({
     drag?.kind !== "pinch"
 
   const readout = (() => {
-    if (drawBox) {
-      return `${boxWidth(drawBox)} × ${boxHeight(drawBox)}`
+    if (outlineBox) {
+      return `${boxWidth(outlineBox)} × ${boxHeight(outlineBox)}`
     }
     if (draftBox) {
       return `${boxWidth(draftBox.box)} × ${boxHeight(draftBox.box)}`
@@ -990,7 +993,6 @@ export function AnnotationCanvas({
             objects={shownObjects}
             viewport={viewport}
             colorFor={colorFor}
-            hiddenClasses={hiddenClasses}
             showBoxes={showBoxes}
             selected={selected}
             emphasized={highlight ?? hoverUid}
@@ -1006,9 +1008,9 @@ export function AnnotationCanvas({
               color={colorFor(editableSelection.name)}
             />
           )}
-          {drawBox && (
+          {outlineBox && (
             <rect
-              {...screenRect(viewport, drawBox)}
+              {...screenRect(viewport, outlineBox)}
               fill="none"
               stroke="white"
               strokeWidth={1.5}
@@ -1030,7 +1032,6 @@ export function AnnotationCanvas({
           objects={shownObjects}
           viewport={viewport}
           colorFor={colorFor}
-          hiddenClasses={hiddenClasses}
           selected={selected}
         />
       )}
@@ -1089,7 +1090,6 @@ type BoxLayerProps = {
   objects: EditorObject[]
   viewport: Viewport
   colorFor: (name: string) => string
-  hiddenClasses: ReadonlySet<string>
   showBoxes: boolean
   selected: string | null
   emphasized: string | null
@@ -1099,7 +1099,6 @@ const BoxLayer = memo(function BoxLayer({
   objects,
   viewport,
   colorFor,
-  hiddenClasses,
   showBoxes,
   selected,
   emphasized,
@@ -1110,9 +1109,6 @@ const BoxLayer = memo(function BoxLayer({
   return (
     <g>
       {objects.map((object) => {
-        if (hiddenClasses.has(object.name)) {
-          return null
-        }
         const color = colorFor(object.name)
         const isSelected = object.uid === selected
         const isEmphasized = object.uid === emphasized
@@ -1167,7 +1163,6 @@ type LabelLayerProps = {
   objects: EditorObject[]
   viewport: Viewport
   colorFor: (name: string) => string
-  hiddenClasses: ReadonlySet<string>
   selected: string | null
 }
 
@@ -1175,7 +1170,6 @@ const LabelLayer = memo(function LabelLayer({
   objects,
   viewport,
   colorFor,
-  hiddenClasses,
   selected,
 }: LabelLayerProps) {
   if (objects.length > MAX_LABELED_OBJECTS) {
@@ -1184,9 +1178,6 @@ const LabelLayer = memo(function LabelLayer({
   return (
     <div className="pointer-events-none absolute inset-0 overflow-hidden">
       {objects.map((object) => {
-        if (hiddenClasses.has(object.name)) {
-          return null
-        }
         const color = colorFor(object.name)
         const rect = boxToScreen(viewport, object)
         // 框贴着画布顶部时，名称放到框内。

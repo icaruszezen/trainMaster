@@ -32,11 +32,13 @@ export type Command =
   | { type: "cycle"; direction: 1 | -1 }
   | { type: "escape" }
   /**
-   * 数字键（下标从 0 开始，0 键是第 10 个类别）：有选中的框时修改它的类别，
-   * 否则切换当前类别。
+   * 数字键（下标从 0 开始，0 键是第 10 个候选类别，候选的顺序见
+   * `buildClassOptions`）：有选中的框时修改它的类别，否则切换当前类别。
    */
   | { type: "class"; index: number }
-  /** 打开类别选择框（可搜索），用于类别较多时。 */
+  /**
+   * 打开类别选择框（可搜索）：有选中的框时修改它的类别，否则切换当前类别。
+   */
   | { type: "pickClass" }
   | { type: "toggleDifficult" }
   | { type: "toggleTruncated" }
@@ -69,7 +71,7 @@ export type ShortcutContext = {
   mac: boolean
   /**
    * 有选中（且显示着）的框：方向键移动它；没有时 ← / → 切换图片。隐藏的框
-   * （H 隐藏所有框，或隐藏了它的类别）不算选中。
+   * （H 隐藏所有框时）不算选中。
    */
   hasSelection: boolean
 }
@@ -240,12 +242,34 @@ export function allowsRepeat(command: Command) {
   )
 }
 
-/** 第 `index` 个类别的数字键（前 10 个类别有），没有时为 null。 */
+/** 第 `index` 个候选类别的数字键（前 10 个有），没有时为 null。 */
 export function classHotkey(index: number) {
   if (index < 0 || index > 9) {
     return null
   }
   return index === 9 ? "0" : String(index + 1)
+}
+
+/**
+ * 类别选择框中按下的数字键对应的候选下标（与 {@link classHotkey} 一致：1–9 是
+ * 前 9 个，0 是第 10 个），不是数字时为 null。按输入的字符（`key`）而不是物理
+ * 按键匹配：这里拦下的是“往搜索框里输入了一个数字”，用哪个键输入数字随键盘布局
+ * 而不同；小键盘关闭 NumLock 时输入的是方向键，照常移动高亮。输入法处理中的按键
+ * （`key` 为 `Process`）不是数字。
+ */
+export function pickerDigitIndex(
+  event: Pick<KeyInput, "key" | "ctrlKey" | "metaKey" | "altKey">
+) {
+  if (
+    event.ctrlKey ||
+    event.metaKey ||
+    event.altKey ||
+    !/^[0-9]$/.test(event.key)
+  ) {
+    return null
+  }
+  const digit = Number(event.key)
+  return digit === 0 ? 9 : digit - 1
 }
 
 /**
@@ -397,11 +421,26 @@ export function leaveOverlay(overlay: Element | null) {
   })
 }
 
+/**
+ * 浮层（类别选择框）中的输入框失去焦点时是否关闭浮层（刚画的框随之放弃），
+ * `next` 是随后获得焦点的元素（`relatedTarget`）：
+ * - 焦点移到浮层以外（点到别的控件、画布或页面上不能获得焦点的地方）时关闭；
+ * - 整个窗口失去焦点（切换到别的标签页或应用、打开开发者工具）时不关闭：用户
+ *   可能是去查目标的名称，回来时浏览器把焦点还给输入框，选择框和框都还在。
+ *   不能按 `next` 为 null 判断，点到页面上不能获得焦点的地方时它也是 null。
+ */
+export function closesOnBlur(overlay: Element, next: Node | null) {
+  if (!overlay.ownerDocument.hasFocus()) {
+    return false
+  }
+  return !overlay.contains(next)
+}
+
 const OPEN_DIALOG =
   '[role="dialog"][data-state="open"], [role="alertdialog"][data-state="open"]'
 
 /**
- * 工作台的对话框（快捷键说明、类别管理、离开与删除的确认）的
+ * 工作台的对话框（快捷键说明、离开与删除的确认）的
  * `onCloseAutoFocus`：它们没有触发按钮，Radix 默认不移动焦点，焦点落到 body
  * 上，Tab 不再切换框。这里改为移到标注画布上；窄屏时弹出的面板（也是对话框）
  * 还开着时移到面板中，不离开面板。画布还不在页面上（图片还在读取）时保持默认
@@ -458,8 +497,17 @@ export function shortcutHelp(mac: boolean): ShortcutHelp[] {
       items: [
         { keys: ["W", "R"], label: "画矩形框：拖动，或先后点击两个对角" },
         { keys: ["Shift"], label: "画框时按住：画正方形" },
+        {
+          keys: ["Enter"],
+          label:
+            "画好框后确定它的类别（默认是当前类别；可按数字键直接选择、输入筛选，或输入新的类别名称）",
+        },
         { keys: ["V"], label: "选择 / 编辑框（拖动空白处平移画面）" },
-        { keys: ["Esc"], label: "取消正在画的框 → 取消选中 → 回到选择工具" },
+        {
+          keys: ["Esc"],
+          label:
+            "放弃刚画、还没有选择类别的框 → 取消正在画的框 → 取消选中 → 回到选择工具",
+        },
         {
           keys: ["Tab", "Shift+Tab"],
           label: "画布有焦点时选中下一个 / 上一个框（到头后焦点移出画布）",
@@ -472,9 +520,13 @@ export function shortcutHelp(mac: boolean): ShortcutHelp[] {
       items: [
         {
           keys: ["1 – 9", "0"],
-          label: "选中框时修改它的类别，否则切换当前类别",
+          label:
+            "前 10 个候选类别：选中框时修改它的类别，否则切换当前类别；类别选择框中还没有输入时直接选择（名称以数字开头时先输入空格）",
         },
-        { keys: ["T"], label: "搜索类别（类别较多时）" },
+        {
+          keys: ["T"],
+          label: "搜索类别：选中框时修改它的类别，否则切换当前类别",
+        },
         { keys: ["Q"], label: "切换“难例”（difficult，虚线框）" },
         { keys: ["E"], label: "切换“截断”（truncated）" },
       ],
