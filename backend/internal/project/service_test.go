@@ -195,6 +195,76 @@ func TestIntegrationProjectCRUD(t *testing.T) {
 	}
 }
 
+// addModel inserts a model row directly (the model package's own tests
+// cover uploading).
+func (e *testEnv) addModel(t *testing.T, projectID int64, version int, yolo string) int64 {
+	t.Helper()
+	var id int64
+	if err := e.db.QueryRow(context.Background(), `INSERT INTO models (project_id, version, source, yolo_version, task,
+			file_name, dir_name, size_bytes, sha256) VALUES ($1, $2, 'upload', $3, 'detect', 'best.pt', $4, 1, 'x')
+		RETURNING id`, projectID, version, yolo, fmt.Sprintf("project-%d/v%d", projectID, version)).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestIntegrationProjectModels(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	p, err := e.svc.CreateProject(ctx, CreateProjectInput{Name: "外观检测"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := e.svc.CreateProject(ctx, CreateProjectInput{Name: "other"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ModelCount != 0 || p.LatestModel != nil {
+		t.Errorf("new project: %d models, latest %+v", p.ModelCount, p.LatestModel)
+	}
+
+	// The latest model is the one with the highest version.
+	e.addModel(t, p.ID, 1, "yolov8")
+	latest := e.addModel(t, p.ID, 3, "yolo26")
+	e.addModel(t, p.ID, 2, "yolo11")
+	otherLatest := e.addModel(t, other.ID, 1, "yolo11")
+	got, err := e.svc.GetProject(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ModelCount != 3 || got.LatestModel == nil || got.LatestModel.ID != latest || got.LatestModel.Version != 3 ||
+		got.LatestModel.YOLOVersion != "yolo26" || got.LatestModel.CreatedAt.IsZero() ||
+		got.LatestModel.CreatedAt.Location() != time.UTC {
+		t.Errorf("project = %d models, latest %+v", got.ModelCount, got.LatestModel)
+	}
+	list, err := e.svc.ListProjects(ctx, "")
+	if err != nil || len(list) != 2 {
+		t.Fatalf("ListProjects = %+v, %v", list, err)
+	}
+	for _, x := range list {
+		want, wantLatest := 3, latest
+		if x.ID == other.ID {
+			want, wantLatest = 1, otherLatest
+		}
+		if x.ModelCount != want || x.LatestModel == nil || x.LatestModel.ID != wantLatest {
+			t.Errorf("listed %s: %d models, latest %+v", x.Name, x.ModelCount, x.LatestModel)
+		}
+	}
+
+	// A project with models cannot be deleted.
+	err = e.svc.DeleteProject(ctx, p.ID)
+	wantKind(t, err, ErrHasModels, "项目中有 3 个模型，请先删除模型，或选择同时删除模型")
+	if _, err := e.svc.GetProject(ctx, p.ID); err != nil {
+		t.Errorf("the project must be kept: %v", err)
+	}
+	if _, err := e.db.Exec(ctx, "DELETE FROM models WHERE project_id = $1", p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.DeleteProject(ctx, p.ID); err != nil {
+		t.Errorf("DeleteProject without models: %v", err)
+	}
+}
+
 func TestIntegrationProjectDatasets(t *testing.T) {
 	e := newTestEnv(t)
 	ctx := context.Background()

@@ -103,7 +103,7 @@ export function ProjectCard({ project, onEdit, onDelete }: ProjectCardProps) {
           </p>
         </div>
 
-        <dl className="grid grid-cols-3 gap-2 text-sm">
+        <dl className="grid grid-cols-4 gap-2 text-sm">
           <div className="grid gap-0.5">
             <dt className="text-xs text-muted-foreground">数据集</dt>
             <dd className="font-medium tabular-nums">
@@ -117,8 +117,21 @@ export function ProjectCard({ project, onEdit, onDelete }: ProjectCardProps) {
             </dd>
           </div>
           <div className="grid gap-0.5">
+            <dt className="text-xs text-muted-foreground">模型</dt>
+            <dd
+              className="font-medium tabular-nums"
+              title={
+                project.latest_model
+                  ? `最新 v${project.latest_model.version}`
+                  : undefined
+              }
+            >
+              {formatNumber(project.model_count)}
+            </dd>
+          </div>
+          <div className="grid gap-0.5">
             <dt className="text-xs text-muted-foreground">大小</dt>
-            <dd className="font-medium tabular-nums">
+            <dd className="truncate font-medium tabular-nums">
               {formatBytes(project.total_bytes)}
             </dd>
           </div>

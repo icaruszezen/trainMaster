@@ -370,7 +370,7 @@ function ProjectsEmptyState({ onCreate }: { onCreate: () => void }) {
         </EmptyMedia>
         <EmptyTitle>还没有项目</EmptyTitle>
         <EmptyDescription>
-          项目用于按检测任务（如某条产线的外观缺陷检测）组织数据集，并汇总其中的图片、标注进度与标签分布；模型功能上线后，项目也会关联训练出的模型。
+          项目用于按检测任务（如某条产线的外观缺陷检测）组织数据集，并汇总其中的图片、标注进度与标签分布；模型仓库中的模型也按项目保存，在项目内迭代版本。
         </EmptyDescription>
       </EmptyHeader>
       <EmptyContent>

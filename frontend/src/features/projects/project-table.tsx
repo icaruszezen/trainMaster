@@ -60,6 +60,9 @@ export function ProjectTable({
             </TableHead>
             <TableHead className="hidden w-44 md:table-cell">已标注</TableHead>
             <TableHead className="hidden text-right lg:table-cell">
+              模型
+            </TableHead>
+            <TableHead className="hidden text-right lg:table-cell">
               大小
             </TableHead>
             <TableHead className="hidden md:table-cell">更新时间</TableHead>
@@ -123,6 +126,16 @@ export function ProjectTable({
                       {formatPercent(percent)}
                     </span>
                   </div>
+                </TableCell>
+                <TableCell
+                  className="hidden text-right tabular-nums lg:table-cell"
+                  title={
+                    project.latest_model
+                      ? `最新 v${project.latest_model.version}`
+                      : undefined
+                  }
+                >
+                  {formatNumber(project.model_count)}
                 </TableCell>
                 <TableCell className="hidden text-right tabular-nums lg:table-cell">
                   {formatBytes(project.total_bytes)}

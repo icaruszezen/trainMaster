@@ -1,4 +1,5 @@
 """训练节点主循环：注册 → 定期心跳（上报实时指标）→ 按需重新检测硬件与 CUDA 环境。
+第一次注册成功后启动任务线程（tasks.TaskWorker），领取并执行平台的任务（如 pt → ONNX 转换）。
 
 - 服务端不可达、5xx、401（令牌不对）、422 都不会让进程退出：记录清晰的日志后指数退避重试
   （1 秒起，最长 60 秒，带抖动），配置在服务端修正后自动恢复。
@@ -23,9 +24,13 @@ from . import __version__
 from . import hardware as hardware_mod
 from . import issues as issues_mod
 from . import node_key as node_key_mod
+from .backoff import BACKOFF_BASE, BACKOFF_CAP, Backoff
 from .client import ApiError, Client, TransportError
 from .config import Config
 from .environment import EnvironmentDetector, deployment_from, failure_raw, utc_now
+from .tasks import TaskWorker
+
+__all__ = ["BACKOFF_BASE", "BACKOFF_CAP", "Agent", "Backoff", "check_heartbeat"]
 
 log = logging.getLogger(__name__)
 
@@ -33,8 +38,6 @@ HEARTBEAT_FILE = "heartbeat"
 DEFAULT_INTERVAL = 10.0
 MIN_INTERVAL = 1.0
 MAX_INTERVAL = 300.0
-BACKOFF_BASE = 1.0
-BACKOFF_CAP = 60.0
 HEALTH_GRACE_SECONDS = 30.0
 
 
@@ -51,31 +54,25 @@ class Detector(Protocol):
     def cancel(self) -> None: ...
 
 
-class Backoff:
-    """指数退避：1、2、4 … 秒，最长 cap 秒，每次乘以 0.75–1.25 的随机系数，避免多个节点同时重试。"""
-
-    def __init__(
-        self, base: float = BACKOFF_BASE, cap: float = BACKOFF_CAP, rng: random.Random | None = None
-    ):
-        self.base = base
-        self.cap = cap
-        self.rng = rng or random.Random()
-        self.attempt = 0
-
-    def next(self) -> float:
-        delay = min(self.cap, self.base * (2 ** min(self.attempt, 30)))
-        self.attempt += 1
-        return min(self.cap, delay * (0.75 + 0.5 * self.rng.random()))
-
-    def reset(self) -> None:
-        self.attempt = 0
-
-
 def _interval(resp: dict[str, Any], current: float) -> float:
     value = resp.get("heartbeat_interval_seconds")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return current
     return float(min(MAX_INTERVAL, max(MIN_INTERVAL, value)))
+
+
+def default_task_worker(agent: Agent) -> TaskWorker:
+    """任务线程使用自己的客户端（长轮询不占用心跳的连接，停止时互不影响）。"""
+    cfg = agent.config
+    assert cfg.server_url is not None
+    return TaskWorker(
+        client=Client(cfg.server_url, cfg.node_token),
+        node_key=agent.node_key,
+        registration=agent,
+        state_dir=cfg.state_dir,
+        node_name=cfg.node_name,
+        export_timeout=cfg.export_timeout,
+    )
 
 
 class Agent:
@@ -92,6 +89,7 @@ class Agent:
         rng: random.Random | None = None,
         node_key: str | None = None,
         hostname: str | None = None,
+        task_worker: Callable[[Agent], TaskWorker | None] | None = None,
     ) -> None:
         if not config.server_url:
             raise ValueError("server_url is required")
@@ -121,7 +119,13 @@ class Agent:
         self._pending_environment: dict[str, Any] | None = None
         self._pending_hardware: dict[str, Any] | None = None
         self._last_environment: dict[str, Any] | None = None
+        self._task_worker_factory = task_worker or default_task_worker
+        self.tasks: TaskWorker | None = None
 
+        # registered 与 epoch（每次注册成功加一）由 _registration 保护：任务线程据此等待注册，
+        # 收到 unknown_node 时请主循环重新注册（registration_lost）。
+        self._registration = threading.Condition()
+        self._epoch = 0
         self.registered = False
         self.node_id: Any = None
         self.interval = DEFAULT_INTERVAL
@@ -133,12 +137,18 @@ class Agent:
     # ---- 生命周期 ----
 
     def stop(self) -> None:
-        """请求停止（可从信号处理函数或其它线程调用）：主循环尽快退出，正在运行的检测子进程被终止。"""
+        """请求停止（可从信号处理函数或其它线程调用）：主循环尽快退出，正在运行的检测子进程与
+        转换子进程被终止。"""
         self._stop.set()
         try:
             self.detector.cancel()
         except Exception as exc:
             log.debug("cancelling environment detection failed: %s", exc)
+        tasks = self.tasks
+        if tasks is not None:
+            tasks.stop()
+        with self._registration:
+            self._registration.notify_all()  # 唤醒等待注册的任务线程
 
     @property
     def stopped(self) -> bool:
@@ -193,12 +203,54 @@ class Agent:
             self.detector.cancel()
         except Exception as exc:
             log.debug("cancelling environment detection failed: %s", exc)
+        tasks = self.tasks
+        if tasks is not None:
+            tasks.stop()
+            tasks.join()
         thread = self._detect_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=10)
         if self._probe is not None:
             self._probe.gpu.sampler.close()
         log.info("trainer stopped")
+
+    # ---- 注册状态（任务线程使用）----
+
+    def _set_registered(self, value: bool) -> None:
+        with self._registration:
+            if value:
+                self._epoch += 1
+            self.registered = value
+            self._registration.notify_all()
+
+    def wait_registered(self, timeout: float) -> int | None:
+        """已注册时返回当前 epoch；否则最多等待 timeout 秒。已停止时返回 None。"""
+        with self._registration:
+            self._registration.wait_for(
+                lambda: self.registered or self._stop.is_set(), timeout=timeout
+            )
+            if self._stop.is_set() or not self.registered:
+                return None
+            return self._epoch
+
+    def registration_lost(self, epoch: int) -> None:
+        """任务接口返回 unknown_node：若 epoch 仍是当前的注册，下一步重新注册（已重新注册过时忽略）。"""
+        with self._registration:
+            if self.registered and self._epoch == epoch:
+                log.info("server does not know this node (unknown_node), registering again")
+                self.registered = False
+
+    def _start_tasks(self) -> None:
+        if self.tasks is not None or self._stop.is_set():
+            return
+        try:
+            self.tasks = self._task_worker_factory(self)
+        except Exception:  # 防御：任务线程出错不应影响注册与心跳
+            log.exception("cannot create the task worker")
+            self._task_worker_factory = lambda agent: None
+            return
+        if self.tasks is not None:
+            self.tasks.start()
 
     # ---- 环境检测 ----
 
@@ -299,7 +351,7 @@ class Agent:
             self.wait(self._backoff.next())
             return
 
-        self.registered = True
+        self._set_registered(True)
         self.node_id = resp.get("node_id")
         self.interval = _interval(resp, self.interval)
         self._backoff.reset()
@@ -317,6 +369,7 @@ class Agent:
         self._last_error = None
         self._write_heartbeat_file()
         self._next_heartbeat = self._clock() + self.interval
+        self._start_tasks()
 
     def _heartbeat(self) -> None:
         with self._lock:
@@ -335,7 +388,7 @@ class Agent:
         except ApiError as exc:
             if exc.status == 404 and exc.code == "unknown_node":
                 log.info("server does not know this node (unknown_node), registering again")
-                self.registered = False
+                self._set_registered(False)
                 return
             self._on_failure("heartbeat", exc)
             self._next_heartbeat = self._clock() + self._backoff.next()

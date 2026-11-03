@@ -20,6 +20,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 	"github.com/icaruszezen/trainmaster/backend/internal/hostinfo"
 	"github.com/icaruszezen/trainmaster/backend/internal/httpapi"
+	"github.com/icaruszezen/trainmaster/backend/internal/model"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 	"github.com/icaruszezen/trainmaster/backend/internal/web"
@@ -80,6 +81,14 @@ func run() error {
 	}
 	defer datasets.Stop()
 
+	// The model repository. Its background work (conversions whose
+	// training node stopped reporting are queued again, stale uploads and
+	// temporary files are cleaned up) runs until shutdown; Stop runs before
+	// the pool closes.
+	models := model.NewService(model.Options{DB: db.Pool, Storage: store, Logger: log})
+	models.Start(ctx)
+	defer models.Stop()
+
 	// CPU utilization of this machine for the compute page, sampled in the
 	// background until shutdown.
 	host := hostinfo.New(hostinfo.Options{FS: hostinfo.SystemFS()})
@@ -100,6 +109,7 @@ func run() error {
 		Compute: compute.NewService(compute.Options{
 			DB: db.Pool, Logger: log, HeartbeatInterval: cfg.NodeHeartbeatInterval,
 		}),
+		Models:           models,
 		Host:             host,
 		NodeToken:        cfg.NodeToken,
 		LocalTrainerMode: cfg.TrainerMode,
@@ -117,13 +127,16 @@ func run() error {
 		Handler:           httpapi.NewHandler(opts),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
-		// No Read/WriteTimeout: dataset uploads and future model downloads
-		// can legitimately take long.
+		// No Read/WriteTimeout: dataset and model uploads, model downloads
+		// and the training nodes' long polls can legitimately take long.
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 	// Shutdown waits for in-flight requests but does not interrupt them.
 	// Long-lived handlers (e.g. SSE training logs) should stop by
 	// themselves when it begins: hook them up via srv.RegisterOnShutdown.
+	// The training nodes' task claims (long polls of up to 30 seconds)
+	// return at once; the nodes claim again after the restart.
+	srv.RegisterOnShutdown(models.StopLongPolls)
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
 		return err

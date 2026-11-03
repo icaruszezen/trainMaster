@@ -19,10 +19,12 @@ import pytest
 from fake_platform import HEARTBEAT, REGISTER, FakePlatform, wait_until
 from fakes import TRAINER_DIR
 
-from trainmaster_trainer import gpu
+from trainmaster_trainer import __version__, gpu
 from trainmaster_trainer.agent import Agent, Backoff, check_heartbeat
+from trainmaster_trainer.client import Client
 from trainmaster_trainer.config import Config
 from trainmaster_trainer.hardware import HardwareProbe
+from trainmaster_trainer.tasks import TaskWorker
 
 TOKEN = "right-token-0123456789"
 
@@ -87,7 +89,14 @@ class FakeHardware:
 
 class Harness:
     def __init__(
-        self, tmp_path: Path, url: str, *, token: str | None = TOKEN, detector=None, client=None
+        self,
+        tmp_path: Path,
+        url: str,
+        *,
+        token: str | None = TOKEN,
+        detector=None,
+        client=None,
+        task_worker=None,
     ):
         self.clock = FakeClock()
         self.detector = detector or FakeDetector()
@@ -109,6 +118,7 @@ class Harness:
             rng=random.Random(1),
             node_key="node-key-1",
             hostname="host-1",
+            task_worker=task_worker,
         )
         self.exit_code: int | None = None
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -149,7 +159,7 @@ def test_register_then_heartbeat_with_environment(platform, tmp_path, caplog):
         assert body["node_key"] == "node-key-1"
         assert body["name"] == "gpu-01"
         assert body["hostname"] == "host-1"
-        assert body["agent_version"] == "0.1.0"
+        assert body["agent_version"] == __version__ == "0.2.0"
         assert body["hardware"]["probe"] == 1
         assert body["environment"] is None  # 检测还没有完成
         assert body["metrics"]["cpu_percent"] is None  # 第一次采集
@@ -477,6 +487,126 @@ def test_heartbeat_file_write_failure_is_logged_once(platform, tmp_path, caplog)
         thread.join(timeout=10)
     warnings = [r for r in caplog.records if "cannot write heartbeat file" in r.getMessage()]
     assert len(warnings) == 1
+
+
+# ---- 任务线程 ----
+
+
+def worker_factory(platform: FakePlatform, tmp_path: Path, created: list[TaskWorker], **kw: Any):
+    """创建能领取 model_export 的任务线程（不依赖测试环境是否安装了 torch / onnx）。"""
+
+    def factory(agent: Agent) -> TaskWorker:
+        worker = TaskWorker(
+            client=Client(platform.url, TOKEN),
+            node_key=agent.node_key,
+            registration=agent,
+            state_dir=tmp_path,
+            node_name="gpu-01",
+            export_timeout=60,
+            find_spec=lambda name: object(),
+            **kw,
+        )
+        created.append(worker)
+        return worker
+
+    return factory
+
+
+def test_task_worker_starts_after_registration_and_stops(platform, tmp_path):
+    platform.max_claim_wait = 0.2
+    platform.mode = "503"
+    created: list[TaskWorker] = []
+    with Harness(
+        tmp_path, platform.url, task_worker=worker_factory(platform, tmp_path, created)
+    ) as h:
+        wait_until(lambda: platform.count(REGISTER) >= 3)
+        assert created == [] and platform.claims == []  # 注册成功之前不启动
+        platform.mode = "up"
+        wait_until(lambda: platform.claims)
+        assert h.agent.tasks is created[0] and created[0].alive
+        claim = platform.claims[0]
+        assert claim["node_key"] == "node-key-1" and claim["kinds"] == ["model_export"]
+        with platform.lock:
+            platform.nodes.clear()  # 重新注册不会再启动一个任务线程
+        wait_until(lambda: (registered(platform) or {}).get("registrations"))
+        claims = len(platform.claims)
+        wait_until(lambda: len(platform.claims) > claims)
+    assert len(created) == 1
+    assert created[0].stopped
+    wait_until(lambda: not created[0].alive)
+
+
+def test_stop_interrupts_a_running_export(platform, tmp_path):
+    import hashlib
+
+    pid_file = tmp_path / "child.pid"
+    child = tmp_path / "child.py"
+    child.write_text(
+        f"import os, pathlib, time\npathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+    )
+    created: list[TaskWorker] = []
+    factory = worker_factory(
+        platform, tmp_path, created, export_command=[sys.executable, str(child)]
+    )
+    platform.max_claim_wait = 0.2
+    data = b"pt" * 100
+    export_id = platform.add_export(data)
+    assert platform.export(export_id)["model"]["sha256"] == hashlib.sha256(data).hexdigest()
+    started = None
+    with Harness(tmp_path, platform.url, task_worker=factory):
+        wait_until(lambda: pid_file.exists() and pid_file.read_text())
+        pid = int(pid_file.read_text())
+        started = time.monotonic()
+    # Harness 退出时调用 agent.stop()：结束转换子进程，上报可重试的失败后才退出
+    assert time.monotonic() - started < 10
+    exp = platform.export(export_id)
+    assert exp["status"] == "queued"
+    assert exp["fails"][0]["retryable"] is True
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_registration_state_for_the_task_worker(tmp_path):
+    agent = Agent(
+        Config(server_url="http://127.0.0.1:9", state_dir=tmp_path),
+        node_key="k",
+        detector=FakeDetector(),
+    )
+    assert agent.wait_registered(0.01) is None
+    agent._set_registered(True)
+    assert agent.wait_registered(0) == 1
+    agent.registration_lost(0)  # 旧的注册：忽略
+    assert agent.registered
+    agent.registration_lost(1)
+    assert not agent.registered and agent.wait_registered(0.01) is None
+
+    got: list[int | None] = []
+    waiter = threading.Thread(target=lambda: got.append(agent.wait_registered(10)))
+    waiter.start()
+    time.sleep(0.05)
+    agent._set_registered(True)  # 重新注册唤醒等待的任务线程
+    waiter.join(timeout=5)
+    assert got == [2]
+
+    agent.registration_lost(2)
+    waiter = threading.Thread(target=lambda: got.append(agent.wait_registered(10)))
+    waiter.start()
+    time.sleep(0.05)
+    agent.stop()  # 停止也唤醒它
+    waiter.join(timeout=5)
+    assert not waiter.is_alive() and got == [2, None]
+
+
+def test_task_worker_factory_errors_do_not_stop_the_agent(platform, tmp_path, caplog):
+    def broken(agent):
+        raise RuntimeError("bug")
+
+    with Harness(tmp_path, platform.url, task_worker=broken) as h:
+        node = wait_until(lambda: registered(platform))
+        wait_until(lambda: node.get("heartbeats", 0) >= 2)
+        assert h.agent.tasks is None
+    assert sum("cannot create the task worker" in r.getMessage() for r in caplog.records) == 1
 
 
 # ---- Backoff ----

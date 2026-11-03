@@ -12,13 +12,25 @@ import {
   type Dataset,
   type DatasetImageRef,
 } from "@/features/datasets/api"
+import type { YoloVersion } from "@/features/models/api"
 import { apiGet, apiSend, type ListResponse } from "@/lib/api"
 import { queryClient } from "@/lib/query-client"
 
 /** 项目卡片的封面：来自项目中某个数据集的一张图片。 */
 export type ProjectCover = DatasetImageRef & { dataset_id: number }
 
-/** 项目：一组数据集（以后还有训练任务与模型）。统计数据是其数据集的合计。 */
+/** 项目中版本号最大的模型（详见 features/models）。 */
+export type ProjectLatestModel = {
+  id: number
+  version: number
+  yolo_version: YoloVersion
+  created_at: string
+}
+
+/**
+ * 项目：一组数据集与模型仓库中归属它的模型（以后还有训练任务）。图片、标注等
+ * 统计数据是其数据集的合计。
+ */
 export type Project = {
   id: number
   name: string
@@ -36,6 +48,10 @@ export type Project = {
   total_bytes: number
   /** 最多 4 张，轮流取自项目中的前几个数据集。 */
   covers: ProjectCover[]
+  /** 模型仓库中归属该项目的模型数。 */
+  model_count: number
+  /** 没有模型时为 null。 */
+  latest_model: ProjectLatestModel | null
   created_at: string
   /** 修改信息、增减数据集时更新。 */
   updated_at: string
@@ -124,9 +140,21 @@ export function updateProject(
   return apiSend<Project>("PATCH", projectPath(id), input)
 }
 
-/** 删除项目；其中的数据集保留，只是不再属于该项目。 */
-export function deleteProject(id: number) {
-  return apiSend("DELETE", projectPath(id))
+/**
+ * `?delete_models=true` 时记录已删除、但有模型文件夹没能完全删除的结果（200）；
+ * 全部删除时为 204，`deleteProject` 返回 undefined。
+ */
+export type DeleteProjectResult = { files_removed: boolean; message: string }
+
+/**
+ * 删除项目；其中的数据集保留，只是不再属于该项目。项目中有模型时必须同时删除
+ * 模型（`deleteModels`），否则 409 `conflict`。
+ */
+export function deleteProject(id: number, { deleteModels = false } = {}) {
+  return apiSend<DeleteProjectResult | undefined>(
+    "DELETE",
+    deleteModels ? `${projectPath(id)}?delete_models=true` : projectPath(id)
+  )
 }
 
 /** 把数据集纳入项目（已在项目中的忽略），返回更新后的项目。 */

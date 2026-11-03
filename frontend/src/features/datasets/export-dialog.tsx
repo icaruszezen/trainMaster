@@ -32,6 +32,7 @@ import {
   toClassListText,
 } from "@/features/datasets/class-list"
 import { ClassListField } from "@/features/datasets/class-list-field"
+import { startDownload } from "@/lib/download"
 import { formatBytes, formatNumber } from "@/lib/format"
 
 /** 每种格式下载后的目录结构（与服务端的打包方式一致）。 */
@@ -44,17 +45,6 @@ const exportDescriptions: Record<AnnotationFormat, string> = {
 
 /** 警告中最多列出的标签数。 */
 const LIST_LIMIT = 30
-
-/** 交给浏览器原生下载：压缩包可能有几十 GB，不能读进内存。 */
-function startDownload(url: string, fileName: string) {
-  const link = document.createElement("a")
-  link.href = url
-  link.download = fileName
-  link.style.display = "none"
-  document.body.append(link)
-  link.click()
-  link.remove()
-}
 
 /** 数据集能否下载：文件夹存在且至少有一张图片。 */
 export function canExportDataset(dataset: Dataset) {

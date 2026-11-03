@@ -552,19 +552,22 @@ func (s *server) getDatasetImport(w http.ResponseWriter, r *http.Request) {
 // limitBody caps a request body at limit bytes; reading past it fails with
 // a dataset error of kind ErrTooLarge carrying message.
 func limitBody(w http.ResponseWriter, r *http.Request, limit int64, message string) io.ReadCloser {
-	return tooLargeReader{ReadCloser: http.MaxBytesReader(w, r.Body, limit), message: message}
+	return tooLargeReader{ReadCloser: http.MaxBytesReader(w, r.Body, limit),
+		tooLarge: &dataset.Error{Kind: dataset.ErrTooLarge, Message: message}}
 }
 
+// tooLargeReader replaces the error of reading past a MaxBytesReader's
+// limit with tooLarge.
 type tooLargeReader struct {
 	io.ReadCloser
-	message string
+	tooLarge error
 }
 
 func (t tooLargeReader) Read(p []byte) (int, error) {
 	n, err := t.ReadCloser.Read(p)
 	var mbe *http.MaxBytesError
 	if errors.As(err, &mbe) {
-		err = &dataset.Error{Kind: dataset.ErrTooLarge, Message: t.message}
+		err = t.tooLarge
 	}
 	return n, err
 }

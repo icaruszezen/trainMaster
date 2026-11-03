@@ -13,6 +13,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   Dialog,
   DialogContent,
@@ -43,6 +44,11 @@ import { datasetsQuery } from "@/features/datasets/api"
 import { DescriptionCounter } from "@/features/datasets/dataset-actions"
 import { isNameTaken, validateDescription } from "@/features/datasets/naming"
 import {
+  modelKeys,
+  projectModelsQuery,
+  refreshModels,
+} from "@/features/models/api"
+import {
   cacheNewProject,
   createProject,
   deleteProject,
@@ -55,7 +61,7 @@ import {
 import { DatasetPicker } from "@/features/projects/dataset-picker"
 import { validateProjectName } from "@/features/projects/naming"
 import { ApiError } from "@/lib/api"
-import { formatNumber } from "@/lib/format"
+import { formatBytes, formatNumber } from "@/lib/format"
 import { queryClient } from "@/lib/query-client"
 
 type ProjectActionsMenuProps = {
@@ -208,8 +214,9 @@ function ProjectForm({
       if (isEdit) {
         queryClient.setQueryData(projectKeys.detail(saved.id), saved)
         if (saved.name !== project.name) {
-          // 数据集上的项目标记显示项目名称。
+          // 数据集上的项目标记与模型（标题为“项目名 v3”）显示项目名称。
           refreshMembership()
+          void queryClient.invalidateQueries({ queryKey: modelKeys.all })
         } else {
           void queryClient.invalidateQueries({ queryKey: projectKeys.lists() })
         }
@@ -378,7 +385,7 @@ type DeleteProjectDialogProps = {
   onDeleted?: (project: Project) => void
 }
 
-/** 删除项目：只删除项目本身，其中的数据集保留。 */
+/** 删除项目：其中的数据集保留；项目中有模型时需要勾选同时删除模型。 */
 export function DeleteProjectDialog({
   project,
   onOpenChange,
@@ -408,27 +415,101 @@ function DeleteProjectForm({
   project: Project
   onDeleted: () => void
 }) {
+  const checkboxId = useId()
+  // 以项目的模型列表为准（项目卡片上的数量可能是一会儿之前的）。
+  const models = useQuery(projectModelsQuery(project.id))
+  const modelCount = models.data?.items.length ?? project.model_count
+  const modelBytes = models.data?.items.reduce(
+    (sum, model) => sum + model.size_bytes,
+    0
+  )
+  const exportCount =
+    models.data?.items.reduce((sum, model) => sum + model.export_count, 0) ?? 0
+  const hasModels = modelCount > 0
+  const [deleteModels, setDeleteModels] = useState(false)
+
   const mutation = useMutation({
-    mutationFn: () => deleteProject(project.id),
-    onSuccess: () => {
+    mutationFn: () =>
+      deleteProject(project.id, { deleteModels: hasModels && deleteModels }),
+    onSuccess: (result) => {
       queryClient.removeQueries({ queryKey: projectKeys.detail(project.id) })
-      // 数据集上的项目标记与按项目筛选的结果都会变化。
+      queryClient.removeQueries({ queryKey: modelKeys.project(project.id) })
+      // 数据集上的项目标记与按项目筛选的结果都会变化；模型随项目一起删除。
       refreshMembership()
-      toast.success(`已删除项目“${project.name}”`)
+      if (hasModels) {
+        refreshModels()
+      }
+      if (result?.files_removed === false) {
+        // 记录已删除，但有模型文件夹没能完全删除（如权限不足）：说明留在了哪里。
+        toast.warning(`已删除项目“${project.name}”`, {
+          description: result.message,
+          duration: 15_000,
+        })
+      } else {
+        toast.success(`已删除项目“${project.name}”`, {
+          description: hasModels
+            ? `同时删除了 ${formatNumber(modelCount)} 个模型。`
+            : undefined,
+        })
+      }
       onDeleted()
     },
+    onError: (error) => {
+      if (error instanceof ApiError && error.status === 409) {
+        // 删除期间有新的模型上传到了项目：刷新后显示最新的模型数。
+        void queryClient.invalidateQueries({
+          queryKey: modelKeys.project(project.id),
+        })
+        void queryClient.invalidateQueries({
+          queryKey: projectKeys.detail(project.id),
+        })
+        void queryClient.invalidateQueries({ queryKey: projectKeys.lists() })
+      }
+    },
   })
+
+  const blocked = hasModels && !deleteModels
 
   return (
     <>
       <AlertDialogHeader>
-        <AlertDialogTitle>删除项目“{project.name}”？</AlertDialogTitle>
+        <AlertDialogTitle className="break-words">
+          删除项目“{project.name}”？
+        </AlertDialogTitle>
         <AlertDialogDescription>
           {project.dataset_count > 0
             ? `项目中的 ${formatNumber(project.dataset_count)} 个数据集不会被删除，只是不再属于该项目。`
             : "该项目中还没有数据集。"}
+          {hasModels &&
+            `项目中有 ${formatNumber(modelCount)} 个模型；模型只属于这个项目，需要一起删除。`}
         </AlertDialogDescription>
       </AlertDialogHeader>
+      {hasModels && (
+        <label
+          htmlFor={checkboxId}
+          className="flex cursor-pointer items-start gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50"
+        >
+          <Checkbox
+            id={checkboxId}
+            checked={deleteModels}
+            onCheckedChange={(value) => setDeleteModels(value === true)}
+            disabled={mutation.isPending}
+            className="mt-0.5"
+          />
+          <span className="grid gap-1">
+            <span className="font-medium">
+              同时删除 {formatNumber(modelCount)} 个模型
+              {modelBytes !== undefined && `（${formatBytes(modelBytes)}）`}
+            </span>
+            <span className="text-xs text-muted-foreground">
+              模型文件
+              {exportCount > 0 &&
+                `与 ${formatNumber(exportCount)} 个 ONNX 转换结果`}
+              会被永久删除，无法恢复。
+            </span>
+          </span>
+        </label>
+      )}
       {mutation.error && (
         <p role="alert" className="text-sm text-destructive">
           {mutation.error.message}
@@ -441,10 +522,10 @@ function DeleteProjectForm({
         <Button
           variant="destructive"
           onClick={() => mutation.mutate()}
-          disabled={mutation.isPending}
+          disabled={mutation.isPending || blocked}
         >
           {mutation.isPending && <Spinner aria-hidden />}
-          删除项目
+          {hasModels ? "删除项目与模型" : "删除项目"}
         </Button>
       </AlertDialogFooter>
     </>

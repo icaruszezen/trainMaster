@@ -30,6 +30,7 @@ def test_defaults(tmp_path):
     assert cfg.data_dir == tmp_path
     assert cfg.self_test is True
     assert cfg.self_test_timeout == 300.0
+    assert cfg.export_timeout == 900.0
     assert cfg.log_level == logging.INFO
     assert cfg.torch_variant is None
     assert cfg.state_dir_warning is None
@@ -47,6 +48,7 @@ def test_full_configuration(tmp_path):
             TM_TORCH_VARIANT="cu128",
             TM_SELF_TEST="off",
             TM_SELF_TEST_TIMEOUT="5m",
+            TM_EXPORT_TIMEOUT=" 20m ",
             TM_LOG_LEVEL="DEBUG",
         ),
         require_server=True,
@@ -57,6 +59,7 @@ def test_full_configuration(tmp_path):
     assert cfg.torch_variant == "cu128"
     assert cfg.self_test is False
     assert cfg.self_test_timeout == 300.0
+    assert cfg.export_timeout == 1200.0
     assert cfg.log_level == logging.DEBUG
 
 
@@ -107,6 +110,7 @@ def test_all_problems_reported_together(tmp_path):
         TM_NODE_TOKEN="有 中文",
         TM_SELF_TEST="maybe",
         TM_SELF_TEST_TIMEOUT="soon",
+        TM_EXPORT_TIMEOUT="25h",
         TM_LOG_LEVEL="loud",
     )
     with pytest.raises(ConfigError) as info:
@@ -117,10 +121,11 @@ def test_all_problems_reported_together(tmp_path):
         "TM_NODE_TOKEN",
         "TM_SELF_TEST：",
         "TM_SELF_TEST_TIMEOUT",
+        "TM_EXPORT_TIMEOUT",
         "TM_LOG_LEVEL",
     ):
         assert key in text
-    assert text.count("；") == 4
+    assert text.count("；") == 5
 
 
 @pytest.mark.parametrize(
@@ -200,6 +205,19 @@ def test_parse_timeout(raw, seconds):
 def test_parse_timeout_invalid(raw):
     with pytest.raises(ValueError):
         config.parse_timeout(raw)
+
+
+@pytest.mark.parametrize(("raw", "seconds"), [("900", 900.0), ("30m", 1800.0), ("1.5", 1.5)])
+def test_export_timeout(tmp_path, raw, seconds):
+    # 与 TM_SELF_TEST_TIMEOUT 的规则相同：秒数，可带 s / m 后缀，不超过 24 小时
+    assert config.load(base_env(tmp_path, TM_EXPORT_TIMEOUT=raw)).export_timeout == seconds
+
+
+@pytest.mark.parametrize("raw", ["0", "86401", "1h", "never"])
+def test_export_timeout_invalid(tmp_path, raw):
+    with pytest.raises(ConfigError) as info:
+        config.load(base_env(tmp_path, TM_EXPORT_TIMEOUT=raw))
+    assert str(info.value).startswith("TM_EXPORT_TIMEOUT：")
 
 
 def test_parse_log_level():

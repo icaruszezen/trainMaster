@@ -29,6 +29,8 @@ const (
 	codePayloadTooLarge       = "payload_too_large"      // 413
 	codeValidationFailed      = "validation_failed"      // 422: a field value is invalid; the message names the problem
 	codeUnsupportedImage      = "unsupported_image"      // 422: no thumbnail can be generated for the image
+	codeInvalidModel          = "invalid_model"          // 422: the uploaded file is not a YOLO model the platform supports; the message says why
+	codeYOLOVersionMismatch   = "yolo_version_mismatch"  // 422: the uploaded model is another YOLO version than the chosen one; commit again with that one
 	codeInternal              = "internal_error"         // 500
 	codeNotImplemented        = "not_implemented"        // 501: planned module
 	codeInsufficientStorage   = "insufficient_storage"   // 507: not enough free disk space

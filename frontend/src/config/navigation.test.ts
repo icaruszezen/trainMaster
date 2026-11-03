@@ -62,6 +62,19 @@ describe("navigation config", () => {
     })
   })
 
+  it("marks the model repository as implemented with its API", () => {
+    expect(getNavItem("models")).toMatchObject({
+      status: "ready",
+      path: "/models",
+      apiPath: "/api/v1/models",
+    })
+    // 推理测试仍是占位页，路径在模型仓库下面。
+    expect(getNavItem("inference")).toMatchObject({
+      status: "planned",
+      path: "/models/inference",
+    })
+  })
+
   it("looks up items by id", () => {
     expect(getNavItem("datasets").path).toBe("/datasets")
     expect(() => getNavItem("nope" as ModuleId)).toThrow()
@@ -84,6 +97,7 @@ describe("findActiveNavItem", () => {
     expect(activeId("/projects/7")).toBe("projects")
     expect(activeId("/models/inference")).toBe("inference")
     expect(activeId("/models/abc")).toBe("models")
+    expect(activeId("/models/12")).toBe("models")
   })
 
   it("matches whole path segments only", () => {

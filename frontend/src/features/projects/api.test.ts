@@ -103,6 +103,27 @@ describe("project writes", () => {
       method: "DELETE",
     })
   })
+
+  it("deletes a project together with its models", async () => {
+    const fetchMock = mockFetch(() => new Response(null, { status: 204 }))
+    await expect(
+      deleteProject(9, { deleteModels: true })
+    ).resolves.toBeUndefined()
+    expect(requestOf(fetchMock)).toMatchObject({
+      path: "/api/v1/projects/9?delete_models=true",
+      method: "DELETE",
+    })
+  })
+
+  it("reports model files that could not be removed", async () => {
+    mockFetch(() =>
+      Response.json({ files_removed: false, message: "部分文件未删除" })
+    )
+    await expect(deleteProject(9, { deleteModels: true })).resolves.toEqual({
+      files_removed: false,
+      message: "部分文件未删除",
+    })
+  })
 })
 
 function project(id: number, name: string): Project {
@@ -118,6 +139,8 @@ function project(id: number, name: string): Project {
     object_count: 0,
     total_bytes: 0,
     covers: [],
+    model_count: 0,
+    latest_model: null,
     created_at: "2026-10-30T08:00:00Z",
     updated_at: "2026-10-30T08:00:00Z",
   }

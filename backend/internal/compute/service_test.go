@@ -256,6 +256,42 @@ func TestServiceUnknownNode(t *testing.T) {
 	}
 }
 
+func TestServiceNodeID(t *testing.T) {
+	e := newServiceEnv(t)
+	ctx := context.Background()
+	a := e.register(t, "node-a", "a", nil, nil)
+	b := e.register(t, "node-b", "b", nil, nil)
+	for key, want := range map[string]int64{"node-a": a.NodeID, "node-b": b.NodeID} {
+		if id, err := e.svc.NodeID(ctx, key); err != nil || id != want {
+			t.Errorf("NodeID(%s) = %d, %v, want %d", key, id, err, want)
+		}
+	}
+	_, err := e.svc.NodeID(ctx, "never-registered")
+	wantKind(t, err, ErrUnknownNode, "请重新注册")
+	_, err = e.svc.NodeID(ctx, "")
+	wantKind(t, err, ErrInvalid, "node_key 不能为空")
+	_, err = e.svc.NodeID(ctx, "bad key/")
+	wantKind(t, err, ErrInvalid, "node_key 只能由")
+
+	// A deleted node is unknown.
+	e.clock.Advance(time.Hour)
+	if err := e.svc.Delete(ctx, a.NodeID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.svc.NodeID(ctx, "node-a")
+	wantKind(t, err, ErrUnknownNode, "请重新注册")
+	// Looking a node up does not count as a heartbeat.
+	if n := e.get(t, b.NodeID); n.Status != StatusOffline {
+		t.Errorf("status = %s", n.Status)
+	}
+	if _, err := e.svc.NodeID(ctx, "node-b"); err != nil {
+		t.Fatal(err)
+	}
+	if n := e.get(t, b.NodeID); n.Status != StatusOffline || !n.LastSeenAt.Equal(b.ServerTime) {
+		t.Errorf("node after NodeID = %+v", n)
+	}
+}
+
 func TestServiceReRegisterKeepsEnvironment(t *testing.T) {
 	e := newServiceEnv(t)
 	ctx := context.Background()

@@ -17,7 +17,8 @@ import (
 
 var (
 	projectKeys = []string{"id", "name", "description", "dataset_count", "image_count", "annotated_count",
-		"empty_count", "invalid_count", "object_count", "total_bytes", "covers", "created_at", "updated_at"}
+		"empty_count", "invalid_count", "object_count", "total_bytes", "covers", "model_count", "latest_model",
+		"created_at", "updated_at"}
 	coverKeys        = []string{"dataset_id", "id", "version"}
 	projectLabelKeys = []string{"name", "object_count", "image_count", "dataset_count"}
 )

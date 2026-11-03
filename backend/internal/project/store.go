@@ -179,6 +179,43 @@ func interleave[T any](groups [][]T, max int) []T {
 	return out
 }
 
+// modelStats are the model counter and the latest model of a project.
+type modelStats struct {
+	count  int
+	latest ModelRef
+}
+
+// queryModelStats returns the models of the given projects: how many, and
+// the one with the highest version. Projects without models are missing.
+func queryModelStats(ctx context.Context, q querier, ids []int64) (map[int64]modelStats, error) {
+	// The window function runs before DISTINCT ON keeps the first row (the
+	// highest version) of each project.
+	rows, err := q.Query(ctx, `SELECT DISTINCT ON (project_id) project_id, count(*) OVER (PARTITION BY project_id),
+			id, version, yolo_version, created_at
+		FROM models WHERE project_id = ANY($1)
+		ORDER BY project_id, version DESC`, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := map[int64]modelStats{}
+	var projectID int64
+	var st modelStats
+	_, err = pgx.ForEachRow(rows, []any{&projectID, &st.count, &st.latest.ID, &st.latest.Version, &st.latest.YOLOVersion,
+		&st.latest.CreatedAt}, func() error {
+		st.latest.CreatedAt = st.latest.CreatedAt.UTC()
+		out[projectID] = st
+		return nil
+	})
+	return out, err
+}
+
+// countModels returns the number of models of a project.
+func countModels(ctx context.Context, q querier, projectID int64) (int, error) {
+	var n int
+	err := q.QueryRow(ctx, "SELECT count(*) FROM models WHERE project_id = $1", projectID).Scan(&n)
+	return n, err
+}
+
 func queryLabels(ctx context.Context, q querier, projectID int64) ([]Label, error) {
 	rows, err := q.Query(ctx, `SELECT l.key, sum(l.value::bigint)::bigint, count(*), count(DISTINCT i.dataset_id)
 		FROM project_datasets pd

@@ -3,16 +3,19 @@ package httpapi
 import (
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
+	"github.com/icaruszezen/trainmaster/backend/internal/model"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 )
 
 // Project API: /api/v1/projects, and PUT /api/v1/datasets/{id}/projects.
 // The JSON shapes are defined by the types in internal/project; this file
-// maps HTTP onto project.Service.
+// maps HTTP onto project.Service. The models of a project are served by
+// models.go.
 
 func (s *server) projectRoutes(r chi.Router) {
 	r.Get("/", s.listProjects)
@@ -25,6 +28,9 @@ func (s *server) projectRoutes(r chi.Router) {
 		r.Get("/datasets", s.listProjectDatasets)
 		r.Post("/datasets", s.addProjectDatasets)
 		r.Delete("/datasets/{datasetID}", s.removeProjectDataset)
+		if s.models != nil {
+			r.Get("/models", s.listProjectModels)
+		}
 	})
 }
 
@@ -46,7 +52,7 @@ func projectErrorStatus(kind error) (int, string) {
 		return http.StatusNotFound, codeNotFound
 	case project.ErrInvalid:
 		return http.StatusUnprocessableEntity, codeValidationFailed
-	case project.ErrConflict:
+	case project.ErrConflict, project.ErrHasModels:
 		return http.StatusConflict, codeConflict
 	}
 	return http.StatusInternalServerError, codeInternal
@@ -128,13 +134,41 @@ func (s *server) updateProject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, p)
 }
 
+// deleteProject deletes a project; one with models only with
+// ?delete_models=true, which deletes the models (and their files) first.
+// Like deleting a dataset, it answers 200 with what is left when some
+// model folders could not be removed completely.
 func (s *server) deleteProject(w http.ResponseWriter, r *http.Request) {
 	id, ok := projectID(w, r)
 	if !ok {
 		return
 	}
+	deleteModels := false
+	if v := r.URL.Query().Get("delete_models"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			badRequest(w, "参数 delete_models 无效，应为 true 或 false")
+			return
+		}
+		deleteModels = b
+	}
+	var leftover *model.DeleteResult
+	if deleteModels && s.models != nil {
+		res, err := s.models.DeleteProjectModels(r.Context(), id)
+		if err != nil {
+			s.modelError(w, r, err)
+			return
+		}
+		leftover = res
+	}
+	// A model added after the models were deleted makes this fail with 409;
+	// deleting again deletes it too.
 	if err := s.projects.DeleteProject(r.Context(), id); err != nil {
 		s.projectError(w, r, err)
+		return
+	}
+	if leftover != nil {
+		writeJSON(w, http.StatusOK, leftover)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
