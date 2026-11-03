@@ -21,7 +21,10 @@ import (
 
 // Bounds on what Info keeps from a possibly crafted file. Strings are
 // also made valid UTF-8 without control characters: the service stores
-// Info as jsonb, which rejects "\u0000".
+// Info as jsonb, which rejects "\u0000". A string from the file can be a
+// memoized string of megabytes referenced thousands of times (as every
+// class name, say), so extraction never does more than a bounded amount
+// of work on one: it truncates first (cleanText), and skips longer names.
 const (
 	maxClasses      = 1 << 16
 	maxClassNameLen = 256 // bytes
@@ -184,13 +187,14 @@ func extract(root any) (*Info, error) {
 		info.BestFitness = &f
 	}
 	if metrics := lookupDict(ckpt, "train_metrics"); metrics != nil {
+		n := 0 // numeric entries read; keys that only differ after maxShortTextLen bytes give one metric
 		for i, k := range metrics.keys {
 			key, ok := asString(k)
 			f, ok2 := asFloat(metrics.vals[i])
 			if !ok || !ok2 {
 				continue
 			}
-			if len(info.Metrics) >= maxMetrics {
+			if n++; n > maxMetrics {
 				break
 			}
 			info.Metrics[cleanText(key, maxShortTextLen)] = f
@@ -307,7 +311,7 @@ func layerClasses(model *pyObject) map[string]bool {
 	seq, _ := lookupDict(model, "_modules").get("model")
 	names := map[string]bool{}
 	for _, v := range lookupDict(seq, "_modules").values() {
-		if g := className(v); g != nil {
+		if g := className(v); g != nil && len(g.name) <= maxShortTextLen {
 			names[g.name] = true
 		}
 	}
@@ -328,6 +332,10 @@ func yamlModules(yaml *pyDict) (map[string]bool, string) {
 				continue
 			}
 			if s, ok := l[2].(string); ok {
+				if len(s) > maxShortTextLen { // not a module name
+					last = ""
+					continue
+				}
 				s = s[strings.LastIndexByte(s, '.')+1:]
 				names[s] = true
 				last = cleanText(s, maxShortTextLen)
@@ -393,14 +401,17 @@ func countParameters(model *pyObject) int64 {
 // filled with "class<N>") or a list.
 func classNames(v any) ([]string, bool) {
 	if d, ok := v.(*pyDict); ok {
-		byID := map[int]string{}
+		// Different keys can give the same id (1, "1", "01", ... a crafted
+		// file can have a million of them): the last one wins, and each
+		// class is labeled once.
+		byID := map[int]any{}
 		maxID := -1
 		for i, k := range d.keys {
 			id, ok := classID(k)
 			if !ok {
 				continue
 			}
-			byID[id] = classLabel(d.vals[i], id)
+			byID[id] = d.vals[i]
 			maxID = max(maxID, id)
 		}
 		if maxID < 0 {
@@ -408,11 +419,7 @@ func classNames(v any) ([]string, bool) {
 		}
 		names := make([]string, maxID+1)
 		for i := range names {
-			if s, ok := byID[i]; ok {
-				names[i] = s
-			} else {
-				names[i] = "class" + strconv.Itoa(i)
-			}
+			names[i] = classLabel(byID[i], i) // "class<N>" when missing
 		}
 		return names, true
 	}
@@ -436,6 +443,9 @@ func classID(k any) (int, bool) {
 	case int64:
 		n = x
 	case string:
+		if len(x) > 20 { // ParseInt copies the text into its error
+			return 0, false
+		}
 		v, err := strconv.ParseInt(x, 10, 64)
 		if err != nil {
 			return 0, false
@@ -516,8 +526,13 @@ func taskFromHead(head string) string {
 }
 
 // cleanText makes a string from the file safe to store and show: valid
-// UTF-8, control characters replaced, at most maxBytes long.
+// UTF-8, control characters replaced, at most maxBytes long. It only
+// looks at the first maxBytes (plus a character) of s, and returns a
+// copy, which never keeps a larger string alive.
 func cleanText(s string, maxBytes int) string {
+	if len(s) > maxBytes+utf8.UTFMax {
+		s = truncate(s, maxBytes+utf8.UTFMax)
+	}
 	if !utf8.ValidString(s) {
 		s = strings.ToValidUTF8(s, "�")
 	}
@@ -529,12 +544,20 @@ func cleanText(s string, maxBytes int) string {
 			return r
 		}, s)
 	}
-	if len(s) > maxBytes {
-		n := maxBytes
-		for n > 0 && !utf8.RuneStart(s[n]) {
-			n--
-		}
-		s = s[:n]
+	// A replacement character can be longer than what it replaces.
+	return strings.Clone(truncate(s, maxBytes))
+}
+
+// truncate cuts s to at most n bytes, at the start of a character when
+// one is near (s may not be valid UTF-8).
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
 	}
-	return s
+	for i := n; i >= 0 && i > n-utf8.UTFMax; i-- {
+		if i == 0 || utf8.RuneStart(s[i]) {
+			return s[:i]
+		}
+	}
+	return s[:n]
 }

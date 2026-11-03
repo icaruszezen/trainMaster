@@ -97,14 +97,17 @@ export function taskLabel(task: string) {
   return taskLabels[task as keyof typeof taskLabels] ?? task
 }
 
-/** 带检测框的任务：只有它们可以在导出时嵌入 NMS。 */
+/** 带检测框的任务：只有它们有端到端检测头，也只有它们可以在导出时嵌入 NMS。 */
 const NMS_TASKS: readonly string[] = ["detect", "segment", "pose", "obb"]
 
 type ExportTarget = Pick<Model, "yolo_version" | "task"> & {
   info: Pick<Model["info"], "end2end" | "image_size">
 }
 
-/** 模型带端到端检测头：YOLOv10、YOLO26 都有，其它版本以文件中的标记为准。 */
+/**
+ * 模型带端到端检测头：YOLOv10、YOLO26 都有，其它版本以文件中的标记为准。
+ * 只对带检测框的任务有意义（见 allowedPostprocess）。
+ */
 export function supportsEnd2end(model: ExportTarget) {
   return (
     findYoloVersion(model.yolo_version)?.end2end === true || model.info.end2end
@@ -112,22 +115,58 @@ export function supportsEnd2end(model: ExportTarget) {
 }
 
 /**
- * 模型可以使用的后处理方式，默认的在前：分类模型只有原始输出；带端到端检测头
- * 的模型默认 end2end（也可以在 one-to-many 头上嵌入 NMS）；NMS 需要带检测框的任务。
+ * 模型可以使用的后处理方式，默认的在前（与后端 AllowedPostprocess 一致）：只有
+ * 带检测框的任务有端到端检测头、可以嵌入 NMS，其它任务（分类、语义分割、深度估计，
+ * 即使是 YOLO26）只有原始输出；带端到端检测头的模型默认 end2end（也可以在
+ * one-to-many 头上嵌入 NMS）。
  */
 export function allowedPostprocess(model: ExportTarget): Postprocess[] {
-  if (model.task === "classify") {
+  if (!NMS_TASKS.includes(model.task)) {
     return ["raw"]
   }
   const modes: Postprocess[] = []
   if (supportsEnd2end(model)) {
     modes.push("end2end")
   }
-  modes.push("raw")
-  if (NMS_TASKS.includes(model.task)) {
-    modes.push("nms")
-  }
+  modes.push("raw", "nms")
   return modes
+}
+
+/** 只有原始输出时的说明，如“语义分割模型只有原始输出。”；还有其它方式时为 null。 */
+export function rawOnlyNote(model: ExportTarget) {
+  if (NMS_TASKS.includes(model.task)) {
+    return null
+  }
+  return model.task === ""
+    ? "无法识别模型的任务，只能导出原始输出。"
+    : `${taskLabel(model.task)}模型只有原始输出。`
+}
+
+/**
+ * 某种后处理方式与动态尺寸冲突时的原因，否则为 null。Ultralytics 按导出时的
+ * batch（固定为 1）展开嵌入的 NMS，动态 batch 时第二张图起没有结果，所以嵌入 NMS
+ * 的 ONNX 不能使用动态尺寸（与后端 NormalizeExport 一致）。
+ */
+export function postprocessConflict(mode: Postprocess, dynamic: boolean) {
+  return dynamic && mode === "nms"
+    ? "嵌入 NMS 的 ONNX 只能固定 batch 为 1，关闭动态尺寸后可以选择"
+    : null
+}
+
+/**
+ * 让选项符合模型的规则：模型不支持的后处理方式、与动态尺寸冲突的 nms 换为默认的
+ * 后处理方式（默认值从不是 nms）。用于打开动态尺寸，以及从已有的转换记录（可能
+ * 早于这些规则）回填选项。
+ */
+export function fitExportOptions<
+  T extends Pick<ExportOptions, "dynamic" | "postprocess">,
+>(options: T, model: ExportTarget): T {
+  const usable = allowedPostprocess(model).filter(
+    (mode) => postprocessConflict(mode, options.dynamic) === null
+  )
+  return usable.includes(options.postprocess)
+    ? options
+    : { ...options, postprocess: usable[0] }
 }
 
 export const IMG_SIZE_MIN = 32

@@ -36,6 +36,10 @@ type newModel struct {
 	// on the same file system (under the data directory) and nobody else
 	// may write to it meanwhile.
 	SrcPath string
+	// UploadID is the upload being committed (0 for other sources). The
+	// model folder names it until the commit, so that the file can go back
+	// to the upload after a crash (recoverPending).
+	UploadID int64
 	// inTx runs in the transaction that inserts the model, after the insert
 	// (the upload commit marks its upload as completed).
 	inTx func(ctx context.Context, tx pgx.Tx, modelID int64) error
@@ -51,7 +55,9 @@ const maxVersionSkips = 100
 // distinct versions), moves the file into models/project-<id>/v<N>/ and
 // writes the model.json sidecar. Everything on disk happens inside the
 // transaction and is undone if it fails, so a model row never exists
-// without its folder (unless the folder is removed by hand later).
+// without its folder (unless the folder is removed by hand later). Until
+// the commit the folder holds the .pending marker: if the process dies
+// before the commit, recoverPending clears the folder later.
 func (s *Service) addModel(ctx context.Context, n newModel) (Model, error) {
 	f, err := os.Open(n.SrcPath)
 	if err != nil {
@@ -70,7 +76,7 @@ func (s *Service) addModel(ctx context.Context, n newModel) (Model, error) {
 	sum, err := hashFile(ctx, f)
 	var ci *checkpoint.Info
 	if err == nil {
-		ci, err = s.inspect(f, size)
+		ci, err = s.inspectFile(ctx, f, size)
 	}
 	f.Close()
 	if err != nil {
@@ -97,6 +103,14 @@ func (s *Service) addModel(ctx context.Context, n newModel) (Model, error) {
 		dir     string // the model folder, once created
 		movedTo string // the file in it, once moved
 	)
+	// The folder is in use (recoverPending leaves it alone) from before it
+	// is created until it is complete or removed again.
+	var busyDir string
+	defer func() {
+		if busyDir != "" {
+			s.busy.remove(busyDir)
+		}
+	}()
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		var version int
 		var projectName, dirName, target string
@@ -116,14 +130,20 @@ func (s *Service) addModel(ctx context.Context, n newModel) (Model, error) {
 			if target, err = s.modelDir(dirName); err != nil {
 				return err
 			}
-			// A folder can only exist if an earlier attempt crashed after
-			// moving the file (its version was rolled back), or if files were
-			// restored by hand. It belongs to no model: keep it and skip the
-			// version.
+			// A folder can only exist if an earlier attempt crashed before
+			// its commit (its version was rolled back), or if files were
+			// restored by hand. It belongs to no model. The crash leaves the
+			// .pending marker: such a folder is cleared and its version used.
+			// Others are kept and their version skipped.
 			if _, err := os.Lstat(target); errors.Is(err, fs.ErrNotExist) {
 				break
 			} else if err != nil {
 				return fmt.Errorf("check model folder: %w", err)
+			}
+			if gone, err := s.recoverPending(ctx, tx, dirName); gone {
+				break
+			} else if err != nil {
+				s.log.Warn("clear model folder of an interrupted addition", "path", target, "err", err)
 			}
 			s.log.Warn("model folder already exists; skipping its version", "path", target, "version", version)
 			if skips == maxVersionSkips {
@@ -146,10 +166,15 @@ func (s *Service) addModel(ctx context.Context, n newModel) (Model, error) {
 			}
 		}
 
+		s.busy.add(target)
+		busyDir = target
 		if err := os.MkdirAll(target, 0o755); err != nil {
 			return fmt.Errorf("create model folder: %w", err)
 		}
 		dir = target
+		if err := writePendingMarker(dir, pendingMarker{UploadID: n.UploadID}); err != nil {
+			return err
+		}
 		dst := filepath.Join(dir, modelFile)
 		if err := os.Rename(n.SrcPath, dst); err != nil {
 			_ = os.RemoveAll(dir)
@@ -175,12 +200,30 @@ func (s *Service) addModel(ctx context.Context, n newModel) (Model, error) {
 		}
 		return Model{}, err
 	}
+	// Committed: the folder belongs to the model now. A marker that cannot
+	// be removed is harmless (recoverPending removes it later).
+	if err := os.Remove(filepath.Join(dir, pendingFile)); err != nil {
+		s.log.Warn("remove model folder marker", "path", dir, "err", err)
+	}
 	m, err := s.GetModel(ctx, id)
 	if err == nil {
 		s.log.Info("model added", "model_id", id, "project_id", n.ProjectID, "version", m.Version, "source", n.Source,
 			"yolo_version", n.YOLOVersion, "task", m.Task, "size_bytes", size)
 	}
 	return m, err
+}
+
+// inspectFile reads the metadata of a weights file once one of the
+// maxInspections slots is free. It waits until ctx ends: commits detach
+// their context from the request, so only the service stopping ends it.
+func (s *Service) inspectFile(ctx context.Context, r io.ReaderAt, size int64) (*checkpoint.Info, error) {
+	select {
+	case s.inspectSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-s.inspectSlots }()
+	return s.inspect(r, size)
 }
 
 // hashFile returns the hex SHA-256 of f from its start, stopping early
@@ -249,6 +292,165 @@ func writeSidecar(dir string, sc sidecar) error {
 		return fmt.Errorf("write %s: %w", sidecarFile, err)
 	}
 	return nil
+}
+
+// pendingMarker is the content of .pending, which marks a model folder
+// whose addModel has not committed yet.
+type pendingMarker struct {
+	UploadID int64 `json:"upload_id,omitempty"` // the upload the file came from, if any
+}
+
+// writePendingMarker creates .pending in dir and syncs it, so that it is
+// on disk before the weights are moved in.
+func writePendingMarker(dir string, pm pendingMarker) error {
+	data, err := json.Marshal(pm)
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", pendingFile, err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, pendingFile), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return fmt.Errorf("write %s: %w", pendingFile, err)
+	}
+	_, err = f.Write(append(data, '\n'))
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("write %s: %w", pendingFile, err)
+	}
+	return nil
+}
+
+// recoverPending clears the model folder dirName if the addModel that
+// created it was interrupted before its commit (the process died: the
+// folder still has the .pending marker, and no model owns it). The weights
+// go back to their upload if it is still waiting for them, so that the
+// upload can be committed again; the folder is then moved aside for the
+// janitor (cleanUnused). A folder a model owns only loses its stale
+// marker. It reports whether the folder is gone; folders without the
+// marker, and those in use by this process, are left alone. q sees the
+// committed models (the pool, or the transaction of addModel).
+func (s *Service) recoverPending(ctx context.Context, q querier, dirName string) (bool, error) {
+	dir, err := s.modelDir(dirName)
+	if err != nil {
+		return false, err
+	}
+	if !s.busy.tryAdd(dir) {
+		return false, nil // an addition in progress, or another recovery
+	}
+	defer s.busy.remove(dir)
+	marker := filepath.Join(dir, pendingFile)
+	data, err := os.ReadFile(marker)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", pendingFile, err)
+	}
+	var owned bool
+	if err := q.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM models WHERE dir_name = $1)", dirName).Scan(&owned); err != nil {
+		return false, err
+	}
+	if owned { // the process died after the commit
+		if err := os.Remove(marker); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return false, fmt.Errorf("remove %s: %w", pendingFile, err)
+		}
+		return false, nil
+	}
+	var pm pendingMarker
+	if json.Unmarshal(data, &pm) == nil && pm.UploadID > 0 {
+		if err := s.returnToUpload(ctx, pm.UploadID, filepath.Join(dir, modelFile)); err != nil {
+			return false, err // the upload may still need the file: try again later
+		}
+	}
+	trash := filepath.Join(s.modelsDir(), deletingPrefix+"pending-"+strings.ReplaceAll(dirName, "/", "-")+"-"+
+		strings.ToLower(rand.Text()[:8]))
+	if err := os.Rename(dir, trash); err != nil {
+		return false, fmt.Errorf("move model folder aside: %w", err)
+	}
+	s.log.Warn("cleared the model folder of an addition interrupted before its commit", "dir", dirName,
+		"upload_id", pm.UploadID)
+	return true, nil
+}
+
+// returnToUpload moves the weights of an interrupted commit (src) back to
+// the staged file of their upload, if the upload is still uploading, has
+// received the whole file and has lost its staged file (it was moved
+// away). It fails when that cannot be decided or done now; nil means the
+// file is back or not needed.
+func (s *Service) returnToUpload(ctx context.Context, uploadID int64, src string) error {
+	// Waiting long could only mean the upload is busy; try next time.
+	lockCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	unlock, err := s.uploads.lock(lockCtx, uploadID)
+	if err != nil {
+		return fmt.Errorf("lock model upload %d: %w", uploadID, err)
+	}
+	defer unlock()
+	up, err := s.GetUpload(ctx, uploadID)
+	if errors.Is(err, ErrNotFound) { // deleted with its project
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if up.Status != UploadUploading || up.ReceivedBytes != up.FileSize {
+		return nil
+	}
+	if _, err := os.Lstat(s.uploadPath(uploadID)); err == nil {
+		return nil // it has its file
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("check model upload file: %w", err)
+	}
+	if fi, err := os.Lstat(src); err != nil || !fi.Mode().IsRegular() || fi.Size() != up.FileSize {
+		return nil // not moved in yet, or not the upload's file
+	}
+	err = os.MkdirAll(s.uploadDir(uploadID), 0o755)
+	if err == nil {
+		err = os.Rename(src, s.uploadPath(uploadID))
+	}
+	if err != nil {
+		return fmt.Errorf("move the file of an interrupted commit back to upload %d: %w", uploadID, err)
+	}
+	s.log.Info("moved the file of an interrupted commit back to its upload", "upload_id", uploadID)
+	return nil
+}
+
+// recoverPendingIn runs recoverPending on the model folders of a project
+// folder (e.g. project-12) that have the .pending marker.
+func (s *Service) recoverPendingIn(ctx context.Context, projectDir string) {
+	entries, err := os.ReadDir(filepath.Join(s.modelsDir(), projectDir))
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dirName := projectDir + "/" + e.Name()
+		if _, err := os.Lstat(filepath.Join(s.modelsDir(), projectDir, e.Name(), pendingFile)); err != nil {
+			continue
+		}
+		if _, err := s.recoverPending(ctx, s.db, dirName); err != nil && ctx.Err() == nil {
+			s.log.Warn("clear model folder of an interrupted addition", "dir", dirName, "err", err)
+		}
+	}
+}
+
+// recoverPendingFolders runs recoverPendingIn on every project folder.
+func (s *Service) recoverPendingFolders(ctx context.Context) {
+	entries, err := os.ReadDir(s.modelsDir())
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "project-") {
+			s.recoverPendingIn(ctx, e.Name())
+		}
+	}
 }
 
 // TrainedModelInput describes the weights a training job produced.
@@ -377,7 +579,7 @@ type ModelQuery struct {
 // ListModels returns the models selected by q, newest first.
 func (s *Service) ListModels(ctx context.Context, q ModelQuery) ([]Model, error) {
 	rows, err := collectModels(s.db.Query(ctx, modelSelect+`
-		WHERE ($1 = 0 OR m.project_id = $1) AND ($2 = '' OR m.yolo_version = $2) AND ($3 = '' OR m.source = $3)
+		WHERE ($1::bigint = 0 OR m.project_id = $1::bigint) AND ($2 = '' OR m.yolo_version = $2) AND ($3 = '' OR m.source = $3)
 			AND ($4 = '' OR strpos(lower(m.description), lower($4)) > 0 OR strpos(lower(m.file_name), lower($4)) > 0
 				OR strpos(lower(p.name), lower($4)) > 0)
 		ORDER BY m.created_at DESC, m.id DESC`, q.ProjectID, q.YOLOVersion, q.Source, strings.TrimSpace(q.Search)))
@@ -661,8 +863,11 @@ func (s *Service) DeleteProjectModels(ctx context.Context, projectID int64) (*De
 			leftovers = append(leftovers, res.Message)
 		}
 	}
-	// The project's folder is empty now unless something was left behind.
-	if dir, err := s.modelDir(fmt.Sprintf("project-%d", projectID)); err == nil {
+	// The project's folder is empty now unless something was left behind
+	// (a crash leftover is moved aside first).
+	projectDir := fmt.Sprintf("project-%d", projectID)
+	s.recoverPendingIn(ctx, projectDir)
+	if dir, err := s.modelDir(projectDir); err == nil {
 		_ = os.Remove(dir)
 	}
 	if len(ids) > 0 {

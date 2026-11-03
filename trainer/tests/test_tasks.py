@@ -20,7 +20,7 @@ from typing import Any
 
 import export_fakes
 import pytest
-from fake_platform import CLAIM, FakePlatform, wait_until
+from fake_platform import CLAIM, DROP, FakePlatform, wait_until
 
 from trainmaster_trainer import model_export, tasks
 from trainmaster_trainer.client import Client
@@ -83,14 +83,14 @@ def platform():
 
 @pytest.fixture
 def fake_ml(tmp_path, monkeypatch):
-    """让转换子进程加载假模块；返回设置假模块行为的函数（写入 FAKE_EXPORT）。"""
+    """让转换子进程加载假模块；返回设置假模块行为的函数（写入 fake_export.json）。"""
     root = export_fakes.write_modules(tmp_path / "fake-ml")
     monkeypatch.setenv("PYTHONPATH", str(root))
     calls = tmp_path / "ultralytics-calls.jsonl"
 
     def configure(**config: Any) -> Path:
         config = {"calls_file": str(calls), "end2end_head": True, **config}  # 默认按 YOLO26
-        monkeypatch.setenv(export_fakes.ENV, json.dumps(config))
+        export_fakes.write_config(root, **config)
         return calls
 
     configure()
@@ -194,6 +194,12 @@ def test_export_end_to_end(platform, tmp_path, fake_ml, caplog):
         ("PUT", "output"),
         ("POST", "complete"),
     ]
+    # 上传之前带上文件大小上报进度（预检），平台确认能接收后才上传
+    assert [r["body"] for r in requests if r["path"].endswith("/progress")] == [
+        {"stage": "downloading"},
+        {"stage": "converting"},
+        {"stage": "uploading", "size_bytes": len(exp["output"])},
+    ]
     assert all(r["headers"]["X-Node-Key"] == NODE_KEY for r in requests)
     assert all(r["headers"]["Authorization"] == f"Bearer {TOKEN}" for r in requests)
     claim = platform.claims[0]
@@ -203,18 +209,61 @@ def test_export_end_to_end(platform, tmp_path, fake_ml, caplog):
     assert any(f"model export {export_id} succeeded" in m for m in messages)
 
 
-def test_options_are_passed_to_the_child(platform, tmp_path, fake_ml):
+@pytest.mark.parametrize(
+    ("dynamic", "postprocess", "nms"), [(True, "raw", None), (False, "nms", True)]
+)
+def test_options_are_passed_to_the_child(platform, tmp_path, fake_ml, dynamic, postprocess, nms):
     calls = fake_ml(end2end_head=False)
-    options = {"imgsz": [480, 640], "dynamic": True, "postprocess": "nms", "opset": 12}
+    options = {"imgsz": [480, 640], "dynamic": dynamic, "postprocess": postprocess, "opset": 12}
     export_id = platform.add_export(PT, model={"yolo_version": "yolo11"}, options=options)
     with Run(tmp_path, platform):
         exp = finished(platform, export_id)
     assert exp["status"] == "succeeded", exp
-    export_call = json.loads(calls.read_text().splitlines()[1])
+    load_call, export_call = (json.loads(line) for line in calls.read_text().splitlines())
+    assert load_call["safe_load"] is True  # 子进程用安全加载读取上传的 pt
     assert export_call["imgsz"] == [480, 640]
-    assert export_call["dynamic"] is True and export_call["nms"] is True
+    assert export_call["dynamic"] is dynamic and export_call["nms"] is nms
     assert export_call["opset"] == 12
-    assert exp["result"]["inputs"][0]["shape"] == ["batch", 3, "height", "width"]
+    batch = "batch" if dynamic else 1
+    assert exp["result"]["inputs"][0]["shape"][0] == batch
+
+
+@pytest.mark.parametrize(
+    ("end2end_head", "others"),
+    [(False, "原始输出（raw）"), (True, "原始输出（raw）/ 端到端（end2end）")],
+)
+def test_dynamic_nms_is_refused(platform, tmp_path, fake_ml, end2end_head, others):
+    # 平台不会下发这个组合（嵌入的 NMS 只处理 batch 中的第一张图片）；节点再防一次，不可重试。
+    calls = fake_ml(end2end_head=end2end_head)
+    options = {"dynamic": True, "postprocess": "nms"}
+    export_id = platform.add_export(PT, model={"yolo_version": "yolo11"}, options=options)
+    with Run(tmp_path, platform):
+        exp = finished(platform, export_id)
+    assert exp["status"] == "failed" and exp["attempts"] == 1
+    assert exp["fails"][0]["retryable"] is False
+    assert exp["fails"][0]["error"] == (
+        "嵌入 NMS 的 ONNX 只能固定 batch 为 1，不能与动态尺寸同时使用；"
+        f"请关闭动态尺寸，或选择{others}"
+    )
+    assert [json.loads(line)["call"] for line in calls.read_text().splitlines()] == ["YOLO"]
+    assert exp["output"] is None
+
+
+@pytest.mark.parametrize(("task", "label"), [("semantic", "语义分割"), ("depth", "深度估计")])
+def test_yolo26_models_without_boxes_only_export_raw(platform, tmp_path, fake_ml, task, label):
+    # YOLO26 的语义分割、深度估计模型没有端到端头；提示只建议 raw（平台对它们拒绝 nms）。
+    fake_ml(task=task, end2end_head=False)
+    export_id = platform.add_export(PT, model={"task": task}, options={"postprocess": "end2end"})
+    with Run(tmp_path, platform):
+        exp = finished(platform, export_id)
+    assert exp["fails"] == [
+        {
+            "error": f"{label}模型没有检测框，不能导出 end2end，请选择原始输出（raw）",
+            "detail": exp["fails"][0]["detail"],
+            "retryable": False,
+        }
+    ]
+    assert "nms" not in exp["fails"][0]["error"]
 
 
 def test_long_poll_picks_up_a_new_task(platform, tmp_path, fake_ml):
@@ -414,6 +463,103 @@ def test_upload_rejected(platform, tmp_path, fake_ml, status, message, retryable
         "detail": f"HTTP {status} x: {message}",
         "retryable": retryable,
     }
+
+
+@pytest.mark.parametrize(
+    ("refuse", "status", "message"),
+    [("disk", 507, "磁盘剩余空间不足：可用 100 B，至少需要"),
+     ("too_large", 413, "转换结果不能超过 4 GiB")],
+)  # fmt: skip
+def test_upload_preflight_refused(platform, tmp_path, fake_ml, refuse, status, message):
+    # 平台在读取上传内容之前就拒绝（较大的文件只能看到连接被重置）：先带上大小问一次，不上传、不重试。
+    if refuse == "disk":
+        platform.free_bytes = 100
+    else:
+        platform.hooks["progress"] = lambda exp, req: (
+            (413, {"error": {"code": "payload_too_large", "message": "转换结果不能超过 4 GiB"}})
+            if req["body"].get("size_bytes")
+            else None
+        )
+    export_id = platform.add_export(PT)
+    with Run(tmp_path, platform):
+        exp = finished(platform, export_id, "failed")
+    assert exp["attempts"] == 1
+    fail = exp["fails"][0]
+    assert fail["retryable"] is False
+    assert fail["error"].startswith(f"上传转换结果失败：{message}")
+    assert fail["detail"].startswith(f"HTTP {status} ")
+    methods = [r["method"] for r in task_requests(platform, export_id)]
+    assert "PUT" not in methods  # 没有上传
+
+
+@pytest.mark.parametrize("how", ["conflict", "deleted"])
+def test_upload_preflight_conflict_abandons(platform, tmp_path, fake_ml, how):
+    def progress(exp, req):
+        if not req["body"].get("size_bytes"):
+            return None
+        if how == "deleted":
+            platform.delete_export(exp["id"])
+            return None  # 照常处理：404
+        return 409, {"error": {"code": "conflict", "message": "转换任务不属于该节点"}}
+
+    platform.hooks["progress"] = progress
+    export_id = platform.add_export(PT)
+    with Run(tmp_path, platform) as run:
+        wait_until(lambda: run.worker.tasks_run == 1)
+    actions = [r["path"].rsplit("/", 1)[1] for r in task_requests(platform, export_id)]
+    assert actions == ["progress", "input", "progress", "progress"]  # 不上传，也不上报失败
+
+
+@pytest.mark.parametrize(
+    ("recheck", "outcome"),
+    [(None, "retried"), (409, "abandoned"), (404, "abandoned"), (507, "failed")],
+)
+def test_upload_connection_reset_is_classified(platform, tmp_path, fake_ml, recheck, outcome):
+    # 上传时连接被重置（平台没有读取内容就拒绝了，或网络故障）：再上报一次进度（不带大小）来区分。
+    puts: list[bool] = []
+
+    def output(exp, req):
+        puts.append(True)
+        return DROP
+
+    def progress(exp, req):
+        if not puts or req["body"] != {"stage": "uploading"} or recheck is None:
+            return None
+        if recheck == 404:
+            platform.delete_export(exp["id"])
+            return None
+        if recheck == 409:
+            return 409, {"error": {"code": "conflict", "message": "转换任务不属于该节点"}}
+        return 507, {"error": {"code": "insufficient_storage", "message": "磁盘剩余空间不足"}}
+
+    platform.hooks["output"] = output
+    platform.hooks["progress"] = progress
+    export_id = platform.add_export(PT)
+    with Run(tmp_path, platform) as run:
+        if outcome == "abandoned":
+            wait_until(lambda: run.worker.tasks_run == 1)
+        else:
+            exp = finished(platform, export_id, "failed")
+    requests = task_requests(platform, export_id)
+    if outcome == "abandoned":
+        actions = [r["path"].rsplit("/", 1)[1] for r in requests]
+        assert actions == ["progress", "input", "progress", "progress", "output", "progress"]
+        return
+    bodies = [r["body"] for r in requests if r["path"].endswith("/progress")]
+    assert bodies[2]["size_bytes"] > 0 and bodies[3] == {"stage": "uploading"}
+    if outcome == "retried":  # 网络故障：可重试，3 次后失败
+        assert exp["attempts"] == 3
+        assert [f["retryable"] for f in exp["fails"]] == [True, True, True]
+        assert exp["fails"][0]["error"].startswith("上传转换结果失败：")
+    else:  # 平台磁盘空间不足：不可重试，带上平台的说明
+        assert exp["attempts"] == 1
+        assert exp["fails"] == [
+            {
+                "error": "上传转换结果失败：磁盘剩余空间不足",
+                "detail": "HTTP 507 insufficient_storage: 磁盘剩余空间不足",
+                "retryable": False,
+            }
+        ]
 
 
 # ---- 放弃与停止 ----

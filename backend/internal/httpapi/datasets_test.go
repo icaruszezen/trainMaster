@@ -316,6 +316,9 @@ func TestDatasetAPIArchiveImport(t *testing.T) {
 	if list := want[List[dataset.Dataset]](t, e.do("GET", "/api/v1/datasets?q=nothing", nil), 200); list.Total != 0 || list.Items == nil {
 		t.Errorf("empty search = %+v", list)
 	}
+	for _, q := range []string{"%00", "%FF", "x%E4%BA"} {
+		wantError(t, e.do("GET", "/api/v1/datasets?q="+q, nil), 400, codeBadRequest, "参数 q 无效")
+	}
 
 	// Images.
 	rawList := want[map[string]any](t, e.do("GET", base+"/images", nil), 200)
@@ -370,7 +373,7 @@ func TestDatasetAPIArchiveImport(t *testing.T) {
 			t.Errorf("%s: images %v, want %v", query, paths, wantPaths)
 		}
 	}
-	for _, query := range []string{"limit=0", "limit=201", "offset=-1", "limit=x", "status=bogus"} {
+	for _, query := range []string{"limit=0", "limit=201", "offset=-1", "limit=x", "status=bogus", "q=%00", "q=%FF"} {
 		wantError(t, e.do("GET", base+"/images?"+query, nil), 400, codeBadRequest, "参数")
 	}
 

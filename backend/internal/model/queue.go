@@ -163,19 +163,45 @@ func (s *Service) taskError(ctx context.Context, exportID int64) error {
 	return errTaskNotYours
 }
 
+// ProgressInput is a node's report on a conversion it holds.
+type ProgressInput struct {
+	Stage   string // downloading, converting or uploading
+	Message string // for the log
+	// SizeBytes, with stage uploading, is the size of the result the node
+	// is about to upload (0: not given; older nodes). The report then also
+	// checks the free space as PutTaskOutput does, so the node learns that
+	// the upload would be refused before it sends the file: the server
+	// answers a refused upload before reading it, and a client still
+	// sending a large body only sees the connection being reset.
+	SizeBytes int64
+}
+
+var errOutputTooLarge = &Error{Kind: ErrTooLarge, Message: "转换结果不能超过 4 GiB"}
+
 // ReportProgress records the stage of a conversion the node holds and
 // renews its lease. It returns the lease in seconds.
-func (s *Service) ReportProgress(ctx context.Context, exportID, nodeID int64, stage, message string) (int, error) {
-	switch stage {
+func (s *Service) ReportProgress(ctx context.Context, exportID, nodeID int64, in ProgressInput) (int, error) {
+	switch in.Stage {
 	case StageDownloading, StageConverting, StageUploading:
 	default:
 		return 0, &Error{Kind: ErrInvalid, Message: "stage 必须是 downloading、converting 或 uploading"}
 	}
-	if err := s.renewLease(ctx, exportID, nodeID, stage); err != nil {
+	if in.SizeBytes < 0 {
+		return 0, &Error{Kind: ErrInvalid, Message: "size_bytes 不能为负数"}
+	}
+	if err := s.renewLease(ctx, exportID, nodeID, in.Stage); err != nil {
 		return 0, err
 	}
-	if message = cleanLabel(message, maxErrorRunes); message != "" {
-		s.log.Debug("model export progress", "export_id", exportID, "node_id", nodeID, "stage", stage, "message", message)
+	if in.Stage == StageUploading && in.SizeBytes > 0 {
+		if in.SizeBytes > MaxOutputBytes {
+			return 0, errOutputTooLarge
+		}
+		if err := s.checkFreeSpace(in.SizeBytes); err != nil {
+			return 0, err
+		}
+	}
+	if message := cleanLabel(in.Message, maxErrorRunes); message != "" {
+		s.log.Debug("model export progress", "export_id", exportID, "node_id", nodeID, "stage", in.Stage, "message", message)
 	}
 	return leaseSeconds(), nil
 }
@@ -261,7 +287,7 @@ func (s *Service) PutTaskOutput(ctx context.Context, exportID, nodeID, size int6
 	case size < 1:
 		return 0, &Error{Kind: ErrInvalid, Message: "转换结果是空文件"}
 	case size > MaxOutputBytes:
-		return 0, &Error{Kind: ErrTooLarge, Message: "转换结果不能超过 4 GiB"}
+		return 0, errOutputTooLarge
 	case !isHexSHA256(sum):
 		return 0, &Error{Kind: ErrBadRequest, Message: "请求头 X-Content-Sha256 无效，应为 64 位十六进制的 SHA-256"}
 	}

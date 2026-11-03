@@ -1,6 +1,6 @@
 # 架构说明
 
-本文描述 trainMaster 的整体结构与约定（平台框架 + 已实现的数据集、项目、标注与计算资源）。后续功能开发应遵循这里的约定；需要调整约定时，请同步更新本文。
+本文描述 trainMaster 的整体结构与约定（平台框架 + 已实现的数据集、项目、标注、计算资源与模型仓库）。后续功能开发应遵循这里的约定；需要调整约定时，请同步更新本文。
 
 ## 1. 组件总览
 
@@ -25,14 +25,14 @@ flowchart LR
     server -- "SQL（元数据）" --> pg
     server -- "读写文件" --> storage
     pg --- pgdata
-    trainer -- "注册 / 心跳（HTTP JSON，可选令牌）" --> server
-    remote -- "注册 / 心跳" --> server
+    trainer -- "注册 / 心跳 / 领取并执行任务（HTTP，可选令牌）" --> server
+    remote -- "注册 / 心跳 / 任务" --> server
     trainer --- gpu
     trainer -. "读数据集、写模型与运行产物（规划中）" .-> storage
 ```
 
 - **单镜像**：Go 服务同时提供 `/api` 下的 JSON API 和前端构建产物（`/app/web`），部署只需 `app` 与 `postgres` 两个容器。
-- **训练节点是独立的服务**：Python 训练节点（`trainer/`）运行在有显卡的机器上，主动向平台注册并上报心跳（见第 9 节）。同一台机器上由 compose 的 profile 启用（`gpu` → `trainer`，`cpu` → `trainer-cpu`，`make setup` 自动选择），也可以运行在其它机器上；没有训练节点时平台的其它功能不受影响。
+- **训练节点是独立的服务**：Python 训练节点（`trainer/`）运行在有显卡的机器上，主动向平台注册并上报心跳（见第 9 节）。同一台机器上由 compose 的 profile 启用（`gpu` → `trainer`，`cpu` → `trainer-cpu`，`make setup` 自动选择），也可以运行在其它机器上；训练节点还执行平台的任务（目前是模型仓库的 ONNX 转换，见第 9、10 节），没有训练节点时转换一直排队，平台的其它功能不受影响。
 - **文件与元数据分离**：图片、模型权重等大文件以普通文件形式保存在宿主机目录；PostgreSQL 只保存元数据（记录、关系、状态）。两者都通过绑定挂载持久化。
 - **内网友好**：前端不依赖任何外部 CDN、在线字体或第三方服务。
 
@@ -48,7 +48,9 @@ flowchart LR
 | `internal/database` | pgxpool 连接池、启动时连接重试、内置迁移执行器 |
 | `internal/storage` | 数据目录布局、启动时创建与可写检查、磁盘用量、安全路径解析 |
 | `internal/dataset` | 数据集：命名规则、图片与 VOC 标注识别、压缩包解压、目录扫描、缩略图、导入任务执行器 |
-| `internal/project` | 项目：项目的增删改、项目与数据集的多对多关系、按数据集合计的统计与标签分布 |
+| `internal/project` | 项目：项目的增删改、项目与数据集的多对多关系、按数据集合计的统计与标签分布、项目的模型数与最新版本 |
+| `internal/model` | 模型仓库：分块上传与提交、项目内的版本分配、模型文件夹与 `model.json`、下载、删除；ONNX 转换的选项、缓存、任务队列（领取、租约、重试）与训练节点的任务接口；为平台训练预留的 `RegisterTrainedModel`（见第 10 节） |
+| `internal/model/checkpoint` | 读取 Ultralytics `.pt` 的元数据：zip 中的 `data.pkl` 由只读的 pickle 解释器解析（不执行任何代码），得到任务、类别、输入尺寸、YOLO 版本、训练信息；纯函数，无数据库依赖 |
 | `internal/compute` | 计算资源：训练节点的注册与心跳、上报数据的规范化与校验、在线状态判定、删除与重新检测、内存中的指标历史 |
 | `internal/hostinfo` | 平台服务器自身的 CPU、内存、负载、cgroup 限制与 NVIDIA 显卡（读 `/proc`、`/sys`，根目录可替换以便测试）；后台每 5 秒采样一次 CPU 利用率 |
 | `internal/httpapi` | chi 路由、中间件、统一 JSON 响应与错误信封、各 handler |
@@ -60,8 +62,8 @@ flowchart LR
 2. 初始化存储目录：创建根目录和 6 个子目录（见第 5 节）并做可写探测，失败则退出并提示检查挂载目录权限 / PUID、PGID。
 3. 连接数据库：指数退避重试，最长约 60 秒（数据库容器还在启动时会等待），仍失败则以非 0 退出。
 4. `TM_DB_AUTO_MIGRATE=true`（默认）时执行待执行的迁移。
-5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），然后启动任务执行器（见第 6 节）。
-6. 启动 HTTP 服务；收到 SIGINT / SIGTERM 后停止接收新请求，等待进行中的请求完成（最长 15 秒）；超时后强制关闭剩余连接（取消其请求的 context），最后关闭数据库连接池。还在等待数据库或迁移锁时收到信号，则直接正常退出。收到信号时会立即取消正在执行的导入 / 扫描任务并记为失败（“服务重启，导入被中断”），排队中的任务保留到下次启动执行；HTTP 服务关闭后再等待任务执行器的 worker 退出。进程在写入结果前异常退出时，下次启动由恢复逻辑把任务标记为中断，并重新计算受影响数据集的统计数据。以后的长连接 handler（如 SSE 推送训练日志）应通过 `http.Server.RegisterOnShutdown` 在关闭开始时主动结束。
+5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），然后启动任务执行器（见第 6 节）；启动模型仓库的后台任务（见第 10 节“存储与版本号”）。
+6. 启动 HTTP 服务；收到 SIGINT / SIGTERM 后停止接收新请求，等待进行中的请求完成（最长 15 秒）；超时后强制关闭剩余连接（取消其请求的 context），最后关闭数据库连接池。还在等待数据库或迁移锁时收到信号，则直接正常退出。收到信号时会立即取消正在执行的导入 / 扫描任务并记为失败（“服务重启，导入被中断”），排队中的任务保留到下次启动执行；HTTP 服务关闭后再等待任务执行器的 worker 退出。进程在写入结果前异常退出时，下次启动由恢复逻辑把任务标记为中断，并重新计算受影响数据集的统计数据。长连接 handler 应通过 `http.Server.RegisterOnShutdown` 在关闭开始时主动结束：训练节点领取任务的长轮询（最长 30 秒）就是这样立即返回 `{"task": null}` 的，以后的 SSE 推送（如训练日志）也应如此。
 
 ## 3. API 约定
 
@@ -89,21 +91,23 @@ flowchart LR
 
 | HTTP 状态 | code | 场景 |
 |---|---|---|
-| 400 | `bad_request` | 请求格式不正确（如 JSON 无法解析、参数类型错误） |
-| 401 | `unauthorized` | 配置了 `TM_NODE_TOKEN`，但训练节点的注册 / 心跳没有带正确的 `Authorization: Bearer <令牌>`（“节点令牌不正确”） |
+| 400 | `bad_request` | 请求格式不正确（如 JSON 无法解析、参数类型错误、列表的搜索参数 `q` 含无效的 UTF-8 或 NUL 字符（“参数 q 无效：搜索内容包含无效字符”）、训练节点的任务调用缺少 `X-Node-Key`） |
+| 401 | `unauthorized` | 配置了 `TM_NODE_TOKEN`，但训练节点的 `/agent/*` 调用（注册、心跳、任务）没有带正确的 `Authorization: Bearer <令牌>`（“节点令牌不正确”） |
 | 404 | `not_found` | 接口或资源不存在（未设置 `TM_WEB_DIR` 时，非 `/api` 路径也返回它） |
-| 404 | `unknown_node` | 心跳中的 `node_key` 尚未注册（或节点已被删除），训练节点收到后重新注册 |
+| 404 | `unknown_node` | 心跳或任务调用中的 `node_key`（`X-Node-Key`）尚未注册（或节点已被删除），训练节点收到后重新注册 |
 | 405 | `method_not_allowed` | 路径存在但不支持该方法（响应头 `Allow` 列出支持的方法） |
-| 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、标注文件不能在平台中修改、删除在线的训练节点、重新检测离线的训练节点等） |
+| 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、标注文件不能在平台中修改、删除在线的训练节点、重新检测离线的训练节点、删除有模型的项目、模型文件未上传完就提交、模型上传的临时文件已丢失、转换任务已不属于该训练节点等） |
 | 409 | `annotation_conflict` | 保存 / 删除标注时，标注文件在 `base_version` 之后已被修改（他人在另一个窗口保存，或用其它工具改了文件）。客户端应重新读取图片详情，或带 `force: true` 覆盖 |
 | 409 | `annotation_unpatchable` | 保存标注时，已有的标注文件无法在保留其中平台不编辑的内容的情况下修改（极少见）；带 `regenerate: true` 时按平台的格式重新生成整个文件（`force: true` 只跳过版本检查，不会重新生成） |
-| 409 | `upload_offset_mismatch` | 分块上传的 `offset` 与服务端已接收的字节数不一致，客户端应重新获取任务后从 `received_bytes` 续传 |
-| 413 | `payload_too_large` | 请求体超过限制（单个分块 64 MiB，单次文件夹批量上传 256 MiB，训练节点的注册 / 心跳 1 MiB） |
-| 422 | `validation_failed` | 字段校验失败，`message` 说明具体问题（如数据集名称不合法） |
+| 409 | `upload_offset_mismatch` | 分块上传（数据集压缩包、模型文件）的 `offset` 与服务端已接收的字节数不一致，客户端应重新获取任务或上传后从 `received_bytes` 续传 |
+| 413 | `payload_too_large` | 请求体超过限制（单个分块 64 MiB，单次文件夹批量上传 256 MiB，训练节点的 JSON 请求 1 MiB、上传的转换结果 4 GiB，上传前的进度上报按同样的上限预检） |
+| 422 | `validation_failed` | 字段校验失败，`message` 说明具体问题（如数据集名称不合法、ONNX 转换选项不允许） |
 | 422 | `unsupported_image` | 无法为该图片生成缩略图（格式不支持、文件损坏或像素过大），前端回退为原图或占位图 |
+| 422 | `invalid_model` | 提交的模型文件不是平台支持的 YOLO 模型（不是 PyTorch 文件、旧格式、损坏、不是 Ultralytics 检查点、原版 YOLOv5 仓库、RT-DETR、引用了安全加载不允许的对象等），`message` 说明原因；上传随之失败 |
+| 422 | `yolo_version_mismatch` | 模型文件中识别出的 YOLO 版本与所选的不同；上传保留，带识别出的版本（上传的 `detected_yolo_version`）再次提交即可 |
 | 500 | `internal_error` | 未预期的错误（handler panic 会被恢复并返回此错误） |
 | 501 | `not_implemented` | 规划中的功能模块 |
-| 507 | `insufficient_storage` | 存储空间不足，无法接收该上传 |
+| 507 | `insufficient_storage` | 存储空间不足，无法接收该上传（数据集与模型的上传、训练节点上传的转换结果及其预检） |
 
 新增功能需要其它错误码时，在 `internal/httpapi/respond.go` 中集中定义，并补充到本表。
 
@@ -116,8 +120,9 @@ flowchart LR
 | `GET /api/v1/system/info` | 版本、运行时间、数据库与存储信息（工作台和存储管理页使用）。数据库不可用时仍返回 200，`database.status` 为 `unavailable` |
 | 数据集相关接口 | 见下方“数据集接口” |
 | 项目相关接口 | 见下方“项目接口” |
-| 计算资源相关接口 | 见下方“计算资源接口” |
-| `/api/v1/annotation/tasks`、`/api/v1/annotation/labels`、`/api/v1/training/jobs`、`/api/v1/evaluations`、`/api/v1/models` 及其子路径 | 预留给规划中的模块，任意方法均返回 `501 not_implemented` |
+| 模型仓库相关接口 | 见下方“模型仓库接口” |
+| 计算资源相关接口（含训练节点的任务接口） | 见下方“计算资源接口” |
+| `/api/v1/annotation/tasks`、`/api/v1/annotation/labels`、`/api/v1/training/jobs`、`/api/v1/evaluations` 及其子路径 | 预留给规划中的模块，任意方法均返回 `501 not_implemented` |
 
 `/api/readyz` 示例：
 
@@ -194,17 +199,40 @@ flowchart LR
 
 | 方法与路径 | 说明 |
 |---|---|
-| `GET /api/v1/projects` | 项目列表（`q` 按名称 / 描述筛选），按更新时间倒序。每项带其中数据集的合计统计（`dataset_count`、`image_count`、`annotated_count`、`empty_count`、`invalid_count`、`object_count`、`total_bytes`）和封面图片（最多 4 张，轮流取自项目中最早纳入的几个数据集，每项带 `dataset_id`） |
+| `GET /api/v1/projects` | 项目列表（`q` 按名称 / 描述筛选），按更新时间倒序。每项带其中数据集的合计统计（`dataset_count`、`image_count`、`annotated_count`、`empty_count`、`invalid_count`、`object_count`、`total_bytes`）和封面图片（最多 4 张，轮流取自项目中最早纳入的几个数据集，每项带 `dataset_id`），以及模型数 `model_count` 与版本号最大的模型 `latest_model`（`{id, version, yolo_version, created_at}`，没有模型时为 null） |
 | `POST /api/v1/projects` | `{name, description?, dataset_ids?}` 新建项目，可同时纳入数据集，返回 201。名称不区分大小写唯一（重名 409 `conflict`），最长 64 个字符，不能含控制字符；描述最长 500 个字符，除换行与制表符外不能含控制字符；不合规时返回 422。所选数据集不存在时返回 422，不创建项目 |
 | `GET /api/v1/projects/{id}` | 项目详情（字段同列表项） |
 | `PATCH /api/v1/projects/{id}` | 修改名称和描述（规则同上） |
-| `DELETE /api/v1/projects/{id}` | 删除项目，返回 204。只删除项目本身，其中的数据集保留 |
+| `DELETE /api/v1/projects/{id}` | 删除项目，返回 204。其中的数据集保留，只是不再属于该项目；进行中的模型上传随项目删除（临时文件由清理任务删除）。项目中有模型时返回 409 `conflict`（“项目中有 N 个模型，请先删除模型，或选择同时删除模型”）；`?delete_models=true` 时先逐个删除其模型（记录、转换与文件夹，同 `DELETE /api/v1/models/{modelID}`）再删除项目，有模型文件夹没能完全删除时返回 200 `{"files_removed": false, "message": "…"}`。`delete_models` 不是布尔值时返回 400 |
 | `GET /api/v1/projects/{id}/datasets` | 项目中的数据集，格式同数据集列表。项目不存在时返回 404（`GET /api/v1/datasets?project_id=` 则返回空列表） |
 | `POST /api/v1/projects/{id}/datasets` | `{dataset_ids: [...]}` 把数据集纳入项目（已在项目中的忽略），返回更新后的项目；`dataset_ids` 为空或有数据集不存在时返回 422，不做任何修改 |
 | `DELETE /api/v1/projects/{id}/datasets/{datasetId}` | 把数据集移出项目，返回 204（数据集本身不受影响；本来就不在项目中也返回 204） |
 | `GET /api/v1/projects/{id}/labels` | 项目中所有数据集合计的标签分布：每个标签的目标数、图片数与所在的数据集数；项目不存在时返回 404 |
+| `GET /api/v1/projects/{id}/models` | 项目中的模型（格式同模型列表），按版本号倒序；项目不存在时返回 404 |
 
-一次最多提交 1000 个 ID。增减数据集（包括删除其中的数据集）会更新项目的 `updated_at`；项目与数据集之间的写操作都按“先数据集、后项目，各自按 ID 顺序”加行锁，并发修改同一关系时不会死锁或丢失更新。删除数据集或项目时，关联记录随之级联删除。训练任务与模型上线后也将归属到项目，项目详情页的“模型”目前是占位。
+一次最多提交 1000 个 ID。增减数据集（包括删除其中的数据集）会更新项目的 `updated_at`；项目与数据集之间的写操作都按“先数据集、后项目，各自按 ID 顺序”加行锁，并发修改同一关系时不会死锁或丢失更新。删除数据集或项目时，关联记录随之级联删除。一个模型只属于一个项目（`models.project_id`，`ON DELETE RESTRICT`：数据库不会在模型文件夹还在时删掉模型记录）；删除项目时在事务中锁定项目行并检查其中的模型数，与分配模型版本号使用同一把行锁，正在提交的模型不会漏删。训练任务上线后也将归属到项目。
+
+### 模型仓库接口
+
+模型仓库（`internal/httpapi/models.go`，业务逻辑在 `internal/model`）的设计见第 10 节。字段定义以前端 `frontend/src/features/models/api.ts` 中的类型为准，与后端 `internal/model/types.go` 的 json tag 保持一致。`{modelID}`、`{uploadID}`、`{exportID}` 必须是正整数，否则返回 404。
+
+| 方法与路径 | 说明 |
+|---|---|
+| `GET /api/v1/models` | 模型列表 `{items, total}`，新的在前（`created_at DESC, id DESC`）。筛选：`project_id`（正整数）、`yolo_version`、`source`（`upload` / `training`）、`q`（说明、原始文件名、项目名，不区分大小写），参数值非法时返回 400。每项带所属项目 `project: {id, name}`、版本号、来源与训练任务 `training_job_id`（上传的模型为 null）、YOLO 版本、任务、原始文件名、大小、SHA256、解析出的 `info`、`file_missing`（`model.pt` 已不在磁盘上）、`export_count`（成功的转换数）与 `download_url` |
+| `GET /api/v1/models/{modelID}` | 模型详情（字段同列表项） |
+| `PATCH /api/v1/models/{modelID}` | `{description}` 修改说明（规则同项目描述：最长 500 个字符，除换行与制表符外不能含控制字符） |
+| `DELETE /api/v1/models/{modelID}` | 删除模型记录、转换记录与整个模型文件夹（含 ONNX 缓存），返回 204；正在执行的转换随之删除，训练节点之后的调用得到 404 而停止。记录已删除但文件夹没能完全删除时返回 200 `{"files_removed": false, "message": "…"}`（同数据集），剩余的文件留在原来的文件夹名下，版本号不会被复用 |
+| `GET /api/v1/models/{modelID}/file` | 下载 `model.pt`（`Content-Disposition: attachment`，文件名 `<项目名>_v<版本>.pt`，`application/octet-stream`，支持 Range 与条件请求）；文件不在磁盘上时 404 `not_found`（“模型文件不存在…”） |
+| `POST /api/v1/models/uploads` | `{project_id, yolo_version, file_name, file_size, description?}` 开始上传，返回 201 与上传 `ModelUpload`（`{id, project_id, yolo_version, description, file_name, file_size, received_bytes, status, detected_yolo_version, error, model_id, …}`）。`yolo_version` 见第 10 节；文件名须以 `.pt` 结尾（不区分大小写）、最长 255 个字符、不能含控制字符；大小 1 字节–8 GiB；项目不存在时返回 422；剩余空间不足文件大小 + 512 MiB 时返回 507 |
+| `GET /api/v1/models/uploads/{uploadID}` | 上传状态：`uploading` → `completed` / `failed` / `canceled` |
+| `PUT /api/v1/models/uploads/{uploadID}?offset=N` | 上传一个分块（原始字节，≤ 64 MiB，前端每块 8 MiB），`offset` 必须等于已接收的字节数（否则 409 `upload_offset_mismatch`），超出声明的大小时返回 400；失败的分块不留下数据，可以从 `received_bytes` 续传。服务器上的临时文件已丢失（如恢复了数据库但没有恢复 `tmp/`）时返回 409 `conflict`（“服务器上找不到这次上传已接收的数据（临时文件已丢失），请取消后重新上传”）。被拒绝的分块（404、409、507）平台先读完再回应，浏览器收到的是错误而不是连接被重置 |
+| `POST /api/v1/models/uploads/{uploadID}/commit` | `{yolo_version?, description?}`（可选，覆盖开始上传时的值）提交上传：校验大小、计算 SHA256、解析文件、校验 YOLO 版本，然后作为项目的下一个版本保存（见第 10 节），返回 201 与模型。已完成的上传再次提交返回 200 与同一个模型（可以安全重试）。同时最多解析 2 个文件，其余的提交等待。还没传完或临时文件已丢失时返回 409；文件不是支持的模型时 422 `invalid_model`（上传置为 `failed`，删除临时文件）；版本不一致时 422 `yolo_version_mismatch`（上传保持 `uploading`，记下 `detected_yolo_version`，可以带新的 `yolo_version` 再次提交）；提交过程中项目被删除时返回 422 |
+| `POST /api/v1/models/uploads/{uploadID}/cancel` | 取消上传并删除临时文件，返回上传；已结束的上传原样返回 |
+| `GET /api/v1/models/{modelID}/exports` | 该模型的转换记录 `{items, total}`，新的在前 |
+| `POST /api/v1/models/{modelID}/exports` | 请求转换：`{format: "onnx", imgsz?, dynamic?, postprocess?, opset?}`（选项见第 10 节“ONNX 转换”）。同样选项的转换已成功且文件还在 → 200 与该记录（缓存）；正在排队或转换 → 202 与该记录；失败过、或成功但文件已不在 → 重新排队（尝试次数与错误清零），202；新的选项 → 新记录，202。选项不合法或该模型不支持时返回 422（如动态尺寸与 `nms` 同时使用、没有检测框的模型选择 `nms` / `end2end`）；模型文件不在磁盘上时返回 409 |
+| `GET /api/v1/models/{modelID}/exports/{exportID}` | 转换状态（前端每秒轮询）：`status`（`queued` → `running` → `succeeded` / `failed`）、`stage`（`downloading` / `converting` / `uploading`）、`attempts`、执行的节点 `node`、排队中时的 `queue_position`（从 1 起）、`workers_online`（最近 60 秒内领取过或正在执行转换任务的节点数，前端为 0 时提示没有可以执行转换的训练节点）、下载文件名 `file_name`、成功后的 `size_bytes`、`sha256`、`result`（节点上报的版本、opset、输入输出名称与形状、是否用 ONNX Runtime 验证过、耗时与节点名）与 `download_url`，失败时的 `error`（中文）与 `error_detail`（节点上的错误输出） |
+| `GET /api/v1/models/{modelID}/exports/{exportID}/file` | 下载 ONNX（同 PT 下载），文件名如 `<项目名>_v<版本>_640_end2end.onnx`（见第 10 节）；还没成功时返回 409，文件不在磁盘上时返回 404 |
+| `DELETE /api/v1/models/{modelID}/exports/{exportID}` | 删除转换记录与结果文件，返回 204；排队中或转换中的也可以删除，执行它的节点之后的调用得到 404 而停止 |
 
 JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>` 请求时返回 `Cache-Control: private, max-age=31536000, immutable`（文件变化后版本号随之改变），否则为 `private, no-cache`。
 
@@ -221,9 +249,16 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `POST /api/v1/compute/nodes/{nodeID}/probe` | 请求节点重新检测硬件与 CUDA 环境，返回 202 与 `probe_pending: true` 的节点；节点离线时 409 `conflict` |
 | `POST /api/v1/compute/agent/register` | 节点注册：`{node_key, name, hostname?, agent_version?, hardware, environment?, metrics?}`，按 `node_key`（1–64 个 `A-Z a-z 0-9 . _ -` 字符）新建或更新，返回 `{node_id, heartbeat_interval_seconds, server_time}` |
 | `POST /api/v1/compute/agent/heartbeat` | 节点心跳：`{node_key, metrics?, environment?, hardware?}`，返回 `{node_id, heartbeat_interval_seconds, probe_requested}`；`node_key` 未注册时 404 `unknown_node` |
+| `POST /api/v1/compute/agent/tasks/claim` | 领取任务（长轮询）：`{node_key, kinds: ["model_export"], wait_seconds}`（`wait_seconds` 0–30，超出时 422），返回 `{"task": null \| Task}`。没有任务时最多等待 `wait_seconds`，期间有任务入队（或重新排队）立即返回；服务关闭时立即返回 `{"task": null}`。`node_key` 未注册时 404 `unknown_node`；`kinds` 中不认识的类型忽略 |
+| `GET /api/v1/compute/agent/model-exports/{exportID}/input` | 下载要转换的 `model.pt`（支持 Range）；读取期间每 15 秒续租一次 |
+| `POST /api/v1/compute/agent/model-exports/{exportID}/progress` | `{stage: "downloading" \| "converting" \| "uploading", message?, size_bytes?}` 上报进度并续租，返回 `{"lease_seconds": 60}`。`stage` 为 `uploading` 且 `size_bytes` > 0（即将上传的结果大小）时是上传前的预检，按上传的规则依次检查：转换已删除 404，不属于该节点或已结束 409，超过 4 GiB 413，剩余空间不足 507（“磁盘剩余空间不足：可用 X，至少需要 Y”）；`size_bytes` 为负数时 422，省略或为 0 时只续租 |
+| `PUT /api/v1/compute/agent/model-exports/{exportID}/output` | 上传转换结果（ONNX 原始字节，≤ 4 GiB），必须带 `Content-Length` 与 `X-Content-Sha256`（十六进制）；暂存为 `tmp/model-exports/<exportID>/output.onnx.part`，大小或 SHA256 不一致时丢弃（大小不符 400，SHA256 不符 422），剩余空间不足时 507；成功返回 `{"received_bytes": N}` 并续租，再次上传会替换。因任务状态或磁盘被拒绝（404、409、507）时平台先读掉最多 64 MiB 的请求体再回应，更大的结果由上传前的预检得知会被拒绝（平台在读取之前就拒绝时，还在发送的客户端只能看到连接被重置） |
+| `POST /api/v1/compute/agent/model-exports/{exportID}/complete` | `{result: {...}}`，要求已上传结果：把文件移入模型文件夹（`onnx/<exportID>.onnx`），转换成功，返回转换记录 |
+| `POST /api/v1/compute/agent/model-exports/{exportID}/fail` | `{error, detail?, retryable?}` 报告失败：`retryable` 为 true 且领取次数少于 3 次时重新排队，否则转换失败（`error` 截断到 500 个字符、`detail` 截断到 8 KiB），返回转换记录 |
 
 - 配置了 `TM_NODE_TOKEN` 时，`/agent/*` 必须带 `Authorization: Bearer <令牌>`，否则返回 401 `unauthorized`（常量时间比较）；浏览器使用的其它接口不需要令牌（平台目前没有登录）。
-- 请求体上限 1 MiB（413 `payload_too_large`）。上报的 JSON 允许未知字段（新版节点配旧版平台）；数值为 NaN、无穷或负数时置为 null，过长的字符串与数组截断，不认识的枚举值归为保守的值（如 `status` → `error`、`accelerator` → `cpu`），偶尔异常的指标不会让心跳失败。存入数据库（表 `compute_nodes`，`hardware`、`environment`、`metrics` 为 jsonb）和返回的都是规范化之后的结构。
+- `model-exports/{exportID}/*` 还必须带请求头 `X-Node-Key: <node_key>`（缺少时 400，未注册时 404 `unknown_node`），且该转换正由这个节点执行（`running`）：转换已被删除时返回 404 `not_found`，不属于该节点或已结束时返回 409 `conflict`，节点收到这两种响应后放弃该任务。协议见第 9 节“任务协议”。
+- 请求体上限 1 MiB（413 `payload_too_large`；上传转换结果除外，见上表）。上报的 JSON 允许未知字段（新版节点配旧版平台）；数值为 NaN、无穷或负数时置为 null，过长的字符串与数组截断，不认识的枚举值归为保守的值（如 `status` → `error`、`accelerator` → `cpu`），偶尔异常的指标不会让心跳失败。存入数据库（表 `compute_nodes`，`hardware`、`environment`、`metrics` 为 jsonb）和返回的都是规范化之后的结构。
 - 注册请求中的 `environment` / `metrics` 为 null 时保留原值（节点重启后先上报硬件，CUDA 环境检测完成后再随心跳上报，页面不会闪烁）。`environment` 为 null 的注册同时记下重新检测的请求（`probe_pending` 为 true）：节点重启后正在检测，页面在上次的结果上显示“正在重新检测”，而不是把上次的结果当作当前的。心跳带有 `environment` 时清除重新检测的请求。
 - 节点的 `address` 是平台看到的客户端 IP（见“中间件”中的客户端 IP），可能为 `""`。
 
@@ -257,9 +292,10 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - `src/features/<领域>/` 下每个模块有独立的页面文件；规划中的模块渲染通用占位组件 `ModulePlaceholder`，实现功能时直接替换该文件内容即可。
 - `src/lib/api.ts` 提供 `apiGet<T>()` 和 `apiSend<T>(method, path, body)`，非 2xx 时解析错误信封并抛出 `ApiError(status, code, message)`；网络错误转换为 `code = "network_error"`。
 - 服务端状态用 TanStack Query 管理，界面组件来自 `src/components/ui/`（shadcn/ui）。
-- 项目模块位于 `src/features/projects/`：项目列表页（卡片 / 列表视图）、项目详情页（数据集 / 标签分布 / 模型占位，当前标签页记在 URL 的 `?tab=`）、新建 / 编辑 / 删除对话框、添加数据集对话框，以及数据集页使用的“纳入项目”对话框和项目标记。数据集页的项目筛选记在 URL 的 `?project=<项目ID|none>`。
+- 项目模块位于 `src/features/projects/`：项目列表页（卡片 / 列表视图）、项目详情页（数据集 / 标签分布 / 模型，当前标签页记在 URL 的 `?tab=`）、新建 / 编辑 / 删除对话框（项目中有模型时需要勾选同时删除模型）、添加数据集对话框，以及数据集页使用的“纳入项目”对话框和项目标记。数据集页的项目筛选记在 URL 的 `?project=<项目ID|none>`。
 - 标注模块位于 `src/features/annotation/`：工作台首页（选择数据集）与标注编辑器（`/annotation/workspace/:datasetId`，路由带 `handle.fullBleed`，占满内容区且默认收起侧边栏）。几何计算（`geometry.ts`）、框列表与撤销历史（`document.ts`）、自动保存（`autosave.ts`）、快捷键映射（`shortcuts.ts`）、类别列表编辑（`classes.ts`）都是与界面无关的纯函数 / 类，有单元测试；画布（`annotation-canvas.tsx`）用一张 `<img>` 加屏幕坐标的 SVG 叠加层绘制，指针事件统一处理鼠标、触控笔与触屏（双指缩放；触屏与触控笔的按下取消默认行为，不再产生松开之后才派发的兼容鼠标事件，否则短拖动画好框后弹出的类别选择框会被随后的 mousedown 关掉），macOS Safari 的触控板捏合通过 `gesture*` 事件处理；画布容器为 `overflow: clip`（不可滚动），类别选择框等浮层放在画布内，其中的滚轮不缩放图片；类别选择框的高度不超过画布，画布较矮时其中的列表变短（可以滚动）。打开图片时如果焦点不在任何元素上（刚进入编辑器、用快捷键切换图片后），画布获得焦点，Tab 随即可以依次选中框；焦点在输入框、对话框、图片列表等处时不移动焦点。类别选择框关闭（选好类别、Esc）时焦点还在其中、快捷键说明 / 类别管理 / 离开与删除的确认对话框关闭、点击提示中的按钮（载入最新版本、仍然保存、重试等）或提示条中的操作（放弃修改并切换）后，焦点也回到画布，不会落到页面上；用户已点到别的控件上、按钮在窄屏时弹出的面板中时不移动，对话框关闭时面板还开着则焦点回到面板中。未保存的修改由 react-router 的 `useBlocker` 守护：切换图片（包括浏览器后退 / 前进）或离开工作台前先保存。
 - 数据集模块位于 `src/features/datasets/`：列表页、详情页（图片 / 标签分布 / 导入记录）、新建与导入对话框、图片查看器（叠加 VOC 标注框）。上传由全局的上传管理器（`upload-manager.ts`，`useSyncExternalStore`）执行，切换页面不会中断；右下角的上传面板显示进度，上传中关闭页面会弹出提醒。
+- 模型仓库位于 `src/features/models/`：列表页（`/models`，桌面为表格、窄屏为卡片）、模型详情页（`/models/:modelId`）、上传对话框与下载对话框（PT / ONNX，ONNX 转换的进度与失败原因）。`yolo-versions.ts`（版本表、各模型允许的与默认的后处理方式、转换选项的范围、输出形状说明、下载文件名）与 `naming.ts`（上传文件名与说明的规则）是与后端 `internal/model` 规则一致的纯函数，有单元测试。模型上传由 `features/models/upload-manager.ts` 执行（做法同数据集，复用 `upload-plan.ts` 的分块与重试，进度显示在同一个上传面板中）。
 
 开发时由 Vite（:5173）托管前端并把 `/api` 代理到 Go 服务（:8080）；生产环境由 Go 服务托管 `frontend/dist`。
 
@@ -270,11 +306,11 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | key | 子目录 | 用途 |
 |---|---|---|
 | `datasets` | `datasets/` | 数据集文件夹：每个数据集一个子目录，图片与 VOC 标注直接以文件保存（见第 6 节） |
-| `models` | `models/` | 模型权重文件 |
+| `models` | `models/` | 模型仓库：每个模型一个文件夹 `project-<项目ID>/v<版本号>/`，其中有 `model.pt`、`model.json` 与转换缓存 `onnx/`（见第 10 节） |
 | `runs` | `runs/` | 训练 / 评估运行产物（日志、曲线、中间权重） |
 | `exports` | `exports/` | 导出的训练集（YOLO / VOC / COCO）、打包导出与报告 |
 | `cache` | `cache/` | 缩略图等可再生的缓存，可随时删除，不需要备份 |
-| `tmp` | `tmp/` | 上传、解压等临时文件 |
+| `tmp` | `tmp/` | 上传、解压等临时文件：数据集导入 `imports/`，模型上传 `model-uploads/<上传ID>/`，训练节点上传中的转换结果 `model-exports/<转换ID>/`，平台训练的模型入库前的副本 `model-registrations/` |
 
 平台框架阶段的 `images/` 目录已不再使用（从未写入过数据），旧部署中留下的空目录可以直接删除。
 
@@ -391,7 +427,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 因此迁移文件中**不要写 `BEGIN` / `COMMIT`**，也不能包含无法在事务中执行的语句（如 `CREATE INDEX CONCURRENTLY`）。
 - 迁移只向前：**已发布的迁移文件不要修改，也不要改名**，需要变更就新增一个文件。
 - 同一个版本号只能对应一个文件。执行器会比对 `schema_migrations` 中记录的文件名：数据库里已执行过的版本号在当前代码中对应另一个文件名时（典型情况是两个分支各自新增了 `0002_*.sql`，又共用一个开发数据库），启动直接失败并给出两个文件名，而不是悄悄跳过。此时给后合入的那个文件换一个新编号；开发数据库可以删掉 `data/postgres` 重建。
-- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表（见第 6 节“标注”）；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
+- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表（见第 6 节“标注”）；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）；`0008_create_models.sql` 建立模型仓库的 `models`、`model_uploads`、`model_exports`（转换任务，同时是转换结果的缓存），并为 `projects` 增加 `model_version_seq`（见第 10 节）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
 
 ## 8. 日志
 
@@ -401,7 +437,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 ## 9. 训练节点
 
-训练需要 GPU 和 Python 生态（PyTorch / Ultralytics），因此作为**独立的服务**接入，而不是放进 Go 服务：训练节点（`trainer/`，Python 包 `trainmaster_trainer`）运行在每台 GPU 机器上，主动向平台注册并上报心跳。平台不连接节点，也不调度容器。
+训练需要 GPU 和 Python 生态（PyTorch / Ultralytics），因此作为**独立的服务**接入，而不是放进 Go 服务：训练节点（`trainer/`，Python 包 `trainmaster_trainer`）运行在每台 GPU 机器上，主动向平台注册并上报心跳，并领取、执行平台的任务（目前是模型仓库的 ONNX 转换，见下方“任务协议”“模型转换”）。平台不连接节点，也不调度容器。
 
 ### 部署形态
 
@@ -444,8 +480,117 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 “计算资源”页面上的曲线来自最近的指标（每个节点最多 60 个点：CPU、内存与每块显卡的利用率和显存）。它们**只保存在 app 进程的内存中**（`internal/compute` 中按节点的环形缓冲），服务重启后清空，删除节点时一并删除；数据库只保存每个节点最新的一份 `hardware`、`environment` 与 `metrics`。因此与导入任务执行器一样，目前只支持单实例部署。
 
+### 任务协议
+
+节点主动向平台领取任务，平台从不连接节点（接口见第 3 节“计算资源接口”）。任务记录在 PostgreSQL 中，目前只有一种：`model_export`（表 `model_exports`，模型仓库的 pt → ONNX 转换）。
+
+1. **能力**：任务线程（`trainmaster_trainer/tasks.py`）在第一次注册成功后启动。本机能找到 `torch`、`ultralytics` 与 `onnx`（`importlib.util.find_spec`，常驻进程不导入它们）时才在 `kinds` 中带上 `model_export`；缺少时记录一条日志，之后每 5 分钟重新检查（裸机节点可能随后补装了依赖）。
+2. **领取（长轮询）**：`POST …/agent/tasks/claim`，`wait_seconds=25`（平台最多等 30 秒，客户端超时为等待时间 + 15 秒），返回 `{"task": null}` 时立即再领。平台用 `UPDATE … WHERE id = (SELECT id FROM model_exports WHERE status = 'queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)` 取最早排队的转换，一个任务只会交给一个节点；任务入队或重新排队时通过进程内的通知唤醒正在等待的领取。平台关闭时（`http.Server.RegisterOnShutdown`）正在等待的领取立即返回 `{"task": null}`，节点在平台重启后再领。领取时 404 `unknown_node` → 请主循环重新注册；其它 404 / 405 / 501（旧版平台没有任务接口）→ 每 5 分钟重试一次，只记录一次日志；网络错误与 5xx → 与心跳相同的指数退避。
+3. **身份**：领取的请求体带 `node_key`；之后关于这个任务的每个调用（任务中给出的 `input_url`、`progress_url`、`output_url`、`complete_url`、`fail_url`）都带请求头 `X-Node-Key`。平台只接受领取它的节点、且任务仍在执行中的调用：任务被删除（用户删除了转换或模型）时返回 404，已不属于该节点或已结束时返回 409，节点收到后结束子进程、放弃任务，不再上报。
+4. **租约**：领取后任务为 `running`，租约 60 秒（`lease_seconds`）。每次上报进度、下载输入与上传结果的过程中（每 15 秒）、结果上传完成时都会续租；节点在执行期间每 15 秒上报一次进度。平台每 15 秒检查一次：租约过期（节点崩溃、断网或被强制停止）的任务在领取次数少于 3 次时重新排队，否则失败（“训练节点在转换过程中失去联系（已尝试 3 次）”）。
+5. **失败与重试**：`fail` 带 `retryable`：网络错误、下载的文件大小或 SHA256 不一致、节点磁盘空间不足、平台返回 5xx（507 除外）或 401 等可能下次成功的失败为 true，领取次数少于 3 次时重新排队；转换本身的失败（模型无法加载、后处理方式不适用、超时、ONNX Runtime 验证失败等）与平台拒绝接收结果（上传前的预检或上传返回 413、507）为 false，直接失败，`error` 为中文说明，`error_detail` 为节点上的错误输出（截断到 8 KiB）。用户再次请求同样的转换时重新排队，尝试次数清零。
+6. **结果**：节点先计算结果文件的 SHA256，以 `{"stage": "uploading", "size_bytes": N}` 上报一次进度（预检，见第 3 节：404 / 409 放弃任务，413 / 507 为不可重试的失败，带平台的说明；不认识 `size_bytes` 的旧版平台照常续租），再用 `PUT output` 一次上传（带 `Content-Length` 与 `X-Content-Sha256`），平台边接收边计算并核对大小与 SHA256，不一致时丢弃（节点把 422 视为传输错误，可以重试）。上传中连接被重置时，节点再上报一次不带大小的进度来区分原因：404 / 409 放弃，507 不可重试，其它情况按网络错误重试；再 `POST complete`，平台把文件从 `tmp/model-exports/` 移入模型文件夹，转换成功。
+7. **停止**：节点停止（`docker stop`、`systemctl stop`）时结束正在运行的转换子进程，以 `retryable: true` 上报失败（超时 5 秒，不拖慢停止），任务立即重新排队（领取次数已满 3 次时为失败）；没能上报时由租约过期处理。空闲时停在长轮询中的领取不等待，直接退出。
+8. 一个节点同时只执行一个任务。“正在执行转换的节点数”（`workers_online`）是最近 60 秒内领取过或上报过转换任务的节点，只保存在 app 进程的内存中；与指标历史一样，目前只支持单实例部署。
+
+### 模型转换
+
+`model_export` 任务由 `trainmaster_trainer/model_export.py` 执行（工作目录为状态目录中的 `work/model-export-<转换ID>/`，开始前清理残留，结束后删除；节点启动时也清理上次留下的工作目录）：
+
+1. 检查剩余空间（至少为 pt 文件大小的 3 倍，不足时为可重试的失败）；下载 `model.pt`（流式写入，边写边计算 SHA256），与任务中的 `size_bytes`、`sha256` 核对。
+2. 在**子进程** `python -m trainmaster_trainer.model_export --spec <JSON>` 中转换。pt 来自用户上传，子进程只继承运行 Python 需要的环境变量（`PATH`、`HOME`、语言与时区、临时目录、`PYTHON*`、`VIRTUAL_ENV`、`LD_LIBRARY_PATH`、CPU 线程数、`LC_*`、`YOLO_*` 等，见 `_EXPORT_ENV_NAMES`），没有 `TM_NODE_TOKEN` 等节点配置、代理与云服务密钥；另外设置 `YOLO_OFFLINE=1`、`YOLO_CONFIG_DIR=<状态目录>/ultralytics`、`CUDA_VISIBLE_DEVICES=""`（在 CPU 上转换，不占用显存、不受正在进行的训练影响）、`YOLO_AUTOINSTALL=False`（不让 Ultralytics 在线安装缺少的依赖）与 `ULTRALYTICS_SAFE_LOAD=1`（安全加载，子进程在导入 ultralytics 之前也会设置）；超时为 `TM_EXPORT_TIMEOUT`（默认 900 秒），超时或停止时结束整个进程组。torch、ultralytics、onnx 只在这个短命的子进程中导入。
+3. 子进程：先确认安全加载已生效（有 `ultralytics.nn.tasks._SafeLoad`、`_SafeLoad.SUPPORTED`（PyTorch 2.6 及以上）、`SAFE_LOAD` 已打开），否则不加载、转换失败（不可重试），提示升级训练节点：这时 Ultralytics 会静默退回普通加载。`YOLO(pt, task=…)` 加载模型（`torch.load(weights_only=True)`，只还原 `_SafeLoad` 允许清单中的对象），按后处理方式设置 `nms`（`raw` → `None`，`nms` → `True`，`end2end` → `False`），调用 `model.export(format="onnx", imgsz=[高, 宽], dynamic=…, nms=…, opset=…, simplify=True, device="cpu", batch=1)`。规则与平台相同（第 10 节“ONNX 转换”）：`nms` 与 `end2end` 只用于有检测框的任务（检测、分割、姿态、旋转框），`end2end` 还要求检测头带 one-to-one 分支（`one2one_cv2`，YOLOv10、YOLO26）；`nms` 不能与 `dynamic` 同时使用：Ultralytics 的 `NMSModel` 逐张处理 batch，导出时这个循环按 batch 1 展开，动态 batch 时第一张之后的输出全为 0。
+4. 核对结果：`onnx.checker.check_model`，读取 opset、输入输出的名称 / 形状 / 类型与 metadata；Ultralytics 会静默忽略不适用的选项（如 YOLO11 上的 `nms=False`），所以按 metadata 中的 `end2end`、`nms` 与输入形状核对是否符合请求，不符时报错。再用 ONNX Runtime（CPU）以全零输入推理一次，输出必须是有限值（`result.verified`）。
+5. 子进程把结果以 JSON 输出到 stdout 的最后一行（`{"ok": true, "onnx_path", "result"}` 或 `{"ok": false, "error", "detail"}`），常见的失败翻译成中文：如节点的 Ultralytics 版本太旧、不认识模型中的类（YOLO26 需要 8.4.0 及以上、YOLO11 需要 8.3.0 及以上，模型由更新的 Ultralytics 保存时一并说明；安全加载拒绝的是允许的模块中节点上没有的类时也按这种情况处理），安全加载拒绝了文件中的对象（“模型文件中引用了不允许加载的对象（posix.system），为了安全训练节点不会加载它…”），文件损坏或不是检查点，内存不足，缺少 onnx / onnxslim / onnxruntime，opset 不可用。
+6. 上传结果并完成（见“任务协议”第 6 条），`result` 中带上节点名。
+
+**信任边界**：用户上传的 pt 只在这个子进程中反序列化，且只按 Ultralytics 的允许清单还原对象；平台在上传时已拒绝引用了清单之外对象的文件（第 10 节“解析模型文件”）。安全加载不是沙箱：子进程仍以训练节点的用户运行，能访问节点能访问的文件（包括挂载的 `/data`），PyTorch 安全加载与 Ultralytics 清单本身的漏洞不在防护之内。用户下载 PT 后自己用普通方式加载（Ultralytics 默认不启用安全加载，或 `torch.load(weights_only=False)`）时，文件仍会被完整反序列化，平台的检查对此没有保证。
+
+`python -m trainmaster_trainer export --weights x.pt [--imgsz 640] [--postprocess raw|nms|end2end] [--dynamic] [--opset N] [--output out.onnx] [--json]` 用同一个子进程在本机转换，不连接平台，便于排障；训练节点镜像构建时也用它离线转换一次 YOLO11n（320×320），保证镜像中的 ONNX 依赖完整、安全加载可用。
+
+### 为平台训练预留
+
+- **模型来源**：`models.source` 区分用户上传（`upload`）与平台训练（`training`）；`training` 的模型必须有 `training_job_id`（数据库约束；训练任务表上线后再加外键）。
+- **入库接口**：`model.Service.RegisterTrainedModel(ctx, TrainedModelInput{ProjectID, TrainingJobID, YOLOVersion, Description, WeightsPath, FileName})` 把训练任务产出的权重（`WeightsPath` 是 `runs/` 下的相对路径，如 `job-7/weights/best.pt`）**复制**到 `tmp/model-registrations/` 后，与上传的提交走同一条路径（SHA256、解析、版本校验、分配版本号、移入模型文件夹、写 `model.json`），成为项目的下一个版本，`runs/` 中的文件保留。目前只有测试调用它。
+- **任务协议**：训练任务将复用上面的领取协议：节点在 `kinds` 中加入训练任务的类型，平台按同样的 `FOR UPDATE SKIP LOCKED`、租约与重试规则交给一个节点，进度、日志与指标通过任务中的 URL 上报。
+
 ### 后续工作
 
-- **训练任务调度**：训练任务记录在 PostgreSQL 中；节点主动通过 HTTP API 领取任务（服务端用 `SELECT … FOR UPDATE SKIP LOCKED` 保证一个任务只被一个节点领取），并上报进度、日志与指标。`/api/v1/training/jobs` 目前仍返回 501。
-- **数据交换**：节点与 app 挂载同一个存储目录（compose 中训练节点已把它挂载为 `/data`），从 `datasets/` 或 `exports/` 读取训练集，把运行产物写入 `runs/`、最终权重写入 `models/`；其它机器上的节点通过 NFS 等共享存储挂载同一目录。
-- 评估、批量推理、预标注等耗时任务也将复用同一套训练节点与任务队列机制。
+- **训练任务调度**：训练任务记录在 PostgreSQL 中，按上面的任务协议由节点领取并上报进度、日志与指标，训练完成后通过 `RegisterTrainedModel` 把最终权重存入模型仓库。`/api/v1/training/jobs` 目前仍返回 501。
+- **数据交换**：节点与 app 挂载同一个存储目录（compose 中训练节点已把它挂载为 `/data`），从 `datasets/` 或 `exports/` 读取训练集，把运行产物写入 `runs/`；其它机器上的节点通过 NFS 等共享存储挂载同一目录。（模型转换不需要共享存储：节点通过 HTTP 下载 pt、上传 ONNX。）
+- 评估、批量推理、预标注、TensorRT 等其它格式的转换等耗时任务也将复用同一套训练节点与任务协议。
+
+## 10. 模型仓库
+
+模型仓库保存用 Ultralytics 训练的 YOLO 权重文件（`.pt`）。实现在 `internal/model`（上传、版本分配、存储、下载、转换队列）与 `internal/model/checkpoint`（读取 `.pt` 的元数据），接口见第 3 节“模型仓库接口”，训练节点一侧见第 9 节“任务协议”“模型转换”。
+
+### 存储与版本号
+
+- **一个模型属于且只属于一个项目**，项目内按版本号编号（v1、v2…）。版本号由 `projects.model_version_seq` 分配，只增不减，删除模型后也不复用，所以版本号与文件夹都不会冲突。分配时锁定项目行（`UPDATE projects SET model_version_seq = model_version_seq + 1 … RETURNING`），同一项目的并发提交得到不同的版本号，删除项目会等正在进行的提交结束。
+- 文件在 `models/` 下，每个模型一个文件夹，数据库中只存相对路径（`models.dir_name`，如 `project-12/v3`）：
+
+  ```text
+  models/
+  └── project-<项目ID>/
+      └── v<版本号>/
+          ├── model.pt          # 上传的原始文件，字节不变（SHA256 记在数据库中）
+          ├── model.json        # 说明文件：模型 ID、项目、版本、来源、YOLO 版本、原始文件名、大小、SHA256、上传时间与解析出的 info
+          └── onnx/
+              └── <转换ID>.onnx  # 转换结果的缓存，可以删除，再次下载时重新转换
+  ```
+
+  `model.json` 让 `models/` 的拷贝或备份不依赖数据库也能看懂；它在模型入库时写入（先写临时文件再改名），之后不再更新（如项目改名、修改说明）。
+- **入库**（上传的提交与 `RegisterTrainedModel` 共用）：打开文件 → 计算 SHA256 → 解析（`checkpoint.Inspect`）→ 校验 YOLO 版本 → 在一个事务中分配版本号、插入 `models`（上传的提交同时把上传标为 `completed`），并在提交事务前把文件 `os.Rename` 进模型文件夹、写入 `model.json`。任何一步失败都回滚，文件移回 `tmp/`，因此不会出现没有文件夹的模型记录。移入文件之前先在模型文件夹中写入并 `fsync` 标记 `.pending`（`{"upload_id": N}`），事务提交后删除。进程在移入与提交之间崩溃时，留下的是带 `.pending`、没有模型记录的文件夹：启动时与每小时的清理（以及分配到这个版本号、删除项目时）把其中的文件放回仍在等待它的上传（`tmp/model-uploads/<上传ID>/upload.pt`，可以再次提交），再把文件夹改名为 `models/.deleting-pending-…` 由清理删除，这个版本号随之可以使用；有模型记录的（崩溃发生在提交之后）只删除标记；上传正忙或无法判断时保留，下次再试。分配到的版本号对应的文件夹已经存在、又没有 `.pending` 时（如手动恢复的文件），跳过这个版本号而不是覆盖它。解析最多同时进行 2 个（每个最多约 1 秒 CPU 与几百 MB 内存），其余的提交等待空位。上传的提交不因浏览器断开而中断（大文件的哈希需要一些时间），只在服务关闭时取消。
+- **上传**：分块写入 `tmp/model-uploads/<上传ID>/upload.pt`（第一个分块创建文件），每个分块写入前截断到 `offset` 并在写完后 `fsync`，失败的分块不留下数据；之后的分块或提交发现文件已不在、或比已接收的字节数短时返回 409（临时文件已丢失，需要取消后重新上传），不会用 0 补齐；同一个上传的分块与提交串行执行。开始上传与每个分块都检查剩余空间（始终保留 512 MiB）。
+- **删除**：在事务中删除模型与其转换记录，并把文件夹改名为 `models/.deleting-<模型ID>`，事务提交后再删除它；没能完全删除时（如权限不足）剩余的文件恢复为原来的文件夹名，接口返回 200 与说明。版本号不复用，留下的文件夹不会被新模型占用。删除项目带 `delete_models=true` 时逐个这样删除其模型，再删除项目。
+- **文件缺失**：模型的 `model.pt` 不在磁盘上（在服务器上被删除或移动）时，详情中 `file_missing` 为 true，下载返回 404，不能请求转换（409）；转换结果文件被删除时，再次请求同样的转换会重新排队。
+- **后台任务**（`model.Service.Start`，服务关闭时 `Stop`）：每 15 秒把租约过期的转换重新排队或置为失败（见第 9 节“任务协议”）；启动时与每小时取消 24 小时没有进展的上传（“上传超时未完成，已自动取消”），清理崩溃留下的带 `.pending` 的模型文件夹（见上），并删除不属于进行中的上传或转换的临时文件夹、没删干净的 `.deleting-*` 文件夹。领取的通知、`workers_online` 与上传的串行锁都在进程内存中，与导入任务执行器一样，**目前只支持单实例部署**。
+
+### 解析模型文件
+
+平台（Alpine 镜像）不安装 Python 与 PyTorch。PyTorch 1.6 起的 `.pt` 是 zip，模型对象以 pickle 保存在 `<根目录>/data.pkl` 中；`internal/model/checkpoint` 只读取这个文件（不超过 64 MiB，不读张量数据），用自己实现的只读 pickle 解释器（协议 0–5）解析：
+
+- **从不导入或执行任何东西**：`GLOBAL` / `STACK_GLOBAL` 只得到 `{模块, 类名}`；`REDUCE`、`NEWOBJ`、`BUILD` 只对已知的构造器做结构化处理（`OrderedDict`、张量与参数的重建函数（记录形状，参数计入参数量）、`set` / `frozenset`、`pathlib` 路径、numpy 标量等），其余得到占位对象。
+- **只允许安全加载认可的对象**：`GLOBAL` / `STACK_GLOBAL` / `INST` 引用的每个 `模块.名称`（按 PyTorch 的方式映射 Python 2 的模块名之后）都要在 Ultralytics 安全加载（`ULTRALYTICS_SAFE_LOAD=1`，`ultralytics/nn/tasks.py` 的 `_SafeLoad`；训练节点就这样加载）允许的范围内（`checkpoint/safe.go`，对应 torch 2.14 与 Ultralytics 8.4.198）：PyTorch 自己的清单、`_SafeLoad._build` 中的条目、`torch.nn.modules` / `ultralytics.nn.modules`（及其直接子模块）/ `ultralytics.nn.tasks` / `ultralytics.utils.loss` 等模块中的类，以及文件引用了它们时的分类预处理（`torchvision.transforms`）与 CLIP。引用了其它对象（如 `os.system`、自定义模块中的类）的文件以 `unsafe` 拒绝，说明中列出最多 3 个对象；文件的其它问题（如原版 YOLOv5、TorchScript）优先报告。平台不导入任何模块，只按名称判断类（含大写字母的标识符），所以比训练节点稍宽（如 `ultralytics.nn.tasks.LOGGER` 这样的非类名称、Ultralytics 只在加载时才限制的 `getattr` 调用），这样的文件在训练节点加载时被拒绝。pickle 协议 0、1 保存的文件引用 `copyreg._reconstructor`，因此也被拒绝；协议 4、5 的文件能通过检查，但 PyTorch 的安全加载读不了，转换会失败（`torch.save` 使用协议 2）。
+- 操作数、对象数、栈深度、MARK 与 MEMO 的数量都有上限；解析中构造的字符串（类名、路径、编码转换、`bytes`、张量形状等）总长度不超过 16 MiB 加 `data.pkl` 的大小，解析时间不超过 10 秒（真实的检查点最多用到约 15 KB、30 毫秒），超出时以 `too_large` 拒绝（“模型文件的结构过于复杂（data.pkl 第 N 字节：字符串总长度超过上限 / 解析时间超过上限）…”）。构造的文件不能耗尽内存或 CPU；解析器对任何输入都不应 panic（`FuzzInspect` 模糊测试），万一 panic 也被恢复为“文件损坏”的错误。
+- 模型对象取 `ckpt["ema"]`，为空时取 `ckpt["model"]`。任务来自模型类：`DetectionModel` → detect、`SegmentationModel` → segment、`ClassificationModel` → classify、`PoseModel` → pose、`OBBModel` → obb、`SemanticSegmentationModel` → semantic、`DepthModel` → depth（YOLO26 的语义分割与深度估计），YOLO-World / YOLOE 按检测或分割处理，其它 Ultralytics 模型类按 `train_args.task`、模型的 `task` 或检测头推断。
+
+读出的信息存为 `models.info`（接口中的 `info`，字符串与数量都有上限）：模型类与检测头、模型配置文件名与规模（n / s / m / l / x …）、识别出的 YOLO 版本与识别方式、类别名称、训练输入尺寸、输入通道数、参数量、是否带端到端检测头、保存时的 Ultralytics 版本、训练时间、总轮数与当前轮次（-1 为训练完成的最终权重）、best fitness、`train_metrics` 中的指标（最多 64 个，如 `metrics/mAP50(B)`）、训练数据与基础模型、是否含优化器状态（可续训的 `last.pt`）。未知的数值为 null。
+
+拒绝的文件返回 422 `invalid_model`，`message` 为中文原因（`checkpoint.Error` 的 `Reason`）：不是 zip 或没有 `data.pkl`（`not_torch`）、PyTorch 1.6 之前的旧格式（`legacy_format`）、zip 或 pickle 损坏 / 截断（`corrupt`）、不是 Ultralytics 检查点（纯 `state_dict`、TorchScript 等，`not_ultralytics`）、原版 YOLOv5 仓库训练的模型（类来自 `models.yolo` / `models.common`，`yolov5_repo`）、RT-DETR、YOLO-NAS 等不支持的模型（`unsupported_model`）、`data.pkl` 过大或结构过于复杂（`too_large`）、引用了安全加载不允许的对象（`unsafe`，见上）。测试夹具（`internal/model/checkpoint/testdata/`）是真实的 Ultralytics 检查点，只保留其中的 `data.pkl`，生成方法见其中的 README。
+
+### YOLO 版本
+
+支持的版本（`internal/model/versions.go`；前端 `yolo-versions.ts` 与训练节点 `model_export.py` 中有同样的表）：
+
+| 值 | 显示 | 端到端（NMS-free）检测头 | ONNX 默认后处理 |
+|---|---|---|---|
+| `yolov8` | YOLOv8 | 否 | `raw` |
+| `yolov9` | YOLOv9 | 否 | `raw` |
+| `yolov10` | YOLOv10 | 是 | `end2end` |
+| `yolo11` | YOLO11 | 否 | `raw` |
+| `yolo12` | YOLO12 | 否 | `raw` |
+| `yolo26` | YOLO26 | 是 | `end2end` |
+
+`models.yolo_version` 由应用层校验，增加版本不需要迁移。上传时由用户选择版本，解析器同时从文件中识别：
+
+1. 按模型配置文件名（`model.yaml` 中的 `yaml_file`，没有时为 `train_args.model`）：`yolov8*` → `yolov8`，`yolo11*` / `yolov11*` → `yolo11`，`yoloe-11*` → `yolo11`，`yolov8*-worldv2` → `yolov8` 等（`version_source: yaml_file`）。
+2. 配置文件名是自定义的（如 `line-a-detector.yaml`）时按 `model.yaml` 中的模块推断（`version_source: architecture`）：有 `A2C2f` → YOLO12；YOLO26 的检测头，或带端到端检测头且有 `C3k2` → YOLO26；`v10Detect`、`SCDown`、`PSA` 或 `C2fCIB` → YOLOv10；`RepNCSPELAN4`、`ADown` 或 `SPPELAN` → YOLOv9；`C3k2` → YOLO11（分类模型除外：YOLO11 与 YOLO26 的分类网络相同，不认定版本）；`C2f` 且检测头属于 Detect 系 → YOLOv8。
+3. 都识别不出时按用户所选的版本保存。
+
+识别出的版本与所选的不同时，提交返回 422 `yolo_version_mismatch`，`message` 如“所选的版本是 YOLO11，但文件中的模型是 YOLOv8（yolov8n.yaml）。请改选 YOLOv8 后再保存”；上传保持 `uploading`，记下 `detected_yolo_version`，文件留在 `tmp/` 中，带新的 `yolo_version` 再次提交即可（不需要重新上传）。
+
+### ONNX 转换
+
+请求转换时（`POST …/exports`），平台按模型规范化选项（`internal/model/options.go`，前端 `yolo-versions.ts` 规则相同）：
+
+- `imgsz`：`[高, 宽]`，每边 32–4096 且是 32 的倍数；可以只给一个整数（正方形）。省略时为训练时的输入尺寸（向上取 32 的倍数），不知道时为 640。
+- `dynamic`：动态输入（batch、高、宽），默认 false；不能与 `postprocess: nms` 同时使用（422：嵌入的 NMS 只能固定 batch 为 1，见第 9 节“模型转换”）。
+- `postprocess`：`raw`（原始输出，需要自行 NMS；Ultralytics `nms=None`）、`nms`（导出时嵌入 NMS；`nms=True`）、`end2end`（端到端检测头，不需要 NMS；`nms=False`）。允许的方式：只有有检测框的任务（检测、分割、姿态、旋转框）有 `end2end` 与 `nms`，其中 YOLOv10、YOLO26（以及文件中带端到端检测头的模型）有 `end2end`，并作为默认，其余默认 `raw`；分类与 YOLO26 的语义分割、深度估计模型只有 `raw`。不允许的组合返回 422，说明中只建议允许的方式（如“语义分割模型没有检测框，不能导出为 end2end，请选择 raw”）。
+- `opset`：null（由 Ultralytics 选择）或 11–21。
+
+规范化后的选项写成 `options_key`（如 `imgsz=640x640;dynamic=0;postprocess=raw;opset=auto`），`model_exports` 对 `(model_id, format, options_key)` 唯一：**一条转换记录同时是该选项的缓存**。同样的选项已成功且结果文件还在时直接返回（200）；正在排队或转换时返回同一条记录；失败过或结果文件已不在时把同一条记录重新排队（尝试次数与错误清零）；新的选项新建一条记录。入队后唤醒正在长轮询的训练节点，之后的领取、续租、重试与上传见第 9 节。
+
+下载文件名：PT 为 `<项目名>_v<版本>.pt`；ONNX 为 `<项目名>_v<版本>_<高>x<宽>[_dynamic][_nms|_end2end][_opset<N>].onnx`，正方形时 `<高>x<宽>` 写作边长（如 `A线外观检测_v3_640_end2end.onnx`）。项目名中的 `\ / : * ? " < > |` 与控制字符替换为 `_`。
+
+节点上报的 `result`（版本、opset、输入输出、是否验证、耗时、节点名）由平台按类型与长度清洗后存储；动态维度的形状元素为字符串（如 `"batch"`）。

@@ -180,8 +180,10 @@ export function SelectedSource({
   disabled?: boolean
   children?: ReactNode
 }) {
+  // 列宽用 minmax(0,1fr)：默认的 auto 列以不换行的名称为最小宽度，
+  // 过长的文件名不会截断，而是把卡片（以及对话框）撑宽。
   return (
-    <div className="grid gap-4 rounded-xl border bg-muted/30 p-4">
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-4 rounded-xl border bg-muted/30 p-4">
       <div className="flex items-center gap-3">
         <div className="flex size-10 shrink-0 items-center justify-center rounded-lg border bg-background text-muted-foreground">
           <Icon className="size-5" />

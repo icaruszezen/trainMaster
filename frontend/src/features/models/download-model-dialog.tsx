@@ -18,6 +18,7 @@ import {
   CircleAlert,
   CircleCheck,
   Download,
+  Info,
   RotateCw,
   Server,
   TriangleAlert,
@@ -60,6 +61,7 @@ import {
   isActiveExport,
   modelExportQuery,
   modelExportsQuery,
+  modelExistsQuery,
   modelKeys,
   refreshModelExports,
   requestModelExport,
@@ -69,10 +71,13 @@ import {
   type Postprocess,
 } from "@/features/models/api"
 import {
+  exportProgressView,
   exportStatusText,
   exportStep,
   exportSteps,
+  isNotFound,
   modelTitle,
+  type ExportProgressView,
   shapeText,
 } from "@/features/models/model-info"
 import {
@@ -81,16 +86,18 @@ import {
   describePostprocess,
   exportFileName,
   exportOptionsText,
+  fitExportOptions,
   modelArchLabel,
   modelFileName,
   opsetChoices,
+  postprocessConflict,
+  rawOnlyNote,
   sameExportOptions,
   taskLabel,
   validateImgSize,
 } from "@/features/models/yolo-versions"
 import { CopyButton } from "@/features/training/command-block"
 import { useNow } from "@/hooks/use-now"
-import { ApiError } from "@/lib/api"
 import { startDownload } from "@/lib/download"
 import { formatBytes, formatDuration, formatNumber } from "@/lib/format"
 import { queryClient } from "@/lib/query-client"
@@ -170,8 +177,9 @@ function DownloadModel({
 }) {
   const defaults = useMemo(() => defaultExportOptions(model), [model])
   const [format, setFormat] = useState<DownloadFormat>(initialFormat)
+  // 已有的转换记录可能早于现在的规则（如动态尺寸 + 嵌入 NMS），回填时换为可用的选项。
   const [options, setOptions] = useState<OptionsDraft>(() =>
-    toDraft(exportJob?.options ?? defaults)
+    toDraft(fitExportOptions(exportJob?.options ?? defaults, model))
   )
   const [tracking, setTracking] = useState<Tracking | null>(() =>
     exportJob ? trackingOf(exportJob) : null
@@ -206,7 +214,7 @@ function DownloadModel({
         onRetry={(job) => request.mutate(job.options)}
         onEditOptions={(job) => {
           if (job) {
-            setOptions(toDraft(job.options))
+            setOptions(toDraft(fitExportOptions(job.options, model)))
           }
           request.reset()
           setTracking(null)
@@ -245,7 +253,8 @@ function DownloadModel({
           })
           onDone()
         } else {
-          request.mutate(exportOptions)
+          // 表单已经排除了不能组合的选项，这里再保证一次不会发出。
+          request.mutate(fitExportOptions(exportOptions, model))
         }
       }}
       onCancel={onDone}
@@ -322,6 +331,7 @@ function DownloadForm({
     enabled: format === "onnx",
   })
   const allowed = allowedPostprocess(model)
+  const onlyRaw = rawOnlyNote(model)
   const heightError = validateImgSize(options.height)
   const widthError = validateImgSize(options.width)
   const sizeError = heightError ?? widthError
@@ -362,7 +372,11 @@ function DownloadForm({
   }
 
   return (
-    <form onSubmit={submit} className="grid min-w-0 gap-6" noValidate>
+    <form
+      onSubmit={submit}
+      className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-6"
+      noValidate
+    >
       <DialogHeader>
         <DialogTitle>下载模型</DialogTitle>
         <DialogDescription className="break-words">
@@ -479,13 +493,19 @@ function DownloadForm({
             <div className="grid gap-1">
               <Label htmlFor={dynamicId}>动态尺寸</Label>
               <p className="text-xs text-muted-foreground">
-                batch、高、宽可以在推理时改变；上面的尺寸是导出时使用的示例输入。
+                batch、高、宽可以在推理时改变（不能与嵌入 NMS
+                同时使用）；上面的尺寸是导出时使用的示例输入。
               </p>
             </div>
             <Switch
               id={dynamicId}
               checked={options.dynamic}
-              onCheckedChange={(checked) => update({ dynamic: checked })}
+              // 打开时已选的嵌入 NMS 换为默认的后处理方式。
+              onCheckedChange={(checked) =>
+                onOptionsChange(
+                  fitExportOptions({ ...options, dynamic: checked }, model)
+                )
+              }
               disabled={pending}
             />
           </div>
@@ -508,6 +528,7 @@ function DownloadForm({
                   imgsz,
                   dynamic: options.dynamic,
                 })
+                const conflict = postprocessConflict(mode, options.dynamic)
                 return (
                   <ChoiceCard
                     key={mode}
@@ -518,6 +539,8 @@ function DownloadForm({
                     code={mode}
                     badge={mode === defaults.postprocess ? "默认" : undefined}
                     description={info.summary}
+                    disabled={conflict !== null}
+                    note={conflict ?? undefined}
                   >
                     {info.outputs.length > 0 && (
                       <ul className="grid gap-1 text-xs text-muted-foreground">
@@ -535,10 +558,8 @@ function DownloadForm({
                 )
               })}
             </RadioGroup>
-            {allowed.length === 1 && model.task === "classify" && (
-              <p className="text-xs text-muted-foreground">
-                分类模型只有原始输出。
-              </p>
+            {onlyRaw && (
+              <p className="text-xs text-muted-foreground">{onlyRaw}</p>
             )}
           </div>
 
@@ -629,6 +650,8 @@ function ChoiceCard({
   code,
   badge,
   description,
+  disabled = false,
+  note,
   children,
 }: {
   id: string
@@ -639,6 +662,10 @@ function ChoiceCard({
   code?: string
   badge?: string
   description: string
+  /** 不能选择（原因写在 note 中）。 */
+  disabled?: boolean
+  /** 说明下方的提示，如为什么不能选择。 */
+  note?: string
   children?: ReactNode
 }) {
   return (
@@ -646,12 +673,23 @@ function ChoiceCard({
       htmlFor={id}
       className={cn(
         "flex min-w-0 cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors hover:bg-muted/40",
-        selected && "border-primary/60 bg-muted/40"
+        selected && "border-primary/60 bg-muted/40",
+        disabled && "cursor-not-allowed hover:bg-transparent"
       )}
     >
-      <RadioGroupItem id={id} value={value} className="mt-0.5" />
+      <RadioGroupItem
+        id={id}
+        value={value}
+        className="mt-0.5"
+        disabled={disabled}
+      />
       <span className="grid min-w-0 flex-1 gap-1">
-        <span className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-sm font-medium">
+        <span
+          className={cn(
+            "flex flex-wrap items-center gap-x-1.5 gap-y-1 text-sm font-medium",
+            disabled && "text-muted-foreground"
+          )}
+        >
           {title}
           {code && (
             <span className="font-mono text-xs font-normal text-muted-foreground">
@@ -667,6 +705,12 @@ function ChoiceCard({
         <span className="text-xs text-pretty text-muted-foreground">
           {description}
         </span>
+        {note && (
+          <span className="flex items-start gap-1.5 text-xs text-pretty text-amber-700 dark:text-amber-500">
+            <Info className="mt-px size-3.5 shrink-0" />
+            {note}
+          </span>
+        )}
         {children}
       </span>
     </label>
@@ -686,15 +730,33 @@ function ExportProgress({
   tracking: Tracking
   /** 失败后用同样的选项再次请求。 */
   onRetry: (job: ModelExport) => void
-  /** 回到选项（转换已被删除时 job 为 null）。 */
+  /** 回到选项，用 job 的选项回填（没有转换记录时 job 为 null）。 */
   onEditOptions: (job: ModelExport | null) => void
   onDone: () => void
   retrying: boolean
   retryError: Error | null
 }) {
   const query = useQuery(modelExportQuery(model.id, tracking.exportId))
-  const job = query.data
-  const active = job !== undefined && isActiveExport(job)
+  // 转换 404 时确认模型是否还在（模型或项目被删除时转换也随之删除）；无法确认时
+  // 按转换被删除处理。
+  const exportGone = isNotFound(query.error)
+  const modelExists = useQuery({
+    ...modelExistsQuery(model.id),
+    enabled: exportGone,
+  })
+  const view = exportProgressView({
+    job: query.data,
+    error: query.error,
+    modelGone:
+      modelExists.data !== undefined
+        ? !modelExists.data
+        : modelExists.isError || !exportGone
+          ? false
+          : null,
+  })
+  // 被删除后缓存中仍是删除前的记录：只在没有被删除时使用它。
+  const job = "job" in view ? view.job : undefined
+  const active = view.kind === "active"
   const now = useNow(1_000)
   const downloaded = useRef<number | null>(null)
 
@@ -710,13 +772,13 @@ function ExportProgress({
     },
   })
 
-  // 结束时刷新转换记录与模型的转换数；成功时自动开始下载（每个转换只下载一次）。
-  const status = job?.status
+  // 结束或被删除时刷新转换记录与模型的转换数；成功时自动开始下载（每个转换只下载一次）。
+  const status = query.data?.status
   useEffect(() => {
-    if (status === "succeeded" || status === "failed") {
+    if (exportGone || status === "succeeded" || status === "failed") {
       refreshModelExports(model.id)
     }
-  }, [status, model.id])
+  }, [exportGone, status, model.id])
   useEffect(() => {
     if (
       job?.status === "succeeded" &&
@@ -728,48 +790,61 @@ function ExportProgress({
     }
   }, [job])
 
-  const gone = query.error instanceof ApiError && query.error.status === 404
+  // 记录早于现在的规则（如动态尺寸 + 嵌入 NMS）时不能原样重试，只能修改选项。
+  const retryable =
+    job?.status === "failed" &&
+    fitExportOptions(job.options, model).postprocess === job.options.postprocess
+
+  const titles: Record<ExportProgressView["kind"], string> = {
+    deleted: "转换任务已被删除",
+    model_deleted: "模型已被删除",
+    loading: "正在转换为 ONNX",
+    unavailable: "正在转换为 ONNX",
+    active: "正在转换为 ONNX",
+    succeeded: "转换完成",
+    failed: "转换失败",
+  }
 
   return (
-    <div className="grid min-w-0 gap-6">
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-6">
       <DialogHeader>
-        <DialogTitle>
-          {job?.status === "succeeded"
-            ? "转换完成"
-            : job?.status === "failed"
-              ? "转换失败"
-              : "正在转换为 ONNX"}
-        </DialogTitle>
+        <DialogTitle>{titles[view.kind]}</DialogTitle>
         <DialogDescription className="break-words">
           {modelTitle(model)}
-          {job && ` · ${exportOptionsText(job.options)}`}
+          {query.data && ` · ${exportOptionsText(query.data.options)}`}
         </DialogDescription>
       </DialogHeader>
 
-      {gone ? (
+      {view.kind === "deleted" ? (
         <Alert>
           <CircleAlert />
-          <AlertTitle>转换任务已被删除</AlertTitle>
-          <AlertDescription>可以返回修改选项后重新转换。</AlertDescription>
+          <AlertDescription>
+            这个转换任务已在别处（如转换记录中）被删除，不会再继续。可以返回修改选项后重新转换。
+          </AlertDescription>
         </Alert>
-      ) : job === undefined ? (
-        query.error ? (
-          <p role="alert" className="text-sm text-destructive">
-            无法获取转换状态：{query.error.message}
-          </p>
-        ) : (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Spinner aria-hidden />
-            正在获取转换状态…
-          </div>
-        )
-      ) : job.status === "succeeded" ? (
-        <ExportSucceeded job={job} />
-      ) : job.status === "failed" ? (
-        <ExportFailed job={job} />
+      ) : view.kind === "model_deleted" ? (
+        <Alert>
+          <CircleAlert />
+          <AlertDescription>
+            这个模型（或所在的项目）已被删除，无法继续转换或下载。
+          </AlertDescription>
+        </Alert>
+      ) : view.kind === "unavailable" ? (
+        <p role="alert" className="text-sm text-destructive">
+          无法获取转换状态：{view.error.message}
+        </p>
+      ) : view.kind === "loading" ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Spinner aria-hidden />
+          正在获取转换状态…
+        </div>
+      ) : view.kind === "succeeded" ? (
+        <ExportSucceeded job={view.job} />
+      ) : view.kind === "failed" ? (
+        <ExportFailed job={view.job} />
       ) : (
         <ExportRunning
-          job={job}
+          job={view.job}
           elapsedSeconds={Math.max(0, (now - tracking.requestedAt) / 1000)}
         />
       )}
@@ -786,7 +861,7 @@ function ExportProgress({
       )}
 
       <DialogFooter>
-        {active ? (
+        {view.kind === "active" ? (
           <>
             <Button
               type="button"
@@ -801,28 +876,38 @@ function ExportProgress({
               在后台继续
             </Button>
           </>
-        ) : job?.status === "failed" ? (
+        ) : view.kind === "failed" ? (
           <>
             <Button
               type="button"
-              variant="outline"
-              onClick={() => onEditOptions(job)}
+              variant={retryable ? "outline" : "default"}
+              onClick={() => onEditOptions(view.job)}
               disabled={retrying}
             >
               修改选项
             </Button>
-            <Button
-              type="button"
-              onClick={() => onRetry(job)}
-              disabled={retrying}
-            >
-              {retrying ? <Spinner aria-hidden /> : <RotateCw />}
-              重试
-            </Button>
+            {retryable && (
+              <Button
+                type="button"
+                onClick={() => onRetry(view.job)}
+                disabled={retrying}
+              >
+                {retrying ? <Spinner aria-hidden /> : <RotateCw />}
+                重试
+              </Button>
+            )}
           </>
-        ) : gone ? (
-          <Button type="button" onClick={() => onEditOptions(null)}>
+        ) : view.kind === "deleted" ? (
+          // 用删除前的选项回到表单，方便重新转换。
+          <Button
+            type="button"
+            onClick={() => onEditOptions(query.data ?? null)}
+          >
             返回
+          </Button>
+        ) : view.kind === "model_deleted" ? (
+          <Button type="button" onClick={onDone}>
+            关闭
           </Button>
         ) : (
           <Button type="button" onClick={onDone}>
@@ -891,7 +976,7 @@ function ExportRunning({
       </ol>
 
       {job.node && job.status === "running" && (
-        <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <p className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
           <Server className="size-3.5 shrink-0" />
           <span className="min-w-0 truncate">
             训练节点 {job.node.name}

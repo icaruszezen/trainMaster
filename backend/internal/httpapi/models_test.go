@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -9,11 +10,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,6 +55,8 @@ var (
 type modelEnv struct {
 	*apiEnv
 	models *model.Service
+	// freeBytes, when not 0, is the free disk space the model service sees.
+	freeBytes atomic.Uint64
 }
 
 const fakeWeightsMagic = "fake-pt"
@@ -94,13 +100,21 @@ func newModelEnv(t *testing.T, token string) *modelEnv {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.DiscardHandler)
-	models := model.NewService(model.Options{DB: db.Pool, Storage: st, Logger: log, Inspect: fakeInspect})
+	e := &modelEnv{}
+	e.models = model.NewService(model.Options{DB: db.Pool, Storage: st, Logger: log, Inspect: fakeInspect,
+		DiskUsage: func() (storage.Usage, error) {
+			if free := e.freeBytes.Load(); free != 0 {
+				return storage.Usage{TotalBytes: 1 << 40, FreeBytes: free}, nil
+			}
+			return st.Usage()
+		}})
 	h := NewHandler(Options{Logger: log, DB: fakeDB{}, Storage: st, StartedAt: time.Now(),
 		Datasets: dataset.NewService(dataset.Options{DB: db.Pool, Storage: st, Logger: log}),
 		Projects: project.NewService(project.Options{DB: db.Pool, Logger: log}),
 		Compute:  compute.NewService(compute.Options{DB: db.Pool, Logger: log, HeartbeatInterval: 10 * time.Second}),
-		Models:   models, NodeToken: token})
-	return &modelEnv{apiEnv: &apiEnv{h: h, st: st}, models: models}
+		Models:   e.models, NodeToken: token})
+	e.apiEnv = &apiEnv{h: h, st: st}
+	return e
 }
 
 func (e *modelEnv) project(t *testing.T, name string) project.Project {
@@ -280,6 +294,7 @@ func TestModelAPIModels(t *testing.T) {
 		"/api/v1/models?source=upload&q=other":              {o1.ID},
 		"/api/v1/models?q=" + "%E7%BA%BF":                   {o1.ID, v2.ID, v1.ID}, // 线, in both project names
 		"/api/v1/models?project_id=99999":                   {},
+		"/api/v1/models?project_id=3000000000":              {}, // bigint, beyond int4
 		fmt.Sprintf("/api/v1/projects/%d/models", p.ID):     {v2.ID, v1.ID},
 		fmt.Sprintf("/api/v1/projects/%d/models", other.ID): {o1.ID},
 	} {
@@ -287,7 +302,7 @@ func TestModelAPIModels(t *testing.T) {
 			t.Errorf("GET %s = %v, want %v", target, got, wantIDs)
 		}
 	}
-	for _, q := range []string{"project_id=0", "project_id=x", "yolo_version=yolov5", "source=bogus"} {
+	for _, q := range []string{"project_id=0", "project_id=x", "yolo_version=yolov5", "source=bogus", "q=%00", "q=a%FFb"} {
 		rec := e.do("GET", "/api/v1/models?"+q, nil)
 		if rec.Code != 400 || decode[errorBody](t, rec).Error.Code != codeBadRequest {
 			t.Errorf("GET /models?%s = %d %s", q, rec.Code, rec.Body)
@@ -457,10 +472,13 @@ func TestModelAPIExportFlow(t *testing.T) {
 		t.Errorf("same options gave export %d, want %d", again.ID, exportID)
 	}
 	other := want[model.Export](t, e.do("POST", exportsURL, map[string]any{"format": "onnx", "imgsz": []int{480, 640},
-		"postprocess": "nms", "dynamic": true, "opset": 17}), 202)
-	if other.Options.ImgSize != [2]int{480, 640} || other.FileName != "A 线外观检测_v1_480x640_dynamic_nms_opset17.onnx" {
+		"postprocess": "nms", "dynamic": false, "opset": 17}), 202)
+	if other.Options.ImgSize != [2]int{480, 640} || other.FileName != "A 线外观检测_v1_480x640_nms_opset17.onnx" {
 		t.Errorf("other = %+v", other)
 	}
+	// Embedded NMS is traced for batch 1: not with a dynamic batch.
+	wantError(t, e.do("POST", exportsURL, map[string]any{"format": "onnx", "postprocess": "nms", "dynamic": true}),
+		422, codeValidationFailed, "嵌入 NMS 的 ONNX 只能固定 batch 为 1，不能与动态尺寸同时使用")
 	for _, body := range []any{
 		map[string]any{"format": "onnx", "imgsz": "640"},
 		map[string]any{"format": "onnx", "imgsz": 640.5},
@@ -628,7 +646,7 @@ func TestModelAPIExportFlow(t *testing.T) {
 	wantError(t, e.do("POST", otherBase+"fail", `{"error": "x"}`, node2...), 409, codeConflict, "")
 	// Requesting it again queues it again.
 	if again := want[model.Export](t, e.do("POST", exportsURL, map[string]any{"format": "onnx", "imgsz": []int{480, 640},
-		"postprocess": "nms", "dynamic": true, "opset": 17}), 202); again.ID != other.ID || again.Status != model.ExportQueued ||
+		"postprocess": "nms", "opset": 17}), 202); again.ID != other.ID || again.Status != model.ExportQueued ||
 		again.Attempts != 0 || again.Error != "" {
 		t.Errorf("requeued = %+v", again)
 	}
@@ -653,6 +671,107 @@ func TestModelAPIExportFlow(t *testing.T) {
 	wantError(t, e.do("GET", thirdBase+"input", nil, node...), 404, codeNotFound, "转换任务不存在")
 	wantError(t, e.do("POST", thirdBase+"complete", `{"result": {}}`, node...), 404, codeNotFound, "转换任务不存在")
 	wantError(t, e.do("POST", thirdBase+"fail", `{"error": "x"}`, node...), 404, codeNotFound, "转换任务不存在")
+}
+
+// TestModelAPIUploadPreflight checks the report a node sends before it
+// uploads its result, and that a refused upload of a few MB is still
+// answered: a node sends the whole body before it reads the response
+// (Python's urllib does), and the server would otherwise close the
+// connection under it.
+func TestModelAPIUploadPreflight(t *testing.T) {
+	e := newModelEnv(t, "")
+	p := e.project(t, "p")
+	m := e.uploadModel(t, p.ID, "yolo11", fakeWeights(t, "yolo11", "detect", "x"))
+	e.register(t, "node-a")
+	e.register(t, "node-b")
+	exportsURL := fmt.Sprintf("/api/v1/models/%d/exports", m.ID)
+	exp := want[model.Export](t, e.do("POST", exportsURL, map[string]any{"format": "onnx"}), 202)
+	if body := want[map[string]any](t, e.do("POST", "/api/v1/compute/agent/tasks/claim",
+		`{"node_key": "node-a", "kinds": ["model_export"]}`), 200); body["task"] == nil {
+		t.Fatal("no task")
+	}
+	base := fmt.Sprintf("/api/v1/compute/agent/model-exports/%d/", exp.ID)
+	node := []string{"X-Node-Key", "node-a"}
+	intruder := []string{"X-Node-Key", "node-b"}
+	const size = 8 << 20
+	preflight := fmt.Sprintf(`{"stage": "uploading", "size_bytes": %d}`, size)
+
+	if body := want[map[string]any](t, e.do("POST", base+"progress", preflight, node...), 200); body["lease_seconds"] != 60.0 {
+		t.Errorf("preflight = %v", body)
+	}
+	wantError(t, e.do("POST", base+"progress", `{"stage": "uploading", "size_bytes": -1}`, node...), 422, codeValidationFailed, "size_bytes")
+	wantError(t, e.do("POST", base+"progress", preflight, intruder...), 409, codeConflict, "已不属于该节点")
+	e.freeBytes.Store(100 << 20) // less than the size plus the 512 MiB reserve
+	wantError(t, e.do("POST", base+"progress", preflight, node...), 507, codeInsufficientStorage, "磁盘剩余空间不足")
+	// Without a size (older nodes) nothing changes.
+	want[map[string]any](t, e.do("POST", base+"progress", `{"stage": "uploading"}`, node...), 200)
+
+	srv := httptest.NewServer(e.h)
+	defer srv.Close()
+	// send writes a whole request (headers, then the body) and only then
+	// reads the response.
+	send := func(method, target string, body []byte, header ...string) (int, errorBody) {
+		t.Helper()
+		conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+		var head strings.Builder
+		fmt.Fprintf(&head, "%s %s HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n", method, target, len(body))
+		for i := 0; i+1 < len(header); i += 2 {
+			fmt.Fprintf(&head, "%s: %s\r\n", header[i], header[i+1])
+		}
+		head.WriteString("\r\n")
+		if _, err := io.WriteString(conn, head.String()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write(body); err != nil {
+			t.Fatalf("%s %s: sending the body: %v", method, target, err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatalf("%s %s: reading the response: %v", method, target, err)
+		}
+		defer resp.Body.Close()
+		var eb errorBody
+		if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {
+			t.Fatalf("%s %s: response body: %v", method, target, err)
+		}
+		return resp.StatusCode, eb
+	}
+	wantSent := func(status int, eb errorBody, wantStatus int, code string) {
+		t.Helper()
+		if status != wantStatus || eb.Error.Code != code {
+			t.Errorf("response = %d %+v, want %d %s", status, eb, wantStatus, code)
+		}
+	}
+	onnx := bytes.Repeat([]byte("onnx"), size/4)
+	sum := hexSHA256(onnx)
+	status, eb := send("PUT", base+"output", onnx, append([]string{"X-Content-Sha256", sum}, node...)...)
+	wantSent(status, eb, 507, codeInsufficientStorage)
+	e.freeBytes.Store(0)
+	status, eb = send("PUT", base+"output", onnx, append([]string{"X-Content-Sha256", sum}, intruder...)...)
+	wantSent(status, eb, 409, codeConflict)
+	status, eb = send("PUT", "/api/v1/compute/agent/model-exports/99999/output", onnx,
+		append([]string{"X-Content-Sha256", sum}, node...)...)
+	wantSent(status, eb, 404, codeNotFound)
+
+	// Chunks of browser uploads likewise.
+	up := want[model.Upload](t, e.do("POST", "/api/v1/models/uploads", map[string]any{"project_id": p.ID,
+		"yolo_version": "yolo11", "file_name": "best.pt", "file_size": 2 * size}), http.StatusCreated)
+	chunkURL := fmt.Sprintf("/api/v1/models/uploads/%d", up.ID)
+	status, eb = send("PUT", chunkURL+"?offset=5", onnx)
+	wantSent(status, eb, 409, codeUploadOffsetMismatch)
+	if err := os.RemoveAll(filepath.Join(e.st.Dir(storage.Tmp), "model-uploads", strconv.FormatInt(up.ID, 10))); err != nil {
+		t.Fatal(err)
+	}
+	status, eb = send("PUT", chunkURL+"?offset=0", onnx)
+	wantSent(status, eb, 409, codeConflict)
+	if !strings.Contains(eb.Error.Message, "请取消后重新上传") {
+		t.Errorf("message = %q", eb.Error.Message)
+	}
 }
 
 // TestModelAPIClaimShutdown checks that a waiting claim ends at once when

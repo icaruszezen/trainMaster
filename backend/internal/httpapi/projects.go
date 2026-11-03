@@ -68,7 +68,11 @@ func projectID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 }
 
 func (s *server) listProjects(w http.ResponseWriter, r *http.Request) {
-	items, err := s.projects.ListProjects(r.Context(), r.URL.Query().Get("q"))
+	search, ok := searchParam(w, r)
+	if !ok {
+		return
+	}
+	items, err := s.projects.ListProjects(r.Context(), search)
 	if err != nil {
 		s.projectError(w, r, err)
 		return

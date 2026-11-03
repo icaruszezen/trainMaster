@@ -5,6 +5,7 @@ import type {
   ModelInfo,
   ModelSource,
 } from "@/features/models/api"
+import { ApiError } from "@/lib/api"
 
 export const sourceLabels: Record<ModelSource, string> = {
   upload: "用户上传",
@@ -188,6 +189,57 @@ export function exportStatusText(
     case "failed":
       return "失败"
   }
+}
+
+/**
+ * 转换进度对话框显示的内容。转换或模型被删除后查询 404，但缓存中仍是删除前的记录
+ * （可能还是“转换中”），所以先看错误：
+ * - `deleted`：转换任务被删除；`model_deleted`：模型（或所在的项目）被删除，
+ *   `modelGone` 为 null 表示还在确认模型是否存在，这时显示 `loading`；
+ * - `loading` / `unavailable`：还没有拿到转换记录（`unavailable` 为出错）；
+ * - 其余为转换记录的状态，查询暂时出错（如网络中断）时沿用上一次的记录。
+ */
+export type ExportProgressView =
+  | { kind: "deleted" }
+  | { kind: "model_deleted" }
+  | { kind: "loading" }
+  | { kind: "unavailable"; error: Error }
+  | { kind: "active"; job: ModelExport }
+  | { kind: "succeeded"; job: ModelExport }
+  | { kind: "failed"; job: ModelExport }
+
+export function exportProgressView({
+  job,
+  error,
+  modelGone,
+}: {
+  job: ModelExport | undefined
+  error: Error | null
+  /** 转换 404 后模型是否也已不存在；确认中为 null。 */
+  modelGone: boolean | null
+}): ExportProgressView {
+  if (isNotFound(error)) {
+    if (modelGone === null) {
+      return { kind: "loading" }
+    }
+    return modelGone ? { kind: "model_deleted" } : { kind: "deleted" }
+  }
+  if (job === undefined) {
+    return error ? { kind: "unavailable", error } : { kind: "loading" }
+  }
+  switch (job.status) {
+    case "succeeded":
+      return { kind: "succeeded", job }
+    case "failed":
+      return { kind: "failed", job }
+    default:
+      return { kind: "active", job }
+  }
+}
+
+/** 接口返回 404（资源不存在或已被删除）。 */
+export function isNotFound(error: unknown) {
+  return error instanceof ApiError && error.status === 404
 }
 
 /** 转换的步骤，用于进度显示；排队算第 0 步。 */

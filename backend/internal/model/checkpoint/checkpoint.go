@@ -45,6 +45,7 @@ const (
 	ReasonYOLOv5Repo       = "yolov5_repo"       // trained with the original YOLOv5 repository
 	ReasonUnsupportedModel = "unsupported_model" // an Ultralytics model the platform does not support (RT-DETR, ...)
 	ReasonTooLarge         = "too_large"         // the pickle exceeds the size or complexity limits
+	ReasonUnsafe           = "unsafe"            // references classes or functions that safe loading refuses (os.system, ...)
 )
 
 // Error explains why a file cannot be used. Message is written in Chinese
@@ -74,8 +75,10 @@ func pickleTooLarge() *Error {
 
 // Inspect parses a PyTorch .pt file (torch zip format) produced by
 // Ultralytics. Problems with the file are returned as *Error; other errors
-// come from reading r. Inspect only reads data.pkl, at most 64 MiB, and
-// is safe to call concurrently.
+// come from reading r. A file that references a class or function that
+// Ultralytics' safe loading refuses is rejected (ReasonUnsafe, see
+// safe.go) unless another problem explains it better. Inspect only reads
+// data.pkl, at most 64 MiB, and is safe to call concurrently.
 func Inspect(r io.ReaderAt, size int64) (info *Info, err error) {
 	// The parser is written not to panic on any input (FuzzInspect); this
 	// keeps an overlooked case from taking the server down.
@@ -92,7 +95,8 @@ func inspect(r io.ReaderAt, size int64) (*Info, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, err := unpickle(data, defaultLimits)
+	u := newUnpickler(data, defaultLimits)
+	root, err := u.run()
 	if err != nil {
 		var pe *pickleError
 		if errors.As(err, &pe) && pe.tooLarge {
@@ -100,5 +104,12 @@ func inspect(r io.ReaderAt, size int64) (*Info, error) {
 		}
 		return nil, corruptError("pickle 解析失败，" + err.Error())
 	}
-	return extract(root)
+	info, err := extract(root)
+	if err != nil {
+		return nil, err // e.g. a YOLOv5 repository model: its classes are refused too, but this says why
+	}
+	if names, more := u.globals.result(); len(names) > 0 {
+		return nil, unsafeError(names, more)
+	}
+	return info, nil
 }

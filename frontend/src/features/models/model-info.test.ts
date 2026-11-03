@@ -3,16 +3,20 @@ import { describe, expect, it } from "vitest"
 import {
   allMetrics,
   epochText,
+  exportProgressView,
   exportStatusText,
   exportStep,
   formatMetric,
   formatParameters,
+  isNotFound,
   metricLabel,
   modelTitle,
   shapeText,
   summaryMetrics,
   trainedAt,
 } from "@/features/models/model-info"
+import type { ModelExport } from "@/features/models/api"
+import { ApiError } from "@/lib/api"
 
 describe("model info", () => {
   it("titles a model by project and version", () => {
@@ -151,5 +155,73 @@ describe("export status", () => {
       "batch × 3 × height × ?"
     )
     expect(shapeText([])).toBe("标量")
+  })
+})
+
+describe("export progress view", () => {
+  const job = (status: ModelExport["status"]) => ({ status }) as ModelExport
+  const notFound = new ApiError(404, "not_found", "转换任务不存在")
+  const offline = new ApiError(0, "network_error", "无法连接服务器")
+
+  it("recognizes not-found errors", () => {
+    expect(isNotFound(notFound)).toBe(true)
+    expect(isNotFound(offline)).toBe(false)
+    expect(isNotFound(new Error("boom"))).toBe(false)
+    expect(isNotFound(null)).toBe(false)
+  })
+
+  it("shows the job's status", () => {
+    const view = (status: ModelExport["status"]) =>
+      exportProgressView({ job: job(status), error: null, modelGone: false })
+        .kind
+    expect(view("queued")).toBe("active")
+    expect(view("running")).toBe("active")
+    expect(view("succeeded")).toBe("succeeded")
+    expect(view("failed")).toBe("failed")
+    expect(
+      exportProgressView({ job: undefined, error: null, modelGone: false })
+    ).toEqual({ kind: "loading" })
+  })
+
+  it("trusts a 404 over the cached job", () => {
+    // 删除后缓存中仍是删除前“转换中”的记录。
+    expect(
+      exportProgressView({
+        job: job("running"),
+        error: notFound,
+        modelGone: false,
+      })
+    ).toEqual({ kind: "deleted" })
+    expect(
+      exportProgressView({
+        job: job("queued"),
+        error: notFound,
+        modelGone: true,
+      })
+    ).toEqual({ kind: "model_deleted" })
+    expect(
+      exportProgressView({ job: undefined, error: notFound, modelGone: false })
+    ).toEqual({ kind: "deleted" })
+    // 还在确认模型是否存在。
+    expect(
+      exportProgressView({
+        job: job("running"),
+        error: notFound,
+        modelGone: null,
+      })
+    ).toEqual({ kind: "loading" })
+  })
+
+  it("keeps the last job through temporary errors", () => {
+    expect(
+      exportProgressView({
+        job: job("running"),
+        error: offline,
+        modelGone: false,
+      }).kind
+    ).toBe("active")
+    expect(
+      exportProgressView({ job: undefined, error: offline, modelGone: false })
+    ).toEqual({ kind: "unavailable", error: offline })
   })
 })

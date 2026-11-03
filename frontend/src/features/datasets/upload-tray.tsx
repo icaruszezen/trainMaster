@@ -208,7 +208,7 @@ function UploadTaskItem({ task }: { task: UploadTask }) {
       <div className="flex size-8 shrink-0 items-center justify-center rounded-md border bg-muted/50 text-muted-foreground">
         <Icon className="size-4" />
       </div>
-      <div className="grid min-w-0 flex-1 gap-1.5">
+      <div className="grid min-w-0 flex-1 grid-cols-[minmax(0,1fr)] gap-1.5">
         <div className="flex items-start gap-2">
           <div className="min-w-0 flex-1">
             <p className="truncate text-sm font-medium" title={task.fileName}>
@@ -314,7 +314,7 @@ function UploadTaskStatus({ task }: { task: UploadTask }) {
       return (
         <p className="flex items-start gap-1.5 text-xs text-destructive">
           <CircleAlert className="mt-px size-3.5 shrink-0" />
-          <span className="break-words">{task.error}</span>
+          <span className="min-w-0 break-words">{task.error}</span>
         </p>
       )
     case "canceled":

@@ -41,7 +41,7 @@ export function ModelUploadTaskItem({ task }: { task: ModelUploadTask }) {
       <div className="flex size-8 shrink-0 items-center justify-center rounded-md border bg-muted/50 text-muted-foreground">
         <Boxes className="size-4" />
       </div>
-      <div className="grid min-w-0 flex-1 gap-1.5">
+      <div className="grid min-w-0 flex-1 grid-cols-[minmax(0,1fr)] gap-1.5">
         <div className="flex items-start gap-2">
           <div className="min-w-0 flex-1">
             <p className="truncate text-sm font-medium" title={task.fileName}>
@@ -161,10 +161,10 @@ function ModelUploadStatusLine({ task }: { task: ModelUploadTask }) {
       )
     case "mismatch":
       return (
-        <div className="grid gap-2">
+        <div className="grid grid-cols-[minmax(0,1fr)] gap-2">
           <p className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-500">
             <TriangleAlert className="mt-px size-3.5 shrink-0" />
-            <span className="break-words">{task.error}</span>
+            <span className="min-w-0 break-words">{task.error}</span>
           </p>
           <MismatchAction task={task} />
         </div>
@@ -189,7 +189,7 @@ function ModelUploadStatusLine({ task }: { task: ModelUploadTask }) {
       return (
         <p className="flex items-start gap-1.5 text-xs text-destructive">
           <CircleAlert className="mt-px size-3.5 shrink-0" />
-          <span className="break-words">{task.error}</span>
+          <span className="min-w-0 break-words">{task.error}</span>
         </p>
       )
     case "canceled":

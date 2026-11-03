@@ -41,9 +41,13 @@ func TestAllowedPostprocess(t *testing.T) {
 		{"yolo11", "classify", false, []string{"raw"}},
 		{"yolo26", "classify", false, []string{"raw"}},
 		{"yolov10", "classify", true, []string{"raw"}},
-		// Tasks without boxes cannot embed NMS.
+		// Tasks without boxes have neither an end-to-end head nor NMS, even
+		// in YOLO26.
 		{"yolo11", "", false, []string{"raw"}},
-		{"yolo26", "semantic", false, []string{"end2end", "raw"}},
+		{"yolo26", "", false, []string{"raw"}},
+		{"yolo26", "semantic", false, []string{"raw"}},
+		{"yolo26", "depth", false, []string{"raw"}},
+		{"yolo26", "semantic", true, []string{"raw"}},
 	} {
 		got := AllowedPostprocess(testModel(tt.yolo, tt.task, 0, tt.end2end))
 		if !slices.Equal(got, tt.want) {
@@ -74,8 +78,20 @@ func TestNormalizeExportDefaults(t *testing.T) {
 			ExportOptions{ImgSize: [2]int{640, 640}, Postprocess: "end2end"}},
 		{"yolo26 classify raw", testModel("yolo26", "classify", 224, false),
 			ExportOptions{ImgSize: [2]int{224, 224}, Postprocess: "raw"}},
+		{"yolo26 semantic raw", testModel("yolo26", "semantic", 320, false),
+			ExportOptions{ImgSize: [2]int{320, 320}, Postprocess: "raw"}},
+		{"yolo26 depth raw", testModel("yolo26", "depth", 0, false),
+			ExportOptions{ImgSize: [2]int{640, 640}, Postprocess: "raw"}},
+		{"dynamic keeps the default", testModel("yolo11", "detect", 640, false),
+			ExportOptions{ImgSize: [2]int{640, 640}, Dynamic: true, Postprocess: "raw"}},
+		{"dynamic yolo26 end2end", testModel("yolo26", "detect", 640, false),
+			ExportOptions{ImgSize: [2]int{640, 640}, Dynamic: true, Postprocess: "end2end"}},
 	} {
-		got, err := NormalizeExport(tt.m, ExportRequest{Format: "onnx"})
+		req := ExportRequest{Format: "onnx"}
+		if tt.want.Dynamic {
+			req.Dynamic = boolPtr(true)
+		}
+		got, err := NormalizeExport(tt.m, req)
 		if err != nil {
 			t.Errorf("%s: %v", tt.name, err)
 			continue
@@ -90,15 +106,28 @@ func TestNormalizeExportDefaults(t *testing.T) {
 func TestNormalizeExportExplicit(t *testing.T) {
 	m := testModel("yolo26", "detect", 640, false)
 	got, err := NormalizeExport(m, ExportRequest{Format: "onnx", ImgSize: []int{480, 640}, Dynamic: boolPtr(true),
+		Postprocess: "end2end", Opset: intPtr(17)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ImgSize != [2]int{480, 640} || !got.Dynamic || got.Postprocess != "end2end" || got.Opset == nil || *got.Opset != 17 {
+		t.Errorf("options = %+v", got)
+	}
+	if key := OptionsKey(got); key != "imgsz=480x640;dynamic=1;postprocess=end2end;opset=17" {
+		t.Errorf("key = %s", key)
+	}
+	got, err = NormalizeExport(m, ExportRequest{Format: "onnx", ImgSize: []int{480, 640}, Dynamic: boolPtr(false),
 		Postprocess: "nms", Opset: intPtr(17)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ImgSize != [2]int{480, 640} || !got.Dynamic || got.Postprocess != "nms" || got.Opset == nil || *got.Opset != 17 {
-		t.Errorf("options = %+v", got)
-	}
-	if key := OptionsKey(got); key != "imgsz=480x640;dynamic=1;postprocess=nms;opset=17" {
+	if key := OptionsKey(got); key != "imgsz=480x640;dynamic=0;postprocess=nms;opset=17" {
 		t.Errorf("key = %s", key)
+	}
+	// Dynamic with raw outputs is fine.
+	if got, err = NormalizeExport(testModel("yolo11", "pose", 640, false), ExportRequest{Format: "onnx",
+		Dynamic: boolPtr(true), Postprocess: "raw"}); err != nil || !got.Dynamic || got.Postprocess != "raw" {
+		t.Errorf("dynamic raw = %+v, %v", got, err)
 	}
 	got, err = NormalizeExport(m, ExportRequest{Format: "onnx", ImgSize: []int{320}, Dynamic: boolPtr(false), Postprocess: "raw"})
 	if err != nil {
@@ -140,6 +169,20 @@ func TestNormalizeExportInvalid(t *testing.T) {
 		{"classify nms", testModel("yolo11", "classify", 224, false), ExportRequest{Format: "onnx", Postprocess: "nms"}, "分类模型只支持原始输出"},
 		{"classify end2end", testModel("yolo26", "classify", 224, false), ExportRequest{Format: "onnx", Postprocess: "end2end"}, "分类模型只支持原始输出"},
 		{"nms without boxes", testModel("yolo11", "", 0, false), ExportRequest{Format: "onnx", Postprocess: "nms"}, "不能嵌入 NMS"},
+		// YOLO26 semantic segmentation and depth models have no end-to-end
+		// head; nms is not suggested for them.
+		{"semantic end2end", testModel("yolo26", "semantic", 640, false), ExportRequest{Format: "onnx", Postprocess: "end2end"},
+			"语义分割模型没有检测框，不能导出为 end2end，请选择 raw"},
+		{"depth end2end", testModel("yolo26", "depth", 640, false), ExportRequest{Format: "onnx", Postprocess: "end2end"},
+			"深度估计模型没有检测框，不能导出为 end2end，请选择 raw"},
+		{"depth nms", testModel("yolo26", "depth", 640, false), ExportRequest{Format: "onnx", Postprocess: "nms"},
+			"深度估计模型没有检测框，不能嵌入 NMS，请选择 raw"},
+		// Embedded NMS is traced for batch 1: no dynamic batch.
+		{"dynamic nms", v11, ExportRequest{Format: "onnx", Dynamic: boolPtr(true), Postprocess: "nms"},
+			"嵌入 NMS 的 ONNX 只能固定 batch 为 1，不能与动态尺寸同时使用；请关闭动态尺寸，或选择原始输出（raw）"},
+		{"dynamic nms with an end-to-end head", testModel("yolo26", "segment", 640, false),
+			ExportRequest{Format: "onnx", Dynamic: boolPtr(true), Postprocess: "nms", ImgSize: []int{320}},
+			"请关闭动态尺寸，或选择原始输出（raw）/ 端到端（end2end）"},
 		{"opset low", v11, ExportRequest{Format: "onnx", Opset: intPtr(10)}, "opset 必须在 11–21 之间"},
 		{"opset high", v11, ExportRequest{Format: "onnx", Opset: intPtr(22)}, "opset"},
 	} {
@@ -148,6 +191,11 @@ func TestNormalizeExportInvalid(t *testing.T) {
 		if t.Failed() {
 			t.Logf("case %s", tt.name)
 		}
+	}
+	// Only models that have it are pointed to end2end.
+	_, err := NormalizeExport(v11, ExportRequest{Format: "onnx", Dynamic: boolPtr(true), Postprocess: "nms"})
+	if err == nil || strings.Contains(err.Error(), "end2end") || strings.Contains(err.Error(), "端到端") {
+		t.Errorf("dynamic nms of YOLO11: %v", err)
 	}
 }
 
@@ -167,8 +215,9 @@ func TestExportFileNames(t *testing.T) {
 	}{
 		{ExportOptions{ImgSize: [2]int{640, 640}, Postprocess: "raw"}, "线体_v3_640.onnx"},
 		{ExportOptions{ImgSize: [2]int{640, 640}, Postprocess: "end2end"}, "线体_v3_640_end2end.onnx"},
-		{ExportOptions{ImgSize: [2]int{480, 640}, Dynamic: true, Postprocess: "nms", Opset: intPtr(17)},
-			"线体_v3_480x640_dynamic_nms_opset17.onnx"},
+		{ExportOptions{ImgSize: [2]int{480, 640}, Dynamic: true, Postprocess: "end2end", Opset: intPtr(17)},
+			"线体_v3_480x640_dynamic_end2end_opset17.onnx"},
+		{ExportOptions{ImgSize: [2]int{480, 640}, Postprocess: "nms"}, "线体_v3_480x640_nms.onnx"},
 		{ExportOptions{ImgSize: [2]int{320, 320}, Dynamic: true, Postprocess: "raw", Opset: intPtr(11)},
 			"线体_v3_320_dynamic_opset11.onnx"},
 	} {

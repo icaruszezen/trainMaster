@@ -46,6 +46,9 @@ type Options struct {
 	// Inspect reads the metadata of a weights file; nil means
 	// checkpoint.Inspect. Tests inject fixed results.
 	Inspect func(r io.ReaderAt, size int64) (*checkpoint.Info, error)
+	// DiskUsage reports the free space of the storage directory; nil means
+	// Storage.Usage. Tests simulate a full disk.
+	DiskUsage func() (storage.Usage, error)
 }
 
 // Service implements the model repository operations used by the HTTP
@@ -56,6 +59,9 @@ type Service struct {
 	log     *slog.Logger
 	clock   func() time.Time
 	inspect func(r io.ReaderAt, size int64) (*checkpoint.Info, error)
+	usage   func() (storage.Usage, error)
+	// inspectSlots bounds the weights files inspected at once (inspectFile).
+	inspectSlots chan struct{}
 
 	uploads keyedMutex // serializes the writes to one upload's staged file (chunks, commit)
 	outputs keyedMutex // serializes the result uploads of one export, its completion and cleanup
@@ -77,14 +83,16 @@ type Service struct {
 // NewService creates a Service. It does not touch the database yet.
 func NewService(o Options) *Service {
 	s := &Service{
-		db:        o.DB,
-		storage:   o.Storage,
-		log:       o.Logger,
-		clock:     o.Now,
-		inspect:   o.Inspect,
-		base:      context.Background(),
-		closing:   make(chan struct{}),
-		removeAll: os.RemoveAll,
+		db:           o.DB,
+		storage:      o.Storage,
+		log:          o.Logger,
+		clock:        o.Now,
+		inspect:      o.Inspect,
+		usage:        o.DiskUsage,
+		inspectSlots: make(chan struct{}, maxInspections),
+		base:         context.Background(),
+		closing:      make(chan struct{}),
+		removeAll:    os.RemoveAll,
 	}
 	if s.clock == nil {
 		s.clock = time.Now
@@ -92,8 +100,16 @@ func NewService(o Options) *Service {
 	if s.inspect == nil {
 		s.inspect = checkpoint.Inspect
 	}
+	if s.usage == nil {
+		s.usage = o.Storage.Usage
+	}
 	return s
 }
+
+// maxInspections bounds the weights files inspected at once: reading one
+// takes up to about a second of CPU and a few hundred MB of memory, and
+// commits run until they finish even when their client goes away.
+const maxInspections = 2
 
 // Intervals of the background work.
 const (
@@ -156,9 +172,12 @@ func (s *Service) backgroundLoop(ctx context.Context) {
 	}
 }
 
-// cleanup cancels stale uploads and removes temporary files that belong to
-// nothing in progress.
+// cleanup cancels stale uploads, clears the model folders of additions
+// interrupted before their commit and removes temporary files that belong
+// to nothing in progress.
 func (s *Service) cleanup(ctx context.Context) {
+	// Before uploads expire: a recovered file goes back to its upload.
+	s.recoverPendingFolders(ctx)
 	if err := s.expireUploads(ctx); err != nil && ctx.Err() == nil {
 		s.log.Error("expire stale model uploads", "err", err)
 	}
@@ -193,6 +212,9 @@ const (
 	// deletingPrefix marks folders in models/ of deleted models that are
 	// being removed. Being hidden, they are no model's folder.
 	deletingPrefix = ".deleting-"
+	// pendingFile marks a model folder whose addModel has not committed
+	// yet (it names the upload; see recoverPending).
+	pendingFile = ".pending"
 )
 
 func (s *Service) modelsDir() string { return s.storage.Dir(storage.Models) }
@@ -388,7 +410,7 @@ const reserveBytes = 512 << 20
 // checkFreeSpace fails with ErrInsufficientStorage unless need bytes plus
 // the reserve are available. Platforms without disk usage support skip it.
 func (s *Service) checkFreeSpace(need int64) error {
-	u, err := s.storage.Usage()
+	u, err := s.usage()
 	if err != nil {
 		if !errors.Is(err, storage.ErrUsageUnsupported) {
 			s.log.Warn("check free disk space", "err", err)
@@ -536,6 +558,21 @@ func (p *pathSet) add(path string) {
 		p.paths = map[string]int{}
 	}
 	p.paths[path]++
+}
+
+// tryAdd adds path unless it is in use already, and reports whether it
+// did.
+func (p *pathSet) tryAdd(path string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.paths[path] > 0 {
+		return false
+	}
+	if p.paths == nil {
+		p.paths = map[string]int{}
+	}
+	p.paths[path]++
+	return true
 }
 
 func (p *pathSet) remove(path string) {

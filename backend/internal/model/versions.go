@@ -86,8 +86,11 @@ func checkYOLOVersion(chosen string, info *checkpoint.Info) error {
 		"，但文件中的模型是 " + label + how + "。请改选 " + label + " 后再保存"}
 }
 
-// Tasks whose models predict boxes; only they can embed NMS.
+// Tasks whose models predict boxes; only they have an end-to-end head or
+// can embed NMS.
 var nmsTasks = []string{"detect", "segment", "pose", "obb"}
+
+func hasBoxes(task string) bool { return slices.Contains(nmsTasks, task) }
 
 const taskClassify = "classify"
 
@@ -98,6 +101,8 @@ var taskLabels = map[string]string{
 	"classify": "分类",
 	"pose":     "姿态",
 	"obb":      "旋转框",
+	"semantic": "语义分割",
+	"depth":    "深度估计",
 }
 
 func taskLabel(task string) string {
@@ -110,8 +115,8 @@ func taskLabel(task string) string {
 	return task
 }
 
-// end2endCapable reports whether a model has an end-to-end head: YOLOv10
-// and YOLO26 always do; other files say so themselves.
+// end2endCapable reports whether a box model (hasBoxes) has an end-to-end
+// head: YOLOv10 and YOLO26 always do; other files say so themselves.
 func end2endCapable(yoloVersion string, info Info) bool {
 	v, _ := LookupYOLOVersion(yoloVersion)
 	return v.End2End || info.End2End

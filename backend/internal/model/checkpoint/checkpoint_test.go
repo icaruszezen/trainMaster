@@ -123,6 +123,10 @@ func TestInspectFixtures(t *testing.T) {
 	custom26.VersionSource, custom26.End2End = VersionSourceArchitecture, true // scale: the first in the yaml, as Ultralytics builds it
 	customV8 := untrained("DetectionModel", "detect", "yolov8", "my-model.yaml", "Detect", "2026-11-03T01:50:25.710053+00:00", 3157200)
 	customV8.VersionSource = VersionSourceArchitecture
+	// yolo26-cls.yaml under a custom name: the network is the same as
+	// yolo11-cls, so no version is claimed.
+	custom26cls := untrained("ClassificationModel", "classify", "", "parts-cls.yaml", "Classify", "2026-11-03T04:48:18.883173+00:00", 2812104)
+	custom26cls.VersionSource, custom26cls.ClassNames = "", numbered(1000)
 	v10 := untrained("DetectionModel", "detect", "yolov10", "yolov10n.yaml", "v10Detect", "2026-11-03T01:50:23.201358+00:00", 2775520)
 	v10.End2End = true
 	y26 := untrained("DetectionModel", "detect", "yolo26", "yolo26n.yaml", "Detect", "2026-11-03T01:50:23.684984+00:00", 2572280)
@@ -146,14 +150,13 @@ func TestInspectFixtures(t *testing.T) {
 		"yolov8n-worldv2.pt":  untrained("WorldModel", "detect", "yolov8", "yolov8n-worldv2.yaml", "WorldDetect", "2026-11-03T01:50:24.923449+00:00", 3695183),
 		"line-a-detector.pt":  custom26,
 		"my-model.pt":         customV8,
+		"parts-cls.pt":        custom26cls,
 		"yolo11n-best.pt":     yolo11Best(),
 		"yolo11n-last.pt":     last,
 		"yolo11n-variants.pt": variants,
 		"yolo26n-best.pt":     yolo26Best(),
-		// The same checkpoint pickled with the other protocols (protocol 0
-		// cannot even be loaded by torch: its persistent ids are strings).
-		"yolo26n-best-protocol0.pt": yolo26Best(),
-		"yolo26n-best-protocol1.pt": yolo26Best(),
+		// The same checkpoint pickled with protocols 4 and 5 (0 and 1:
+		// TestInspectOldProtocols).
 		"yolo26n-best-protocol4.pt": yolo26Best(),
 		"yolo26n-best-protocol5.pt": yolo26Best(),
 	}
@@ -171,6 +174,34 @@ func TestInspectFixtures(t *testing.T) {
 						t.Errorf("%s = %#v, want %#v", g.Type().Field(i).Name, g.Field(i).Interface(), w.Field(i).Interface())
 					}
 				}
+			}
+		})
+	}
+}
+
+// TestInspectOldProtocols: protocols 0 and 1 pickle objects with
+// copyreg._reconstructor, which safe loading refuses (protocol 0 cannot
+// even be loaded by torch: its persistent ids are strings), so Inspect
+// rejects them; the interpreter still reads them like the others.
+func TestInspectOldProtocols(t *testing.T) {
+	for _, name := range []string{"yolo26n-best-protocol0.pt", "yolo26n-best-protocol1.pt"} {
+		t.Run(name, func(t *testing.T) {
+			data := readFixture(t, name)
+			_, err := inspectBytes(data)
+			var e *Error
+			if !errors.As(err, &e) || e.Reason != ReasonUnsafe || !strings.Contains(e.Message, "（copyreg._reconstructor、builtins.object）") {
+				t.Errorf("Inspect: %v, want %s naming copyreg._reconstructor", err, ReasonUnsafe)
+			}
+			root, err := unpickle(fixturePickle(t, data), defaultLimits)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := extract(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := yolo26Best(); !reflect.DeepEqual(*got, want) {
+				t.Errorf("extract = %+v, want %+v", *got, want)
 			}
 		})
 	}
@@ -560,6 +591,10 @@ func TestExtract(t *testing.T) {
 		metrics.set("m"+strconv.Itoa(i), float64(i))
 	}
 	metrics.set("nan", 0.0)
+	longMetrics := dict() // keys that only differ after maxShortTextLen bytes
+	for i := 0; i < 70; i++ {
+		longMetrics.set(strings.Repeat("k", maxShortTextLen)+strconv.Itoa(i), float64(i))
+	}
 
 	tests := []struct {
 		name  string
@@ -570,6 +605,12 @@ func TestExtract(t *testing.T) {
 			int64(-1), "neg", int64(maxClasses), "big", "x", "bad", int64(3), list())))),
 			func(t *testing.T, info *Info) {
 				if want := []string{"a", "class1", "c", "class3", "class4", "7"}; !reflect.DeepEqual(info.ClassNames, want) {
+					t.Errorf("ClassNames = %q, want %q", info.ClassNames, want)
+				}
+			}},
+		{"names: the last of the keys giving an id", ckpt(ultralyticsModel(dict("names", dict(int64(1), "a", "01", "b", "2", "c", "002", nil)))),
+			func(t *testing.T, info *Info) {
+				if want := []string{"class0", "b", "class2"}; !reflect.DeepEqual(info.ClassNames, want) {
 					t.Errorf("ClassNames = %q, want %q", info.ClassNames, want)
 				}
 			}},
@@ -603,6 +644,12 @@ func TestExtract(t *testing.T) {
 		{"at most 64 finite metrics", ckpt(ultralyticsModel(dict()), "train_metrics", metrics),
 			func(t *testing.T, info *Info) {
 				if len(info.Metrics) != maxMetrics || info.Metrics["m63"] != 63 {
+					t.Errorf("Metrics = %v", info.Metrics)
+				}
+			}},
+		{"at most 64 metrics read, even under one cleaned key", ckpt(ultralyticsModel(dict()), "train_metrics", longMetrics),
+			func(t *testing.T, info *Info) {
+				if want := map[string]float64{strings.Repeat("k", maxShortTextLen): 63}; !reflect.DeepEqual(info.Metrics, want) {
 					t.Errorf("Metrics = %v", info.Metrics)
 				}
 			}},
@@ -741,7 +788,13 @@ func TestCleanText(t *testing.T) {
 		{"\xffa", 64, "\ufffda"},
 		{"划痕-凹坑", 4, "划"},
 		{"划痕", 5, "划"},
+		{"划痕", 2, ""},
 		{"", 4, ""},
+		// Only the start of a long string is looked at.
+		{strings.Repeat("a", 1000) + "\x00", 8, "aaaaaaaa"},
+		{"\x01" + strings.Repeat("b", 1000), 6, "\ufffdbbb"},
+		{strings.Repeat("长", 1000), 7, "长长"},
+		{strings.Repeat("\x01", 1000), 7, "\ufffd\ufffd"},
 	} {
 		got := cleanText(tt.in, tt.max)
 		if got != tt.want || !utf8.ValidString(got) {

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"math"
 	"strings"
+	"unicode/utf8"
 )
 
 // Structural handling of the callables found in checkpoints. The rule is
@@ -12,11 +13,14 @@ import (
 // have been called. Arguments are inspected, never trusted: a wrong type
 // gives a placeholder, not an error.
 
-// maxTensorDims and maxPathParts bound the work per REDUCE: the arguments
-// can be huge tuples reused through the memo.
+// maxTensorDims, maxPathParts and maxPathLen bound the work per REDUCE:
+// the arguments can be huge tuples or strings reused through the memo.
+// What the handlers build still counts against the byte budget, as the
+// results can be kept a million times over.
 const (
 	maxTensorDims = 64
 	maxPathParts  = 256
+	maxPathLen    = 8 << 10 // bytes of a joined path (PATH_MAX is 4096)
 )
 
 // call handles REDUCE, OBJ and INST: fn(*args).
@@ -66,7 +70,7 @@ func (u *unpickler) call(fn any, args []any) (any, error) {
 		}
 		return &pyTuple{items: items}, nil
 	case "builtins.bytes", "builtins.bytearray":
-		return newBytes(args), nil
+		return u.newBytes(args)
 	case "_codecs.encode": // how protocols 0–2 pickle bytes: encode(text, "latin1")
 		if len(args) > 0 {
 			if s, ok := args[0].(string); ok {
@@ -74,7 +78,7 @@ func (u *unpickler) call(fn any, args []any) (any, error) {
 				if len(args) > 1 {
 					encoding, _ = args[1].(string)
 				}
-				return encodeString(s, encoding), nil
+				return u.encodeString(s, encoding)
 			}
 		}
 	case "copyreg._reconstructor": // (cls, base, state): object.__new__(cls)
@@ -105,6 +109,11 @@ func (u *unpickler) call(fn any, args []any) (any, error) {
 				}
 			}
 		}
+		if t != nil {
+			if err := u.allocBytes(8 * len(t.shape)); err != nil {
+				return nil, err
+			}
+		}
 		if len(args) > 1 {
 			if c, ok := args[1].(*pyGlobal); ok && c.name == "Parameter" {
 				return newParameter(t), nil
@@ -126,11 +135,18 @@ func (u *unpickler) call(fn any, args []any) (any, error) {
 		}
 	default:
 		if t := rebuildTensor(g, args); t != nil {
+			if err := u.allocBytes(8 * len(t.shape)); err != nil {
+				return nil, err
+			}
 			return t, nil
 		}
 		if (g.module == "pathlib" || g.module == "pathlib._local") && isPathClass(g.name) {
-			if s, ok := joinPath(args, strings.Contains(g.name, "Windows")); ok {
-				return s, nil
+			n, ok := pathLen(args)
+			if ok {
+				if err := u.allocBytes(n); err != nil {
+					return nil, err
+				}
+				return joinPath(args, strings.Contains(g.name, "Windows")), nil
 			}
 		}
 	}
@@ -194,8 +210,23 @@ func (u *unpickler) mergeAttrs(o *pyObject, d *pyDict) error {
 		return err
 	}
 	for i, k := range d.keys {
-		o.attrs.set(k, d.vals[i])
+		if err := u.dictSet(o.attrs, k, d.vals[i]); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// dictSet is d.set, with the key a tuple key builds counted against the
+// byte budget (a str or bytes key is not copied).
+func (u *unpickler) dictSet(d *pyDict, k, v any) error {
+	hk, ok := hashKey(k)
+	if tk, isTuple := hk.(tupleKey); ok && isTuple {
+		if err := u.allocBytes(len(tk)); err != nil {
+			return err
+		}
+	}
+	d.setHashed(k, hk, ok, v)
 	return nil
 }
 
@@ -206,7 +237,9 @@ func (u *unpickler) fillDict(d *pyDict, src any) error {
 			return err
 		}
 		for i, k := range m.keys {
-			d.set(k, m.vals[i])
+			if err := u.dictSet(d, k, m.vals[i]); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -216,7 +249,9 @@ func (u *unpickler) fillDict(d *pyDict, src any) error {
 	}
 	for _, item := range items {
 		if kv, ok := sequence(item); ok && len(kv) == 2 {
-			d.set(kv[0], kv[1])
+			if err := u.dictSet(d, kv[0], kv[1]); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -259,7 +294,9 @@ func (u *unpickler) setItems(target any, kv []any) error {
 		return u.corrupt("不能向 %s 写入键值", typeName(target))
 	}
 	for i := 0; i < len(kv); i += 2 {
-		d.set(kv[i], kv[i+1])
+		if err := u.dictSet(d, kv[i], kv[i+1]); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -300,48 +337,71 @@ func iterate(v any) []any {
 
 // newBytes handles bytes(...) and bytearray(...): (), (bytes,), (str,
 // encoding) or (list of ints,).
-func newBytes(args []any) any {
+func (u *unpickler) newBytes(args []any) (any, error) {
 	if len(args) == 0 {
-		return pyBytes("")
+		return pyBytes(""), nil
 	}
 	switch x := args[0].(type) {
 	case pyBytes:
-		return x
+		return x, nil
 	case string:
 		encoding := "utf-8"
 		if len(args) > 1 {
 			encoding, _ = args[1].(string)
 		}
-		return encodeString(x, encoding)
+		return u.encodeString(x, encoding)
 	}
 	if items, ok := sequence(args[0]); ok && len(items) <= 1<<16 {
+		if err := u.allocBytes(len(items)); err != nil {
+			return nil, err
+		}
 		b := make([]byte, 0, len(items))
 		for _, item := range items {
 			n, ok := asInt(item)
 			if !ok || n < 0 || n > 255 {
-				return &pyObject{args: args}
+				return &pyObject{args: args}, nil
 			}
 			b = append(b, byte(n))
 		}
-		return pyBytes(b)
+		return pyBytes(b), nil
 	}
-	return &pyObject{args: args}
+	return &pyObject{args: args}, nil
 }
 
-// encodeString is str.encode for the encodings pickles use.
-func encodeString(s, encoding string) pyBytes {
+// encodeString is str.encode for the encodings pickles use. Only Latin-1
+// copies the text (UTF-8 is how strings are kept already).
+func (u *unpickler) encodeString(s, encoding string) (pyBytes, error) {
+	if !isLatin1(encoding) {
+		return pyBytes(s), nil
+	}
+	if err := u.allocBytes(len(s)); err != nil {
+		return "", err
+	}
+	return latin1(s), nil
+}
+
+// isLatin1 recognizes the names of the Latin-1 encoding.
+func isLatin1(encoding string) bool {
+	if len(encoding) > 16 { // a crafted name is not copied below
+		return false
+	}
 	switch strings.ReplaceAll(strings.ToLower(encoding), "_", "-") {
 	case "latin1", "latin-1", "iso-8859-1", "iso8859-1", "l1":
-		b := make([]byte, 0, len(s))
-		for _, r := range s {
-			if r > 0xff {
-				r = '?'
-			}
-			b = append(b, byte(r))
-		}
-		return pyBytes(b)
+		return true
 	}
-	return pyBytes(s)
+	return false
+}
+
+// latin1 encodes s as Latin-1 (characters beyond it become '?').
+func latin1(s string) pyBytes {
+	b := make([]byte, 0, len(s))
+	for _, r := range s {
+		if r > 0xff {
+			r = '?'
+		}
+		b = append(b, byte(r))
+	}
+	return pyBytes(b)
 }
 
 // rebuildTensor handles the torch._utils functions that rebuild a tensor
@@ -399,17 +459,32 @@ func isPathClass(name string) bool {
 	return false
 }
 
-// joinPath rebuilds a pathlib path from its pickled parts as a string.
-func joinPath(args []any, windows bool) (string, bool) {
+// pathLen checks that args are the parts of a pathlib path, at most
+// maxPathParts strings of at most maxPathLen bytes in all, and returns an
+// upper bound of the length of the joined path; false gives a placeholder.
+func pathLen(args []any) (int, bool) {
 	if len(args) > maxPathParts {
-		return "", false
+		return 0, false
 	}
-	parts := make([]string, 0, len(args))
+	n := 0
 	for _, a := range args {
 		s, ok := a.(string)
 		if !ok {
-			return "", false
+			return 0, false
 		}
+		if n += len(s) + 1; n > maxPathLen {
+			return 0, false
+		}
+	}
+	return n, true
+}
+
+// joinPath rebuilds a pathlib path from its pickled parts (strings, as
+// checked by pathLen) as a string.
+func joinPath(args []any, windows bool) string {
+	parts := make([]string, 0, len(args))
+	for _, a := range args {
+		s, _ := a.(string)
 		absolute := strings.HasPrefix(s, "/") || (windows && (strings.HasPrefix(s, `\`) || (len(s) >= 2 && s[1] == ':')))
 		if absolute {
 			parts = parts[:0] // an absolute part replaces what came before
@@ -429,7 +504,7 @@ func joinPath(args []any, windows bool) (string, bool) {
 		}
 		b.WriteString(p)
 	}
-	return b.String(), true
+	return b.String()
 }
 
 // numpyScalar decodes numpy.core.multiarray.scalar(dtype, data): how numpy
@@ -444,15 +519,23 @@ func numpyScalar(args []any) (any, bool) {
 		return nil, false
 	}
 	code, ok := dt.args[0].(string)
-	if !ok {
+	if !ok || len(code) > 16 {
 		return nil, false
 	}
+	// The data is at most 8 bytes (8 characters of a str); larger values,
+	// possibly memoized strings of megabytes, are not copied.
 	var data []byte
 	switch x := args[1].(type) {
 	case pyBytes:
+		if len(x) > 8 {
+			return nil, false
+		}
 		data = []byte(x)
 	case string:
-		data = []byte(encodeString(x, "latin1"))
+		if len(x) > 8*utf8.UTFMax {
+			return nil, false
+		}
+		data = []byte(latin1(x))
 	default:
 		return nil, false
 	}

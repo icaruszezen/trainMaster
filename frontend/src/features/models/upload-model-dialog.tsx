@@ -298,7 +298,11 @@ function UploadForm({
   }
 
   return (
-    <form onSubmit={submit} className="grid min-w-0 gap-6" noValidate>
+    <form
+      onSubmit={submit}
+      className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-6"
+      noValidate
+    >
       <DialogHeader>
         <DialogTitle>上传模型</DialogTitle>
         <DialogDescription>
@@ -548,7 +552,8 @@ function ModelFilePicker({
   )
 }
 
-function UploadTaskView({
+/** 提交后对话框显示的上传任务：进度、版本不一致或结果。 */
+export function UploadTaskView({
   task,
   onClose,
   onUploadAnother,
@@ -574,7 +579,7 @@ function UploadTaskView({
   }
 
   return (
-    <div className="grid min-w-0 gap-6">
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-6">
       <DialogHeader>
         <DialogTitle>{titles[task.status]}</DialogTitle>
         <DialogDescription className="break-words">
@@ -632,7 +637,7 @@ function UploadTaskBody({ task }: { task: ModelUploadTask }) {
             <TriangleAlert />
             <AlertTitle>文件中的模型不是所选的版本</AlertTitle>
             <AlertDescription>
-              <p className="break-words">{task.error}</p>
+              <p className="wrap-anywhere">{task.error}</p>
               <p>文件已经上传到服务器，改选版本后直接保存，不需要重新上传。</p>
             </AlertDescription>
           </Alert>
@@ -706,7 +711,7 @@ function UploadTaskBody({ task }: { task: ModelUploadTask }) {
               : "上传没有完成"}
           </AlertTitle>
           <AlertDescription>
-            <p className="break-words">{task.error}</p>
+            <p className="wrap-anywhere">{task.error}</p>
             {task.retryable && (
               <p>已上传的部分保留在服务器上，重试时从断点继续。</p>
             )}

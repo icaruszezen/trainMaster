@@ -9,7 +9,14 @@
 import { queryOptions } from "@tanstack/react-query"
 
 import { projectKeys, projectPath } from "@/features/projects/api"
-import { apiGet, apiSend, apiUpload, type ListResponse } from "@/lib/api"
+import {
+  ApiError,
+  apiGet,
+  apiSend,
+  apiUpload,
+  isPermanentError,
+  type ListResponse,
+} from "@/lib/api"
 import { queryClient } from "@/lib/query-client"
 
 /** 支持的 YOLO 版本（Ultralytics 训练的模型），说明见 yolo-versions.ts。 */
@@ -261,6 +268,7 @@ export const modelKeys = {
   exports: (id: number) => [...modelKeys.detail(id), "exports"] as const,
   export: (id: number, exportId: number) =>
     [...modelKeys.detail(id), "export", exportId] as const,
+  exists: (id: number) => [...modelKeys.detail(id), "exists"] as const,
 }
 
 /** 模型列表，新的在前，可按项目、YOLO 版本、来源与关键字筛选。 */
@@ -298,13 +306,39 @@ export function modelQuery(id: number) {
   })
 }
 
+/**
+ * 模型是否还存在（404 时为 false）：转换 404 时用来区分是转换还是模型被删除。
+ * 与 modelQuery 分开缓存，不会沿用删除前的模型；不再使用时立即丢弃。
+ */
+export function modelExistsQuery(id: number) {
+  return queryOptions({
+    queryKey: modelKeys.exists(id),
+    queryFn: async ({ signal }) => {
+      try {
+        await apiGet<Model>(modelPath(id), { signal })
+        return true
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) {
+          return false
+        }
+        throw error
+      }
+    },
+    staleTime: 0,
+    gcTime: 0,
+  })
+}
+
 const ACTIVE_EXPORTS: ReadonlySet<ExportStatus> = new Set(["queued", "running"])
 
 export function isActiveExport(job: Pick<ModelExport, "status">) {
   return ACTIVE_EXPORTS.has(job.status)
 }
 
-/** 模型的转换记录（新的在前）；有转换在进行时每 2 秒刷新。 */
+/**
+ * 模型的转换记录（新的在前）；有转换在进行时每 2 秒刷新。模型被删除（404）等
+ * 再请求也不会变的错误后停止：缓存中仍是出错前的记录，不能再以它为准。
+ */
 export function modelExportsQuery(modelId: number) {
   return queryOptions({
     queryKey: modelKeys.exports(modelId),
@@ -313,17 +347,26 @@ export function modelExportsQuery(modelId: number) {
         signal,
       }),
     refetchInterval: (query) =>
-      query.state.data?.items.some(isActiveExport) ? 2_000 : false,
+      !isPermanentError(query.state.error) &&
+      query.state.data?.items.some(isActiveExport)
+        ? 2_000
+        : false,
   })
 }
 
-/** 单个转换；排队或转换中时每秒轮询，结束后停止。 */
+/**
+ * 单个转换；排队或转换中时每秒轮询，结束后停止。转换或模型被删除（404）后也停止：
+ * 缓存中仍是删除前的记录（可能还是“转换中”）。网络错误、5xx 可能是暂时的，继续轮询。
+ */
 export function modelExportQuery(modelId: number, exportId: number) {
   return queryOptions({
     queryKey: modelKeys.export(modelId, exportId),
     queryFn: ({ signal }) =>
       apiGet<ModelExport>(modelExportPath(modelId, exportId), { signal }),
     refetchInterval: (query) => {
+      if (isPermanentError(query.state.error)) {
+        return false
+      }
       const job = query.state.data
       return !job || isActiveExport(job) ? 1_000 : false
     },

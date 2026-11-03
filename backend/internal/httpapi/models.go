@@ -120,7 +120,11 @@ func pathIDOr404(w http.ResponseWriter, r *http.Request, name, message string) (
 // ---- models ----
 
 func (s *server) listModels(w http.ResponseWriter, r *http.Request) {
-	q := model.ModelQuery{Search: r.URL.Query().Get("q")}
+	search, ok := searchParam(w, r)
+	if !ok {
+		return
+	}
+	q := model.ModelQuery{Search: search}
 	if v := r.URL.Query().Get("project_id"); v != "" {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || id <= 0 {
@@ -141,7 +145,6 @@ func (s *server) listModels(w http.ResponseWriter, r *http.Request) {
 		q.YOLOVersion = v
 	}
 	if r.URL.Query().Get("source") != "" {
-		var ok bool
 		if q.Source, ok = enumParam(w, r, "source", model.SourceUpload, model.SourceTraining); !ok {
 			return
 		}
@@ -294,6 +297,25 @@ const (
 	msgOutputTooLarge     = "转换结果不能超过 4 GiB"
 )
 
+// maxRefusedDrain bounds how much of a refused upload drainRefused reads.
+const maxRefusedDrain = 64 << 20
+
+// drainRefused reads and discards (at most maxRefusedDrain bytes of) the
+// rest of an upload body that model.Service refused because of the state
+// of the upload or conversion (404, 409) or the disk (507), usually before
+// reading any of it. The server itself discards only 256 KiB of an unread
+// body and then closes the connection, so a client still sending a larger
+// one sees the connection being reset instead of the response. Chunks of
+// browser uploads fit; nodes ask before sending a larger result (the
+// uploading progress report with size_bytes). It runs before the response
+// is written: after that, the body may no longer be readable.
+func drainRefused(body io.Reader, err error) {
+	if errors.Is(err, model.ErrNotFound) || errors.Is(err, model.ErrConflict) ||
+		errors.Is(err, model.ErrOffsetMismatch) || errors.Is(err, model.ErrInsufficientStorage) {
+		_, _ = io.CopyN(io.Discard, body, maxRefusedDrain)
+	}
+}
+
 func (s *server) uploadModelChunk(w http.ResponseWriter, r *http.Request) {
 	id, ok := uploadID(w, r)
 	if !ok {
@@ -311,6 +333,7 @@ func (s *server) uploadModelChunk(w http.ResponseWriter, r *http.Request) {
 	body := limitModelBody(w, r, model.MaxChunkBytes, msgModelChunkTooLarge)
 	up, err := s.models.WriteChunk(r.Context(), id, offset, body)
 	if err != nil {
+		drainRefused(body, err)
 		s.modelError(w, r, err)
 		return
 	}
@@ -594,6 +617,10 @@ func (s *server) agentExportInput(w http.ResponseWriter, r *http.Request) {
 type exportProgressRequest struct {
 	Stage   string `json:"stage"`
 	Message string `json:"message"`
+	// SizeBytes, with stage uploading: the size of the result about to be
+	// uploaded. The report then fails like the upload would (404, 409, 507)
+	// before the node sends the file.
+	SizeBytes int64 `json:"size_bytes"`
 }
 
 type leaseResponse struct {
@@ -609,7 +636,9 @@ func (s *server) agentExportProgress(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	lease, err := s.models.ReportProgress(r.Context(), id, nodeID, req.Stage, req.Message)
+	lease, err := s.models.ReportProgress(r.Context(), id, nodeID, model.ProgressInput{
+		Stage: req.Stage, Message: req.Message, SizeBytes: req.SizeBytes,
+	})
 	if err != nil {
 		s.modelError(w, r, err)
 		return
@@ -639,6 +668,7 @@ func (s *server) agentExportOutput(w http.ResponseWriter, r *http.Request) {
 	body := limitModelBody(w, r, model.MaxOutputBytes, msgOutputTooLarge)
 	n, err := s.models.PutTaskOutput(r.Context(), id, nodeID, r.ContentLength, r.Header.Get("X-Content-Sha256"), body)
 	if err != nil {
+		drainRefused(body, err)
 		s.modelError(w, r, err)
 		return
 	}

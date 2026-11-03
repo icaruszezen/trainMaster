@@ -74,6 +74,27 @@ func newGlobal(module, name string) *pyGlobal {
 	return &pyGlobal{module: module, name: name, qual: module + "." + name}
 }
 
+// global handles GLOBAL, STACK_GLOBAL and INST. The qualified name is a new
+// string, as long as its parts (and so is the name torch checks, for the
+// few modules it renames differently), and STACK_GLOBAL takes them from
+// the stack (memoized strings of any size), so it counts against the byte
+// budget.
+func (u *unpickler) global(module, name string) (*pyGlobal, error) {
+	if err := u.allocBytes(len(module) + len(name) + 1); err != nil {
+		return nil, err
+	}
+	g := newGlobal(module, name)
+	full := g.qual
+	if m := torchModule(module); m != g.module {
+		if err := u.allocBytes(len(m) + len(name) + 1); err != nil {
+			return nil, err
+		}
+		full = m + "." + name
+	}
+	u.globals.add(full)
+	return g, nil
+}
+
 // pyDict is an insertion-ordered dict. Keys that Python can hash are
 // deduplicated (a later SETITEM replaces the value in place, as in
 // Python); unhashable or unusual keys are simply appended.
@@ -105,6 +126,11 @@ func (d *pyDict) find(hk any) int {
 
 func (d *pyDict) set(k, v any) {
 	hk, ok := hashKey(k)
+	d.setHashed(k, hk, ok, v)
+}
+
+// setHashed is set with the result of hashKey(k).
+func (d *pyDict) setHashed(k, hk any, ok bool, v any) {
 	if ok {
 		if i := d.find(hk); i >= 0 {
 			d.vals[i] = v
@@ -165,26 +191,36 @@ type (
 	tupleKey string
 )
 
-// Bounds for hashing tuple keys: a crafted pickle can nest tuples deeply
-// or make them huge, and every SETITEM hashes its key.
+// Bounds for hashing keys: every SETITEM hashes its key, and a crafted
+// pickle can make keys huge (a memoized string of megabytes, or a tuple of
+// many references to one) or nest tuples deeply. Keys beyond the bounds
+// are not hashed (they are appended, like unhashable keys), so hashing
+// costs at most a few kilobytes per key. Real keys are short names.
 const (
+	maxKeyBytes      = 1024 // of a str or bytes key, and of the str and bytes items of a tuple key
 	maxTupleKeyDepth = 4
 	maxTupleKeyItems = 32
 )
+
+// keyBudget is what is left of the bounds while hashing a tuple key.
+type keyBudget struct{ items, bytes int }
 
 // hashKey returns the normalized form of a dict key, equal for keys that
 // Python considers equal (1, 1.0 and True; equal strings; equal tuples of
 // those), or false when the key is unhashable or not worth hashing.
 func hashKey(v any) (any, bool) {
-	budget := maxTupleKeyItems
+	budget := keyBudget{items: maxTupleKeyItems, bytes: maxKeyBytes}
 	return hashKeyDepth(v, 0, &budget)
 }
 
-func hashKeyDepth(v any, depth int, budget *int) (any, bool) {
+func hashKeyDepth(v any, depth int, budget *keyBudget) (any, bool) {
 	switch x := v.(type) {
 	case nil:
 		return noneKey{}, true
 	case string:
+		if budget.bytes -= len(x); budget.bytes < 0 {
+			return nil, false
+		}
 		return x, true
 	case int64:
 		return x, true
@@ -202,18 +238,20 @@ func hashKeyDepth(v any, depth int, budget *int) (any, bool) {
 		}
 		return x, true
 	case pyBytes:
+		if budget.bytes -= len(x); budget.bytes < 0 {
+			return nil, false
+		}
 		return bytesKey(x), true
 	case *pyGlobal, *pyObject, *pyTensor: // hashed by identity
 		return x, true
 	case *pyTuple:
-		if depth >= maxTupleKeyDepth {
+		if depth >= maxTupleKeyDepth || len(x.items) > budget.items {
 			return nil, false
 		}
 		var b strings.Builder
 		b.WriteByte('(')
 		for _, item := range x.items {
-			*budget--
-			if *budget < 0 {
+			if budget.items--; budget.items < 0 {
 				return nil, false
 			}
 			k, ok := hashKeyDepth(item, depth+1, budget)

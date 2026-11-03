@@ -6,9 +6,12 @@
   有 onnxruntime 时用全零输入推理一次，把结果以 JSON 输出到 stdout 的最后一行：
   {"ok": true, "onnx_path": …, "result": {…}} 或 {"ok": false, "error": "中文说明", "detail": "回溯尾部"}。
   torch / ultralytics / onnx 只在这个短命的子进程中导入，常驻进程不导入它们、不占用显存。
+  pt 文件来自用户上传：子进程只继承运行 Python 需要的环境变量（没有 TM_NODE_TOKEN 等），并用 Ultralytics
+  的安全加载（ULTRALYTICS_SAFE_LOAD，torch.load(weights_only=True)）只还原已知的模型类，不执行文件中的代码。
 - 父进程：ExportProcess 限时运行子进程（可从其它线程取消，结束整个进程组）；ModelExportTask 在任务线程中
-  执行平台下发的转换任务：工作目录 → 检查磁盘 → 下载并校验 pt → 转换 → 上传 onnx → 完成，期间定期上报
-  进度（续租）。平台上的任务被删除或已不属于本节点（404 / 409）时结束子进程并放弃，不再上报。
+  执行平台下发的转换任务：工作目录 → 检查磁盘 → 下载并校验 pt → 转换 → 上传 onnx（先带上文件大小上报
+  进度，平台确认能接收）→ 完成，期间定期上报进度（续租）。平台上的任务被删除或已不属于本节点（404 / 409）
+  时结束子进程并放弃，不再上报。
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import argparse
 import ast
 import contextlib
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -60,9 +64,51 @@ POSTPROCESS_LABELS = {
     "nms": "嵌入 NMS（nms）",
     "end2end": "端到端（end2end）",
 }
+# 有检测框的任务：只有它们能嵌入 NMS 或带端到端头（与平台的 nmsTasks 相同）。
 NMS_TASKS = ("detect", "segment", "pose", "obb")
+# 说明中的任务名（与平台的 taskLabels 相同）。
+TASK_LABELS = {
+    "detect": "检测",
+    "segment": "分割",
+    "classify": "分类",
+    "pose": "姿态",
+    "obb": "旋转框",
+    "semantic": "语义分割",
+    "depth": "深度估计",
+}
 # 加载各版本的模型至少需要的 Ultralytics 版本（只列出确定的），加载失败时作为升级提示。
 MIN_ULTRALYTICS = (("yolo26", "8.4.0"), ("yolo11", "8.3.0"))
+# Ultralytics 的安全加载开关：torch.load(weights_only=True)，只允许其清单中的类（ultralytics.nn.tasks._SafeLoad）。
+SAFE_LOAD_ENV = "ULTRALYTICS_SAFE_LOAD"
+# 安全加载按需允许的模型类所在的模块（与 _SafeLoad.register 相同：这些模块，以及 _SAFE_CLASS_PACKAGES 的
+# 直接子模块）：其中不存在的类（大写开头）说明模型由更新的版本保存，而不是夹带了不安全的对象。
+_SAFE_CLASS_MODULES = (
+    "torch.nn.modules",
+    "ultralytics.nn.modules",
+    "ultralytics.nn.tasks",
+    "ultralytics.nn.distill_model",
+    "ultralytics.utils.loss",
+    "ultralytics.utils.tal",
+)
+_SAFE_CLASS_PACKAGES = ("torch.nn.modules", "ultralytics.nn.modules")
+# torch 拒绝时的说明中被拒绝的对象：“Unsupported global: GLOBAL os.system …”、“unsupported GLOBAL
+# posix.system whose module posix is blocked”，以及 Ultralytics 限制的 getattr；没有对象时的原因
+# （“WeightsUnpickler error: Unsupported operand 83”：文件已损坏或不是 torch.save 保存的内容）。
+_REFUSED_GLOBAL = re.compile(r"\bGLOBAL\s+([A-Za-z_][\w.]*)")
+_REFUSED_GETATTR = re.compile(r"unsafe (getattr\([^)]*\))")
+_UNPICKLER_ERROR = re.compile(r"WeightsUnpickler error:\s*([^\n]+)")
+# 转换子进程只继承这些环境变量（加上 LC_* 与 YOLO_*）：运行 Python 与查找依赖、语言与时区、临时目录、
+# CPU 线程数。pt 文件来自用户上传，不把 TM_NODE_TOKEN 等节点配置与其它密钥交给加载它的进程。
+_EXPORT_ENV_NAMES = frozenset(
+    {
+        "PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TEMP", "TMP",
+        "PYTHONPATH", "PYTHONHOME", "PYTHONNOUSERSITE", "PYTHONUSERBASE", "PYTHONIOENCODING",
+        "PYTHONUTF8", "PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "VIRTUAL_ENV",
+        "LD_LIBRARY_PATH", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "MPLCONFIGDIR", "CUDA_DEVICE_ORDER",
+        "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+    }
+)  # fmt: skip
+_EXPORT_ENV_PREFIXES = ("LC_", "YOLO_")
 # ONNX TensorProto.DataType 的编号（ONNX 标准中固定）→ 结果中的类型名。
 _ONNX_TYPES = {
     1: "float32",
@@ -247,11 +293,60 @@ def _unknown_class(exc: BaseException) -> bool:
     return isinstance(exc, ImportError) and "cannot import name" in text and "ultralytics" in text
 
 
+def _chain_text(exc: BaseException) -> str:
+    """异常及其 cause / context 的消息。"""
+    texts: list[str] = []
+    current: BaseException | None = exc
+    while current is not None and len(texts) < 8:
+        texts.append(str(current))
+        current = current.__cause__ or current.__context__
+    return "\n".join(texts)
+
+
+def safe_load_refusal(exc: BaseException) -> str | None:
+    """安全加载拒绝了文件中的对象时返回它的名字（说明中找不到名字时为空字符串），不是这种错误时返回 None。
+    ultralytics 把 torch 的 UnpicklingError（“Weights only load failed …”）包装为 TypeError，名字在 cause 中。"""
+    text = _chain_text(exc)
+    if (
+        "Weights only load failed" not in text
+        and "outside the supported Ultralytics checkpoint format" not in text
+    ):
+        return None
+    m = _REFUSED_GLOBAL.search(text) or _REFUSED_GETATTR.search(text)
+    return m.group(1).rstrip(".") if m else ""
+
+
+def _missing_class(name: str) -> bool:
+    """被拒绝的对象是安全加载按需允许的模块中的类，但节点上的 Ultralytics / PyTorch 中没有它（模型由更新的
+    版本保存）。"""
+    module, _, attr = name.rpartition(".")
+    if not attr[:1].isupper() or not (
+        module in _SAFE_CLASS_MODULES or module.rpartition(".")[0] in _SAFE_CLASS_PACKAGES
+    ):
+        return False
+    try:
+        return not hasattr(importlib.import_module(module), attr)
+    except ImportError:
+        return True
+    except Exception:  # 模块存在但导入出错：不是版本问题
+        return False
+
+
 def translate_load_error(exc: BaseException, spec: ExportSpec, node_version: str) -> str:
     saved = spec.saved_ultralytics_version
     if _is_out_of_memory(exc):
         return "训练节点内存不足，无法加载该模型"
-    if _unknown_class(exc):
+    refused = safe_load_refusal(exc)
+    if refused and not _missing_class(refused):
+        return (
+            f"模型文件中引用了不允许加载的对象（{refused}），为了安全训练节点不会加载它。"
+            "请上传由 Ultralytics 训练保存的模型文件"
+        )
+    if refused == "":  # 安全加载拒绝了文件的内容，但不是某个对象：文件已损坏或不是检查点
+        m = _UNPICKLER_ERROR.search(_chain_text(exc))
+        why = f"（{m.group(1).strip()}）" if m else ""
+        return f"模型文件已损坏，或不是 Ultralytics 保存的检查点，无法加载{why}"
+    if refused is not None or _unknown_class(exc):
         return _too_old_message(node_version, spec.yolo_version) + _newer_hint(saved, node_version)
     text = str(exc)
     if isinstance(exc, FileNotFoundError):
@@ -314,21 +409,43 @@ def has_end2end_head(model: Any) -> bool:
     return getattr(_head(model), "one2one_cv2", None) is not None
 
 
+def _raw_or_nms(dynamic: bool) -> str:
+    """有检测框的模型不能导出 end2end 时建议的其它后处理方式（与平台允许的组合相同）：嵌入 NMS 不能
+    与动态尺寸同时使用。没有检测框的任务只能选择 raw（resolve_postprocess 先检查）。"""
+    return "raw（关闭动态尺寸后也可以选择 nms）" if dynamic else "raw 或 nms"
+
+
 def resolve_postprocess(spec: ExportSpec, task: str, end2end_head: bool) -> str:
-    """选择后处理方式并检查组合是否可行；不可行时抛出 ExportError（平台已经校验过，这里再防一次）。"""
+    """选择后处理方式并检查组合是否可行；不可行时抛出 ExportError（平台已经校验过，这里再防一次）。
+    与平台的规则相同：嵌入 NMS 与 end2end 只用于有检测框的任务（NMS_TASKS），end2end 还需要端到端头；
+    嵌入 NMS 不能与动态尺寸同时使用。"""
+    boxes = task in NMS_TASKS
+    end2end_ok = end2end_head and boxes
     postprocess = spec.postprocess
     if postprocess is None:
-        postprocess = "end2end" if end2end_head and task in NMS_TASKS else "raw"
+        postprocess = "end2end" if end2end_ok else "raw"
     label = f"（{yolo_label(spec.yolo_version)}）" if spec.yolo_version else ""
     if task == "classify" and postprocess != "raw":
         raise ExportError(
             f"分类模型只能导出原始输出（raw），不支持{POSTPROCESS_LABELS[postprocess]}"
         )
-    if postprocess == "nms" and task not in NMS_TASKS:
-        raise ExportError(f"{task or '该'}任务的模型不支持嵌入 NMS，请选择原始输出（raw）")
+    # 语义分割、深度估计等没有检测框的任务（YOLO26 的这些模型也没有端到端头）只有原始输出
+    if postprocess != "raw" and not boxes:
+        what = "嵌入 NMS" if postprocess == "nms" else "导出 end2end"
+        raise ExportError(
+            f"{TASK_LABELS.get(task, task) or '该'}模型没有检测框，不能{what}，请选择原始输出（raw）"
+        )
+    if postprocess == "nms" and spec.dynamic:
+        # NMSModel 按 batch 逐张处理，导出时循环被展开：动态 batch 的图只处理第一张图片，其余输出全为 0。
+        others = "原始输出（raw）/ 端到端（end2end）" if end2end_ok else "原始输出（raw）"
+        raise ExportError(
+            "嵌入 NMS 的 ONNX 只能固定 batch 为 1，不能与动态尺寸同时使用；"
+            f"请关闭动态尺寸，或选择{others}"
+        )
     if postprocess == "end2end" and not end2end_head:
         raise ExportError(
-            f"该模型{label}没有端到端（NMS-free）检测头，不能导出 end2end；请选择 raw 或 nms"
+            f"该模型{label}没有端到端（NMS-free）检测头，不能导出 end2end；"
+            f"请选择 {_raw_or_nms(spec.dynamic)}"
         )
     return postprocess
 
@@ -411,9 +528,10 @@ def check_onnx(
         end2end = want_end2end
     if nms is None:
         nms = want_nms
-    if want_end2end and not end2end:
+    if want_end2end and not end2end:  # 只有有检测框的任务才会请求 end2end（resolve_postprocess）
         raise ExportError(
-            "该模型不支持端到端（end2end）导出：Ultralytics 导出的仍是原始输出。请选择 raw 或 nms"
+            "该模型不支持端到端（end2end）导出：Ultralytics 导出的仍是原始输出。"
+            f"请选择 {_raw_or_nms(spec.dynamic)}"
         )
     if want_nms and not nms:
         others = "raw 或 end2end" if end2end_head else "raw"
@@ -487,6 +605,36 @@ def verify_onnx(
     return str(getattr(ort, "__version__", "")) or "unknown"
 
 
+def require_safe_load(node_version: str) -> None:
+    """确认 ultralytics 会用安全加载读取模型文件：有 ultralytics.nn.tasks._SafeLoad、torch 支持
+    （_SafeLoad.SUPPORTED，需要 PyTorch 2.6 及以上）且 ULTRALYTICS_SAFE_LOAD 已生效。否则 ultralytics 会
+    静默退回普通加载（执行文件中的任意代码），所以转换失败（不可重试），提示升级训练节点。"""
+    torch_version = str(getattr(sys.modules.get("torch"), "__version__", "")) or "unknown"
+    try:
+        tasks = importlib.import_module("ultralytics.nn.tasks")
+    except Exception as exc:
+        raise ExportError(
+            f"训练节点无法导入 ultralytics.nn.tasks（{_clean_message(exc)}），"
+            "请用 python -m trainmaster_trainer selftest 检查训练节点的环境",
+            summarize_exception(exc, MAX_DETAIL),
+        ) from exc
+    safe = getattr(tasks, "_SafeLoad", None)
+    if safe is None:
+        reason = f"训练节点的 Ultralytics {node_version} 不支持安全加载模型文件"
+    elif getattr(safe, "SUPPORTED", False) is not True:
+        reason = (
+            f"训练节点的 PyTorch {torch_version} 不支持 Ultralytics 的安全加载（需要 2.6 及以上）"
+        )
+    elif getattr(tasks, "SAFE_LOAD", False) is not True:
+        reason = f"训练节点的 Ultralytics {node_version} 没有启用安全加载（{SAFE_LOAD_ENV}）"
+    else:
+        return
+    raise ExportError(
+        f"{reason}，为了安全不会加载上传的模型文件。请升级训练节点"
+        "（镜像或 requirements.txt 中的 ultralytics 与 torch）"
+    )
+
+
 def run_export(spec: ExportSpec) -> dict[str, Any]:
     """子进程中执行：加载模型、导出 ONNX、核对并验证。返回 {"ok": …} 结构，不抛出异常。"""
     start = time.monotonic()
@@ -523,6 +671,7 @@ def _run_export(spec: ExportSpec, start: float) -> dict[str, Any]:
         ) from exc
     node_version = str(getattr(ultralytics, "__version__", "")) or "unknown"
     torch = sys.modules.get("torch")
+    require_safe_load(node_version)
 
     try:
         model = ultralytics.YOLO(spec.weights, task=spec.task)
@@ -585,6 +734,7 @@ def child_main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     os.environ.setdefault("YOLO_OFFLINE", "1")
     os.environ.setdefault("YOLO_AUTOINSTALL", "False")
+    os.environ[SAFE_LOAD_ENV] = "1"  # 在导入 ultralytics 之前：它在导入时读取这个开关
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
 
     sys.stdout.flush()
@@ -612,13 +762,22 @@ def child_main(argv: Sequence[str] | None = None) -> int:
 
 
 def export_env(state_dir: Path, base: Mapping[str, str] | None = None) -> dict[str, str]:
-    """转换子进程的环境变量：与环境检测相同（YOLO_OFFLINE、YOLO_CONFIG_DIR、PYTHONPATH），另外只用 CPU
-    （不占用显存、不受正在进行的训练影响），不让 ultralytics 尝试自动安装依赖；默认输出 ultralytics 的
-    日志（失败时作为详情）。"""
+    """转换子进程的环境变量。子进程加载的是用户上传的 pt 文件，所以只继承运行 Python 需要的变量
+    （_EXPORT_ENV_NAMES、LC_*、YOLO_*；没有 TM_NODE_TOKEN 等节点配置与密钥），并打开 Ultralytics 的
+    安全加载（ULTRALYTICS_SAFE_LOAD=1）。其余与环境检测相同（YOLO_OFFLINE、YOLO_CONFIG_DIR、PYTHONPATH），
+    另外只用 CPU（不占用显存、不受正在进行的训练影响），不让 ultralytics 尝试自动安装依赖；默认输出
+    ultralytics 的日志（失败时作为详情）。"""
     source = os.environ if base is None else base
-    env = child_env(state_dir, None, {**source, "YOLO_VERBOSE": source.get("YOLO_VERBOSE", "True")})
+    kept = {
+        k: v
+        for k, v in source.items()
+        if k in _EXPORT_ENV_NAMES or k.startswith(_EXPORT_ENV_PREFIXES)
+    }
+    kept.setdefault("YOLO_VERBOSE", "True")
+    env = child_env(state_dir, None, kept)
     env["CUDA_VISIBLE_DEVICES"] = ""
     env["YOLO_AUTOINSTALL"] = "False"
+    env[SAFE_LOAD_ENV] = "1"
     return env
 
 
@@ -1107,7 +1266,7 @@ class ModelExportTask:
                 f"转换生成的 ONNX 文件太大（{format_bytes(size)}），平台最多接受 {format_bytes(MAX_OUTPUT_BYTES)}"
             )
 
-        self._report_stage("uploading")
+        self._start_upload(size)
         result = dict(outcome["result"], node_name=self.node_name)
         self._upload(info, onnx_path, size)
         try:
@@ -1192,6 +1351,7 @@ class ModelExportTask:
             raise self._api_error(exc, "上传转换结果") from None
         except TransportError as exc:
             self._check_interrupted()
+            self._recheck_upload()
             raise TaskFailed(f"上传转换结果失败：{exc}", retryable=True) from None
         except OSError as exc:
             raise TaskFailed(f"无法读取转换结果 {path}：{exc}") from None
@@ -1212,24 +1372,48 @@ class ModelExportTask:
         self._progress()
         self._check_interrupted()
 
-    def _progress(self) -> None:
-        """POST progress。404 / 409（任务被删除、已不属于本节点）时放弃任务；其它错误只记录（租约有 60 秒，
-        之后的上报会续上）。"""
+    def _start_upload(self, size: int) -> None:
+        """进入上传阶段：上报进度时带上文件大小（预检）。平台在读取上传内容之前就会拒绝（任务已被删除或
+        不属于本节点、文件太大、平台磁盘空间不足），拒绝后断开连接，正在上传较大文件的节点只能看到连接
+        被重置；所以先问一次，平台做与上传相同的检查：404 / 409 放弃，413 / 507 不可重试的失败（平台的
+        说明）。不认识 size_bytes 的旧版平台照常续租；其它错误与平时的进度上报一样只记录。"""
+        self._check_interrupted()
+        self.stage = "uploading"
+        self._raise_if_refused(self._progress(size_bytes=size))
+
+    def _recheck_upload(self) -> None:
+        """上传时连接中断：可能是平台没有读取内容就拒绝了上传。再上报一次进度（不带大小）来区分：
+        404 / 409 放弃，507 不可重试的失败；成功或其它错误时由调用方按网络错误处理（可重试）。"""
+        self._raise_if_refused(self._progress())
+
+    def _raise_if_refused(self, error: ApiError | None) -> None:
+        """上传阶段的进度上报被拒绝时结束任务：404 / 409 已在 _progress 中放弃，413 / 507 平台不会接收
+        这个文件（重试也一样），不可重试的失败。"""
+        self._check_interrupted()
+        if error is not None and error.status in (413, 507):
+            raise self._api_error(error, "上传转换结果")
+
+    def _progress(self, size_bytes: int | None = None) -> ApiError | None:
+        """POST progress，返回平台返回的错误（成功或网络错误时为 None）。404 / 409（任务被删除、已不属于
+        本节点）时放弃任务；其它错误只记录（租约有 60 秒，之后的上报会续上）。size_bytes 见 _start_upload。"""
         assert self.info is not None
+        payload: dict[str, Any] = {"stage": self.stage}
+        if size_bytes is not None:
+            payload["size_bytes"] = size_bytes
         with self._progress_lock:
             if self._abandoned is not None:
-                return
+                return None
             try:
-                self.client.post(
-                    self.info.progress_url, {"stage": self.stage}, headers=self._headers
-                )
+                self.client.post(self.info.progress_url, payload, headers=self._headers)
             except ApiError as exc:
                 if exc.status in (404, 409):
                     self._abandon(exc)
                 else:
                     log.debug("model export %s: progress report failed: %s", self.info.id, exc)
+                return exc
             except TransportError as exc:
                 log.debug("model export %s: progress report failed: %s", self.info.id, exc)
+        return None
 
     def _keep_lease(self) -> None:
         while not self._finished.wait(self.progress_interval):

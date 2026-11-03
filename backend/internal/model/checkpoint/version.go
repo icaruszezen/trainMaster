@@ -81,14 +81,16 @@ var detectHeads = map[string]bool{
 //     head with C3k2: YOLO26;
 //   - v10Detect, SCDown, PSA or C2fCIB: YOLOv10;
 //   - RepNCSPELAN4, ADown or SPPELAN: YOLOv9;
-//   - C3k2 (without an end-to-end head): YOLO11;
+//   - C3k2 (without an end-to-end head): YOLO11, except with a Classify
+//     head: yolo11-cls.yaml and yolo26-cls.yaml are the very same network,
+//     so a classification model with a custom yaml name gives "";
 //   - C2f (or C3Ghost, of yolov8-ghost) with a head of the Detect family:
 //     YOLOv8.
 //
 // Anything else (YOLOv3/v5u/v6, RT-DETR, ResNet or TorchVision backbones,
-// ...) gives "". YOLO26 classification
-// models have the very same architecture as YOLO11 ones, so they are
-// recognized as YOLO11 unless the yaml name says otherwise.
+// ...) gives "". A version is only claimed when the architecture belongs
+// to that version alone: the service rejects a model whose recognized
+// version differs from the one chosen.
 func versionFromArchitecture(modules map[string]bool, head string, end2end bool) string {
 	switch {
 	case modules["A2C2f"]:
@@ -100,6 +102,9 @@ func versionFromArchitecture(modules map[string]bool, head string, end2end bool)
 	case modules["RepNCSPELAN4"] || modules["ADown"] || modules["SPPELAN"]:
 		return versionV9
 	case modules["C3k2"]:
+		if head == "Classify" {
+			return "" // YOLO11 or YOLO26
+		}
 		return version11
 	case (modules["C2f"] || modules["C3Ghost"]) && detectHeads[head]:
 		return versionV8

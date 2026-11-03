@@ -85,6 +85,11 @@ func notUploading(up Upload) error {
 	return &Error{Kind: ErrConflict, Message: "上传已完成，不能继续上传"}
 }
 
+// errUploadFileLost: an upload that is still uploading has no staged file
+// (any more), e.g. after the database was restored from a backup without
+// the temporary files. What it received is gone; it has to start over.
+var errUploadFileLost = &Error{Kind: ErrConflict, Message: "服务器上找不到这次上传已接收的数据（临时文件已丢失），请取消后重新上传"}
+
 // bodyError marks errors from reading the request body, as opposed to
 // writing to disk.
 type bodyError struct{ err error }
@@ -143,16 +148,35 @@ func (s *Service) WriteChunk(ctx context.Context, id, offset int64, body io.Read
 		return up, err
 	}
 
-	f, err := os.OpenFile(s.uploadPath(id), os.O_WRONLY|os.O_CREATE, 0o644)
+	// The first chunk creates the file in the folder CreateUpload made.
+	flags := os.O_WRONLY
+	if offset == 0 {
+		flags |= os.O_CREATE
+	}
+	f, err := os.OpenFile(s.uploadPath(id), flags, 0o644)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) { // folder removed: canceled meanwhile
-			if cur, gerr := s.GetUpload(ctx, id); gerr == nil && cur.Status != UploadUploading {
+		if errors.Is(err, fs.ErrNotExist) {
+			// The folder is removed when the upload is canceled meanwhile;
+			// otherwise the staged file is lost.
+			cur, gerr := s.GetUpload(ctx, id)
+			switch {
+			case gerr != nil:
+				return up, gerr
+			case cur.Status != UploadUploading:
 				return cur, notUploading(cur)
 			}
+			return cur, errUploadFileLost
 		}
 		return up, fmt.Errorf("open model upload file: %w", err)
 	}
 	defer f.Close()
+	// The bytes received so far must all be there (Truncate would fill a
+	// shorter file with zeros).
+	if fi, err := f.Stat(); err != nil {
+		return up, fmt.Errorf("stat model upload file: %w", err)
+	} else if fi.Size() < offset {
+		return up, errUploadFileLost
+	}
 	// Drop whatever an earlier, failed chunk may have left behind.
 	if err := f.Truncate(offset); err != nil {
 		return up, fmt.Errorf("truncate model upload file: %w", err)
@@ -247,13 +271,15 @@ func (s *Service) CommitUpload(ctx context.Context, id int64, in CommitInput) (M
 			formatBytes(uint64(up.ReceivedBytes)), formatBytes(uint64(up.FileSize)))
 	}
 	path := s.uploadPath(id)
-	if fi, err := os.Stat(path); err != nil || fi.Size() != up.FileSize {
+	if fi, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		return Model{}, false, errUploadFileLost
+	} else if err != nil || fi.Size() != up.FileSize {
 		return Model{}, false, &Error{Kind: ErrConflict, Message: "服务器上的模型文件不完整，请取消后重新上传"}
 	}
 
 	var ended *Upload // the upload was canceled (or deleted) meanwhile
 	m, err := s.addModel(ctx, newModel{ProjectID: up.ProjectID, Source: SourceUpload, YOLOVersion: yolo,
-		Description: desc, FileName: up.FileName, SrcPath: path,
+		Description: desc, FileName: up.FileName, SrcPath: path, UploadID: id,
 		inTx: func(ctx context.Context, tx pgx.Tx, modelID int64) error {
 			cur, err := scanUpload(tx.QueryRow(ctx, `UPDATE model_uploads SET status = 'completed', model_id = $2,
 					yolo_version = $3, description = $4, detected_yolo_version = NULL, error = '', updated_at = now()

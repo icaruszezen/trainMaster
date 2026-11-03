@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 )
 
 func sha256Hex(data []byte) string {
@@ -206,13 +208,13 @@ func TestIntegrationExportLifecycle(t *testing.T) {
 	}
 
 	// Progress.
-	if lease, err := e.svc.ReportProgress(ctx, exp.ID, node, StageConverting, "exporting\n"); err != nil || lease != 60 {
+	if lease, err := e.svc.ReportProgress(ctx, exp.ID, node, ProgressInput{Stage: StageConverting, Message: "exporting\n"}); err != nil || lease != 60 {
 		t.Errorf("ReportProgress = %d, %v", lease, err)
 	}
 	if got := e.export(t, m.ID, exp.ID); got.Stage != StageConverting {
 		t.Errorf("stage = %q", got.Stage)
 	}
-	_, err = e.svc.ReportProgress(ctx, exp.ID, node, "done", "")
+	_, err = e.svc.ReportProgress(ctx, exp.ID, node, ProgressInput{Stage: "done"})
 	wantKind(t, err, ErrInvalid, "stage 必须是")
 
 	// Completing needs the result first.
@@ -289,7 +291,7 @@ func TestIntegrationExportLifecycle(t *testing.T) {
 	}
 
 	// The node does not hold it any more.
-	_, err = e.svc.ReportProgress(ctx, exp.ID, node, StageUploading, "")
+	_, err = e.svc.ReportProgress(ctx, exp.ID, node, ProgressInput{Stage: StageUploading})
 	wantKind(t, err, ErrConflict, "已不属于该节点或已结束")
 	_, err = e.svc.CompleteTask(ctx, exp.ID, node, nil)
 	wantKind(t, err, ErrConflict, "已不属于该节点或已结束")
@@ -398,13 +400,16 @@ func TestIntegrationTaskOwnership(t *testing.T) {
 	exp, _ := e.requestExport(t, m.ID, ExportRequest{})
 
 	// Nobody holds a queued conversion.
-	_, err := e.svc.ReportProgress(ctx, exp.ID, node, StageConverting, "")
+	_, err := e.svc.ReportProgress(ctx, exp.ID, node, ProgressInput{Stage: StageConverting})
 	wantKind(t, err, ErrConflict, "已不属于该节点")
 
 	e.claim(t, node)
 	data := []byte("onnx")
 	calls := map[string]func(nodeID int64) error{
-		"progress": func(n int64) error { _, err := e.svc.ReportProgress(ctx, exp.ID, n, StageConverting, ""); return err },
+		"progress": func(n int64) error {
+			_, err := e.svc.ReportProgress(ctx, exp.ID, n, ProgressInput{Stage: StageConverting})
+			return err
+		},
 		"input": func(n int64) error {
 			f, err := e.svc.OpenTaskInput(ctx, exp.ID, n)
 			if err == nil {
@@ -457,7 +462,7 @@ func TestIntegrationTaskOwnership(t *testing.T) {
 	if exists(e.svc.exportTempDir(exp2.ID)) {
 		t.Error("the partial result should be removed with the model")
 	}
-	_, err = e.svc.ReportProgress(ctx, exp2.ID, node, StageConverting, "")
+	_, err = e.svc.ReportProgress(ctx, exp2.ID, node, ProgressInput{Stage: StageConverting})
 	wantKind(t, err, ErrNotFound, "转换任务不存在")
 	_, err = e.svc.CompleteTask(ctx, exp2.ID, node, nil)
 	wantKind(t, err, ErrNotFound, "转换任务不存在")
@@ -546,6 +551,70 @@ func TestIntegrationFailTask(t *testing.T) {
 	}
 }
 
+// TestIntegrationUploadPreflight checks the report a node sends before it
+// uploads its result: stage uploading with the size of the file.
+func TestIntegrationUploadPreflight(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	m := e.addModel(t, e.project(t, "p"), "yolo11")
+	node := e.node(t, "a")
+	intruder := e.node(t, "b")
+	exp, _ := e.requestExport(t, m.ID, ExportRequest{})
+	e.claim(t, node)
+	var mu sync.Mutex
+	free := uint64(10 << 30)
+	e.svc.usage = func() (storage.Usage, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return storage.Usage{TotalBytes: 20 << 30, FreeBytes: free}, nil
+	}
+	setFree := func(n uint64) {
+		mu.Lock()
+		defer mu.Unlock()
+		free = n
+	}
+	report := func(nodeID int64, stage string, size int64) error {
+		_, err := e.svc.ReportProgress(ctx, exp.ID, nodeID, ProgressInput{Stage: stage, SizeBytes: size})
+		return err
+	}
+
+	if err := report(node, StageUploading, 100<<20); err != nil {
+		t.Fatalf("preflight with room: %v", err)
+	}
+	if got := e.export(t, m.ID, exp.ID); got.Stage != StageUploading {
+		t.Errorf("stage = %q", got.Stage)
+	}
+	wantKind(t, report(node, StageUploading, -1), ErrInvalid, "size_bytes")
+	wantKind(t, report(node, StageUploading, MaxOutputBytes+1), ErrTooLarge, "不能超过 4 GiB")
+
+	// Not enough room for the file plus the reserve: refused like the
+	// upload itself would be.
+	setFree(600 << 20)
+	wantKind(t, report(node, StageUploading, 100<<20), ErrInsufficientStorage, "磁盘剩余空间不足")
+	data := []byte("onnx")
+	_, err := e.svc.PutTaskOutput(ctx, exp.ID, node, 100<<20, sha256Hex(data), bytes.NewReader(data))
+	wantKind(t, err, ErrInsufficientStorage, "磁盘剩余空间不足")
+	// The check needs the stage and the size; older nodes send no size.
+	if err := report(node, StageUploading, 0); err != nil {
+		t.Errorf("uploading without a size: %v", err)
+	}
+	if err := report(node, StageConverting, 100<<20); err != nil {
+		t.Errorf("converting with a size: %v", err)
+	}
+	if err := report(node, StageUploading, 1<<20); err != nil {
+		t.Errorf("a file that fits: %v", err)
+	}
+	// Whether the node holds the conversion comes first: it stops then.
+	wantKind(t, report(intruder, StageUploading, 100<<20), ErrConflict, "已不属于该节点")
+	if got := e.export(t, m.ID, exp.ID); got.Status != ExportRunning || got.Node == nil || got.Node.ID != node {
+		t.Errorf("after the preflights: %+v", got)
+	}
+	if err := e.svc.DeleteExport(ctx, m.ID, exp.ID); err != nil {
+		t.Fatal(err)
+	}
+	wantKind(t, report(node, StageUploading, 100<<20), ErrNotFound, "转换任务不存在")
+}
+
 func TestIntegrationLeaseExpiry(t *testing.T) {
 	e := newTestEnv(t)
 	ctx := context.Background()
@@ -568,7 +637,7 @@ func TestIntegrationLeaseExpiry(t *testing.T) {
 				t.Errorf("attempt %d: %+v", attempt, got)
 			}
 			// The node that lost it cannot report on it any more.
-			_, err := e.svc.ReportProgress(ctx, exp.ID, node, StageConverting, "")
+			_, err := e.svc.ReportProgress(ctx, exp.ID, node, ProgressInput{Stage: StageConverting})
 			wantKind(t, err, ErrConflict, "已不属于该节点")
 			continue
 		}
@@ -585,7 +654,7 @@ func TestIntegrationLeaseExpiry(t *testing.T) {
 		t.Fatalf("claim = %+v", task)
 	}
 	e.expireLease(t, fresh.ID)
-	if _, err := e.svc.ReportProgress(ctx, fresh.ID, node, StageConverting, ""); err != nil {
+	if _, err := e.svc.ReportProgress(ctx, fresh.ID, node, ProgressInput{Stage: StageConverting}); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.svc.expireLeases(ctx); err != nil {
@@ -870,7 +939,7 @@ func TestIntegrationQueueOrder(t *testing.T) {
 		t.Errorf("workers_online after 61s = %d", got.WorkersOnline)
 	}
 	// Working on a conversion counts as being online.
-	if _, err := e.svc.ReportProgress(ctx, ids[0], node, StageConverting, ""); err != nil {
+	if _, err := e.svc.ReportProgress(ctx, ids[0], node, ProgressInput{Stage: StageConverting}); err != nil {
 		t.Fatal(err)
 	}
 	if got := e.export(t, m.ID, ids[1]); got.WorkersOnline != 1 {

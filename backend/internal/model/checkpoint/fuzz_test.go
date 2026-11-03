@@ -52,6 +52,13 @@ var fuzzSeeds = []string{
 	"\x8d\xff\xff\xff\xff\xff\xff\xff\xff.",
 	"N" + strings.Repeat("r\x00\x00\x00\x00", 100) + strings.Repeat("h\x00", 100) + ".",
 	"\x80\x02}(X\x05\x00\x00\x00modelcultralytics.nn.tasks\nDetectionModel\n)\x81}X\x05\x00\x00\x00names}K\x00X\x01\x00\x00\x00as\x85bu.",
+	// Memoized strings reused by opcodes that build from them (the large
+	// versions are in TestCraftedAmplification).
+	"\x80\x04X\x08\x00\x00\x00aaaaaaaaq\x00]" + strings.Repeat("h\x00h\x00\x93a", 20) + ".",
+	"X\x08\x00\x00\x00ppppppppq\x00]cpathlib\nPosixPath\nq\x01(" + strings.Repeat("h\x00", 30) + "tq\x020" + strings.Repeat("h\x01h\x02Ra", 20) + ".",
+	"X\x08\x00\x00\x00\x01\x01\x01\x01\x01\x01\x01\x01q\x000(" + strings.Repeat("h\x00", 32) + "tq\x010}" + strings.Repeat("h\x01Ns", 20) + ".",
+	"\x80\x02}(X\x05\x00\x00\x00modelcultralytics.nn.tasks\nDetectionModel\n)\x81}X\x05\x00\x00\x00names]X\x03\x00\x00\x00\x01abq\x00(" +
+		strings.Repeat("h\x00", 50) + "esbX\x04\x00\x00\x00evilcposix\nsystem\nX\x02\x00\x00\x00id\x85Ru.",
 }
 
 func FuzzInspect(f *testing.F) {
@@ -93,7 +100,7 @@ func checkInspect(t *testing.T, data []byte) {
 		}
 		switch e.Reason {
 		case ReasonNotTorch, ReasonLegacyFormat, ReasonCorrupt, ReasonNotUltralytics,
-			ReasonYOLOv5Repo, ReasonUnsupportedModel, ReasonTooLarge:
+			ReasonYOLOv5Repo, ReasonUnsupportedModel, ReasonTooLarge, ReasonUnsafe:
 		default:
 			t.Fatalf("unknown reason %q", e.Reason)
 		}
@@ -185,6 +192,50 @@ func TestInfoSanity(t *testing.T) {
 		checkInspect(t, []byte(s))
 		checkInspect(t, torchZip("seed", []byte(s)))
 	}
+}
+
+// cleanTextFull is cleanText as it was first written: it cleans the whole
+// string, then truncates it.
+func cleanTextFull(s string, maxBytes int) string {
+	s = strings.ToValidUTF8(s, "\ufffd")
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return '\ufffd'
+		}
+		return r
+	}, s)
+	if len(s) > maxBytes {
+		n := maxBytes
+		for n > 0 && !utf8.RuneStart(s[n]) {
+			n--
+		}
+		s = s[:n]
+	}
+	return s
+}
+
+// FuzzCleanText: cleanText only looks at the start of the string, and
+// gives the same result as cleaning all of it, except that a run of
+// invalid bytes cut at the end can leave the result shorter.
+func FuzzCleanText(f *testing.F) {
+	for _, s := range []string{"scratch", "a\tb\nc", "\xffa", "划痕-凹坑", strings.Repeat("\x01", 40), strings.Repeat("\xe5\x88", 20),
+		strings.Repeat("长", 30) + "\x00", strings.Repeat("\x80", 20) + "abc"} {
+		f.Add(s, 8)
+		f.Add(s, 2)
+	}
+	f.Fuzz(func(t *testing.T, s string, n int) {
+		n %= 300
+		if n < 0 {
+			n = -n
+		}
+		got := cleanText(s, n)
+		if len(got) > n || !utf8.ValidString(got) || strings.IndexFunc(got, unicode.IsControl) >= 0 {
+			t.Fatalf("cleanText(%q, %d) = %q", s, n, got)
+		}
+		if want := cleanTextFull(s, n); (utf8.ValidString(s) || len(s) <= n+utf8.UTFMax) && got != want {
+			t.Fatalf("cleanText(%q, %d) = %q, want %q", s, n, got, want)
+		}
+	})
 }
 
 func BenchmarkInspect(b *testing.B) {

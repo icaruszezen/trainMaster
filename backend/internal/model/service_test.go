@@ -319,6 +319,8 @@ func TestIntegrationUploadAndCommit(t *testing.T) {
 		{ModelQuery{Search: "BEST.PT"}, []int64{m3.ID, m2.ID, m.ID}},
 		{ModelQuery{Search: "其它"}, []int64{m3.ID}},
 		{ModelQuery{Search: "nothing"}, []int64{}},
+		// Project IDs are bigint, beyond the range of int4.
+		{ModelQuery{ProjectID: 3000000000}, []int64{}},
 	} {
 		ms, err := e.svc.ListModels(ctx, tt.q)
 		if err != nil || !slices.Equal(ids(ms), tt.want) {
@@ -534,8 +536,8 @@ func TestIntegrationVersionsNotReused(t *testing.T) {
 		t.Errorf("version = %d, want 4", m4.Version)
 	}
 
-	// A folder left behind by hand (or by a crash) is kept, and its version
-	// skipped.
+	// A folder left behind by hand (without the marker an interrupted
+	// commit leaves) is kept, and its version skipped.
 	stray := filepath.Join(e.st.Dir(storage.Models), fmt.Sprintf("project-%d", projectID), "v5")
 	if err := os.MkdirAll(stray, 0o755); err != nil {
 		t.Fatal(err)
@@ -843,5 +845,300 @@ func TestIntegrationCleanup(t *testing.T) {
 	}
 	if !exists(busy) || !exists(part) {
 		t.Error("files in use must be kept")
+	}
+}
+
+// TestIntegrationUploadFileLost checks an upload whose staged file is gone
+// while its row still says uploading (e.g. the database was restored from
+// a backup without tmp/).
+func TestIntegrationUploadFileLost(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	projectID := e.project(t, "p")
+	data := fakePT(t, detectInfo("yolo11"), strings.Repeat("w", 100))
+	half := int64(len(data) / 2)
+	start := func() Upload {
+		t.Helper()
+		up, err := e.svc.CreateUpload(ctx, CreateUploadInput{ProjectID: projectID, YOLOVersion: "yolo11", FileName: "a.pt",
+			FileSize: int64(len(data))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if up, err = e.svc.WriteChunk(ctx, up.ID, 0, bytes.NewReader(data[:half])); err != nil {
+			t.Fatal(err)
+		}
+		return up
+	}
+	const lost = "临时文件已丢失），请取消后重新上传"
+
+	// The file is gone: the next chunk is refused, nothing is created.
+	up := start()
+	if err := os.Remove(e.svc.uploadPath(up.ID)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.svc.WriteChunk(ctx, up.ID, half, bytes.NewReader(data[half:]))
+	wantKind(t, err, ErrConflict, lost)
+	if exists(e.svc.uploadPath(up.ID)) {
+		t.Error("no file should be created in place of the lost one")
+	}
+	if got, _ := e.svc.GetUpload(ctx, up.ID); got.Status != UploadUploading || got.ReceivedBytes != half {
+		t.Errorf("upload = %+v", got)
+	}
+	// The folder is gone too.
+	if err := os.RemoveAll(e.svc.uploadDir(up.ID)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.svc.WriteChunk(ctx, up.ID, half, bytes.NewReader(data[half:]))
+	wantKind(t, err, ErrConflict, lost)
+	// Canceling works as usual.
+	if c, err := e.svc.CancelUpload(ctx, up.ID); err != nil || c.Status != UploadCanceled {
+		t.Errorf("cancel = %+v, %v", c, err)
+	}
+	_, err = e.svc.WriteChunk(ctx, up.ID, half, bytes.NewReader(data[half:]))
+	wantKind(t, err, ErrConflict, "上传已取消")
+
+	// Nothing received yet and no folder: the first chunk is refused too.
+	fresh, err := e.svc.CreateUpload(ctx, CreateUploadInput{ProjectID: projectID, YOLOVersion: "yolo11", FileName: "a.pt",
+		FileSize: int64(len(data))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(e.svc.uploadDir(fresh.ID)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.svc.WriteChunk(ctx, fresh.ID, 0, bytes.NewReader(data))
+	wantKind(t, err, ErrConflict, lost)
+
+	// A file shorter than what was received is not padded with zeros.
+	up = start()
+	if err := os.Truncate(e.svc.uploadPath(up.ID), 10); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.svc.WriteChunk(ctx, up.ID, half, bytes.NewReader(data[half:]))
+	wantKind(t, err, ErrConflict, lost)
+	if fi, err := os.Stat(e.svc.uploadPath(up.ID)); err != nil || fi.Size() != 10 {
+		t.Errorf("staged file: %v, %v", fi, err)
+	}
+
+	// Commit says the same.
+	up = e.upload(t, projectID, "yolo11", data)
+	if err := os.Remove(e.svc.uploadPath(up.ID)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = e.svc.CommitUpload(ctx, up.ID, CommitInput{})
+	wantKind(t, err, ErrConflict, lost)
+	if got, _ := e.svc.GetUpload(ctx, up.ID); got.Status != UploadUploading {
+		t.Errorf("upload after a refused commit = %+v", got)
+	}
+}
+
+// interruptedCommit leaves the state of a process that died after addModel
+// moved the file of upload (0: a registration) into models/<dirName> and
+// before the commit: the folder with the marker and the file, the version
+// rolled back.
+func (e *testEnv) interruptedCommit(t *testing.T, dirName string, upload Upload, data []byte) string {
+	t.Helper()
+	dir := filepath.Join(e.st.Dir(storage.Models), filepath.FromSlash(dirName))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePendingMarker(dir, pendingMarker{UploadID: upload.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if upload.ID > 0 {
+		if err := os.Rename(e.svc.uploadPath(upload.ID), filepath.Join(dir, modelFile)); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := os.WriteFile(filepath.Join(dir, modelFile), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSidecar(dir, sidecar{ModelID: 999, Version: 1}); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestIntegrationInterruptedCommit(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	projectID := e.project(t, "p")
+	projectDir := fmt.Sprintf("project-%d", projectID)
+	data := fakePT(t, detectInfo("yolo11"), "first")
+
+	// After the restart the upload has lost its file; the cleanup at start
+	// gives it back, and the commit can be retried with the same version.
+	up := e.upload(t, projectID, "yolo11", data)
+	leftover := e.interruptedCommit(t, projectDir+"/v1", up, nil)
+	_, _, err := e.svc.CommitUpload(ctx, up.ID, CommitInput{})
+	wantKind(t, err, ErrConflict, "请取消后重新上传")
+	// While the upload is busy the folder is kept for the next time.
+	unlock, err := e.svc.uploads.lock(ctx, up.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.svc.cleanup(ctx)
+	unlock()
+	if !exists(filepath.Join(leftover, modelFile)) || exists(e.svc.uploadPath(up.ID)) {
+		t.Fatal("the leftover of a busy upload should be kept")
+	}
+	e.svc.cleanup(ctx)
+	if exists(leftover) {
+		t.Error("the leftover folder should be cleared")
+	}
+	if entries, _ := os.ReadDir(e.st.Dir(storage.Models)); len(entries) != 1 || entries[0].Name() != projectDir {
+		t.Errorf("models/ = %v (the moved-aside folder should be removed)", entries)
+	}
+	if b, err := os.ReadFile(e.svc.uploadPath(up.ID)); err != nil || !bytes.Equal(b, data) {
+		t.Fatalf("the file should be back in its upload: %v", err)
+	}
+	m, created, err := e.svc.CommitUpload(ctx, up.ID, CommitInput{})
+	if err != nil || !created || m.Version != 1 {
+		t.Fatalf("commit after the recovery = %+v, %v, %v", m, created, err)
+	}
+	if b, err := os.ReadFile(e.modelPath(m, modelFile)); err != nil || !bytes.Equal(b, data) {
+		t.Errorf("model.pt: %v", err)
+	}
+	if exists(e.modelPath(m, pendingFile)) {
+		t.Error("a committed model folder keeps no marker")
+	}
+
+	// A leftover in the way of the next version (here of a registration,
+	// which has no upload) is cleared by the addition itself, which takes
+	// its version.
+	e.interruptedCommit(t, projectDir+"/v2", Upload{}, []byte("left over"))
+	m2 := e.addModel(t, projectID, "yolo11")
+	if m2.Version != 2 {
+		t.Errorf("version = %d, want 2", m2.Version)
+	}
+	if b, err := os.ReadFile(e.modelPath(m2, modelFile)); err != nil || string(b) == "left over" {
+		t.Errorf("model.pt of v2: %q, %v", b, err)
+	}
+	if exists(e.modelPath(m2, pendingFile)) {
+		t.Error("v2 keeps no marker")
+	}
+
+	// The upload has ended meanwhile: the file is removed with the folder.
+	gone := e.upload(t, projectID, "yolo11", fakePT(t, detectInfo("yolo11"), "canceled"))
+	leftover = e.interruptedCommit(t, projectDir+"/v3", gone, nil)
+	if _, err := e.svc.CancelUpload(ctx, gone.ID); err != nil {
+		t.Fatal(err)
+	}
+	// The process died after the commit, before removing the marker: the
+	// model keeps its folder.
+	if err := writePendingMarker(filepath.Dir(e.modelPath(m2, modelFile)), pendingMarker{}); err != nil {
+		t.Fatal(err)
+	}
+	// An addition in progress is left alone.
+	busy := e.interruptedCommit(t, projectDir+"/v9", Upload{}, []byte("busy"))
+	e.svc.busy.add(busy)
+	// Folders without the marker (restored by hand) are kept.
+	restored := filepath.Join(e.st.Dir(storage.Models), projectDir, "v8")
+	if err := os.MkdirAll(restored, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.svc.cleanup(ctx)
+	if exists(leftover) || exists(e.svc.uploadDir(gone.ID)) {
+		t.Error("the leftover of a canceled upload should be removed")
+	}
+	if got, _ := e.svc.GetUpload(ctx, gone.ID); got.Status != UploadCanceled {
+		t.Errorf("canceled upload = %+v", got)
+	}
+	if exists(e.modelPath(m2, pendingFile)) || !exists(e.modelPath(m2, modelFile)) {
+		t.Error("only the stale marker of v2 should be removed")
+	}
+	if got, err := e.svc.GetModel(ctx, m2.ID); err != nil || got.FileMissing {
+		t.Errorf("v2 = %+v, %v", got, err)
+	}
+	if !exists(filepath.Join(busy, pendingFile)) || !exists(restored) {
+		t.Error("folders in use and folders without the marker must be kept")
+	}
+	e.svc.busy.remove(busy)
+	if err := os.RemoveAll(restored); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deleting the project's models clears its leftovers, so that its
+	// folder goes too.
+	if _, err := e.svc.DeleteProjectModels(ctx, projectID); err != nil {
+		t.Fatal(err)
+	}
+	if exists(filepath.Join(e.st.Dir(storage.Models), projectDir)) {
+		entries, _ := os.ReadDir(filepath.Join(e.st.Dir(storage.Models), projectDir))
+		t.Errorf("project folder kept: %v", entries)
+	}
+}
+
+func TestInspectFileWaitsForASlot(t *testing.T) {
+	calls := 0
+	s := &Service{inspectSlots: make(chan struct{}, 1), inspect: func(io.ReaderAt, int64) (*checkpoint.Info, error) {
+		calls++
+		return &checkpoint.Info{Task: "detect"}, nil
+	}}
+	s.inspectSlots <- struct{}{} // taken by another commit
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := s.inspectFile(ctx, strings.NewReader("x"), 1); !errors.Is(err, context.DeadlineExceeded) || calls != 0 {
+		t.Errorf("waiting for a slot = %v, %d calls", err, calls)
+	}
+	<-s.inspectSlots
+	if info, err := s.inspectFile(context.Background(), strings.NewReader("x"), 1); err != nil || info.Task != "detect" ||
+		calls != 1 || len(s.inspectSlots) != 0 {
+		t.Errorf("inspectFile = %+v, %v, %d calls, %d slots taken", info, err, calls, len(s.inspectSlots))
+	}
+}
+
+// TestIntegrationInspectSlots checks that at most maxInspections commits
+// inspect their file at once, and that stopping the service ends the wait
+// of the others.
+func TestIntegrationInspectSlots(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	projectID := e.project(t, "p")
+	const n = maxInspections + 1
+	uploads := make([]Upload, n)
+	for i := range uploads {
+		uploads[i] = e.upload(t, projectID, "yolo11", fakePT(t, detectInfo("yolo11"), strings.Repeat("x", i)))
+	}
+	entered, release := make(chan struct{}, n), make(chan struct{})
+	e.inspectHook = func() { entered <- struct{}{}; <-release }
+	e.svc.Start(ctx)
+	done := make(chan error, n)
+	for _, up := range uploads {
+		go func() {
+			_, _, err := e.svc.CommitUpload(ctx, up.ID, CommitInput{})
+			done <- err
+		}()
+	}
+	for range maxInspections {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("commits did not start inspecting")
+		}
+	}
+	select {
+	case <-entered:
+		t.Fatal("more commits inspect at once than there are slots")
+	case err := <-done:
+		t.Fatalf("a commit ended early: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	e.svc.Stop()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("the waiting commit = %v, want canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stopping the service did not end the wait")
+	}
+	close(release)
+	for range maxInspections {
+		<-done
+	}
+	for _, up := range uploads {
+		if got, _ := e.svc.GetUpload(ctx, up.ID); got.Status != UploadUploading || !exists(e.svc.uploadPath(up.ID)) {
+			t.Errorf("upload %d = %+v", up.ID, got)
+		}
 	}
 }

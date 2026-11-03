@@ -13,6 +13,7 @@ trainMaster 以 Docker Compose 部署：`postgres`（PostgreSQL 17）+ `app`（G
   - Linux 上的 Docker 还需要 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)，`make up SETUP_ARGS="--install-toolkit"` 可自动安装与配置（见第 10.2 节）。
   - Windows 上的 Docker Desktop（WSL 2 后端）自带 GPU 支持：在 Windows 中安装 NVIDIA 驱动即可，不需要（也不能）在 WSL 中安装驱动或 NVIDIA Container Toolkit。macOS 没有 NVIDIA GPU 支持，只能运行 CPU 训练节点。
   - 训练节点镜像包含 PyTorch 与 CUDA 运行库，第一次构建需要下载数 GB（可换成国内镜像，见第 7 节）。
+- 模型仓库下载 ONNX 时，转换由训练节点执行：需要至少一个在线的训练节点（0.2.0 或更新；CPU 训练节点即可，不需要 GPU），见第 10.10 节。没有训练节点时其它功能（包括上传模型、下载 PT）不受影响
 - `make setup` / `make up` 需要 bash 与 make（Linux、macOS、WSL 中都有）；没有时可以手动配置（见第 10.4 节）
 
 ## 2. 部署步骤
@@ -85,8 +86,9 @@ docker compose --profile '*' down   # 停止并删除全部容器（即 make dow
 | `TM_NODE_NAME` | 空 | 训练节点在平台上显示的名称，为空时为主机名。为空时 `make setup` 写入本机的主机名；它仍是 `make setup` 写入的主机名（等于原来的 `TM_HOST_HOSTNAME`）时跟随本机当前的主机名（如把 `.env` 迁移到新服务器后，见第 6 节），自己设置的名称不变 |
 | `TM_HOST_HOSTNAME` | 空 | 本机的主机名，`make setup` 每次写入。app 与训练节点容器以它作为主机名（compose 中的 `hostname`），页面上显示的服务器与节点主机名就是真实的机器名，重建容器后也不变；为空时 app 为 `trainmaster`、训练节点为 `trainmaster-trainer`。本机的主机名与 compose 中的服务名 `app`、`postgres` 相同（或第一个点之前的部分相同）时 `make setup` 把它留空：容器中这个名字会指向容器自己 |
 | `TM_SERVER_URL` | `http://app:8080` | 训练节点连接的平台地址；只在其它机器上运行训练节点时设置，如 `http://192.168.1.10:8080` |
-| `TM_HOST_TRAINER_DIR` | `./data/trainer` | 训练节点的状态目录（节点标识 `node-key`、心跳文件、Ultralytics 配置），挂载为容器内 `/var/lib/trainmaster`。训练节点还把 `TM_HOST_STORAGE_DIR` 挂载为 `/data`。不要拷贝到其它机器（见第 6 节） |
+| `TM_HOST_TRAINER_DIR` | `./data/trainer` | 训练节点的状态目录（节点标识 `node-key`、心跳文件、Ultralytics 配置、模型转换的临时工作目录 `work/`），挂载为容器内 `/var/lib/trainmaster`。训练节点还把 `TM_HOST_STORAGE_DIR` 挂载为 `/data`。不要拷贝到其它机器（见第 6 节） |
 | `TM_TRAINER_SHM_SIZE` | `8gb` | 训练节点容器的 `/dev/shm` 大小（PyTorch DataLoader 多进程加载数据使用） |
+| `TM_EXPORT_TIMEOUT` | 空（15 分钟） | 训练节点上一次模型转换（pt → ONNX，含校验）的时间上限，传给 `trainer` 与 `trainer-cpu`：秒数，或带 `s` / `m` 后缀（如 `900`、`30m`），不超过 24 小时。见第 10.10 节 |
 | `TRAINER_PYTHON_IMAGE` | `python:3.12-slim-bookworm` | 构建参数：训练节点的基础镜像，可换成内网镜像仓库地址；`make setup` 也用它验证 Docker 能否使用显卡 |
 | `DEBIAN_MIRROR` | 空（官方源） | 构建参数：训练节点镜像的 Debian 软件源，如 `https://mirrors.aliyun.com/debian` |
 | `PIP_INDEX_URL` | `https://pypi.org/simple` | 构建参数：PyPI 源（Ultralytics 等依赖，以及 `cu130` 版 PyTorch） |
@@ -143,11 +145,12 @@ docker compose --profile '*' down   # 停止并删除全部容器（即 make dow
 | `TM_TRAINER_SERVICE` | 空（按 `trainer` 处理） | `trainer` / `trainer-cpu` | 节点所在的 compose 服务，修复建议中的命令用它（如 `docker compose up -d --build trainer-cpu`）；裸机安装不设置 |
 | `TM_TRAINER_MODE` | `auto` | 来自 `.env` | `make setup` 的模式。为 `cpu` 时节点看到没有传入容器的显卡，给出“已选择 CPU 模式”的提示，而不是“显卡没有传入容器”的警告 |
 | `TM_TRAINER_VARIANT` | 空（不固定） | 来自 `.env`，默认 `auto` | `make setup --variant` 固定的 PyTorch 变体，`auto` 为不固定。固定时修复建议用 `--variant auto` 恢复自动选择，而不是再固定另一个变体 |
-| `TM_STATE_DIR` | `/var/lib/trainmaster` | `/var/lib/trainmaster` | 状态目录：节点标识 `node-key`、心跳文件、Ultralytics 配置；不可写时退回 `~/.local/state/trainmaster`（节点标识不能持久保存，日志中有提示） |
+| `TM_STATE_DIR` | `/var/lib/trainmaster` | `/var/lib/trainmaster` | 状态目录：节点标识 `node-key`、心跳文件、Ultralytics 配置、模型转换的工作目录 `work/model-export-<ID>/`（转换结束后删除）；不可写时退回 `~/.local/state/trainmaster`（节点标识不能持久保存，日志中有提示） |
 | `TM_DATA_DIR` | `/data` | `/data` | 数据目录，上报其磁盘空间；不存在时使用状态目录 |
 | `TM_TORCH_VARIANT` | 空 | 镜像构建时的变体 | 已安装的 PyTorch 变体，用于诊断 |
 | `TM_SELF_TEST` | `true` | `true` | 检测 CUDA 环境时是否执行自检（矩阵乘法与 YOLO 前向推理） |
 | `TM_SELF_TEST_TIMEOUT` | `300` | `300` | 环境检测子进程的超时秒数 |
+| `TM_EXPORT_TIMEOUT` | `900` | 来自 `.env`，留空为 `900` | 一次模型转换（pt → ONNX 子进程）的超时：秒数，可带 `s` / `m` 后缀（如 `900`、`30m`），大于 0 且不超过 24 小时（规则同 `TM_SELF_TEST_TIMEOUT`），见第 10.10 节 |
 | `TM_LOG_LEVEL` | `info` | 来自 `.env` | debug / info / warn / error |
 
 ## 4. 目录权限（PUID / PGID）
@@ -195,6 +198,7 @@ docker compose logs -f app       # 确认迁移执行成功、服务正常
 - `make up` 会写入提交号与构建时间，并先重新检测计算资源（驱动升级后可能换用更新的 PyTorch 变体）。它先构建并启动 postgres 与 app，再构建训练节点镜像：PyTorch 变体不变时，体积最大的 PyTorch 层使用构建缓存；训练节点镜像构建失败时只警告，平台的升级不受影响。直接 `docker compose up -d --build` 则一次构建全部镜像，训练节点镜像构建失败时 app 也不会更新。
 - **从没有训练节点的版本升级**：`make up` 现在会运行 `make setup`，在 `.env` 中启用训练节点（有可用的显卡时为 GPU 版 `trainer`，否则为 `trainer-cpu`）并构建它的镜像，第一次需要下载 PyTorch（GPU 版数 GB）。国内网络先按第 7 节配置镜像源；不需要训练节点时把第 3 步的 `make up` 换成 `make up SETUP_ARGS="--mode off"`。
 - 新旧版本的平台与训练节点可以混用一段时间（上报的数据允许未知字段），其它机器上的训练节点按第 10.6 节分别升级。
+- **升级到带模型仓库的版本**：迁移 `0008_create_models` 自动执行。ONNX 转换需要 0.2.0 或更新的训练节点（新增依赖 onnx、onnxslim、onnxruntime）：本机的训练节点由 `make up` 重新构建（PyTorch 变体不变时 PyTorch 层使用构建缓存）；其它机器上的训练节点、裸机节点按第 10.10 节升级。旧版训练节点照常注册与上报心跳，只是不领取转换任务；新版训练节点连接旧版平台时同样只是不领取任务（每 5 分钟检查一次平台是否已支持）。
 - 迁移只向前，不提供自动回滚。需要回退版本时，先恢复升级前的数据库备份（第 6 节），再用保留的旧镜像启动 postgres 与 app（`--no-build`：不构建任何镜像）：
 
   ```bash
@@ -206,7 +210,7 @@ docker compose logs -f app       # 确认迁移执行成功、服务正常
 
 ## 6. 备份与恢复
 
-需要备份两部分：**数据库**（元数据）和**存储目录**（图片等文件）。两者应在同一时间点附近备份。训练节点的状态目录（`TM_HOST_TRAINER_DIR`）只保存节点标识，不需要备份：丢失后训练节点会作为新节点注册，旧的节点记录显示为离线，可以在页面上删除。
+需要备份两部分：**数据库**（元数据）和**存储目录**（图片、模型等文件）。两者应在同一时间点附近备份。训练节点的状态目录（`TM_HOST_TRAINER_DIR`）只保存节点标识，不需要备份：丢失后训练节点会作为新节点注册，旧的节点记录显示为离线，可以在页面上删除。
 
 > **不要把训练节点的状态目录拷贝到其它机器**：`node-key` 就是节点的身份。把整个部署目录（包括 `./data/trainer`）拷贝到另一台 GPU 机器，或克隆装好训练节点的虚拟机，两台机器会使用同一个节点标识，在页面上只显示为一个节点，主机名、显卡与指标在两台机器之间来回变化（平台日志中有“两台机器使用了同一个节点标识”的警告）。在其中一台机器上删除状态目录中的 `node-key`（Docker 为 `./data/trainer/node-key`，裸机默认为 `/var/lib/trainmaster/node-key`）并重启训练节点，它会作为新节点注册。
 
@@ -241,6 +245,8 @@ tar -C "$STORAGE_DIR" --exclude ./cache --exclude ./tmp -czf "$BACKUP/storage-$(
 ```cron
 0 3 * * * cd /opt/trainMaster && docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > /backup/trainmaster/db-$(date +\%F).dump && rsync -a --delete --exclude /cache/ --exclude /tmp/ ./data/storage/ /backup/trainmaster/storage/
 ```
+
+**模型仓库**（`models/`）在存储目录的备份中：每个模型文件夹中的 `model.pt` 与 `model.json` 需要备份；`onnx/` 中只是 ONNX 转换结果的缓存，可以不备份（rsync 再加 `--exclude '/models/*/*/onnx/'`，tar 再加 `--exclude './models/*/*/onnx'`），恢复后再次下载时由训练节点重新转换。上传中的模型（`tmp/model-uploads/`）不在备份中，恢复后需要重新上传：继续上传或提交时会提示临时文件已丢失，在上传面板中取消即可（24 小时没有进展的上传也会自动取消）。备份时正在入库的模型文件夹带 `.pending` 标记：恢复后没有对应的模型记录时平台自动清理它（这个版本号随之可用），有记录时只删除标记。数据库与 `models/` 不是同一时间点的备份时：数据库中有、磁盘上没有文件的模型在页面上显示文件缺失，不能下载；磁盘上有、数据库中没有的模型文件夹不会显示，之后新上传的模型会跳过这些版本号，不会覆盖它们。
 
 ### 恢复
 
@@ -358,7 +364,7 @@ docker compose up -d          # 不加 --build，直接使用导入的镜像
 
 ## 9. 反向代理（nginx 示例）
 
-需要通过域名、HTTPS 或统一入口访问时，在 trainMaster 前面加一层 nginx。数据集导入会上传大量数据：压缩包按 8 MiB 分块上传（服务端单块上限 64 MiB），文件夹按批上传（服务端单批上限 256 MiB），因此 `client_max_body_size` 不能小于 `300m`（以后下载模型等可能更大，下例直接放宽到 2g）；同时注意超时设置：
+需要通过域名、HTTPS 或统一入口访问时，在 trainMaster 前面加一层 nginx。数据集导入会上传大量数据：压缩包与模型文件按 8 MiB 分块上传（服务端单块上限 64 MiB），文件夹按批上传（服务端单批上限 256 MiB），因此 `client_max_body_size` 不能小于 `300m`。其它机器上的训练节点经这个代理连接平台时（`TM_SERVER_URL` 为代理的地址），ONNX 转换的结果在一个请求中整个上传（平台上限 4 GiB），`client_max_body_size` 还要大于要转换的模型的 ONNX 文件（下例的 2g 足够常见的 YOLO 模型）；领取任务的长轮询最长 30 秒，`proxy_read_timeout` 不能比它短。同时注意超时设置：
 
 ```nginx
 server {
@@ -391,7 +397,7 @@ server {
 
 ## 10. GPU 训练节点
 
-训练节点（`trainer` / `trainer-cpu` 服务）自动识别本机的显卡、CPU 与 CUDA 环境，向平台注册并定时上报心跳，在“计算资源”页面中显示；镜像中预装与驱动匹配的 PyTorch 与 Ultralytics（YOLO），启动后自检。原理见 [架构说明 · 训练节点](architecture.md#9-训练节点)。
+训练节点（`trainer` / `trainer-cpu` 服务）自动识别本机的显卡、CPU 与 CUDA 环境，向平台注册并定时上报心跳，在“计算资源”页面中显示；镜像中预装与驱动匹配的 PyTorch 与 Ultralytics（YOLO），启动后自检。训练节点还执行模型仓库的 ONNX 转换（见 10.10）。原理见 [架构说明 · 训练节点](architecture.md#9-训练节点)。
 
 ### 10.1 make setup 做了什么
 
@@ -537,7 +543,7 @@ docker compose logs -f trainer
 - 平台在 HTTPS 反向代理之后时，填写代理的地址（如 `https://trainmaster.example.internal`）。
 - 用 `git clone` 接入新机器，不要从平台或其它节点拷贝整个部署目录：`./data/trainer` 中的节点标识会一起被拷贝，两台机器会成为同一个节点（见第 6 节）。
 - 升级：`git pull` 后再次执行 `make setup` 与 `docker compose up -d --build trainer`（或 `make setup` 输出的服务）。修改 `.env` 中的 `TM_TRAINER_SHM_SIZE` 等设置后：`docker compose up -d trainer`。
-- 训练节点把这台机器上的 `TM_HOST_STORAGE_DIR` 挂载为 `/data`，目前只用于上报磁盘空间；训练任务上线后需要读取数据集，届时需要通过 NFS 等共享存储挂载与平台相同的目录。
+- 训练节点把这台机器上的 `TM_HOST_STORAGE_DIR` 挂载为 `/data`，目前只用于上报磁盘空间（模型转换通过 HTTP 下载模型、上传结果，不需要共享存储）；训练任务上线后需要读取数据集，届时需要通过 NFS 等共享存储挂载与平台相同的目录。
 
 ### 10.7 不用 Docker（裸机安装）
 
@@ -576,10 +582,37 @@ services:
 
 训练节点镜像的 Debian 软件源、PyPI、PyTorch 与 NVIDIA Container Toolkit 软件源都可以换成国内镜像（`DEBIAN_MIRROR`、`PIP_INDEX_URL`、`TORCH_FIND_LINKS`、`NVIDIA_TOOLKIT_REPO`），基础镜像 `python:3.12-slim-bookworm` 可以换成内网镜像仓库（`TRAINER_PYTHON_IMAGE`），见第 7 节。
 
-### 10.10 常见问题
+### 10.10 模型转换（ONNX）
+
+在模型仓库中下载 ONNX 时，平台把转换放入队列，由训练节点领取后在本机转换并把结果传回平台（原理见 [架构说明 · 模型转换](architecture.md#模型转换)）。
+
+- **需要至少一个在线的训练节点，版本 0.2.0 或更新**（“计算资源”页面上显示为“节点 v0.2.0”；`python -m trainmaster_trainer --version`）。转换在 CPU 上进行（转换子进程中 `CUDA_VISIBLE_DEVICES` 为空），不占用显存，也不影响正在进行的训练，所以 **CPU 训练节点（`trainer-cpu`）就足够，不需要 GPU**。`make up` 在没有可用显卡时也会启动 CPU 训练节点；用 `--mode off` 关闭了训练节点的部署不能转换 ONNX（PT 下载不受影响），需要时改为 `make up SETUP_ARGS="--mode cpu"`。
+- **依赖**：转换需要 `onnx`、`onnxslim` 与 `onnxruntime`，版本固定在 `trainer/requirements.txt` 中（1.23.2 / 0.1.98 / 1.23.2），训练节点镜像与 `install.sh` 都会安装。转换用 Ultralytics 的安全加载读取模型文件，需要 PyTorch 2.6 及以上和带安全加载的 Ultralytics：`torch_variants.txt` 中的变体（最旧的 `cu118` 为 2.7.1）与固定的 Ultralytics 版本都满足，不满足时（如自己装了旧版依赖的裸机节点）转换失败并提示升级。镜像构建时会离线做一次 YOLO11n 的 ONNX 转换，依赖不完整或安全加载不可用时构建失败。节点运行时找不到 torch、ultralytics 或 onnx 时不领取转换任务，日志中有 `not claiming model_export tasks: cannot find …`，之后每 5 分钟重新检查一次。
+- **升级训练节点**：本机的 Docker 节点 `make up`（重新构建镜像）；其它机器上的 Docker 节点 `git pull` 后 `make setup`，再 `docker compose up -d --build trainer`（CPU 训练节点为 `trainer-cpu`，见 10.6）；裸机节点在新版的仓库目录中重新运行 `sudo trainer/scripts/install.sh`（沿用已有的配置，安装新增的依赖并重启服务，见 10.7）。
+- **离线 / 内网**：转换不访问网络，也不下载任何权重：子进程设置 `YOLO_OFFLINE=1`，并禁止 Ultralytics 在线安装缺少的依赖（`YOLO_AUTOINSTALL=False`）。依赖只在构建镜像（或运行 `install.sh`）时从 PyPI（`PIP_INDEX_URL`，可用内网镜像，见第 7 节）安装；离线服务器导入在联网机器上构建的训练节点镜像即可（第 7 节）。
+- **超时**：一次转换最长 `TM_EXPORT_TIMEOUT`（默认 900 秒），超时后转换失败，可以减小输入尺寸后重试，或延长超时。Docker 部署时在 `.env` 中设置（如 `TM_EXPORT_TIMEOUT=30m`，见 `.env.example`），然后 `docker compose up -d trainer`（CPU 训练节点为 `trainer-cpu`）；裸机节点写在配置文件 `<安装目录>/trainer.env` 中（重新运行 `install.sh` 时会保留），然后 `sudo systemctl restart trainmaster-trainer`。
+- **磁盘**：转换在训练节点状态目录的 `work/model-export-<ID>/` 中进行（Docker 为 `TM_HOST_TRAINER_DIR`），需要约 3 倍于模型文件的剩余空间，结束后删除。平台一侧，结果先写入存储目录的 `tmp/model-exports/` 再移入模型文件夹：节点上传前先带上文件大小询问平台，平台空间不足时转换直接失败（“上传转换结果失败：磁盘剩余空间不足…”），不会反复重试。
+- **安全**：上传的 pt 是用户提供的 pickle。转换子进程用 Ultralytics 的安全加载（`ULTRALYTICS_SAFE_LOAD=1`，只还原其允许清单中的类），只继承运行 Python 需要的环境变量，拿不到 `TM_NODE_TOKEN`、代理与云服务密钥；平台上传时也已拒绝引用了清单之外对象的文件。安全加载不是沙箱：转换子进程仍能访问训练节点能访问的文件（包括挂载的 `/data`），防护依赖 PyTorch 的安全加载与 Ultralytics 的允许清单本身没有漏洞；训练节点没有关闭它的选项，安全加载不可用时不转换。用户下载 PT 后在自己的机器上用 Ultralytics 或 `torch.load` 普通加载时不受这些保护，只加载来源可信的文件。
+- **一个节点同时只做一个转换**，其余的排队（页面上显示排队位置）；有多个在线的训练节点时并行。执行转换的节点中途停止时任务立即重新排队，崩溃或断网时在租约（60 秒）过期后重新排队，一个转换最多尝试 3 次。
+- **在节点上手动转换**（排障）：`export` 子命令用与平台的转换任务相同的子进程在本机转换，不连接平台，打印输入输出的形状与 ONNX Runtime 的验证结果。平台所在机器上的训练节点可以直接取模型仓库中的文件（训练节点把存储目录挂载为 `/data`）。先拷贝到容器的 `/tmp` 再转换：Ultralytics 把 ONNX 先写在 pt 文件旁边，不要让它写进模型文件夹：
+
+  ```bash
+  docker compose exec trainer sh -c 'cp /data/models/project-1/v3/model.pt /tmp/ &&
+    python -m trainmaster_trainer export --weights /tmp/model.pt --postprocess nms --imgsz 640'
+  ```
+
+  结果为 `/tmp/model.onnx`（`--output` 可以另指定）。其它选项：`--dynamic`（不能与 `--postprocess nms` 同时使用，规则与平台相同）、`--opset N`（11–21）、`--json`；`python -m trainmaster_trainer export --help` 查看全部。裸机节点用安装目录中的解释器：`/opt/trainmaster-trainer/bin/python -m trainmaster_trainer export --weights best.pt`。
+
+### 10.11 常见问题
 
 | 现象 | 原因与解决 |
 |---|---|
+| 下载 ONNX 时转换一直“排队中”，页面提示“没有可以执行转换的训练节点” | 没有在线的、能执行转换的训练节点（见 10.10）。在“计算资源”页面确认至少有一个在线的节点，且版本（“节点 v…”）不低于 0.2.0：旧版节点照常显示在线，但不领取转换任务，按 10.10 升级。版本已是 0.2.0 时查看节点日志（`docker compose logs trainer`，CPU 训练节点为 `trainer-cpu`；裸机为 `journalctl -u trainmaster-trainer`）：有 `not claiming model_export tasks: cannot find …` → 节点缺少 torch / ultralytics / onnx，重新构建镜像或重新运行 `install.sh`；有 `the platform does not support task claims` → 平台是旧版本，升级平台；有 401 / “节点令牌不正确” → 见下方“训练节点一直显示离线”一行。用 `--mode off` 关闭了本机训练节点时改为 `make up SETUP_ARGS="--mode cpu"`（或 `--mode auto`）。没有这条提示、只是排队位置不变时，节点正在执行排在前面的转换 |
+| 转换失败：“训练节点的 Ultralytics … 无法加载该模型” | 模型由比训练节点更新的 Ultralytics 版本训练（如 YOLO26 需要 8.4.0 及以上）：升级训练节点（10.10），再在下载对话框或模型详情页重试 |
+| 转换失败：“转换超时（… 秒内没有完成）” | CPU 较慢或模型、输入尺寸较大：减小输入尺寸，或按 10.10 调大训练节点的 `TM_EXPORT_TIMEOUT` |
+| 转换失败：“训练节点的 PyTorch … 不支持 Ultralytics 的安全加载（需要 2.6 及以上）”或“训练节点的 Ultralytics … 不支持 / 没有启用安全加载” | 节点上的 torch 或 ultralytics 太旧（多见于自己安装了依赖的裸机节点），节点为了安全不加载上传的文件：按 10.10 升级训练节点 |
+| 转换失败：“模型文件中引用了不允许加载的对象（…）” | 文件中有 Ultralytics 安全加载不允许的对象（上传时的检查只按名称判断，个别文件到加载时才被拒绝），可能是构造的恶意文件，或被其它工具改过：上传 Ultralytics 训练直接保存的 `best.pt` / `last.pt` |
+| 转换失败：“上传转换结果失败：磁盘剩余空间不足…” | 平台的存储目录（`TM_HOST_STORAGE_DIR`）空间不足，放不下转换结果：清理磁盘后在下载对话框或模型详情页重试 |
 | 启动 `trainer` 时报 `could not select device driver "nvidia" with capabilities: [[gpu]]`（较新的 Docker 为 `failed to discover GPU vendor from CDI: no known GPU vendor found`） | Docker 没有安装或没有配置 NVIDIA Container Toolkit：`make up SETUP_ARGS="--install-toolkit"`（其它机器上的训练节点：`make setup SETUP_ARGS="--install-toolkit"`，再 `docker compose up -d --build trainer`）。暂时不用 GPU：`make up SETUP_ARGS="--mode cpu"` |
 | `docker run --gpus all …` 或启动 `trainer` 时报 `AMD CDI spec not found` | Docker 29.5 起，dockerd 启动时还没有安装 NVIDIA Container Toolkit（装好 Toolkit 后没有重启 Docker）就会这样报错，与 AMD 显卡无关：`make up SETUP_ARGS="--install-toolkit"`（已安装时只配置并重启 Docker；其它机器上的训练节点：`make setup SETUP_ARGS="--install-toolkit"`，再 `docker compose up -d --build trainer`），或手动 `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` |
 | `--install-toolkit` 只打印了手动步骤，没有安装 | snap 版或 rootless 模式的 Docker、没有运行 systemd 的 WSL：脚本不能可靠地配置它们，按打印的步骤执行后重新运行 `make setup`，见 10.2 |
@@ -613,7 +646,13 @@ services:
 | “添加已有目录”里看不到拷贝上去的文件夹 | 确认文件夹在 `TM_HOST_STORAGE_DIR/datasets/` 下一级、不是以 `.` 开头、不是符号链接，并且对 `PUID:PGID` 可读，见第 4 节；文件夹名不是 UTF-8 编码（如在 Linux 上用 `unzip` 解压 Windows 打包的 zip 得到的乱码名）时也不会列出，请重命名（或改用 `unzip -O GBK` / 7-Zip 解压） |
 | 扫描结果提示“文件名不是 UTF-8 编码，已跳过” | 同上，这些文件不会被索引；在服务器上重命名后点“重新扫描”。直接在页面上传压缩包则不会有这个问题（GBK 文件名会自动转换） |
 | 数据集显示“文件夹缺失” | 数据集文件夹在服务器上被移动或删除了；放回原位置后点“重新扫描”，或删除该数据集记录 |
-| 训练节点（GPU、驱动、CUDA 环境）相关的问题 | 见第 10.10 节 |
+| 训练节点（GPU、驱动、CUDA 环境）相关的问题 | 见第 10.11 节 |
+| 上传模型时提示“磁盘剩余空间不足” | 上传模型需要至少“文件大小 + 512 MiB”的剩余空间：清理磁盘或把 `TM_HOST_STORAGE_DIR` 换到更大的磁盘 |
+| 上传模型时提示“文件中引用了平台不允许加载的对象（…）” | 文件引用了 Ultralytics 安全加载不允许的类或函数（如 `os.system`、自定义模块中的类），可能是构造的恶意文件，训练节点也不会加载它：上传由 Ultralytics 训练保存的模型文件。用 pickle 协议 0 / 1 另存过的文件也会这样被拒绝（`torch.save` 默认的协议 2 没有问题） |
+| 上传或提交模型时提示“服务器上找不到这次上传已接收的数据（临时文件已丢失）…” | 上传的临时文件（`tmp/model-uploads/<上传ID>/`）不在了，如恢复了数据库而 `tmp/` 不在备份中，或手动清理了 `tmp/`：在上传面板中取消后重新上传 |
+| 上传完成后长时间显示“正在校验模型” | 平台同时最多解析 2 个模型文件，其余的提交排队等待；大文件计算 SHA256 也需要一些时间。关闭页面不会中断提交 |
+| 存储目录的 `models/` 下有 `.deleting-…` 文件夹 | 删除模型时的临时改名（`.deleting-pending-…` 来自崩溃时还没提交的入库），平台启动时与每小时删除它们；一直留着时多半是权限不足（见第 4 节）。模型文件夹中的 `.pending` 是正在入库的标记，提交后删除，崩溃留下的由同一清理处理，不要手动删除 |
+| 下载 ONNX 时一直排队或转换失败 | 见第 10.11 节 |
 | 日志提示 `migration versions must never be reused or renamed` | 两个不同的迁移文件用了同一个编号（如不同分支各自新增了 `0002_*.sql`），或改了已执行文件的名字，见[架构说明 · 数据库迁移约定](architecture.md#7-数据库迁移约定) |
 
 容器日志按 10MB × 5 个文件轮转（`docker-compose.yml` 中的 `x-logging`），`docker compose logs` 只能看到最近的日志，需要长期保存时请接入日志系统。

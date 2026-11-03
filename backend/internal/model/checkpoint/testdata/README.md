@@ -9,10 +9,11 @@ in `<root>/data/N` is dropped) and the whole set stays around 1.3 MB.
 | `yolov8n.pt`, `yolov9t.pt`, `yolov10n.pt`, `yolo11n.pt`, `yolo12n.pt`, `yolo26n.pt` | `YOLO("<name>.yaml").save(...)`: untrained detection models; `yolov8n.pt` is stored uncompressed like the files torch writes, the others are deflated | Version and scale from the yaml name, parameter counts, heads, `End2End` (yolov10, yolo26), `ImageSize` 640 from `model.args` |
 | `yolo11n-seg.pt`, `yolo11n-cls.pt`, `yolo11n-pose.pt`, `yolo11n-obb.pt`, `yolo26n-seg.pt`, `yoloe-11n-seg.pt`, `yolov8n-worldv2.pt` | The same for the other tasks and heads | Task, head and model class of each task |
 | `line-a-detector.pt`, `my-model.pt` | `yolo26.yaml` and `yolov8.yaml` copied under custom names | Version from the architecture, scale from the first `scales` key |
+| `parts-cls.pt` | `yolo26-cls.yaml` copied under a custom name | No version from the architecture: `yolo11-cls.yaml` is the same network |
 | `yolo11n-best.pt`, `yolo26n-best.pt` | `best.pt` of 2 epochs of training (imgsz 96, CPU) on a synthetic dataset with the classes `scratch` and `划痕-凹坑` | Class names, `ImageSize` 96, epochs, epoch -1, best fitness, metrics, `TrainData`, `BaseModel` |
 | `yolo11n-last.pt` | `last.pt` after the first epoch, copied in `on_model_save` before Ultralytics strips the optimizer | `TrainingCheckpoint`, epoch 0 |
-| `yolo11n-variants.pt` | `yolo11n-best.pt` re-saved with numpy scalars (as older Ultralytics versions save), a `PurePosixPath`, class names as a list, imgsz `[96, 128]`, a NaN, a string and an int in the metrics | numpy and pathlib reducers, value cleaning |
-| `yolo26n-best-protocol0.pt`, `-protocol1.pt`, `-protocol4.pt`, `-protocol5.pt` | `yolo26n-best.pt` re-saved with pickle protocols 0, 1, 4 and 5 (torch uses 2) | The pickle interpreter (torch itself cannot load protocol 0) |
+| `yolo11n-variants.pt` | `yolo11n-best.pt` re-saved with numpy scalars (as older Ultralytics versions save), a `PosixPath`, class names as a list, imgsz `[96, 128]`, a NaN, a string and an int in the metrics | numpy and pathlib reducers, value cleaning |
+| `yolo26n-best-protocol0.pt`, `-protocol1.pt`, `-protocol4.pt`, `-protocol5.pt` | `yolo26n-best.pt` re-saved with pickle protocols 0, 1, 4 and 5 (torch uses 2) | The pickle interpreter (torch itself cannot load protocol 0). Protocols 0 and 1 pickle objects with `copyreg._reconstructor`, which safe loading refuses, so `Inspect` rejects them (`unsafe`) and the test checks their extraction directly |
 | `rtdetr-l.pt` | `RTDETR("rtdetr-l.yaml")` | `unsupported_model` |
 | `yolov5-repo.pt` | A tiny model with the class layout of the original YOLOv5 repository (`models.yolo.DetectionModel`, `models.common.Conv`) | `yolov5_repo` |
 | `state-dict.pt`, `state-dict-wrapped.pt` | `model.state_dict()`, and `{"model": OrderedDict of tensors}` | `not_ultralytics` (weights only) |
@@ -24,7 +25,9 @@ Inputs that are not files here are built by the tests: truncated and damaged zip
 a zip64 archive larger than 4 GiB (a sparse virtual file), oversized zip directories and `data.pkl` entries,
 top-level values that are not checkpoints (`TestInspectRejected`), and hostile pickles: deep nesting,
 huge LONG4 / BINUNICODE lengths, memo abuse, amplification through memo references, cycles
-(`TestUnpickleErrors`, `TestUnpickleCraftedDefaults`, the seeds of `FuzzInspect`).
+(`TestUnpickleErrors`, `TestUnpickleCraftedDefaults`, the seeds of `FuzzInspect`), a few-KB pickle that makes
+an opcode or the extraction copy or scan one large memoized string many times (`TestCraftedAmplification`),
+and `yolo11n-best.pt` with calls of `os.system` and the like added (`TestInspectUnsafe`).
 
 `.gitattributes` marks the `.pt` files as binary.
 
@@ -85,7 +88,8 @@ for name in ["yolov8n", "yolov9t", "yolov10n", "yolo11n", "yolo12n", "yolo26n", 
 RTDETR("rtdetr-l.yaml").save(pt / "rtdetr-l.pt")
 
 # 2. Custom yaml names (copies of the Ultralytics files): the version is recognized from the architecture.
-for src, dst in [("26/yolo26.yaml", "line-a-detector.yaml"), ("v8/yolov8.yaml", "my-model.yaml")]:
+for src, dst in [("26/yolo26.yaml", "line-a-detector.yaml"), ("v8/yolov8.yaml", "my-model.yaml"),
+                 ("26/yolo26-cls.yaml", "parts-cls.yaml")]:
     shutil.copy(models_cfg / src, work / dst)
     YOLO(str(work / dst)).save(pt / dst.replace(".yaml", ".pt"))
 
@@ -124,7 +128,7 @@ ckpt["best_fitness"] = np.float64(0.375)
 ckpt["epoch"] = np.int64(41)
 ckpt["train_metrics"] = {"metrics/mAP50(B)": np.float64(0.91), "metrics/mAP50-95(B)": np.float32(0.625),
                          "fitness": np.float64(float("nan")), "note": "text", "val/box_loss": 1}
-ckpt["train_args"]["data"] = pathlib.PurePosixPath("/data/exports/line-a/data.yaml")
+ckpt["train_args"]["data"] = pathlib.PosixPath("/data/exports/line-a/data.yaml")  # PurePosixPath is not a safe global
 ckpt["train_args"]["imgsz"] = [96, 128]
 ckpt["model"].names = ["scratch", "划痕-凹坑"]
 torch.save(ckpt, pt / "yolo11n-variants.pt")
@@ -333,3 +337,92 @@ for p in sorted(root.rglob("*.yaml")):
     e2e = bool(y.get("end2end")) or last == "v10Detect"
     print(f'{{"{p.relative_to(root)}", "{" ".join(sorted(mods))}", "{last}", {str(e2e).lower()}}},')
 ```
+
+## Safe globals
+
+`safe.go` mirrors what Ultralytics' safe loading (`ULTRALYTICS_SAFE_LOAD=1`, `_SafeLoad` in
+`ultralytics/nn/tasks.py`) allows with torch 2.14.1 and ultralytics 8.4.198; `safeGlobalCases` in `safe_test.go`
+and `TestFixtureGlobals` hold the verdicts. To check them against Python (after upgrading torch or Ultralytics),
+save `safe_globals.py` (below) next to the other scripts and run it with the module and name of each case, and
+with the fixtures and some real checkpoints:
+
+```sh
+export YOLO_OFFLINE=1 YOLO_CONFIG_DIR=/var/tmp/ckpt-ycfg CUDA_VISIBLE_DEVICES=
+/var/tmp/ckpt-venv/bin/python -I /var/tmp/ckpt-scripts/safe_globals.py lists
+/var/tmp/ckpt-venv/bin/python -I /var/tmp/ckpt-scripts/safe_globals.py names torch._utils _rebuild_tensor_v2 posix system
+/var/tmp/ckpt-venv/bin/python -I /var/tmp/ckpt-scripts/safe_globals.py files backend/internal/model/checkpoint/testdata/*.pt
+```
+
+`lists` prints `torchSafeGlobals` and `ultralyticsGlobals`. With torch 2.14.1 and ultralytics 8.4.198 every
+verdict of `names` matches `safeGlobalCases`, except `ultralytics.nn.text_model.CLIP`, which needs the `clip`
+package (`safe.go` allows it, as Ultralytics does once `clip` is installed). `files` refuses nothing in any
+fixture or real checkpoint except `torchscript.pt` and `yolov5-repo.pt` (as `TestFixtureGlobals` expects);
+torch's safe unpickler cannot read the protocol 0, 1, 4 and 5 files at all (it only knows the opcodes of
+protocol 2, which `torch.save` uses), so `Inspect` refuses the globals of the first two and accepts the
+others.
+
+`safe_globals.py`:
+
+```python
+"""Prints what Ultralytics' safe loading (ULTRALYTICS_SAFE_LOAD=1) refuses, to compare with safe.go.
+
+safe_globals.py lists                 the allow-lists: torchSafeGlobals and ultralyticsGlobals
+safe_globals.py names MODULE NAME ... one line per GLOBAL (module and name as pickled): allowed or refused
+safe_globals.py files FILE.pt ...     one line per checkpoint: the globals it references that are refused
+"""
+
+import io
+import sys
+import warnings
+
+import torch.serialization as ts
+from torch import _weights_only_unpickler as w
+from ultralytics.nn.tasks import _SafeLoad
+
+warnings.filterwarnings("ignore")
+scan = ts.get_unsafe_globals_in_checkpoint
+
+
+def register(weight, needed=None):
+    """Runs _SafeLoad.register in a fresh state, for a file or for a checkpoint referencing `needed`."""
+    ts.clear_safe_globals()
+    _SafeLoad._registry = None
+    if needed is not None:
+        ts.get_unsafe_globals_in_checkpoint = lambda _: needed
+    try:
+        _SafeLoad.register(weight)
+    finally:
+        ts.get_unsafe_globals_in_checkpoint = scan
+
+
+def safe():
+    return set(w._get_allowed_globals()) | set(w._get_user_allowed_globals())
+
+
+mode, args = sys.argv[1], sys.argv[2:]
+if mode == "lists":
+    print("torch:", " ".join(sorted(w._get_allowed_globals())))
+    print("ultralytics:", " ".join(sorted(_SafeLoad._build())))
+elif mode == "names":
+    for module, name in zip(args[::2], args[1::2]):
+        m, n = w._read_global_instruction(io.BytesIO(f"{module}\n{name}\n".encode()).readline)  # torch's renaming
+        try:
+            register("unused.pt", [f"{m}.{n}"])
+            verdict = "allowed" if f"{m}.{n}" in safe() else "refused"
+        except Exception as e:  # e.g. ModuleNotFoundError: clip is not installed
+            verdict = f"error {type(e).__name__}: {e}"
+        print(f"{module}.{name}\t{verdict}")
+elif mode == "files":
+    for path in args:
+        try:
+            register(path)
+            print(f"{path}\trefused {sorted(scan(path))}")
+        except Exception as e:  # pickle opcodes torch's safe unpickler does not read (protocols 0, 1, 4, 5), TorchScript
+            print(f"{path}\terror {type(e).__name__}: {str(e)[:100]}")
+```
+
+`allowedClass` only checks that a name in the modules whose classes `_SafeLoad` allows looks like a class (an
+identifier with an upper-case letter, so that `v10Detect`, `v8DetectionLoss` and `_ConvNd` pass): without
+importing anything the platform cannot check that it is an `nn.Module`. This accepts no fewer names than
+Ultralytics (checked over every attribute of those modules), and the few more it accepts (typing names,
+constants such as `ultralytics.nn.tasks.LOGGER`) are refused by the trainer, which loads with the real rule.

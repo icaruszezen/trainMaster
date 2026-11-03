@@ -73,7 +73,8 @@ TM_SERVER_URL=http://localhost:8080 TM_STATE_DIR=../data/trainer-dev .venv/bin/p
 - 在 `trainer/` 目录下运行 `python -m trainmaster_trainer` 即可导入本包，不需要安装；也可以 `pip install -e .` 后在任意目录运行 `trainmaster-trainer`。
 - 没有安装 PyTorch 时，硬件与实时指标照常上报，CUDA 环境显示为异常（`torch_missing`）。需要完整的环境时安装 CPU 版或与本机驱动匹配的 PyTorch 与 Ultralytics：`bash scripts/install-torch.sh cpu --python .venv/bin/python && .venv/bin/pip install -r requirements.txt`（变体见 [部署指南第 10.3 节](deployment.md#103-驱动与-pytorch-变体)）。
 - 本地后端默认不要求令牌；设置了 `TM_NODE_TOKEN` 时训练节点也要设置同一个值。`TM_STATE_DIR` 中保存节点标识，换一个目录就会作为新节点注册。
-- 其它子命令：`selftest`（中文的 CUDA 环境检测结果，`--json` 输出 JSON）、`healthcheck`；配置变量见 [部署指南第 3.3 节](deployment.md#33-训练节点配置容器内由-compose-和镜像设置)。
+- 其它子命令：`selftest`（中文的 CUDA 环境检测结果，`--json` 输出 JSON）、`export`（在本机把 pt 转换为 ONNX，与平台的转换任务使用同一个子进程）、`healthcheck`；配置变量见 [部署指南第 3.3 节](deployment.md#33-训练节点配置容器内由-compose-和镜像设置)。
+- 模型仓库的 ONNX 转换：节点注册后自动领取本地后端的转换任务。`requirements-dev.txt` 不含 torch 与 onnx，此时节点不领取转换任务（日志中有说明）；要在本机跑真实的转换，按上一条安装 CPU 版 PyTorch 与 `requirements.txt`（含 onnx、onnxslim、onnxruntime），可以先用 `.venv/bin/python -m trainmaster_trainer export --weights best.pt --imgsz 320` 单独验证。
 - 构建并运行镜像：`make docker-build-trainer`（使用 `.env` 中的 `TM_TORCH_VARIANT`），或不需要 GPU 的 CPU 版：`docker build --build-arg TORCH_VARIANT=cpu -t trainmaster-trainer:dev-cpu trainer`，再 `docker run --rm trainmaster-trainer:dev-cpu python -m trainmaster_trainer probe`。
 
 ## 3. 测试与检查
@@ -96,7 +97,7 @@ for t in trainer/scripts/tests/test-*.sh deploy/scripts/tests/test-*.sh; do bash
 shellcheck -x $(git ls-files '*.sh')
 ```
 
-后端单元测试不依赖数据库（数据集模块的压缩包、VOC、缩略图等测试使用 `backend/internal/dataset/testdata/` 中的小样本，来源见其中的 README）。数据库集成测试（迁移、并发加锁、`app_settings` 读写、数据集导入 / 扫描 / 接口）通过 `TM_TEST_DATABASE_URL` 启用，未设置时自动跳过。数据集相关的测试会为每个测试新建并删除一个独立的数据库，所以该账号需要 `CREATEDB` 权限（postgres 超级用户即可）。请使用一次性的数据库：
+后端单元测试不依赖数据库（数据集模块的压缩包、VOC、缩略图等测试使用 `backend/internal/dataset/testdata/` 中的小样本，来源见其中的 README）。数据库集成测试（迁移、并发加锁、`app_settings` 读写、数据集导入 / 扫描 / 接口，模型仓库的上传、版本分配、转换队列与租约）通过 `TM_TEST_DATABASE_URL` 启用，未设置时自动跳过。数据集相关的测试会为每个测试新建并删除一个独立的数据库，所以该账号需要 `CREATEDB` 权限（postgres 超级用户即可）。请使用一次性的数据库：
 
 ```bash
 docker run -d --rm --name tm-test-pg -e POSTGRES_PASSWORD=x -p 55432:5432 postgres:17-alpine
@@ -105,9 +106,22 @@ TM_TEST_DATABASE_URL='postgres://postgres:x@localhost:55432/postgres?sslmode=dis
 docker rm -f tm-test-pg
 ```
 
+### 模型文件解析的测试
+
+`backend/internal/model/checkpoint`（读取 `.pt` 的 pickle 解析器）的测试不需要 Python 与 PyTorch：
+
+- **夹具**：`testdata/*.pt` 是真实的 Ultralytics 检查点（YOLOv8 / v9 / v10 / 11 / 12 / 26 的各种任务、训练产出的 `best.pt` 与 `last.pt`、自定义配置名、不同的 pickle 协议，以及平台拒绝的 RT-DETR、原版 YOLOv5、纯 `state_dict`、TorchScript、旧格式），只保留 zip 中的 `data.pkl` 与 `version`（不含张量数据）。生成脚本与版本、需要同步更新的期望值见 `testdata/README.md`；`internal/model` 的集成测试（`checkpoint_e2e_test.go`）也用这些文件走完上传与转换请求的流程。
+- **安全加载的允许清单**：`safe.go` 照抄 Ultralytics 安全加载（`_SafeLoad`）在 torch 2.14.1、Ultralytics 8.4.198 下允许的对象，`safeGlobalCases`（`safe_test.go`）与 `TestFixtureGlobals` 记录了各名称与夹具的结论。升级训练节点的 torch 或 Ultralytics 后，用 `testdata/README.md`“Safe globals”一节中的 `safe_globals.py` 在装有它们的 Python 中对照一遍，不一致时同步修改 `safe.go`。
+- **模糊测试**：`FuzzInspect` 用夹具与构造的恶意 pickle 作为种子，检查解析器不 panic、不耗尽内存；`FuzzCleanText` 检查先截断再清洗的字符串与整串清洗的结果一致。平时的 `go test` 只运行种子与 `testdata/fuzz/FuzzInspect/` 中保存的输入；需要时运行一段时间的模糊测试，发现的输入会自动保存到该目录，修复后随代码提交作为回归用例：
+
+  ```bash
+  cd backend
+  go test ./internal/model/checkpoint -run '^$' -fuzz '^FuzzInspect$' -fuzztime 5m
+  ```
+
 ### 训练节点与脚本的测试
 
-- **pytest**（`trainer/tests/`）：不依赖 GPU、torch 与网络——NVML、torch、ultralytics 用假模块代替，平台用本地 `http.server` 模拟。CI 在 Python 3.10（`requires-python` 的下限）与 3.12（镜像中的版本）上运行。
+- **pytest**（`trainer/tests/`）：不依赖 GPU、torch 与网络——NVML、torch、ultralytics 用假模块代替，平台用本地 `http.server` 模拟（`tests/fake_platform.py`，含任务的领取、下载、进度、上传、完成与失败接口）。模型转换的测试（`test_model_export.py`、`test_tasks.py`）用 `tests/export_fakes.py` 中假的 `ultralytics`（含 `ultralytics.nn.tasks._SafeLoad`）、`onnx`、`onnxruntime` 覆盖各 YOLO 版本与后处理方式的参数、结果核对、错误翻译、安全加载、子进程的环境变量（没有 `TM_NODE_TOKEN`）、超时、SHA256 校验、上传前的预检、停止与放弃任务。转换子进程只继承允许清单中的环境变量，所以假模块从同目录的 `fake_export.json` 读取配置，而不是从环境变量；真实的转换由 CPU 版训练节点镜像构建时的冒烟检查覆盖（也检查安全加载可用）。CI 在 Python 3.10（`requires-python` 的下限）与 3.12（镜像中的版本）上运行。
 - **`trainer/scripts/tests/test-torch-variant.sh`**：变体选择规则（`lib/torch-variant.sh`）；Python 侧的 `tests/test_variants.py` 覆盖同样的用例，两边必须一致。修改 `torch_variants.txt` 时运行这两组测试，并同步 README 与部署指南第 10.3 节中抄录的表格。
 - **`trainer/scripts/tests/test-install.sh`**：裸机安装脚本 `install.sh` 与 `install-torch.sh`。
 - **`deploy/scripts/tests/test-setup-compute.sh`**：`make setup` 的脚本。用假的 `nvidia-smi`、`docker`、sysfs、`sudo`、apt / dnf / yum / zypper 等覆盖各种机器（有 / 没有显卡与驱动、旧驱动、RTX 50 系列、有 / 没有 NVIDIA Container Toolkit、新旧 Docker 的报错（包括 Docker 29.5 的 `AMD CDI spec not found`）、Docker Desktop、snap 与 rootless Docker、有 / 没有 systemd、WSL、无法连接 Docker、离线、超时等）、`.env` 的合并与安装流程，不需要 Docker 与 GPU，也不会改动本机。`VERBOSE=1` 打印每次运行的输出；脚本兼容 macOS 自带的 bash 3.2。
@@ -116,7 +130,7 @@ docker rm -f tm-test-pg
 
 在真实机器上调试 `make setup` 时，加 `SETUP_ARGS=--dry-run` 只检测、不修改任何文件，或用 `--env-file` 写到别的文件。
 
-CI（`.github/workflows/ci.yml`）在每次 push 到 main 和每个 Pull Request 上运行：后端（gofmt、vet、带 PostgreSQL 服务的测试、Windows/macOS 交叉编译）、前端（lint、typecheck、test、build）、训练节点（ruff、Python 3.10 与 3.12 上的 pytest、shellcheck、bash 测试），以及 Docker 镜像构建：应用镜像、CPU 版训练节点镜像（构建时执行一次 CPU 上的 YOLO 自检，再检查 `probe` 的输出），并分别在不启用训练节点、`COMPOSE_PROFILES=gpu`、`COMPOSE_PROFILES=cpu` 下检查 `docker compose config`。
+CI（`.github/workflows/ci.yml`）在每次 push 到 main 和每个 Pull Request 上运行：后端（gofmt、vet、带 PostgreSQL 服务的测试、Windows/macOS 交叉编译）、前端（lint、typecheck、test、build）、训练节点（ruff、Python 3.10 与 3.12 上的 pytest、shellcheck、bash 测试），以及 Docker 镜像构建：应用镜像、CPU 版训练节点镜像（构建时执行一次 CPU 上的 YOLO 自检与一次离线的 ONNX 转换，再检查 `probe` 的输出），并分别在不启用训练节点、`COMPOSE_PROFILES=gpu`、`COMPOSE_PROFILES=cpu` 下检查 `docker compose config`。
 
 ## 4. 添加新的后端 API
 
@@ -202,7 +216,7 @@ npx shadcn@latest add dialog
 **Python（训练节点）**
 
 - 提交前 `ruff check` 与 `ruff format --check` 必须通过（配置在 `trainer/pyproject.toml`，CI 会检查）；代码需兼容 Python 3.10。
-- 常驻进程只依赖标准库、`psutil` 与 `nvidia-ml-py`（HTTP 客户端用 `urllib`）；`torch`、`ultralytics` 只在环境检测的子进程中导入，常驻进程不占用显存。
+- 常驻进程只依赖标准库、`psutil` 与 `nvidia-ml-py`（HTTP 客户端用 `urllib`）；`torch`、`ultralytics`、`onnx` 只在环境检测与模型转换的子进程中导入，常驻进程不占用显存。
 - 运行依赖在 `requirements.txt` 中固定版本；`psutil`、`nvidia-ml-py` 的版本同时写在 `requirements-dev.txt` 中（有测试检查两者一致）。
 
 **Shell 脚本**

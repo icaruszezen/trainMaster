@@ -19,6 +19,10 @@ EXPORTS = "/api/v1/compute/agent/model-exports/"
 LEASE_SECONDS = 60
 MAX_ATTEMPTS = 3
 STAGES = ("downloading", "converting", "uploading")
+MAX_OUTPUT_BYTES = 4 << 30
+# hooks 返回 DROP 时不响应、直接断开连接：真实的服务端在读取上传内容之前拒绝较大的上传时，
+# 正在上传的节点看到的就是连接被重置（读不到响应）。
+DROP = "drop"
 _EXPORT_PATH = re.compile(
     r"/api/v1/compute/agent/model-exports/(\d+)/(input|progress|output|complete|fail)"
 )
@@ -46,6 +50,8 @@ class FakePlatform:
     mode：up 正常；503 返回服务端错误；drop 读完请求后直接断开连接（模拟网络故障）；
     422 返回校验失败（这三种对所有接口生效）。tasks_supported=False 模拟没有任务接口的旧版平台
     （任务接口返回 404 not_found）。hooks[接口名] 可以替换某个任务接口的响应（见 task_request）。
+    free_bytes：平台磁盘的剩余空间（None 为不限），上传结果与带 size_bytes 的上传阶段进度上报
+    与真实的服务端一样检查它（507）。
     """
 
     def __init__(self, token: str | None = None, interval: float = 10) -> None:
@@ -66,8 +72,10 @@ class FakePlatform:
         self.exports: dict[int, dict[str, Any]] = {}
         self.claims: list[dict[str, Any]] = []
         # hooks["claim" | "input" | "progress" | "output" | "complete" | "fail"](export 或 None, 请求)
-        # 返回 (status, payload) 时替换响应，返回 None 时照常处理；payload 为 bytes 时原样发送。
+        # 返回 (status, payload) 时替换响应，返回 None 时照常处理；payload 为 bytes 时原样发送；
+        # 返回 DROP 时断开连接。
         self.hooks: dict[str, Callable[[dict[str, Any] | None, dict[str, Any]], Any]] = {}
+        self.free_bytes: int | None = None
         self.task_changed = threading.Condition(self.lock)
         self.closed = False
         self._wakeups = 0
@@ -138,7 +146,12 @@ class FakePlatform:
                 if platform.tasks_supported and (
                     self.path == CLAIM or self.path.startswith(EXPORTS)
                 ):
-                    status, payload = platform.task_request(method, request)
+                    response = platform.task_request(method, request)
+                    if response == DROP:
+                        self.close_connection = True
+                        self.connection.shutdown(2)
+                        return
+                    status, payload = response
                     content_type = (
                         "application/octet-stream" if isinstance(payload, bytes) else None
                     )
@@ -309,7 +322,8 @@ class FakePlatform:
             "error": exp.get("error", ""),
         }
 
-    def task_request(self, method: str, request: dict[str, Any]) -> tuple[int, Any]:
+    def task_request(self, method: str, request: dict[str, Any]) -> tuple[int, Any] | str:
+        """返回 (status, payload)，或 DROP（断开连接，只有 hooks 会返回）。"""
         path = request["path"]
         if path == CLAIM and method == "POST":
             return self._claim(request)
@@ -377,9 +391,27 @@ class FakePlatform:
         stage = body.get("stage") if isinstance(body, dict) else None
         if stage not in STAGES:
             return _error(422, "validation_failed", "stage 不合法")
+        size = body.get("size_bytes")
+        if size is not None and (not isinstance(size, int) or size < 0):
+            return _error(422, "validation_failed", "size_bytes 不能为负数")
         exp["stage"] = stage
         exp["progress"].append(stage)
+        if stage == "uploading" and size:  # 预检：与上传时相同的检查
+            if size > MAX_OUTPUT_BYTES:
+                return _error(413, "payload_too_large", "转换结果不能超过 4 GiB")
+            refused = self._check_free_space(size)
+            if refused is not None:
+                return refused
         return 200, {"lease_seconds": LEASE_SECONDS}
+
+    def _check_free_space(self, size: int) -> tuple[int, Any] | None:
+        if self.free_bytes is not None and size > self.free_bytes:
+            return _error(
+                507,
+                "insufficient_storage",
+                f"磁盘剩余空间不足：可用 {self.free_bytes} B，至少需要 {size} B",
+            )
+        return None
 
     def _output(self, exp: dict[str, Any], request: dict[str, Any]) -> tuple[int, Any]:
         data = request["raw"] or b""
@@ -389,6 +421,9 @@ class FakePlatform:
             return _error(422, "validation_failed", "上传的字节数与 Content-Length 不一致")
         if sha.lower() != hashlib.sha256(data).hexdigest():
             return _error(422, "validation_failed", "上传的文件与 X-Content-Sha256 不一致")
+        refused = self._check_free_space(len(data))
+        if refused is not None:
+            return refused
         exp["output"] = data
         exp["output_sha256"] = sha.lower()
         return 200, {"received_bytes": len(data)}

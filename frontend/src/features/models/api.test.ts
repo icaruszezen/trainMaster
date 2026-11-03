@@ -6,6 +6,7 @@ import {
   createModelUpload,
   deleteModel,
   deleteModelExport,
+  modelExistsQuery,
   modelExportQuery,
   modelExportsQuery,
   modelKeys,
@@ -18,6 +19,7 @@ import {
   type ModelExport,
 } from "@/features/models/api"
 import { projectKeys } from "@/features/projects/api"
+import { ApiError } from "@/lib/api"
 import { queryClient } from "@/lib/query-client"
 
 afterEach(() => {
@@ -112,6 +114,65 @@ describe("model queries", () => {
     expect(interval(single, job("queued"))).toBe(1_000)
     expect(interval(single, job("succeeded"))).toBe(false)
     expect(interval(single, job("failed"))).toBe(false)
+  })
+
+  it("stops polling once the conversion or model is gone", () => {
+    const job = (status: ModelExport["status"]) => ({ status }) as ModelExport
+    const interval = (
+      options: { refetchInterval?: unknown },
+      data: unknown,
+      error: Error | null
+    ) =>
+      (options.refetchInterval as (query: unknown) => number | false)({
+        state: { data, error },
+      })
+    const notFound = new ApiError(404, "not_found", "转换任务不存在")
+    const offline = new ApiError(0, "network_error", "无法连接服务器")
+    const gateway = new ApiError(502, "http_error", "Bad Gateway")
+
+    // 删除后缓存中仍是“转换中”的记录：以 404 为准，不再轮询。
+    const single = modelExportQuery(5, 9)
+    expect(interval(single, job("running"), notFound)).toBe(false)
+    expect(interval(single, undefined, notFound)).toBe(false)
+    // 网络错误、5xx 可能是暂时的，继续轮询。
+    expect(interval(single, job("running"), offline)).toBe(1_000)
+    expect(interval(single, job("queued"), gateway)).toBe(1_000)
+
+    const list = modelExportsQuery(5)
+    const items = { items: [job("running")], total: 1 }
+    expect(interval(list, items, notFound)).toBe(false)
+    expect(interval(list, items, offline)).toBe(2_000)
+  })
+
+  it("checks whether a model still exists", async () => {
+    const run = (options: { queryFn?: unknown }) =>
+      (options.queryFn as (context: unknown) => Promise<boolean>)({
+        signal: new AbortController().signal,
+      })
+    const query = modelExistsQuery(5)
+    // 与模型详情分开缓存（不会沿用删除前的模型），但随详情一起刷新。
+    expect(query.queryKey).not.toEqual(modelKeys.detail(5))
+    expect(query.queryKey.slice(0, 3)).toEqual(modelKeys.detail(5))
+
+    const fetchMock = mockFetch(() => Response.json({ id: 5 }))
+    await expect(run(query)).resolves.toBe(true)
+    expect(requestOf(fetchMock).path).toBe("/api/v1/models/5")
+
+    mockFetch(() =>
+      Response.json(
+        { error: { code: "not_found", message: "模型不存在" } },
+        { status: 404 }
+      )
+    )
+    await expect(run(query)).resolves.toBe(false)
+
+    mockFetch(() =>
+      Response.json(
+        { error: { code: "internal", message: "服务器内部错误" } },
+        { status: 500 }
+      )
+    )
+    await expect(run(query)).rejects.toMatchObject({ status: 500 })
   })
 })
 

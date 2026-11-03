@@ -29,22 +29,20 @@ type ExportRequest struct {
 }
 
 // AllowedPostprocess returns the postprocessing modes a model can be
-// exported with, its default first. Classification models only have raw
-// outputs; models with an end-to-end head default to it (and can still
-// embed NMS on their one-to-many head); NMS needs a task with boxes.
+// exported with, its default first. Only tasks with boxes have an
+// end-to-end head or can embed NMS; the others (classification, semantic
+// segmentation, depth) only have raw outputs, even in YOLO26. Box models
+// with an end-to-end head default to it (and can still embed NMS on their
+// one-to-many head).
 func AllowedPostprocess(m Model) []string {
-	if m.Task == taskClassify {
+	if !hasBoxes(m.Task) {
 		return []string{PostprocessRaw}
 	}
 	var modes []string
 	if end2endCapable(m.YOLOVersion, m.Info) {
 		modes = append(modes, PostprocessEnd2End)
 	}
-	modes = append(modes, PostprocessRaw)
-	if slices.Contains(nmsTasks, m.Task) {
-		modes = append(modes, PostprocessNMS)
-	}
-	return modes
+	return append(modes, PostprocessRaw, PostprocessNMS)
 }
 
 // NormalizeExport validates a conversion request for m and fills in the
@@ -91,6 +89,16 @@ func NormalizeExport(m Model, req ExportRequest) (ExportOptions, error) {
 	default:
 		return invalid("后处理方式必须是 raw、nms 或 end2end")
 	}
+	// Ultralytics traces the embedded NMS for the export batch (always 1):
+	// with a dynamic batch, every image after the first gets no detections.
+	// The default is never nms, so only explicit requests end up here.
+	if o.Dynamic && o.Postprocess == PostprocessNMS {
+		alternative := "原始输出（raw）"
+		if slices.Contains(allowed, PostprocessEnd2End) {
+			alternative = "原始输出（raw）/ 端到端（end2end）"
+		}
+		return invalid("嵌入 NMS 的 ONNX 只能固定 batch 为 1，不能与动态尺寸同时使用；请关闭动态尺寸，或选择%s", alternative)
+	}
 
 	if req.Opset != nil {
 		if *req.Opset < minOpset || *req.Opset > maxOpset {
@@ -102,12 +110,16 @@ func NormalizeExport(m Model, req ExportRequest) (ExportOptions, error) {
 	return o, nil
 }
 
+// postprocessNotAllowed explains why mode is not in AllowedPostprocess(m);
+// it only suggests nms for tasks with boxes.
 func postprocessNotAllowed(m Model, mode string) error {
 	switch {
 	case m.Task == taskClassify:
 		return &Error{Kind: ErrInvalid, Message: "分类模型只支持原始输出（raw）"}
-	case mode == PostprocessNMS:
+	case !hasBoxes(m.Task) && mode == PostprocessNMS:
 		return newError(ErrInvalid, "%s模型没有检测框，不能嵌入 NMS，请选择 raw", taskLabel(m.Task))
+	case !hasBoxes(m.Task):
+		return newError(ErrInvalid, "%s模型没有检测框，不能导出为 end2end，请选择 raw", taskLabel(m.Task))
 	}
 	return newError(ErrInvalid, "%s 模型没有端到端（NMS-free）检测头，不能导出为 end2end，请选择 raw 或 nms",
 		versionLabel(m.YOLOVersion))

@@ -4,14 +4,14 @@
 
 它是桌面工具 [ez_training](https://github.com/icaruszezen/ez_training)（PyQt 版，覆盖数据集、预标注、标注、数据准备、训练、验证等）的团队 Web 版。
 
-> **当前进度：** 平台框架（Go + React 工程骨架、shadcn/ui 界面框架、Docker 部署与数据持久化）已完成；**数据集管理**已上线：压缩包 / 文件夹导入（VOC、X-AnyLabeling、YOLO 标注，统一转换为 VOC 保存）、服务器上已有文件夹直接添加为数据集、缩略图浏览与标注预览、按 VOC / X-AnyLabeling / YOLO 格式下载；**项目管理**已上线：按检测任务把数据集组织成项目（一个数据集可以属于多个项目），项目页汇总其中的数据、标注与模型情况；**标注工作台**已上线：在浏览器中逐张画矩形框，标注直接保存为数据集文件夹中的 VOC 文件；**计算资源**已上线：训练节点自动识别显卡、驱动、CPU 与内存并实时上报，按驱动与显卡自动准备好 YOLO 训练所需的 CUDA 版 PyTorch 环境并自检，`make setup` 自动检测并配置 Docker 的显卡支持。其余模块已有占位页，将在后续迭代中逐个实现。
+> **当前进度：** 平台框架（Go + React 工程骨架、shadcn/ui 界面框架、Docker 部署与数据持久化）已完成；**数据集管理**已上线：压缩包 / 文件夹导入（VOC、X-AnyLabeling、YOLO 标注，统一转换为 VOC 保存）、服务器上已有文件夹直接添加为数据集、缩略图浏览与标注预览、按 VOC / X-AnyLabeling / YOLO 格式下载；**项目管理**已上线：按检测任务把数据集组织成项目（一个数据集可以属于多个项目），项目页汇总其中的数据、标注与模型情况；**标注工作台**已上线：在浏览器中逐张画矩形框，标注直接保存为数据集文件夹中的 VOC 文件；**计算资源**已上线：训练节点自动识别显卡、驱动、CPU 与内存并实时上报，按驱动与显卡自动准备好 YOLO 训练所需的 CUDA 版 PyTorch 环境并自检，`make setup` 自动检测并配置 Docker 的显卡支持；**模型仓库**已上线：按项目上传 Ultralytics YOLO 的 `.pt` 模型（YOLOv8 / v9 / v10 / 11 / 12 / 26）并按 v1、v2… 迭代版本，平台直接解析文件、校验所选的 YOLO 版本，下载时可选 PT 或由训练节点自动转换的 ONNX。其余模块已有占位页，将在后续迭代中逐个实现。
 
 ## 功能模块
 
 | 分组 | 模块 | 页面路径 | 预留 API | 状态 |
 |---|---|---|---|---|
 | 概览 | 工作台（系统状态、平台流程入口） | `/` | `GET /api/v1/system/info` | 已完成 |
-| 项目管理 | 项目：新建 / 编辑 / 删除、纳入数据集、项目详情（数据集、标签分布、模型占位） | `/projects` | `/api/v1/projects` | 已完成 |
+| 项目管理 | 项目：新建 / 编辑 / 删除、纳入数据集、项目详情（数据集、标签分布、模型版本） | `/projects` | `/api/v1/projects` | 已完成 |
 | 数据管理 | 数据集：压缩包 / 文件夹导入（VOC / X-AnyLabeling / YOLO 标注）、添加已有目录、缩略图浏览与标注预览、按格式下载 | `/datasets` | `/api/v1/datasets` | 已完成 |
 | 数据管理 | 数据版本：划分、快照、导出 YOLO/VOC/COCO、增强 | `/datasets/versions` | `/api/v1/datasets` | 规划中 |
 | 标注 | 标注任务：分配、进度、审核返修、抽检 | `/annotation/tasks` | `/api/v1/annotation/tasks` | 规划中 |
@@ -21,8 +21,8 @@
 | 模型训练 | 训练任务：创建、排队调度、实时日志与曲线 | `/training/jobs` | `/api/v1/training/jobs` | 规划中 |
 | 模型训练 | 计算资源：训练节点自动接入、显卡 / CPU / 内存与 CUDA 环境识别、实时监控、重新检测 | `/training/compute` | `/api/v1/compute` | 已完成 |
 | 模型评估 | 模型评估：mAP/P/R/F1、混淆矩阵、PR 曲线、对比报告 | `/evaluation` | `/api/v1/evaluations` | 规划中 |
-| 模型管理 | 模型仓库：版本、溯源、ONNX/TensorRT 导出、发布 | `/models` | `/api/v1/models` | 规划中 |
-| 模型管理 | 推理测试：在线推理、结果可视化、阈值调节 | `/models/inference` | `/api/v1/models` | 规划中 |
+| 模型管理 | 模型仓库：上传 .pt、按项目迭代版本、PT / ONNX 下载（训练节点自动转换） | `/models` | `/api/v1/models` | 已完成 |
+| 模型管理 | 推理测试：在线推理、结果可视化、阈值调节 | `/models/inference` | — | 规划中 |
 | 系统管理 | 成员与权限：账号、角色、操作审计 | `/system/members` | — | 规划中 |
 | 系统管理 | 存储管理：存储目录与容量（已接入真实数据）、备份清理 | `/system/storage` | `GET /api/v1/system/info` | 部分完成 |
 | 系统管理 | 系统设置：平台配置、默认训练参数、视觉 API | `/system/settings` | — | 规划中 |
@@ -50,12 +50,12 @@
 
 ## 项目管理
 
-项目用于按检测任务（如“A 线外观检测”）组织数据集，以后训练任务和模型也会归到项目下。
+项目用于按检测任务（如“A 线外观检测”）组织数据集和模型，以后训练任务也会归到项目下。
 
-- 在项目页新建、编辑、删除项目；删除项目只删除项目本身，其中的数据集保留。
+- 在项目页新建、编辑、删除项目；删除项目只删除项目本身，其中的数据集保留。项目中有模型时，需要在删除对话框中勾选“同时删除 N 个模型”（模型文件与 ONNX 缓存一并删除）。
 - **一个数据集可以纳入多个项目**：新建项目时直接勾选数据集，或在项目详情页“添加数据集”，也可以在数据集卡片 / 详情页的“纳入项目”中勾选它所属的项目。
 - 数据集页可以按项目筛选，也可以筛选“未纳入项目”的数据集；卡片和列表上会显示数据集所属的项目。
-- 项目详情页汇总其中所有数据集的图片数、标注进度、占用空间，按数据集列出明细，并合计标签分布；“模型”一栏为占位，模型仓库上线后显示本项目的模型。
+- 项目详情页汇总其中所有数据集的图片数、标注进度、占用空间，按数据集列出明细，并合计标签分布；“模型”一栏按版本倒序列出本项目的模型，可以直接上传新版本（见下方“模型仓库”）。
 
 接口详见 [架构说明 · 项目接口](docs/architecture.md#项目接口)。
 
@@ -103,7 +103,36 @@ PyTorch 版本的选择规则（变体表 [`trainer/trainmaster_trainer/torch_va
 | 其它 GPU 机器（Docker） | 克隆本仓库，`make setup SETUP_ARGS="--server-url http://<平台IP>:8080 --token <令牌>"`（令牌即平台 `.env` 中的 `TM_NODE_TOKEN`），再只启动训练节点：`docker compose up -d --build trainer`（按 `make setup` 最后输出的服务名，选择 CPU 时为 `trainer-cpu`；需要时加 `--install-toolkit` 让脚本安装 NVIDIA Container Toolkit）。不要在这台机器上运行 `make up`，它会再启动一套平台 |
 | 不用 Docker | `sudo trainer/scripts/install.sh --server-url http://<平台IP>:8080 --token <令牌> --systemd`：安装到虚拟环境并注册为 systemd 服务 |
 
-完整说明（手动配置、只使用部分显卡、国内镜像、常见问题）见 [部署文档 · GPU 训练节点](docs/deployment.md#10-gpu-训练节点)。训练任务的排队与调度将在后续迭代中实现。
+完整说明（手动配置、只使用部分显卡、国内镜像、常见问题）见 [部署文档 · GPU 训练节点](docs/deployment.md#10-gpu-训练节点)。训练节点目前还负责模型仓库的 ONNX 转换（见下一节）；训练任务的排队与调度将在后续迭代中实现。
+
+## 模型仓库
+
+模型仓库（`/models`）按项目保存用 Ultralytics 训练的 YOLO 模型：**一个模型属于一个项目，一个项目可以有多个迭代版本**，同一项目中的模型依次编号为 v1、v2…，版本号只增不减，删除后也不会被复用。模型以普通文件保存在存储目录的 `models/` 下（宿主机默认 `./data/storage/models/project-<项目ID>/v<版本号>/`）：`model.pt` 是上传的原始文件（字节不变），`model.json` 记录项目、版本、YOLO 版本、SHA256 与从文件中读出的信息，不看数据库也能知道它是什么。
+
+- **上传**：在模型仓库，或项目详情页的“模型”中上传 `.pt` 文件（最大 8 GiB），选择所属项目与 YOLO 版本（YOLOv8、YOLOv9、YOLOv10、YOLO11、YOLO12、YOLO26），可以填写说明。按 8 MiB 分块上传、断点续传，进度显示在右下角的上传面板中，切换页面不会中断。
+- **检查文件**：平台不安装 PyTorch，而是直接读取 `.pt` 中保存的模型信息（只读的解析器，不执行文件中的任何代码），得到任务（检测 / 分割 / 分类 / 姿态 / 旋转框，以及 YOLO26 的语义分割 / 深度估计）、类别名称、训练输入尺寸、模型规模与参数量、训练轮数与 mAP 等指标。不是 Ultralytics 模型的文件会被拒绝并说明原因：纯 `state_dict`、TorchScript、PyTorch 1.6 之前的旧格式、原版 YOLOv5 仓库（`ultralytics/yolov5`）训练的模型、RT-DETR、YOLO-NAS 等。文件中引用了 Ultralytics 安全加载不允许的对象（如 `os.system`、自定义模块中的类）时也会被拒绝（“文件中引用了平台不允许加载的对象…”）：训练节点不会加载这样的文件，它也可能是构造的恶意文件。
+- **YOLO 版本**：平台从模型配置名（如 `yolo11n.yaml`）或网络结构识别文件中的版本，与所选的不同时不保存，提示改选识别出的版本；已上传的文件留在服务器上，改选后直接保存，不需要重新上传。识别不出版本的文件按所选的版本保存（如配置名是自定义的分类模型：YOLO11 与 YOLO26 的分类网络相同）。
+- **模型详情**（`/models/<模型ID>`）：YOLO 版本与规模、任务、输入尺寸、参数量、训练信息与指标、类别列表、SHA256、ONNX 转换记录；说明可以修改。删除模型同时删除它的文件夹（包括 ONNX 缓存）。
+
+**下载**：PT 直接下载原始文件（文件名为 `<项目名>_v<版本>.pt`）。选择 ONNX 时，平台把转换放入队列，由在线的训练节点用 Ultralytics 在 CPU 上转换并用 ONNX Runtime 验证一次，再传回平台；页面显示排队位置与进度，完成后自动开始下载。可以选择输入尺寸（高、宽：32–4096 且为 32 的倍数，默认为训练时的尺寸）、动态尺寸（batch、高、宽；不能与嵌入 NMS 同时使用）、opset（自动或 11–21）与后处理方式：
+
+| 后处理方式 | 输出（检测模型，640×640 输入） | 说明 |
+|---|---|---|
+| `raw` 原始输出 | `1 × (4 + 类别数) × 8400` | 推理后需要自行 NMS |
+| `nms` 嵌入 NMS | `1 × 300 × 6`（x1, y1, x2, y2, 置信度, 类别） | NMS 已嵌入模型；用于检测、分割、姿态、旋转框模型。只能固定 batch 为 1：Ultralytics 按导出时的 batch 展开嵌入的 NMS，动态 batch 时第一张之后的图片没有结果，所以不能与动态尺寸同时使用 |
+| `end2end` 端到端 | `1 × 300 × 6` | 使用端到端（NMS-free）检测头，不需要 NMS；只用于带这种检测头的检测、分割、姿态、旋转框模型 |
+
+| YOLO 版本 | 检测 / 分割 / 姿态 / 旋转框 | 分类、语义分割、深度估计（没有检测框） |
+|---|---|---|
+| YOLOv8、YOLOv9、YOLO11、YOLO12 | `raw`（默认）、`nms` | `raw` |
+| YOLOv10、YOLO26 | `end2end`（默认）、`raw`、`nms` | `raw` |
+
+- **缓存**：同一模型、同样的选项只转换一次，之后再下载直接返回保存在模型文件夹 `onnx/` 中的结果；结果文件被删除或上次转换失败时，再次下载会重新转换。关闭下载对话框不会取消转换，之后可以在模型详情页的转换记录中下载。
+- **需要在线的训练节点**：转换需要至少一个在线、版本不低于 0.2.0 的训练节点，CPU 训练节点即可，不需要 GPU，也不需要访问外网。没有这样的节点时转换一直排队，页面提示“没有可以执行转换的训练节点”，节点上线后自动开始；PT 下载不受影响。执行转换的节点中途掉线时，任务在租约（60 秒）过期后重新排队，最多尝试 3 次。见 [部署文档 · 模型转换](docs/deployment.md#1010-模型转换onnx)。
+- **安全**：`.pt` 是 pickle，加载时可以执行文件中的代码。平台只解析、从不加载它；训练节点转换时用 Ultralytics 的安全加载（`ULTRALYTICS_SAFE_LOAD=1`，只还原其允许清单中的类），转换子进程也拿不到节点令牌 `TM_NODE_TOKEN` 等配置。下载 PT 后自己用 Ultralytics（默认不启用安全加载）或 `torch.load(weights_only=False)` 加载时，文件仍会被完整反序列化：上传时的检查不能保证这样加载是安全的，请只加载来源可信的模型文件。
+- **为平台训练预留**：模型记录了来源（用户上传 / 平台训练）；训练任务上线后，训练产出的模型也会作为所属项目的新版本存入模型仓库，使用同样的检查与存储方式。
+
+存储方式、文件解析与接口见 [架构说明 · 模型仓库](docs/architecture.md#10-模型仓库)，转换任务的协议见 [架构说明 · 任务协议](docs/architecture.md#任务协议)。
 
 ## 技术栈
 
@@ -113,7 +142,7 @@ PyTorch 版本的选择规则（变体表 [`trainer/trainmaster_trainer/torch_va
 | 数据库 | PostgreSQL 17（只存元数据） |
 | 文件存储 | 宿主机本地目录（图片等文件直接以文件形式保存） |
 | 前端 | React 19、TypeScript、Vite、Tailwind CSS v4、[shadcn/ui](https://ui.shadcn.com)（new-york 风格，neutral 配色）、React Router、TanStack Query |
-| 训练节点 | Python 3.12、[PyTorch](https://pytorch.org)（按驱动自动选择 CUDA 版本）、[Ultralytics](https://github.com/ultralytics/ultralytics)（YOLO）、NVML（nvidia-ml-py）、psutil |
+| 训练节点 | Python 3.12、[PyTorch](https://pytorch.org)（按驱动自动选择 CUDA 版本）、[Ultralytics](https://github.com/ultralytics/ultralytics)（YOLO）、ONNX 与 ONNX Runtime（模型转换）、NVML（nvidia-ml-py）、psutil |
 | 部署 | Docker 多阶段构建（单镜像：Go 服务同时托管前端）、Docker Compose（训练节点为单独的镜像，按 profile 启用）、NVIDIA Container Toolkit |
 
 前端不引用任何外部 CDN 或在线字体，所有资源都打包进镜像，可在无外网的内网环境运行。
@@ -153,7 +182,7 @@ data/
 ├── postgres/          # PostgreSQL 数据目录（TM_HOST_POSTGRES_DIR），属主为容器内 postgres 用户（uid 70）
 ├── storage/           # 文件存储根目录（TM_HOST_STORAGE_DIR），挂载为容器内 /data
 │   ├── datasets/      # 数据集：每个数据集一个文件夹，图片与 VOC 标注直接以文件保存
-│   ├── models/        # 模型权重文件
+│   ├── models/        # 模型仓库：每个模型一个文件夹 project-<项目ID>/v<版本号>/（model.pt、model.json，onnx/ 为转换缓存）
 │   ├── runs/          # 训练/评估运行产物（日志、曲线、中间权重）
 │   ├── exports/       # 导出的训练集（YOLO / VOC / COCO）、打包导出与报告
 │   ├── cache/         # 缩略图等可再生缓存（可随时删除，无需备份）
@@ -161,7 +190,7 @@ data/
 └── trainer/           # 训练节点的状态目录（TM_HOST_TRAINER_DIR）：节点标识 node-key、心跳文件。不要拷贝到其它机器
 ```
 
-- **数据库只存元数据**（数据集、图片索引、导入记录等），图片和模型等大文件都在 `storage/` 下，可以直接用文件管理器、`rsync` 等工具查看和备份。
+- **数据库只存元数据**（数据集、图片索引、导入记录、模型版本等），图片和模型等大文件都在 `storage/` 下，可以直接用文件管理器、`rsync` 等工具查看和备份。
 - 应用启动时会自动创建上述子目录并检查是否可写；应用进程以 `.env` 中的 `PUID:PGID` 运行，建议设为宿主机上存储目录属主的 UID/GID（`id` 命令查看）。
 - 存储目录可以放在任意磁盘，例如在 `.env` 中设置 `TM_HOST_STORAGE_DIR=/mnt/bigdisk/trainmaster`。
 - 默认的 `./data` 位于 git 检出目录内，适合试用。**正式部署建议把 `TM_HOST_STORAGE_DIR`、`TM_HOST_POSTGRES_DIR` 设为仓库之外的绝对路径**（如 `/srv/trainmaster/storage`、`/srv/trainmaster/postgres`）：在仓库里执行 `git clean -x` 之类的清理命令会把 `./data` 一并删除。
@@ -186,6 +215,8 @@ docker compose exec -T postgres sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTG
 rsync -a --delete --exclude /cache/ --exclude /tmp/ "$BACKUP/storage/" "$STORAGE_DIR/"
 docker compose start app
 ```
+
+模型仓库的文件（`models/`）包含在存储目录的备份中；其中每个模型的 `onnx/` 文件夹只是 ONNX 转换的缓存，可以不备份（rsync 加 `--exclude '/models/*/*/onnx/'`），恢复后再次下载时会重新转换。
 
 迁移到新服务器时先 `make down`，再把 `.env` 与**两个数据目录**（`TM_HOST_STORAGE_DIR` 和 `TM_HOST_POSTGRES_DIR`，默认都在 `./data` 下）用 `sudo tar --numeric-owner` 打包拷贝过去，详见 [部署文档第 6 节](docs/deployment.md#6-备份与恢复)。直接拷贝 PostgreSQL 数据目录要求新旧环境的 PostgreSQL 主版本一致（当前为 17）；跨版本请使用 `pg_dump` / `pg_restore`。
 
@@ -215,6 +246,8 @@ trainMaster/
 │       ├── storage/             # 数据目录布局、可写检查、磁盘用量、安全路径解析
 │       ├── dataset/             # 数据集：文件识别、VOC 解析、解压、扫描、缩略图、导入任务
 │       ├── project/             # 项目：项目与数据集的多对多关系、合计统计
+│       ├── model/               # 模型仓库：上传、版本分配、下载、ONNX 转换队列与训练节点的任务接口
+│       │   └── checkpoint/      # 只读解析 Ultralytics 的 .pt（pickle，不执行代码）：任务、类别、YOLO 版本、引用的对象是否安全
 │       ├── compute/             # 计算资源：训练节点注册、心跳、在线状态、指标历史
 │       ├── hostinfo/            # 平台服务器自身的 CPU、内存、负载与 NVIDIA 显卡（/proc、/sys）
 │       ├── httpapi/             # 路由、中间件、统一响应与错误、handler
@@ -225,8 +258,8 @@ trainMaster/
 │       ├── features/            # 各功能模块页面（每个模块一个页面文件）
 │       ├── components/ui/       # shadcn/ui 组件
 │       └── ...
-├── trainer/                     # 训练节点（Python）：硬件与 CUDA 环境检测、自检、注册与心跳
-│   ├── trainmaster_trainer/     # 节点程序；torch_variants.txt 为 PyTorch 变体表
+├── trainer/                     # 训练节点（Python）：硬件与 CUDA 环境检测、自检、注册与心跳、执行平台的任务
+│   ├── trainmaster_trainer/     # 节点程序；tasks.py 领取任务，model_export.py 执行 pt → ONNX 转换，torch_variants.txt 为 PyTorch 变体表
 │   ├── scripts/                 # install.sh（裸机安装）、install-torch.sh、lib/torch-variant.sh（选择变体）
 │   ├── tests/                   # pytest（不需要 GPU 与 torch）
 │   └── Dockerfile               # 训练节点镜像（构建上下文为 trainer/）
@@ -248,11 +281,11 @@ trainMaster/
 3. **标注**（进行中）：已完成标注工作台（矩形框、数据集类别列表、快捷键、自动保存为 VOC）；后续：标签体系（跨数据集的缺陷类别、层级与别名）、标注任务分配与审核、智能预标注。
 4. **数据版本**：训练/验证/测试划分、版本快照、导出 YOLO / VOC / COCO。
 5. **训练**（进行中）：已完成训练节点（自动识别显卡与 CUDA 环境、自动选择 PyTorch 版本、注册与监控、Docker 显卡配置）；后续：训练任务队列与调度、实时日志与曲线。
-6. **评估与模型**：评估指标与报告、模型仓库与溯源、推理测试、预标注。
+6. **评估与模型**（进行中）：已完成模型仓库（上传 .pt、按项目迭代版本、下载 PT 或由训练节点自动转换的 ONNX）；后续：训练产出的模型自动入库、溯源、TensorRT 导出、发布、推理测试，以及评估指标与报告、预标注。
 7. **成员与权限**：账号登录、角色权限、操作审计。
 
 ## 文档
 
-- [架构说明](docs/architecture.md)：组件、模块划分、API 约定、存储布局、迁移约定、训练节点
-- [部署指南](docs/deployment.md)：环境变量、权限、升级、备份恢复、镜像加速、Windows、GPU 训练节点、反向代理
+- [架构说明](docs/architecture.md)：组件、模块划分、API 约定、存储布局、迁移约定、训练节点与任务协议、模型仓库
+- [部署指南](docs/deployment.md)：环境变量、权限、升级、备份恢复、镜像加速、Windows、GPU 训练节点与模型转换、反向代理
 - [开发指南](docs/development.md)：本地开发、训练节点的开发与测试、添加 API 与页面、添加 shadcn 组件、代码规范

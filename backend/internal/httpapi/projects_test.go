@@ -183,6 +183,10 @@ func TestProjectAPI(t *testing.T) {
 	if l := want[List[project.Project]](t, e.do("GET", "/api/v1/projects?q=其", nil), 200); l.Total != 1 || l.Items[0].ID != other.ID {
 		t.Errorf("search = %+v", l)
 	}
+	// PostgreSQL text cannot hold these.
+	for _, q := range []string{"%00", "a%FF", "%C3"} {
+		wantError(t, e.do("GET", "/api/v1/projects?q="+q, nil), 400, codeBadRequest, "参数 q 无效")
+	}
 
 	// Delete: the datasets stay.
 	if rec := e.do("DELETE", base, nil); rec.Code != 204 {

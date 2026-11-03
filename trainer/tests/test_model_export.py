@@ -10,6 +10,7 @@ import sys
 import textwrap
 import threading
 import time
+import types
 from pathlib import Path
 from typing import Any
 
@@ -34,15 +35,26 @@ from trainmaster_trainer.model_export import (
 VERSIONS = list(YOLO_LABELS)
 
 
-def install(monkeypatch, *, onnxruntime: bool = True, onnx: bool = True, **config: Any):
-    """把假模块放进 sys.modules，返回假的 ultralytics（calls 记录调用）与 onnxruntime。"""
+def install(
+    monkeypatch,
+    *,
+    onnxruntime: bool = True,
+    onnx: bool = True,
+    torch_version: str = "2.14.1+cpu",
+    **config: Any,
+):
+    """把假模块放进 sys.modules，返回假的 ultralytics（calls 记录调用）与 onnxruntime。与 child_main
+    一样在“导入” ultralytics 之前打开安全加载（ULTRALYTICS_SAFE_LOAD=1）。"""
+    monkeypatch.setenv(model_export.SAFE_LOAD_ENV, "1")
     ultralytics = export_fakes.make_ultralytics(**config)
     ort = export_fakes.make_onnxruntime() if onnxruntime else None
     monkeypatch.setitem(sys.modules, "ultralytics", ultralytics)
+    for name, module in ultralytics.submodules.items():
+        monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setitem(sys.modules, "onnx", export_fakes.make_onnx() if onnx else None)
     monkeypatch.setitem(sys.modules, "onnxruntime", ort)
     monkeypatch.setitem(sys.modules, "numpy", export_fakes.make_numpy())
-    monkeypatch.setitem(sys.modules, "torch", export_fakes.make_torch())
+    monkeypatch.setitem(sys.modules, "torch", export_fakes.make_torch(torch_version))
     return ultralytics, ort
 
 
@@ -81,6 +93,7 @@ def test_export_arguments_for_every_version(monkeypatch, tmp_path, version, post
         "call": "YOLO",
         "weights": str(tmp_path / "model.pt"),
         "task": "detect",
+        "safe_load": True,  # 用安全加载读取上传的 pt
     }
     assert export_calls(ultralytics) == [
         {
@@ -130,7 +143,9 @@ def test_end2end_allowed_by_the_head_not_the_version(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     ("version", "task", "expected"),
     [("yolo26", "detect", "end2end"), ("yolov10", "detect", "end2end"), ("yolo11", "detect", "raw"),
-     ("yolov8", "segment", "raw"), ("yolo26", "classify", "raw")],
+     ("yolov8", "segment", "raw"), ("yolo26", "classify", "raw"),
+     # 没有检测框的任务即使（自定义结构）带 one2one 头也是 raw，与平台相同
+     ("yolo26", "semantic", "raw"), ("yolo26", "depth", "raw")],
 )  # fmt: skip
 def test_default_postprocess_follows_the_model(monkeypatch, tmp_path, version, task, expected):
     ultralytics, _ = install(
@@ -149,6 +164,63 @@ def test_classify_only_raw(monkeypatch, tmp_path, postprocess):
     assert not out["ok"]
     assert out["error"].startswith("分类模型只能导出原始输出（raw）")
     assert export_calls(ultralytics) == []
+
+
+@pytest.mark.parametrize(("task", "label"), [("semantic", "语义分割"), ("depth", "深度估计")])
+@pytest.mark.parametrize("postprocess", ["nms", "end2end"])
+def test_tasks_without_boxes_only_export_raw(monkeypatch, tmp_path, task, label, postprocess):
+    # YOLO26 的语义分割、深度估计模型：没有端到端头，也不能嵌入 NMS；提示只建议 raw。
+    ultralytics, _ = install(monkeypatch, task=task)
+    out = run_export(spec(tmp_path, yolo_version="yolo26", task=task, postprocess=postprocess))
+    what = {"nms": "嵌入 NMS", "end2end": "导出 end2end"}[postprocess]
+    assert out == {
+        "ok": False,
+        "error": f"{label}模型没有检测框，不能{what}，请选择原始输出（raw）",
+        "detail": None,
+    }
+    assert export_calls(ultralytics) == []
+
+
+def test_tasks_without_boxes_raw(monkeypatch, tmp_path):
+    ultralytics, _ = install(monkeypatch, task="semantic")
+    out = run_export(spec(tmp_path, yolo_version="yolo26", task="semantic", postprocess="raw"))
+    assert out["ok"], out
+    assert export_calls(ultralytics)[0]["nms"] is None
+
+
+@pytest.mark.parametrize(
+    ("end2end_head", "others"),
+    [(False, "原始输出（raw）"), (True, "原始输出（raw）/ 端到端（end2end）")],
+)
+def test_dynamic_nms_is_refused(monkeypatch, tmp_path, end2end_head, others):
+    # NMSModel 按 batch 逐张处理，导出时循环被展开：动态 batch 的图只处理第一张图片，其余输出全为 0。
+    ultralytics, _ = install(monkeypatch, end2end_head=end2end_head)
+    out = run_export(spec(tmp_path, yolo_version="yolo11", dynamic=True, postprocess="nms"))
+    assert out == {
+        "ok": False,
+        "error": "嵌入 NMS 的 ONNX 只能固定 batch 为 1，不能与动态尺寸同时使用；"
+        f"请关闭动态尺寸，或选择{others}",
+        "detail": None,
+    }
+    assert export_calls(ultralytics) == []
+
+
+def test_dynamic_end2end(monkeypatch, tmp_path):
+    # 端到端头不经过 NMSModel，动态 batch 没有问题
+    ultralytics, _ = install(monkeypatch, end2end_head=True)
+    out = run_export(spec(tmp_path, yolo_version="yolo26", dynamic=True, postprocess="end2end"))
+    assert out["ok"], out
+    assert export_calls(ultralytics)[0]["dynamic"] is True
+    assert out["result"]["outputs"][0]["shape"] == ["batch", 300, 6]
+
+
+def test_end2end_hint_with_dynamic_input(monkeypatch, tmp_path):
+    install(monkeypatch)
+    out = run_export(spec(tmp_path, yolo_version="yolo11", dynamic=True, postprocess="end2end"))
+    assert out["error"] == (
+        "该模型（YOLO11）没有端到端（NMS-free）检测头，不能导出 end2end；"
+        "请选择 raw（关闭动态尺寸后也可以选择 nms）"
+    )
 
 
 def test_classify_raw(monkeypatch, tmp_path):
@@ -340,6 +412,123 @@ def test_unexpected_error_is_reported(monkeypatch, tmp_path):
     assert not out["ok"] and "ZeroDivisionError" in out["error"]
 
 
+# ---- 安全加载（pt 文件来自用户上传）----
+
+_UPGRADE = "，为了安全不会加载上传的模型文件。请升级训练节点（镜像或 requirements.txt 中的 ultralytics 与 torch）"
+
+
+@pytest.mark.parametrize(
+    ("config", "reason"),
+    [
+        ({"safe_load_class": False}, "训练节点的 Ultralytics 8.4.198 不支持安全加载模型文件"),
+        ({"safe_load_supported": False, "torch_version": "2.5.1+cpu"},
+         "训练节点的 PyTorch 2.5.1+cpu 不支持 Ultralytics 的安全加载（需要 2.6 及以上）"),
+        ({"safe_load": False}, "训练节点的 Ultralytics 8.4.198 没有启用安全加载（ULTRALYTICS_SAFE_LOAD）"),
+    ],
+)  # fmt: skip
+def test_refuses_to_load_without_safe_load(monkeypatch, tmp_path, config, reason):
+    # 这些情况下 ultralytics 会静默退回普通加载（torch.load(weights_only=False) 执行 pt 中的任意代码）。
+    ultralytics, _ = install(monkeypatch, **config)
+    out = run_export(spec(tmp_path))
+    assert out == {"ok": False, "error": reason + _UPGRADE, "detail": None}
+    assert ultralytics.calls == []  # 没有加载
+
+
+def test_every_torch_variant_supports_safe_load():
+    # 转换只用安全加载读取 pt（_SafeLoad 需要 PyTorch 2.6 及以上）：每个变体的节点都要能转换
+    from trainmaster_trainer.variants import load_variants
+
+    assert [v.name for v in load_variants() if version_tuple(v.torch) < (2, 6)] == []
+
+
+def test_refuses_to_load_without_ultralytics_tasks(monkeypatch, tmp_path):
+    ultralytics, _ = install(monkeypatch)
+    monkeypatch.setitem(sys.modules, "ultralytics.nn.tasks", None)
+    out = run_export(spec(tmp_path))
+    assert not out["ok"]
+    assert out["error"].startswith("训练节点无法导入 ultralytics.nn.tasks（ModuleNotFoundError")
+    assert ultralytics.calls == []
+
+
+# ultralytics 8.4.198 把 torch 拒绝加载的 UnpicklingError 包装为 TypeError；原因（被拒绝的对象）在 cause 中。
+_REFUSED = (
+    "ERROR ❌️ /w/model.pt references types outside the supported Ultralytics checkpoint format. "
+    "Use an official Ultralytics model, i.e. 'yolo predict model=yolo26n.pt'"
+)
+_WEIGHTS_ONLY = (
+    "Weights only load failed. In PyTorch 2.6, we changed the default value of the `weights_only` "
+    "argument in `torch.load` from `False` to `True`.\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("cause", "refused"),
+    [
+        # torch 2.14 的原文：模块被禁止的函数、不在允许清单中的对象、Ultralytics 限制的 getattr
+        (_WEIGHTS_ONLY + "\n\nTrying to load unsupported GLOBAL posix.system whose module posix is "
+         "blocked.\n\nCheck the documentation of torch.load", "posix.system"),
+        (_WEIGHTS_ONLY + "\tWeightsUnpickler error: Unsupported global: GLOBAL subprocess.Popen was not "
+         "an allowed global by default. Please use `torch.serialization.add_safe_globals("
+         "[subprocess.Popen])`", "subprocess.Popen"),
+        (_WEIGHTS_ONLY + "WeightsUnpickler error: \n\nunsafe getattr(type, '__subclasses__') blocked "
+         "during restricted model load\n\n", "getattr(type, '__subclasses__')"),
+    ],
+)  # fmt: skip
+def test_unsafe_checkpoint_is_refused(monkeypatch, tmp_path, cause, refused):
+    install(monkeypatch, load_error=["TypeError", _REFUSED], load_cause=["UnpicklingError", cause])
+    out = run_export(spec(tmp_path, yolo_version="yolo11", saved_ultralytics_version="9.0.0"))
+    assert not out["ok"]
+    assert out["error"] == (
+        f"模型文件中引用了不允许加载的对象（{refused}），为了安全训练节点不会加载它。"
+        "请上传由 Ultralytics 训练保存的模型文件"
+    )
+    assert "Weights only load failed" in out["detail"]
+
+
+@pytest.mark.parametrize(
+    ("cause", "why"),
+    [(_WEIGHTS_ONLY + "WeightsUnpickler error: \n\nUnsupported operand 83\n\nCheck the documentation",
+      "（Unsupported operand 83）"),
+     (_WEIGHTS_ONLY, "")],
+)  # fmt: skip
+def test_safe_load_refusal_without_an_object_is_a_damaged_file(monkeypatch, tmp_path, cause, why):
+    # 随机字节等：安全加载拒绝了内容，但没有不允许的对象，不说“不安全”
+    install(monkeypatch, load_error=["TypeError", _REFUSED], load_cause=["UnpicklingError", cause])
+    out = run_export(spec(tmp_path))
+    assert out["error"] == f"模型文件已损坏，或不是 Ultralytics 保存的检查点，无法加载{why}"
+
+
+def test_class_from_a_newer_ultralytics_is_not_unsafe(monkeypatch, tmp_path):
+    # 安全加载允许的模块中节点上没有的类：模型由更新的 Ultralytics 保存，提示升级而不是“不安全”。
+    cause = (
+        _WEIGHTS_ONLY + "WeightsUnpickler error: Unsupported global: GLOBAL "
+        "ultralytics.nn.modules.block.C9k9 was not an allowed global by default."
+    )
+    install(monkeypatch, load_error=["TypeError", _REFUSED], load_cause=["UnpicklingError", cause])
+    out = run_export(spec(tmp_path, yolo_version="yolo26", saved_ultralytics_version="8.5.3"))
+    assert out["error"] == (
+        "训练节点的 Ultralytics 8.4.198 无法加载该模型（YOLO26 需要 8.4.0 及以上、YOLO11 需要 8.3.0 及以上），"
+        "请升级训练节点；该模型由 Ultralytics 8.5.3 保存，比训练节点的 8.4.198 新"
+    )
+
+
+def test_existing_class_refused_by_safe_load_is_unsafe(monkeypatch, tmp_path):
+    # 模块中有这个类但安全加载不允许（不是 nn.Module）：不是版本问题
+    block = types.ModuleType("ultralytics.nn.modules.block")
+    block.Helper = type("Helper", (), {})  # type: ignore[attr-defined]
+    cause = _WEIGHTS_ONLY + "Unsupported global: GLOBAL ultralytics.nn.modules.block.Helper was not"
+    install(monkeypatch, load_error=["TypeError", _REFUSED], load_cause=["UnpicklingError", cause])
+    monkeypatch.setitem(sys.modules, "ultralytics.nn.modules.block", block)
+    out = run_export(spec(tmp_path))
+    assert out["error"].startswith(
+        "模型文件中引用了不允许加载的对象（ultralytics.nn.modules.block.Helper）"
+    )
+    # 小写开头（函数）的对象、安全加载不按需允许的模块中的类不当作缺少的类
+    assert model_export._missing_class("ultralytics.nn.modules.block.helper") is False
+    assert model_export._missing_class("subprocess.Popen") is False
+    assert model_export._missing_class("ultralytics.nn.modules.block.sub.C9k9") is False
+
+
 # ---- 错误翻译 ----
 
 _TOO_OLD_11 = (
@@ -452,21 +641,20 @@ def test_spec_validation(data):
 
 
 def child_env(tmp_path: Path, **config: Any) -> dict[str, str]:
-    fakes_dir = export_fakes.write_modules(tmp_path / "fake-ml", onnxruntime=True)
+    fakes_dir = export_fakes.write_modules(tmp_path / "fake-ml", onnxruntime=True, **config)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("TM_", "YOLO_"))}
-    env.update(
-        PYTHONPATH=os.pathsep.join([str(fakes_dir), str(TRAINER_DIR)]),
-        FAKE_EXPORT=json.dumps(config),
-    )
+    env.update(PYTHONPATH=os.pathsep.join([str(fakes_dir), str(TRAINER_DIR)]))
     return env
 
 
-def run_child(tmp_path: Path, spec_json: str, **config: Any) -> subprocess.CompletedProcess:
+def run_child(
+    tmp_path: Path, spec_json: str, env: dict[str, str] | None = None, **config: Any
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "trainmaster_trainer.model_export", "--spec", spec_json],
         capture_output=True,
         text=True,
-        env=child_env(tmp_path, **config),
+        env={**child_env(tmp_path, **config), **(env or {})},
         timeout=60,
     )
 
@@ -481,6 +669,17 @@ def test_child_main_prints_only_the_result_json(tmp_path):
     assert data["ok"] is True and data["result"]["end2end"] is True
     assert "C extension writes to fd 1" in proc.stderr
     assert "ultralytics prints its export log" in proc.stderr
+
+
+def test_child_main_turns_on_safe_load(tmp_path):
+    # 在导入 ultralytics 之前打开安全加载（它在导入时读取开关），即使环境变量中关闭了它
+    calls = tmp_path / "calls.jsonl"
+    s = spec(tmp_path, postprocess="raw")
+    proc = run_child(
+        tmp_path, json.dumps(s.to_json()), {model_export.SAFE_LOAD_ENV: "0"}, calls_file=str(calls)
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(calls.read_text().splitlines()[0])["safe_load"] is True
 
 
 def test_child_main_failure_exit_code(tmp_path):
@@ -513,9 +712,8 @@ def process(tmp_path: Path, command: list[str] | None = None, timeout: float = 6
 
 
 def test_process_runs_the_real_child_module(tmp_path, monkeypatch):
-    fakes_dir = export_fakes.write_modules(tmp_path / "fake-ml")
+    fakes_dir = export_fakes.write_modules(tmp_path / "fake-ml", end2end_head=True)
     monkeypatch.setenv("PYTHONPATH", str(fakes_dir))
-    monkeypatch.setenv("FAKE_EXPORT", json.dumps({"end2end_head": True}))
     out = process(tmp_path).run(spec(tmp_path, yolo_version="yolo26", postprocess="end2end"))
     assert out["ok"], out
     assert out["result"]["outputs"][0]["shape"] == [1, 300, 6]
@@ -525,15 +723,21 @@ def test_process_runs_the_real_child_module(tmp_path, monkeypatch):
 def test_process_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     monkeypatch.delenv("YOLO_VERBOSE", raising=False)
+    monkeypatch.setenv("TM_NODE_TOKEN", "node-token-secret")
+    monkeypatch.setenv("TM_SELF_TEST", "true")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+    monkeypatch.setenv("ULTRALYTICS_SAFE_LOAD", "0")
     cmd = script(
         tmp_path,
         """
         import json, os, sys
         keys = ("CUDA_VISIBLE_DEVICES", "YOLO_OFFLINE", "YOLO_CONFIG_DIR", "YOLO_AUTOINSTALL",
-                "YOLO_VERBOSE", "TM_SELF_TEST")
+                "YOLO_VERBOSE", "ULTRALYTICS_SAFE_LOAD", "TM_SELF_TEST", "TM_NODE_TOKEN",
+                "AWS_SECRET_ACCESS_KEY")
         env = {k: os.environ.get(k) for k in keys}
         spec = json.loads(sys.argv[sys.argv.index("--spec") + 1])
-        print(json.dumps({"ok": True, "onnx_path": spec["weights"], "result": {"env": env, "cwd": os.getcwd()}}))
+        result = {"env": env, "names": sorted(os.environ), "cwd": os.getcwd()}
+        print(json.dumps({"ok": True, "onnx_path": spec["weights"], "result": result}))
         """,
     )
     out = process(tmp_path, cmd).run(spec(tmp_path), cwd=tmp_path)
@@ -544,8 +748,19 @@ def test_process_environment(tmp_path, monkeypatch):
         "YOLO_CONFIG_DIR": str(tmp_path / "state" / "ultralytics"),
         "YOLO_AUTOINSTALL": "False",
         "YOLO_VERBOSE": "True",
-        "TM_SELF_TEST": os.environ.get("TM_SELF_TEST"),
+        "ULTRALYTICS_SAFE_LOAD": "1",  # 用安全加载读取上传的 pt
+        # 加载用户上传的 pt 的进程拿不到节点令牌等配置与其它密钥
+        "TM_SELF_TEST": None,
+        "TM_NODE_TOKEN": None,
+        "AWS_SECRET_ACCESS_KEY": None,
     }
+    added = {"PYTHONUNBUFFERED", "CUDA_VISIBLE_DEVICES", "ULTRALYTICS_SAFE_LOAD"}
+    assert all(
+        name in model_export._EXPORT_ENV_NAMES
+        or name.startswith(model_export._EXPORT_ENV_PREFIXES)
+        or name in added
+        for name in out["result"]["names"]
+    ), out["result"]["names"]
     assert out["result"]["cwd"] == str(tmp_path)
 
 
@@ -643,6 +858,28 @@ def test_real_child_module_without_ultralytics(tmp_path, monkeypatch):
     if out["ok"]:
         pytest.skip("ultralytics is installed in the test environment")
     assert out["error"].startswith("训练节点无法导入 Ultralytics")
+
+
+def test_export_env_is_minimal(tmp_path):
+    base = {
+        "PATH": "/usr/local/bin:/usr/bin", "HOME": "/var/lib/trainmaster", "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8", "TZ": "Asia/Shanghai", "PYTHONPATH": "/opt/extra", "OMP_NUM_THREADS": "4",
+        "YOLO_CONFIG_DIR": "/elsewhere", "YOLO_OFFLINE": "0", "CUDA_VISIBLE_DEVICES": "0",
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "ULTRALYTICS_SAFE_LOAD": "false",
+        "TM_NODE_TOKEN": "secret", "TM_SERVER_URL": "http://app:8080", "TM_STATE_DIR": "/x",
+        "AWS_SECRET_ACCESS_KEY": "x", "HTTPS_PROXY": "http://user:pw@proxy:3128", "LD_PRELOAD": "/x.so",
+    }  # fmt: skip
+    env = model_export.export_env(tmp_path, base=base)
+    assert not [k for k in env if k.startswith("TM_")]
+    assert not {"AWS_SECRET_ACCESS_KEY", "HTTPS_PROXY", "LD_PRELOAD"} & set(env)
+    for name in ("PATH", "HOME", "LANG", "LC_ALL", "TZ", "OMP_NUM_THREADS", "CUDA_DEVICE_ORDER"):
+        assert env[name] == base[name]
+    assert env["ULTRALYTICS_SAFE_LOAD"] == "1"
+    assert env["YOLO_OFFLINE"] == "1" and env["YOLO_CONFIG_DIR"] == str(tmp_path / "ultralytics")
+    assert env["YOLO_AUTOINSTALL"] == "False" and env["CUDA_VISIBLE_DEVICES"] == ""
+    assert env["PYTHONPATH"].split(os.pathsep)[0] == "/opt/extra"
+    assert env["PYTHONPATH"].split(os.pathsep)[-1] == str(TRAINER_DIR)  # 从源码目录运行时能导入本包
+    assert base["TM_NODE_TOKEN"] == "secret"  # 不修改传入的环境变量
 
 
 def test_export_env_keeps_explicit_verbosity(tmp_path):

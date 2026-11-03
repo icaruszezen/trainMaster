@@ -8,6 +8,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -102,23 +103,39 @@ const (
 const highestProtocol = 5
 
 // limits bounds the work of the unpickler so that a crafted data.pkl cannot
-// exhaust memory or CPU. Every opcode does a bounded amount of work, so
-// the run time is linear in ops (about 50 ns each), and memory is at most
-// about 35 bytes per value (see pushNew) and 110 per memo entry: 100 MB
-// with the defaults. Real checkpoints stay far below them: the largest
-// Ultralytics data.pkl (a YOLOv9e-seg training checkpoint) is 0.7 MB, and
-// a data.pkl has 0.4–0.65 opcodes, 0.7–1.05 values and 0.1–0.15 memo
-// entries per byte, nesting below 100 levels and a few thousand items on
-// the stack.
+// exhaust memory or CPU. Every opcode does a bounded amount of work, or
+// work that counts against values or bytes (the items it copies, the
+// strings it builds from other values), so the run time is linear in ops
+// (about 50 ns each), and memory is at most about 35 bytes per value (see
+// pushNew), 110 per memo entry and the bytes: with the defaults about
+// 120 MB plus three times the size of data.pkl (the strings read from it
+// do not count against bytes: they take at most twice its size). The time
+// limit is a last resort for a case these accounts miss. Real checkpoints
+// stay far below them: the largest Ultralytics data.pkl (a YOLOv9e-seg
+// training checkpoint) is 0.7 MB, and a data.pkl has 0.4–0.65 opcodes,
+// 0.7–1.05 values and 0.1–0.15 memo entries per byte, nesting below 100
+// levels and a few thousand items on the stack; the fixtures build at most
+// 16 KB (qualified names, paths, tensor shapes) and parse in about 10 ms.
 type limits struct {
 	ops    int // opcodes executed
 	values int // values created plus items added to containers
 	stack  int // items on the stack
 	marks  int // open MARKs (nesting depth of containers being built)
 	memo   int // memo entries
+	// bytes of what the opcodes build from other values (qualified names,
+	// paths, encoded text, tuple dict keys, tensor shapes), beyond the
+	// size of data.pkl
+	bytes int
+	time  time.Duration // run time, checked every timeCheckOps opcodes (0: no limit)
 }
 
-var defaultLimits = limits{ops: 1 << 24, values: 1 << 21, stack: 1 << 18, marks: 1 << 12, memo: 1 << 18}
+var defaultLimits = limits{
+	ops: 1 << 24, values: 1 << 21, stack: 1 << 18, marks: 1 << 12, memo: 1 << 18,
+	bytes: 16 << 20, time: 10 * time.Second,
+}
+
+// timeCheckOps is how often run checks the time limit.
+const timeCheckOps = 1 << 16
 
 // pickleError is a malformed pickle (tooLarge: one over the limits).
 type pickleError struct {
@@ -130,22 +147,28 @@ type pickleError struct {
 func (e *pickleError) Error() string { return fmt.Sprintf("data.pkl 第 %d 字节：%s", e.pos, e.msg) }
 
 type unpickler struct {
-	data   []byte
-	pos    int // next byte to read
-	op     int // offset of the opcode being executed
-	stack  []any
-	marks  []int // stack lengths at each open MARK
-	memo   map[int64]any
-	lim    limits
-	ops    int
-	values int
+	data     []byte
+	pos      int // next byte to read
+	op       int // offset of the opcode being executed
+	stack    []any
+	marks    []int // stack lengths at each open MARK
+	memo     map[int64]any
+	lim      limits
+	ops      int
+	values   int
+	bytes    int // left of the byte budget (lim.bytes plus the size of data)
+	deadline time.Time
+	globals  globalCheck // the globals Ultralytics' safe loading would refuse
+}
+
+func newUnpickler(data []byte, lim limits) *unpickler {
+	return &unpickler{data: data, lim: lim, memo: make(map[int64]any), bytes: lim.bytes + len(data)}
 }
 
 // unpickle runs the pickle in data and returns the value it builds.
 // Errors are *pickleError.
 func unpickle(data []byte, lim limits) (any, error) {
-	u := &unpickler{data: data, lim: lim, memo: make(map[int64]any)}
-	return u.run()
+	return newUnpickler(data, lim).run()
 }
 
 func (u *unpickler) corrupt(format string, args ...any) error {
@@ -161,6 +184,15 @@ func (u *unpickler) alloc(n int) error {
 	u.values += n
 	if u.values > u.lim.values {
 		return u.over("对象数量")
+	}
+	return nil
+}
+
+// allocBytes accounts for n bytes that an opcode builds from other values
+// (a string, bytes, a tensor shape), before they are built.
+func (u *unpickler) allocBytes(n int) error {
+	if u.bytes -= n; u.bytes < 0 {
+		return u.over("字符串总长度")
 	}
 	return nil
 }
@@ -325,6 +357,7 @@ func (u *unpickler) memoGet(i int64) error {
 }
 
 func (u *unpickler) run() (any, error) {
+	u.deadline = time.Now().Add(u.lim.time)
 	for {
 		if u.pos >= len(u.data) {
 			return nil, u.corrupt("数据不完整（缺少 STOP）")
@@ -335,6 +368,9 @@ func (u *unpickler) run() (any, error) {
 		u.ops++
 		if u.ops > u.lim.ops {
 			return nil, u.over("操作数")
+		}
+		if u.ops%timeCheckOps == 0 && u.lim.time > 0 && time.Now().After(u.deadline) {
+			return nil, u.over("解析时间")
 		}
 		if op == opStop {
 			return u.pop()
@@ -651,7 +687,11 @@ func (u *unpickler) exec(op byte) error {
 		if err != nil {
 			return err
 		}
-		return u.pushNew(newGlobal(module, name))
+		g, err := u.global(module, name)
+		if err != nil {
+			return err
+		}
+		return u.pushNew(g)
 	case opStackGlobal:
 		name, err := u.pop()
 		if err != nil {
@@ -666,7 +706,11 @@ func (u *unpickler) exec(op byte) error {
 		if !ok1 || !ok2 {
 			return u.corrupt("STACK_GLOBAL 的参数不是字符串")
 		}
-		return u.pushNew(newGlobal(m, n))
+		g, err := u.global(m, n)
+		if err != nil {
+			return err
+		}
+		return u.pushNew(g)
 	case opExt1, opExt2, opExt4:
 		return u.corrupt("使用了扩展注册表（EXT 操作码），无法解析")
 	case opReduce:
@@ -724,7 +768,11 @@ func (u *unpickler) exec(op byte) error {
 		if err != nil {
 			return err
 		}
-		v, err := u.call(newGlobal(module, name), items)
+		g, err := u.global(module, name)
+		if err != nil {
+			return err
+		}
+		v, err := u.call(g, items)
 		if err != nil {
 			return err
 		}

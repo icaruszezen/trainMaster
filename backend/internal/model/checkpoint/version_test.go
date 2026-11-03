@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -73,7 +74,7 @@ var ultralyticsYAMLs = []struct {
 	want                string
 }{
 	{"11/yolo11-cls-resnet18.yaml", "Classify TorchVision", "Classify", false, ""},
-	{"11/yolo11-cls.yaml", "C2PSA C3k2 Classify Conv", "Classify", false, version11},
+	{"11/yolo11-cls.yaml", "C2PSA C3k2 Classify Conv", "Classify", false, ""}, // the same network as yolo26-cls
 	{"11/yolo11-obb.yaml", "C2PSA C3k2 Concat Conv OBB SPPF Upsample", "OBB", false, version11},
 	{"11/yolo11-pose.yaml", "C2PSA C3k2 Concat Conv Pose SPPF Upsample", "Pose", false, version11},
 	{"11/yolo11-seg.yaml", "C2PSA C3k2 Concat Conv SPPF Segment Upsample", "Segment", false, version11},
@@ -85,7 +86,7 @@ var ultralyticsYAMLs = []struct {
 	{"12/yolo12-pose.yaml", "A2C2f C3k2 Concat Conv Pose Upsample", "Pose", false, version12},
 	{"12/yolo12-seg.yaml", "A2C2f C3k2 Concat Conv Segment Upsample", "Segment", false, version12},
 	{"12/yolo12.yaml", "A2C2f C3k2 Concat Conv Detect Upsample", "Detect", false, version12},
-	{"26/yolo26-cls.yaml", "C2PSA C3k2 Classify Conv", "Classify", false, version11},
+	{"26/yolo26-cls.yaml", "C2PSA C3k2 Classify Conv", "Classify", false, ""},
 	{"26/yolo26-depth.yaml", "C2PSA C3k2 Concat Conv Depth SPPF Upsample", "Depth", false, version26},
 	{"26/yolo26-obb.yaml", "C2PSA C3k2 Concat Conv OBB26 SPPF Upsample", "OBB26", true, version26},
 	{"26/yolo26-p2.yaml", "C2PSA C3k2 Concat Conv Detect SPPF Upsample", "Detect", true, version26},
@@ -157,7 +158,8 @@ func TestVersionFromArchitecture(t *testing.T) {
 
 	// The yaml name and the architecture agree, except for these.
 	disagree := map[string]bool{
-		"26/yolo26-cls.yaml":           true, // the same architecture as yolo11-cls
+		"11/yolo11-cls.yaml":           true, // the same architecture as yolo26-cls
+		"26/yolo26-cls.yaml":           true,
 		"11/yolo11-cls-resnet18.yaml":  true, // TorchVision backbone
 		"v8/yolov8-cls-resnet50.yaml":  true, // ResNet backbone
 		"v8/yolov8-cls-resnet101.yaml": true,
@@ -167,6 +169,27 @@ func TestVersionFromArchitecture(t *testing.T) {
 		byName, _ := versionFromName(tt.path)
 		if (byName == tt.want) == disagree[tt.path] {
 			t.Errorf("%s: by name %q, by architecture %q", tt.path, byName, tt.want)
+		}
+	}
+
+	// No version is claimed for an architecture that yamls of two versions
+	// share (yolo11-cls and yolo26-cls): the service would reject the
+	// other version's models as a mismatch.
+	versions := map[string]map[string]bool{}
+	arch := func(modules, head string, end2end bool) string { return fmt.Sprint(modules, "|", head, "|", end2end) }
+	for _, tt := range ultralyticsYAMLs {
+		k := arch(tt.modules, tt.head, tt.end2end)
+		if versions[k] == nil {
+			versions[k] = map[string]bool{}
+		}
+		if v, _ := versionFromName(tt.path); v != "" {
+			versions[k][v] = true
+		}
+	}
+	for _, tt := range ultralyticsYAMLs {
+		vs := versions[arch(tt.modules, tt.head, tt.end2end)]
+		if got := versionFromArchitecture(moduleSet(tt.modules), tt.head, tt.end2end); len(vs) > 1 && got != "" {
+			t.Errorf("%s: the architecture of %v gives %q", tt.path, vs, got)
 		}
 	}
 
@@ -181,6 +204,9 @@ func TestVersionFromArchitecture(t *testing.T) {
 		{"yolov10 without the end2end flag", "C2f C2fCIB Concat Conv PSA SCDown SPPF Upsample v10Detect", "v10Detect", false, versionV10},
 		{"C2f with a yolo26 head", "C2f Concat Conv SPPF Upsample Segment26", "Segment26", false, version26},
 		{"A2C2f with an end-to-end head", "A2C2f C3k2 Concat Conv Detect Upsample", "Detect", true, version12},
+		{"C3k2 classifier with more layers", "C2PSA C3k2 Classify Conv SPPF", "Classify", false, ""},
+		{"yolo12 classifier", "A2C2f C3k2 Classify Conv", "Classify", false, version12},
+		{"yolov8 classifier", "C2f Classify Conv", "Classify", false, versionV8},
 		{"C2f with an unknown head", "C2f Concat Conv MyHead", "MyHead", false, ""},
 		{"C2f without a head", "C2f Concat Conv", "", false, ""},
 		{"nothing", "", "", false, ""},

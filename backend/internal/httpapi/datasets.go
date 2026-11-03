@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -185,6 +186,18 @@ func intParam(w http.ResponseWriter, r *http.Request, name string, def, lo, hi i
 	return n, true
 }
 
+// searchParam returns the optional search text q of a list. PostgreSQL
+// text holds neither invalid UTF-8 nor NUL bytes, so those are answered
+// with 400 (it writes the response and returns false).
+func searchParam(w http.ResponseWriter, r *http.Request) (string, bool) {
+	q := r.URL.Query().Get("q")
+	if !utf8.ValidString(q) || strings.ContainsRune(q, 0) {
+		badRequest(w, "参数 q 无效：搜索内容包含无效字符")
+		return "", false
+	}
+	return q, true
+}
+
 // enumParam parses an optional query parameter that must be one of values
 // (the first is the default).
 func enumParam(w http.ResponseWriter, r *http.Request, name string, values ...string) (string, bool) {
@@ -204,7 +217,11 @@ func enumParam(w http.ResponseWriter, r *http.Request, name string, values ...st
 // ---- datasets ----
 
 func (s *server) listDatasets(w http.ResponseWriter, r *http.Request) {
-	q := dataset.DatasetQuery{Search: r.URL.Query().Get("q")}
+	search, ok := searchParam(w, r)
+	if !ok {
+		return
+	}
+	q := dataset.DatasetQuery{Search: search}
 	// project_id: a project's datasets, or "none" for those in no project.
 	switch v := r.URL.Query().Get("project_id"); v {
 	case "":
@@ -345,8 +362,11 @@ func (s *server) listDatasetImages(w http.ResponseWriter, r *http.Request) {
 // imageFilters parses the filters of an image list: status, label and q
 // (a substring of the path).
 func imageFilters(w http.ResponseWriter, r *http.Request) (dataset.ImageQuery, bool) {
-	q := dataset.ImageQuery{Label: r.URL.Query().Get("label"), Search: strings.TrimSpace(r.URL.Query().Get("q"))}
-	var ok bool
+	search, ok := searchParam(w, r)
+	if !ok {
+		return dataset.ImageQuery{}, false
+	}
+	q := dataset.ImageQuery{Label: r.URL.Query().Get("label"), Search: strings.TrimSpace(search)}
 	q.Status, ok = enumParam(w, r, "status", dataset.FilterAll, dataset.FilterAnnotated, dataset.FilterEmpty,
 		dataset.FilterInvalid, dataset.FilterUnannotated)
 	return q, ok

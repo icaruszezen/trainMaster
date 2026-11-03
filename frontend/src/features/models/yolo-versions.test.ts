@@ -13,10 +13,13 @@ import {
   exportFileName,
   exportOptionsText,
   findYoloVersion,
+  fitExportOptions,
   imgSizeText,
   modelArchLabel,
   modelFileName,
   opsetChoices,
+  postprocessConflict,
+  rawOnlyNote,
   roundImgSize,
   safeFileStem,
   sameExportOptions,
@@ -79,6 +82,9 @@ describe("yolo versions", () => {
 
     expect(taskLabel("detect")).toBe("检测")
     expect(taskLabel("obb")).toBe("旋转框")
+    // 与后端的任务名称一致。
+    expect(taskLabel("semantic")).toBe("语义分割")
+    expect(taskLabel("depth")).toBe("深度估计")
     expect(taskLabel("")).toBe("未知任务")
     expect(taskLabel("track")).toBe("track")
   })
@@ -123,6 +129,111 @@ describe("allowedPostprocess", () => {
     expect(allowedPostprocess(target("yolo11", "obb"))).toContain("nms")
     expect(allowedPostprocess(target("yolo11", "semantic"))).toEqual(["raw"])
     expect(allowedPostprocess(target("yolo11", ""))).toEqual(["raw"])
+  })
+
+  it("offers end-to-end only for tasks with boxes", () => {
+    // YOLO26 的语义分割、深度估计模型没有端到端检测头，只有原始输出。
+    for (const task of ["semantic", "depth", "classify", ""] as const) {
+      expect(allowedPostprocess(target("yolo26", task)), task).toEqual(["raw"])
+      expect(
+        allowedPostprocess(target("yolo11", task, { end2end: true })),
+        task
+      ).toEqual(["raw"])
+    }
+    for (const task of ["detect", "segment", "pose", "obb"] as const) {
+      expect(allowedPostprocess(target("yolo26", task)), task).toEqual([
+        "end2end",
+        "raw",
+        "nms",
+      ])
+    }
+    expect(defaultExportOptions(target("yolo26", "semantic")).postprocess).toBe(
+      "raw"
+    )
+    expect(defaultExportOptions(target("yolo26", "depth")).postprocess).toBe(
+      "raw"
+    )
+  })
+
+  it("explains why only raw output is offered", () => {
+    expect(rawOnlyNote(target("yolo26", "detect"))).toBeNull()
+    expect(rawOnlyNote(target("yolo11", "obb"))).toBeNull()
+    expect(rawOnlyNote(target("yolo26", "classify"))).toBe(
+      "分类模型只有原始输出。"
+    )
+    expect(rawOnlyNote(target("yolo26", "semantic"))).toBe(
+      "语义分割模型只有原始输出。"
+    )
+    expect(rawOnlyNote(target("yolo26", "depth"))).toBe(
+      "深度估计模型只有原始输出。"
+    )
+    expect(rawOnlyNote(target("yolo11", ""))).toBe(
+      "无法识别模型的任务，只能导出原始输出。"
+    )
+  })
+})
+
+describe("dynamic size and embedded NMS", () => {
+  it("does not combine embedded NMS with a dynamic size", () => {
+    expect(postprocessConflict("nms", true)).toContain("batch 为 1")
+    expect(postprocessConflict("nms", false)).toBeNull()
+    expect(postprocessConflict("raw", true)).toBeNull()
+    expect(postprocessConflict("end2end", true)).toBeNull()
+  })
+
+  it("switches embedded NMS to the default when the size becomes dynamic", () => {
+    expect(
+      fitExportOptions(
+        options({ dynamic: true, postprocess: "nms" }),
+        target("yolo11")
+      )
+    ).toEqual(options({ dynamic: true, postprocess: "raw" }))
+    expect(
+      fitExportOptions(
+        options({ dynamic: true, postprocess: "nms" }),
+        target("yolo26")
+      )
+    ).toEqual(options({ dynamic: true, postprocess: "end2end" }))
+    // 其它组合保持不变（同一个对象）。
+    const raw = options({ dynamic: true, postprocess: "raw" })
+    expect(fitExportOptions(raw, target("yolo26"))).toBe(raw)
+    const nms = options({ postprocess: "nms" })
+    expect(fitExportOptions(nms, target("yolo11"))).toBe(nms)
+    const end2end = options({ dynamic: true, postprocess: "end2end" })
+    expect(fitExportOptions(end2end, target("yolov10"))).toBe(end2end)
+  })
+
+  it("replaces modes the model does not allow", () => {
+    // 规则调整前的记录：YOLO26 语义分割默认为 end2end。
+    expect(
+      fitExportOptions(
+        options({ postprocess: "end2end" }),
+        target("yolo26", "semantic")
+      )
+    ).toEqual(options({ postprocess: "raw" }))
+    expect(
+      fitExportOptions(
+        options({ postprocess: "nms" }),
+        target("yolo26", "depth")
+      )
+    ).toEqual(options({ postprocess: "raw" }))
+    expect(
+      fitExportOptions(options({ postprocess: "end2end" }), target("yolo11"))
+    ).toEqual(options({ postprocess: "raw" }))
+  })
+
+  it("keeps the other fields of a draft", () => {
+    const draft = {
+      height: "640",
+      width: "480",
+      dynamic: true,
+      postprocess: "nms" as const,
+      opset: "auto",
+    }
+    expect(fitExportOptions(draft, target("yolo11"))).toEqual({
+      ...draft,
+      postprocess: "raw",
+    })
   })
 })
 

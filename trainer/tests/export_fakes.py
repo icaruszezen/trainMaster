@@ -2,7 +2,8 @@
 
 假的 export 按 ultralytics 8.4.198 实测的规则（docs/architecture.md、设计文档 3.8 节）生成结果，写出的
 “onnx 文件”是一个 JSON 描述（输入输出、opset、metadata），假的 onnx / onnxruntime 读取它。
-子进程测试通过 PYTHONPATH 上的同名模块文件加载这些假模块，配置放在环境变量 FAKE_EXPORT（JSON）中。
+子进程测试通过 PYTHONPATH 上的同名模块文件加载这些假模块，配置放在同一目录的 fake_export.json 中
+（不用环境变量：转换子进程只继承运行 Python 需要的环境变量，见 model_export.export_env）。
 """
 
 from __future__ import annotations
@@ -15,23 +16,35 @@ from pathlib import Path
 from typing import Any
 
 TESTS_DIR = Path(__file__).resolve().parent
-ENV = "FAKE_EXPORT"
+CONFIG_FILE = "fake_export.json"
 
 _MODULE_FILE = """\
 import sys
 sys.path.insert(0, {tests!r})
 import export_fakes
-sys.modules[__name__] = export_fakes.{factory}(**export_fakes.config_from_env())
+_mod = export_fakes.{factory}(**export_fakes.load_config({root!r}))
+sys.modules[__name__] = _mod
+sys.modules.update(getattr(_mod, "submodules", {{}}))
 """
+SAFE_LOAD_ENV = "ULTRALYTICS_SAFE_LOAD"
 
 
-def config_from_env() -> dict[str, Any]:
-    return json.loads(os.environ.get(ENV) or "{}")
+def load_config(root: str) -> dict[str, Any]:
+    path = Path(root) / CONFIG_FILE
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
 
 
-def write_modules(root: Path, *, onnxruntime: bool = True, onnx: bool = True) -> Path:
-    """写出假模块文件（配置读取环境变量 FAKE_EXPORT），返回要放到 PYTHONPATH 上的目录。"""
+def write_config(root: Path, **config: Any) -> None:
+    """设置假模块的行为（子进程启动时读取）。"""
+    (root / CONFIG_FILE).write_text(json.dumps(config), encoding="utf-8")
+
+
+def write_modules(
+    root: Path, *, onnxruntime: bool = True, onnx: bool = True, **config: Any
+) -> Path:
+    """写出假模块文件与配置（write_config），返回要放到 PYTHONPATH 上的目录。"""
     root.mkdir(parents=True, exist_ok=True)
+    write_config(root, **config)
     modules = {"ultralytics": "make_ultralytics", "numpy": "make_numpy", "torch": "make_torch"}
     if onnx:
         modules["onnx"] = "make_onnx"
@@ -43,7 +56,8 @@ def write_modules(root: Path, *, onnxruntime: bool = True, onnx: bool = True) ->
         (root / "onnxruntime.py").write_text("raise ImportError('No module named onnxruntime')\n")
     for name, factory in modules.items():
         (root / f"{name}.py").write_text(
-            _MODULE_FILE.format(tests=str(TESTS_DIR), factory=factory), encoding="utf-8"
+            _MODULE_FILE.format(tests=str(TESTS_DIR), factory=factory, root=str(root)),
+            encoding="utf-8",
         )
     return root
 
@@ -90,6 +104,7 @@ def make_ultralytics(
     nc: int = 2,
     train_imgsz: int = 640,
     load_error: list[str] | None = None,
+    load_cause: list[str] | None = None,
     export_error: list[str] | None = None,
     ignore_nms: bool = False,
     no_file: bool = False,
@@ -99,15 +114,38 @@ def make_ultralytics(
     wrong_shape: bool = False,
     no_metadata: bool = False,
     calls_file: str | None = None,
+    safe_load: bool | None = None,
+    safe_load_class: bool = True,
+    safe_load_supported: bool = True,
     **_: Any,
 ) -> types.ModuleType:
     """一个只实现转换用到的接口的 ultralytics。load_error / export_error：[异常类名, 消息]（可带
-    ModuleNotFoundError 的 name 作为第三项）；calls_file：把调用记录追加到这个文件（子进程测试读取）。"""
+    ModuleNotFoundError 的 name 作为第三项），load_cause：load_error 的 __cause__（同样的写法）；
+    calls_file：把调用记录追加到这个文件（子进程测试读取）。
+
+    安全加载（ultralytics.nn.tasks，见 submodules）：SAFE_LOAD 与真实的一样在创建（导入）时读取环境变量
+    ULTRALYTICS_SAFE_LOAD，safe_load 不为 None 时用它；safe_load_class=False 时没有 _SafeLoad（旧版），
+    safe_load_supported 为 _SafeLoad.SUPPORTED（torch 是否支持）。"""
     mod = types.ModuleType("ultralytics")
     mod.__version__ = version  # type: ignore[attr-defined]
+    mod.__path__ = []  # type: ignore[attr-defined]  # 包：ultralytics.nn.tasks 是它的子模块
     calls: list[Any] = []
     mod.calls = calls  # type: ignore[attr-defined]
     sys.modules.setdefault("torch", make_torch())
+
+    if safe_load is None:
+        flag = os.environ.get(SAFE_LOAD_ENV, "").strip().lower()
+        safe_load = flag in ("1", "true", "yes", "on", "y", "t")
+    nn = types.ModuleType("ultralytics.nn")
+    nn.__path__ = []  # type: ignore[attr-defined]
+    tasks = types.ModuleType("ultralytics.nn.tasks")
+    tasks.SAFE_LOAD = safe_load  # type: ignore[attr-defined]
+    if safe_load_class:
+        tasks._SafeLoad = type("_SafeLoad", (), {"SUPPORTED": safe_load_supported})  # type: ignore[attr-defined]
+    nn.tasks = tasks  # type: ignore[attr-defined]
+    mod.nn = nn  # type: ignore[attr-defined]
+    # 测试放进 sys.modules 的子模块（真实的 import 会登记它们）
+    mod.submodules = {"ultralytics.nn": nn, "ultralytics.nn.tasks": tasks}  # type: ignore[attr-defined]
 
     def record(item: Any) -> None:
         calls.append(item)
@@ -133,10 +171,10 @@ def make_ultralytics(
 
     class YOLO:
         def __init__(self, weights: str, task: str | None = None) -> None:
-            record({"call": "YOLO", "weights": weights, "task": task})
+            record({"call": "YOLO", "weights": weights, "task": task, "safe_load": tasks.SAFE_LOAD})
             print("ultralytics prints to stdout while loading")
             if load_error:
-                raise build_error(load_error)
+                raise build_error(load_error) from (build_error(load_cause) if load_cause else None)
             self.task = task or default_task
             self.model = types.SimpleNamespace(model=[object(), Head()])
             self.weights = weights
