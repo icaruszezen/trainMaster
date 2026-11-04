@@ -418,8 +418,8 @@ def test_stop_cancels_running_detection(platform, tmp_path):
 def test_detector_crash_reports_error_environment(platform, tmp_path):
     with Harness(tmp_path, platform.url, detector=FakeDetector(error=RuntimeError("boom"))):
         node = wait_until(lambda: registered(platform))
-        wait_until(lambda: node.get("environment_updates") == 1)
-        env = node["environment"]
+        # 检测很快出错：结果可能在注册时就已上报，也可能在之后的心跳中上报
+        env = wait_until(lambda: node.get("environment"))
         assert env["status"] == "error"
         assert "boom" in env["self_test"]["message"]
 
