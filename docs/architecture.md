@@ -1,6 +1,6 @@
 # 架构说明
 
-本文描述 trainMaster 的整体结构与约定（平台框架 + 已实现的数据集、项目、标注、计算资源与模型仓库）。后续功能开发应遵循这里的约定；需要调整约定时，请同步更新本文。
+本文描述 trainMaster 的整体结构与约定（平台框架 + 已实现的数据集、项目、标注、计算资源、模型仓库与模型审图）。后续功能开发应遵循这里的约定；需要调整约定时，请同步更新本文。
 
 ## 1. 组件总览
 
@@ -20,6 +20,7 @@ flowchart LR
     pgdata[/"宿主机目录 ./data/postgres"/]
     gpu[/"NVIDIA 显卡<br/>（驱动 + NVIDIA Container Toolkit）"/]
     remote["其它 GPU 机器上的训练节点<br/>（Docker 或裸机安装）"]
+    reviewer["Windows 电脑上的本地审图程序<br/>trainmaster-reviewer.exe（离线）"]
 
     browser -- "HTTP :8080" --> server
     server -- "SQL（元数据）" --> pg
@@ -29,10 +30,12 @@ flowchart LR
     remote -- "注册 / 心跳 / 任务" --> server
     trainer --- gpu
     trainer -. "读数据集、写模型与运行产物（规划中）" .-> storage
+    browser -. "审图包 / 审图结果（zip 文件）" .- reviewer
 ```
 
 - **单镜像**：Go 服务同时提供 `/api` 下的 JSON API 和前端构建产物（`/app/web`），部署只需 `app` 与 `postgres` 两个容器。
-- **训练节点是独立的服务**：Python 训练节点（`trainer/`）运行在有显卡的机器上，主动向平台注册并上报心跳（见第 9 节）。同一台机器上由 compose 的 profile 启用（`gpu` → `trainer`，`cpu` → `trainer-cpu`，`make setup` 自动选择），也可以运行在其它机器上；训练节点还执行平台的任务（目前是模型仓库的 ONNX 转换，见第 9、10 节），没有训练节点时转换一直排队，平台的其它功能不受影响。
+- **训练节点是独立的服务**：Python 训练节点（`trainer/`）运行在有显卡的机器上，主动向平台注册并上报心跳（见第 9 节）。同一台机器上由 compose 的 profile 启用（`gpu` → `trainer`，`cpu` → `trainer-cpu`，`make setup` 自动选择），也可以运行在其它机器上；训练节点还执行平台的任务（目前是模型仓库的 ONNX 转换与模型审图的识别，见第 9–11 节），没有训练节点时转换与识别一直排队，平台的其它功能不受影响。
+- **本地审图程序**：`trainmaster-reviewer.exe`（`backend/cmd/trainmaster-reviewer`，Go）是在用户的 Windows 电脑上离线审图的单个程序，随平台镜像分发、在页面上下载；它与平台之间只交换文件：用户从平台下载审图包、在程序中审完后导出审图结果，再上传到平台（见第 11 节）。
 - **文件与元数据分离**：图片、模型权重等大文件以普通文件形式保存在宿主机目录；PostgreSQL 只保存元数据（记录、关系、状态）。两者都通过绑定挂载持久化。
 - **内网友好**：前端不依赖任何外部 CDN、在线字体或第三方服务。
 
@@ -43,6 +46,7 @@ flowchart LR
 | 包 | 职责 |
 |---|---|
 | `cmd/trainmaster` | 程序入口，按顺序组装各模块并处理优雅关闭 |
+| `cmd/trainmaster-reviewer` | 本地审图程序（Windows）：在 127.0.0.1 上运行 `internal/reviewer`，用 WebView2 窗口（没有时用默认浏览器）显示嵌入的页面（见第 11 节） |
 | `internal/buildinfo` | 版本号、提交号、构建时间（通过 `-ldflags -X` 注入） |
 | `internal/config` | 读取并校验 `TM_*` 环境变量；非法值一次性全部报出并退出 |
 | `internal/database` | pgxpool 连接池、启动时连接重试、内置迁移执行器 |
@@ -51,6 +55,9 @@ flowchart LR
 | `internal/project` | 项目：项目的增删改、项目与数据集的多对多关系、按数据集合计的统计与标签分布、项目的类别列表（训练时的类别顺序，标注时的候选类别）、项目的模型数与最新版本 |
 | `internal/model` | 模型仓库：分块上传与提交、项目内的版本分配、模型文件夹与 `model.json`、下载、删除；ONNX 转换的选项、缓存、任务队列（领取、租约、重试）与训练节点的任务接口；为平台训练预留的 `RegisterTrainedModel`（见第 10 节） |
 | `internal/model/checkpoint` | 读取 Ultralytics `.pt` 的元数据：zip 中的 `data.pkl` 由只读的 pickle 解释器解析（不执行任何代码），得到任务、类别、输入尺寸、YOLO 版本、训练信息；纯函数，无数据库依赖 |
+| `internal/review` | 模型审图：审图任务的创建、修改与删除；识别任务（实现 `model.TaskSource`，通过训练节点的领取接口下发）、租约与识别结果的写入；审核状态与审图标注；审图包；上传审图结果；合并到数据集的后台任务（见第 11 节） |
+| `internal/reviewfile` | 审图包的文件格式，平台与本地审图程序共用：清单 `review.json` 的读写与校验、Windows 安全的路径（`SafeSegment`、`Layout`）、审图标注（VOC）的读写与原子替换 |
+| `internal/reviewer` | 本地审图程序的本机服务：打开与解压审图包、与平台形状相同的审图接口、审核进度 `review-progress.json`、缩略图、导出审图结果、访问控制 |
 | `internal/compute` | 计算资源：训练节点的注册与心跳、上报数据的规范化与校验、在线状态判定、删除与重新检测、内存中的指标历史 |
 | `internal/hostinfo` | 平台服务器自身的 CPU、内存、负载、cgroup 限制与 NVIDIA 显卡（读 `/proc`、`/sys`，根目录可替换以便测试）；后台每 5 秒采样一次 CPU 利用率 |
 | `internal/httpapi` | chi 路由、中间件、统一 JSON 响应与错误信封、各 handler |
@@ -59,10 +66,10 @@ flowchart LR
 ### 启动流程
 
 1. 加载配置，初始化 slog（`TM_LOG_FORMAT=text|json`）。
-2. 初始化存储目录：创建根目录和 6 个子目录（见第 5 节）并做可写探测，失败则退出并提示检查挂载目录权限 / PUID、PGID。
+2. 初始化存储目录：创建根目录和 7 个子目录（见第 5 节）并做可写探测，失败则退出并提示检查挂载目录权限 / PUID、PGID。
 3. 连接数据库：指数退避重试，最长约 60 秒（数据库容器还在启动时会等待），仍失败则以非 0 退出。
 4. `TM_DB_AUTO_MIGRATE=true`（默认）时执行待执行的迁移。
-5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），然后启动任务执行器（见第 6 节）；启动模型仓库的后台任务（见第 10 节“存储与版本号”）。
+5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），然后启动任务执行器（见第 6 节）；启动模型仓库的后台任务（见第 10 节“存储与版本号”）与模型审图的后台任务（先把上次运行中断的合并记为失败，见第 11 节“存储”）。
 6. 启动 HTTP 服务；收到 SIGINT / SIGTERM 后停止接收新请求，等待进行中的请求完成（最长 15 秒）；超时后强制关闭剩余连接（取消其请求的 context），最后关闭数据库连接池。还在等待数据库或迁移锁时收到信号，则直接正常退出。收到信号时会立即取消正在执行的导入 / 扫描任务并记为失败（“服务重启，导入被中断”），排队中的任务保留到下次启动执行；HTTP 服务关闭后再等待任务执行器的 worker 退出。进程在写入结果前异常退出时，下次启动由恢复逻辑把任务标记为中断，并重新计算受影响数据集的统计数据。长连接 handler 应通过 `http.Server.RegisterOnShutdown` 在关闭开始时主动结束：训练节点领取任务的长轮询（最长 30 秒）就是这样立即返回 `{"task": null}` 的，以后的 SSE 推送（如训练日志）也应如此。
 
 ## 3. API 约定
@@ -96,18 +103,18 @@ flowchart LR
 | 404 | `not_found` | 接口或资源不存在（未设置 `TM_WEB_DIR` 时，非 `/api` 路径也返回它） |
 | 404 | `unknown_node` | 心跳或任务调用中的 `node_key`（`X-Node-Key`）尚未注册（或节点已被删除），训练节点收到后重新注册 |
 | 405 | `method_not_allowed` | 路径存在但不支持该方法（响应头 `Allow` 列出支持的方法） |
-| 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、下载 YOLO 时所选项目还没有类别列表、标注文件不能在平台中修改、删除在线的训练节点、重新检测离线的训练节点、删除有模型的项目、模型文件未上传完就提交、模型上传的临时文件已丢失、转换任务已不属于该训练节点等） |
+| 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、下载 YOLO 时所选项目还没有类别列表、标注文件不能在平台中修改、删除在线的训练节点、重新检测离线的训练节点、删除有模型的项目、模型文件未上传完就提交、模型上传的临时文件已丢失、转换任务已不属于该训练节点、审图图片还没有识别完成、审图任务正在合并时删除或再次合并等） |
 | 409 | `annotation_conflict` | 保存 / 删除标注时，标注文件在 `base_version` 之后已被修改（他人在另一个窗口保存，或用其它工具改了文件）。客户端应重新读取图片详情，或带 `force: true` 覆盖 |
 | 409 | `annotation_unpatchable` | 保存标注时，已有的标注文件无法在保留其中平台不编辑的内容的情况下修改（极少见）；带 `regenerate: true` 时按平台的格式重新生成整个文件（`force: true` 只跳过版本检查，不会重新生成） |
 | 409 | `upload_offset_mismatch` | 分块上传（数据集压缩包、模型文件）的 `offset` 与服务端已接收的字节数不一致，客户端应重新获取任务或上传后从 `received_bytes` 续传 |
-| 413 | `payload_too_large` | 请求体超过限制（单个分块 64 MiB，单次文件夹批量上传 256 MiB，训练节点的 JSON 请求 1 MiB、上传的转换结果 4 GiB，上传前的进度上报按同样的上限预检） |
+| 413 | `payload_too_large` | 请求体超过限制（单个分块 64 MiB，单次文件夹批量上传 256 MiB，训练节点的 JSON 请求 1 MiB、上传的转换结果 4 GiB，上传前的进度上报按同样的上限预检；保存标注 8 MiB，上传的审图结果 4 GiB） |
 | 422 | `validation_failed` | 字段校验失败，`message` 说明具体问题（如数据集名称不合法、ONNX 转换选项不允许） |
 | 422 | `unsupported_image` | 无法为该图片生成缩略图（格式不支持、文件损坏或像素过大），前端回退为原图或占位图 |
 | 422 | `invalid_model` | 提交的模型文件不是平台支持的 YOLO 模型（不是 PyTorch 文件、旧格式、损坏、不是 Ultralytics 检查点、原版 YOLOv5 仓库、RT-DETR、引用了安全加载不允许的对象等），`message` 说明原因；上传随之失败 |
 | 422 | `yolo_version_mismatch` | 模型文件中识别出的 YOLO 版本与所选的不同；上传保留，带识别出的版本（上传的 `detected_yolo_version`）再次提交即可 |
 | 500 | `internal_error` | 未预期的错误（handler panic 会被恢复并返回此错误） |
 | 501 | `not_implemented` | 规划中的功能模块 |
-| 507 | `insufficient_storage` | 存储空间不足，无法接收该上传（数据集与模型的上传、训练节点上传的转换结果及其预检） |
+| 507 | `insufficient_storage` | 存储空间不足，无法接收该上传（数据集与模型的上传、训练节点上传的转换结果及其预检、上传的审图结果） |
 
 新增功能需要其它错误码时，在 `internal/httpapi/respond.go` 中集中定义，并补充到本表。
 
@@ -121,6 +128,7 @@ flowchart LR
 | 数据集相关接口 | 见下方“数据集接口” |
 | 项目相关接口 | 见下方“项目接口” |
 | 模型仓库相关接口 | 见下方“模型仓库接口” |
+| 模型审图相关接口 | 见下方“模型审图接口” |
 | 计算资源相关接口（含训练节点的任务接口） | 见下方“计算资源接口” |
 | `/api/v1/annotation/tasks`、`/api/v1/annotation/labels`、`/api/v1/training/jobs`、`/api/v1/evaluations` 及其子路径 | 预留给规划中的模块，任意方法均返回 `501 not_implemented` |
 
@@ -237,6 +245,38 @@ flowchart LR
 
 JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>` 请求时返回 `Cache-Control: private, max-age=31536000, immutable`（文件变化后版本号随之改变），否则为 `private, no-cache`。
 
+### 模型审图接口
+
+模型审图（`internal/httpapi/reviews.go`、`review_exchange.go`，业务逻辑在 `internal/review`）的设计见第 11 节。字段定义以前端 `frontend/src/features/reviews/api.ts` 中的类型为准，与后端 `internal/review/types.go` 的 json tag 保持一致。`{reviewID}`、`{imageID}`（审图图片的 ID，不是数据集图片的 ID）、`{mergeID}` 必须是正整数，否则返回 404。
+
+| 方法与路径 | 说明 |
+|---|---|
+| `GET /api/v1/reviews` | 审图任务列表 `{items, total}`，新的在前（`id DESC`）。筛选：`q`（名称、说明或项目名，不区分大小写）、`project_id`、`dataset_id`（包含该数据集的任务）、`model_id`、`status`（`queued` / `running` / `ready` / `failed`，其它值 400）。每项带创建时的模型快照 `model` 与 `model_exists`、模型所属项目 `project`、识别参数 `options`、识别状态（`status`、`stage`、`attempts`、`node`、`error`、`error_detail`、`result`，排队中的 `queue_position`，`workers_online`）、图片数 `counts`、各数据集 `datasets: [{id, name, folder, counts}]`（按选择的顺序）、最近一次上传 `last_upload`、进行中的合并 `active_merge` 与最近完成的合并 `last_merge` |
+| `POST /api/v1/reviews` | `{name?, description?, model_id, dataset_ids, options?: {conf?, iou?, imgsz?, max_det?}}` 新建审图任务并排队识别，返回 201。规则见第 11 节“新建”：模型不存在、没有检测框、数据集不存在或超出数量、没有图片、参数超出范围时 422；模型文件不在磁盘上时 409 |
+| `GET /api/v1/reviews/{reviewID}` | 审图任务详情（字段同列表项） |
+| `PATCH /api/v1/reviews/{reviewID}` | `{name?, description?}` 修改名称和说明（规则同项目） |
+| `DELETE /api/v1/reviews/{reviewID}` | 删除审图任务与它的文件夹（审图标注），返回 204；数据集与已经合并到数据集的标注不受影响。正在合并时 409；正在识别时也可以删除，节点之后的调用得到 404 而停止。记录已删除但文件夹没能完全删除时返回 200 `{"files_removed": false, "message": "…"}`（同模型） |
+| `POST /api/v1/reviews/{reviewID}/retry` | 重新识别失败的任务：清零尝试次数与错误后重新排队，返回 202 与任务，从还没有识别的图片继续。不是 `failed` 时 409（“只有识别失败的审图任务可以重试”），模型已被删除或模型文件不在时 409 |
+| `GET /api/v1/reviews/{reviewID}/images` | 图片列表，按任务中的顺序：`offset`、`limit`（默认 60，≤ 200）、`status`（`all` / `pending` / `approved` / `needs_sample` / `reviewed`）、`dataset_id`、`label`、`q`（数据集中的路径包含，不区分大小写）、`edited`（`all` / `edited` / `unedited`）、`boxes`（`all` / `with` / `without`）、`inference`（`all` / `failed`），参数值非法时 400。每项带数据集与数据集图片的 ID、路径、尺寸、`inferred`、`inference_error`、目标数与类别、`prediction_count`、`edited`、`status`、`revision`、`reviewed_at`、`merged_at`、`annotation_version` |
+| `GET /api/v1/reviews/{reviewID}/images/{imageID}` | 单张图片详情：另带 `objects`（审图标注，实时从 VOC 文件读取，没有文件时为 `[]`）、`predictions`（模型的框与置信度）、`dataset_name`，以及文件无法使用时的 `annotation_error` |
+| `GET /api/v1/reviews/{reviewID}/images/{imageID}/neighbors` | 按任务中的顺序的上一张 / 下一张：`{prev, next, position, matches, total}`，筛选参数同图片列表（同数据集的 neighbors） |
+| `PUT /api/v1/reviews/{reviewID}/images/{imageID}/annotation` | 保存审图标注：`{objects, base_version, force?}`（请求体 ≤ 8 MiB），重新生成任务文件夹中的 VOC 文件，返回图片详情。`base_version` 不是当前版本时 409 `annotation_conflict`（带 `force: true` 覆盖）；还没有识别的图片 409 `conflict`；框不合法时 422 |
+| `PUT /api/v1/reviews/{reviewID}/images/{imageID}/status` | `{status: "pending" \| "approved" \| "needs_sample"}` 设置审核状态，返回图片详情；还没有识别的图片 409 |
+| `GET /api/v1/reviews/{reviewID}/images/{imageID}/file` | 原图（来自数据集，同数据集的原图接口） |
+| `GET /api/v1/reviews/{reviewID}/images/{imageID}/thumbnail` | 缩略图 `size=sm` / `lg`（数据集的缩略图） |
+| `GET /api/v1/reviews/{reviewID}/labels` | 审图标注中的类别：`{items: [{name, object_count, image_count}], total}`，按目标数从多到少 |
+| `GET /api/v1/reviews/{reviewID}/classes` | 候选类别 `{items: [{name, color}], total, version}`：模型所属项目的类别列表不为空时用它（带它的 `version`），否则为模型的类别名称（`version` 为 `""`） |
+| `POST /api/v1/reviews/{reviewID}/packages` | 准备下载审图包：`{statuses?, dataset_ids?}`（省略时为全部），返回 201 `{url, file_name, expires_at, image_count}`；没有识别过的图片、或没有符合条件的图片时 409 |
+| `GET /api/v1/reviews/{reviewID}/packages/{token}` | 下载审图包 zip（`Content-Disposition: attachment`，流式输出，无 Content-Length，每次下载都按当时的状态打包）；链接 1 小时内可重复使用，失效后 404 |
+| `POST /api/v1/reviews/{reviewID}/results?overwrite=&file_name=` | 上传本地审图程序导出的审图结果：请求体是 zip 本身（multipart 400），必须带 `Content-Length`（≤ 4 GiB，否则 413），剩余空间不足时 507；不是这个任务的结果或文件无效时 422。返回 `{id, review_id, file_name, overwrite, summary, problems, created_at}`，规则见第 11 节“上传审图结果” |
+| `GET /api/v1/reviews/{reviewID}/uploads` | 最近 50 次上传，新的在前 |
+| `POST /api/v1/reviews/{reviewID}/merges` | 开始合并到数据集：`{dataset_ids?, statuses, on_existing: "skip" \| "overwrite"}`，返回 202 与合并记录（`status: running`）。已有合并在进行、没有识别过的图片、没有符合条件的图片时 409 |
+| `GET /api/v1/reviews/{reviewID}/merges` | 最近 50 次合并，新的在前 |
+| `GET /api/v1/reviews/{reviewID}/merges/{mergeID}` | 合并的状态与进度（前端轮询）：`status`、`total`、`done`、`summary`、`problems`、`error` |
+| `GET /api/v1/reviews/tool` | 本地审图程序：`{available, file_name: "trainmaster-reviewer.exe", size_bytes, version}`（`version` 为平台的版本，两者一起构建；没有时为 `""`） |
+| `GET /api/v1/reviews/tool/download` | 下载本地审图程序（`application/octet-stream`、`attachment`，支持 Range）；平台没有附带（`TM_REVIEWER_TOOL` 未设置或文件不存在）时 404 |
+| `GET /api/v1/datasets/{id}/reviews` | 数据集的审核记录：包含该数据集的审图任务，新的在前；每项为审图任务加上这个数据集的部分 `dataset`（带这个数据集中的图片数 `counts`）与包含它的最近 5 次合并 `dataset_merges`。数据集不存在时 404 |
+
 ### 计算资源接口
 
 “计算资源”页面使用的接口与训练节点的注册 / 心跳（`/agent/*`）都在 `/api/v1/compute` 下（`internal/httpapi/compute.go`，业务逻辑在 `internal/compute`）。字段定义以前端 `frontend/src/features/training/` 中的类型为准，与后端 `internal/compute/types.go`、训练节点 `trainmaster_trainer` 保持一致。`{nodeID}` 必须是正整数，否则返回 404。
@@ -250,15 +290,22 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `POST /api/v1/compute/nodes/{nodeID}/probe` | 请求节点重新检测硬件与 CUDA 环境，返回 202 与 `probe_pending: true` 的节点；节点离线时 409 `conflict` |
 | `POST /api/v1/compute/agent/register` | 节点注册：`{node_key, name, hostname?, agent_version?, hardware, environment?, metrics?}`，按 `node_key`（1–64 个 `A-Z a-z 0-9 . _ -` 字符）新建或更新，返回 `{node_id, heartbeat_interval_seconds, server_time}` |
 | `POST /api/v1/compute/agent/heartbeat` | 节点心跳：`{node_key, metrics?, environment?, hardware?}`，返回 `{node_id, heartbeat_interval_seconds, probe_requested}`；`node_key` 未注册时 404 `unknown_node` |
-| `POST /api/v1/compute/agent/tasks/claim` | 领取任务（长轮询）：`{node_key, kinds: ["model_export"], wait_seconds}`（`wait_seconds` 0–30，超出时 422），返回 `{"task": null \| Task}`。没有任务时最多等待 `wait_seconds`，期间有任务入队（或重新排队）立即返回；服务关闭时立即返回 `{"task": null}`。`node_key` 未注册时 404 `unknown_node`；`kinds` 中不认识的类型忽略 |
+| `POST /api/v1/compute/agent/tasks/claim` | 领取任务（长轮询）：`{node_key, kinds: ["model_export", "review_inference"], wait_seconds}`（`wait_seconds` 0–30，超出时 422），返回 `{"task": null \| Task}`（`Task` 的结构按 `kind`：转换任务见下方，审图识别见第 11 节“识别任务”）。没有任务时最多等待 `wait_seconds`，期间有任务入队（或重新排队）立即返回；服务关闭时立即返回 `{"task": null}`。`node_key` 未注册时 404 `unknown_node`；`kinds` 中不认识的类型忽略 |
 | `GET /api/v1/compute/agent/model-exports/{exportID}/input` | 下载要转换的 `model.pt`（支持 Range）；读取期间每 15 秒续租一次 |
 | `POST /api/v1/compute/agent/model-exports/{exportID}/progress` | `{stage: "downloading" \| "converting" \| "uploading", message?, size_bytes?}` 上报进度并续租，返回 `{"lease_seconds": 60}`。`stage` 为 `uploading` 且 `size_bytes` > 0（即将上传的结果大小）时是上传前的预检，按上传的规则依次检查：转换已删除 404，不属于该节点或已结束 409，超过 4 GiB 413，剩余空间不足 507（“磁盘剩余空间不足：可用 X，至少需要 Y”）；`size_bytes` 为负数时 422，省略或为 0 时只续租 |
 | `PUT /api/v1/compute/agent/model-exports/{exportID}/output` | 上传转换结果（ONNX 原始字节，≤ 4 GiB），必须带 `Content-Length` 与 `X-Content-Sha256`（十六进制）；暂存为 `tmp/model-exports/<exportID>/output.onnx.part`，大小或 SHA256 不一致时丢弃（大小不符 400，SHA256 不符 422），剩余空间不足时 507；成功返回 `{"received_bytes": N}` 并续租，再次上传会替换。因任务状态或磁盘被拒绝（404、409、507）时平台先读掉最多 64 MiB 的请求体再回应，更大的结果由上传前的预检得知会被拒绝（平台在读取之前就拒绝时，还在发送的客户端只能看到连接被重置） |
 | `POST /api/v1/compute/agent/model-exports/{exportID}/complete` | `{result: {...}}`，要求已上传结果：把文件移入模型文件夹（`onnx/<exportID>.onnx`），转换成功，返回转换记录 |
 | `POST /api/v1/compute/agent/model-exports/{exportID}/fail` | `{error, detail?, retryable?}` 报告失败：`retryable` 为 true 且领取次数少于 3 次时重新排队，否则转换失败（`error` 截断到 500 个字符、`detail` 截断到 8 KiB），返回转换记录 |
+| `GET /api/v1/compute/agent/review-inferences/{reviewID}/model` | 下载审图任务所用的 `model.pt`（支持 Range）；读取期间每 15 秒续租一次。模型已被删除或文件已不在磁盘上时审图任务失败，返回 404 |
+| `GET /api/v1/compute/agent/review-inferences/{reviewID}/images?after=&limit=` | 还没有识别的图片：ID 大于 `after` 的，按 ID 排列，`limit` 默认 200、最多 500；返回 `{items: [{id, file_name, width, height, size_bytes, url}], remaining}`，并续租 |
+| `GET /api/v1/compute/agent/review-inferences/{reviewID}/images/{imageID}/file` | 下载一张图片（数据集中的原图，支持 Range）并续租；文件已不存在时 404，节点把这张图片报为识别失败 |
+| `POST /api/v1/compute/agent/review-inferences/{reviewID}/progress` | `{stage: "downloading" \| "inferring", message?}` 上报进度并续租，返回 `{"lease_seconds": 60}` |
+| `POST /api/v1/compute/agent/review-inferences/{reviewID}/results` | 上报一批识别结果：`{results: [{id, ok, width, height, boxes: [{name, class_id, confidence, xmin, ymin, xmax, ymax}], error}]}`（每批最多 500 张），在一个事务中写入并续租，返回 `{lease_seconds, accepted, remaining}`；已经识别过的、不属于任务的图片忽略（可以安全重发） |
+| `POST /api/v1/compute/agent/review-inferences/{reviewID}/complete` | `{result: {...}}` 结束识别，任务为 `ready`，返回审图任务；还有没识别的图片时 409（“还有 N 张图片没有识别”） |
+| `POST /api/v1/compute/agent/review-inferences/{reviewID}/fail` | `{error, detail?, retryable?}` 报告失败，规则同转换任务的 `fail`（领取次数少于 3 次且可重试时重新排队），返回审图任务 |
 
 - 配置了 `TM_NODE_TOKEN` 时，`/agent/*` 必须带 `Authorization: Bearer <令牌>`，否则返回 401 `unauthorized`（常量时间比较）；浏览器使用的其它接口不需要令牌（平台目前没有登录）。
-- `model-exports/{exportID}/*` 还必须带请求头 `X-Node-Key: <node_key>`（缺少时 400，未注册时 404 `unknown_node`），且该转换正由这个节点执行（`running`）：转换已被删除时返回 404 `not_found`，不属于该节点或已结束时返回 409 `conflict`，节点收到这两种响应后放弃该任务。协议见第 9 节“任务协议”。
+- `model-exports/{exportID}/*` 与 `review-inferences/{reviewID}/*` 还必须带请求头 `X-Node-Key: <node_key>`（缺少时 400，未注册时 404 `unknown_node`），且该任务正由这个节点执行（`running`）：任务已被删除时返回 404 `not_found`，不属于该节点或已结束时返回 409 `conflict`，节点收到这两种响应后放弃该任务。协议见第 9 节“任务协议”。
 - 请求体上限 1 MiB（413 `payload_too_large`；上传转换结果除外，见上表）。上报的 JSON 允许未知字段（新版节点配旧版平台）；数值为 NaN、无穷或负数时置为 null，过长的字符串与数组截断，不认识的枚举值归为保守的值（如 `status` → `error`、`accelerator` → `cpu`），偶尔异常的指标不会让心跳失败。存入数据库（表 `compute_nodes`，`hardware`、`environment`、`metrics` 为 jsonb）和返回的都是规范化之后的结构。
 - 注册请求中的 `environment` / `metrics` 为 null 时保留原值（节点重启后先上报硬件，CUDA 环境检测完成后再随心跳上报，页面不会闪烁）。`environment` 为 null 的注册同时记下重新检测的请求（`probe_pending` 为 true）：节点重启后正在检测，页面在上次的结果上显示“正在重新检测”，而不是把上次的结果当作当前的。心跳带有 `environment` 时清除重新检测的请求。
 - 节点的 `address` 是平台看到的客户端 IP（见“中间件”中的客户端 IP），可能为 `""`。
@@ -296,6 +343,8 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 项目模块位于 `src/features/projects/`：项目列表页（卡片 / 列表视图）、项目详情页（数据集 / 类别 / 模型，当前标签页记在 URL 的 `?tab=`，以前“标签分布”的链接 `?tab=labels` 打开“类别”）、类别列表的编辑对话框（列表的增删、改名、颜色、顺序与按 `classes.txt` 排列是 `class-edit.ts` 中与界面无关的纯函数，有单元测试）、新建 / 编辑 / 删除对话框（项目中有模型时需要勾选同时删除模型）、添加数据集对话框，以及数据集页使用的“纳入项目”对话框和项目标记。数据集页的项目筛选记在 URL 的 `?project=<项目ID|none>`。
 - 标注模块位于 `src/features/annotation/`：工作台首页（选择数据集）与标注编辑器（`/annotation/workspace/:datasetId`，路由带 `handle.fullBleed`，占满内容区且默认收起侧边栏）。几何计算（`geometry.ts`）、框列表与撤销历史（`document.ts`）、自动保存（`autosave.ts`）、快捷键映射（`shortcuts.ts`）、候选类别与类别配色（`classes.ts`）都是与界面无关的纯函数 / 类，有单元测试；画布（`annotation-canvas.tsx`）用一张 `<img>` 加屏幕坐标的 SVG 叠加层绘制，指针事件统一处理鼠标、触控笔与触屏（双指缩放；触屏与触控笔的按下取消默认行为，不再产生松开之后才派发的兼容鼠标事件，否则短拖动画好框后弹出的类别选择框会被随后的 mousedown 关掉），macOS Safari 的触控板捏合通过 `gesture*` 事件处理；画布容器为 `overflow: clip`（不可滚动），类别选择框等浮层放在画布内，其中的滚轮不缩放图片；类别选择框的高度不超过画布，画布较矮时其中的列表变短（可以滚动）。打开图片时如果焦点不在任何元素上（刚进入编辑器、用快捷键切换图片后），画布获得焦点，Tab 随即可以依次选中框；焦点在输入框、对话框、图片列表等处时不移动焦点。类别选择框关闭（选好类别、Esc）时焦点还在其中、快捷键说明 / 离开与删除的确认对话框关闭、点击提示中的按钮（载入最新版本、仍然保存、重试等）或提示条中的操作（放弃修改并切换）后，焦点也回到画布，不会落到页面上；用户已点到别的控件上、按钮在窄屏时弹出的面板中时不移动，对话框关闭时面板还开着则焦点回到面板中。未保存的修改由 react-router 的 `useBlocker` 守护：切换图片（包括浏览器后退 / 前进）或离开工作台前先保存。
 - 数据集模块位于 `src/features/datasets/`：列表页、详情页（图片 / 标签分布 / 导入记录）、新建与导入对话框、图片查看器（叠加 VOC 标注框）。上传由全局的上传管理器（`upload-manager.ts`，`useSyncExternalStore`）执行，切换页面不会中断；右下角的上传面板显示进度，上传中关闭页面会弹出提醒。
+- 模型审图位于 `src/features/reviews/`：列表页（`/models/reviews`，项目与模型的筛选记在 URL 的 `?project=`、`?model=`）、详情页（`/models/reviews/:reviewId`：进度、各数据集、本地审图的步骤、上传与合并记录）、审图编辑器（`/models/reviews/:reviewId/workspace?image=`，`handle.fullBleed`，筛选记在 URL 中），以及新建、下载审图包、上传审图结果、合并到数据集的对话框；模型详情页的“用这个模型审图”与数据集详情页的“审核记录”（`?tab=reviews`）也在这里。审图编辑器与标注工作台共用画布、框编辑（`features/annotation/box-editing.tsx`）、工具栏部件（`toolbar-parts.tsx`）、保存守护（`save-guard.tsx`）、快捷键（`use-editor-keys.ts`、`shortcuts.ts` 的 `review` 模式）与跨图片的视图设置（`editor-common.ts`），只通过 `ReviewSource`（接口前缀与查询键）读写，所以本地审图程序直接复用它。`review-status.ts`、`review-format.ts`、`params.ts` 是与界面无关的纯函数，有单元测试。
+- 本地审图程序的页面位于 `src/reviewer/`（入口 `frontend/reviewer.html`，用 `vite.reviewer.config.ts` 单独构建到 `backend/cmd/trainmaster-reviewer/web/dist`）：开始页（打开审图包、最近打开的包、打开进度）、审图页（复用 `ReviewEditor`，接口为本机的 `/api/review`）与导出对话框。
 - 模型仓库位于 `src/features/models/`：列表页（`/models`，桌面为表格、窄屏为卡片）、模型详情页（`/models/:modelId`）、上传对话框与下载对话框（PT / ONNX，ONNX 转换的进度与失败原因）。`yolo-versions.ts`（版本表、各模型允许的与默认的后处理方式、转换选项的范围、输出形状说明、下载文件名）与 `naming.ts`（上传文件名与说明的规则）是与后端 `internal/model` 规则一致的纯函数，有单元测试。模型上传由 `features/models/upload-manager.ts` 执行（做法同数据集，复用 `upload-plan.ts` 的分块与重试，进度显示在同一个上传面板中）。
 
 开发时由 Vite（:5173）托管前端并把 `/api` 代理到 Go 服务（:8080）；生产环境由 Go 服务托管 `frontend/dist`。
@@ -308,10 +357,11 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 |---|---|---|
 | `datasets` | `datasets/` | 数据集文件夹：每个数据集一个子目录，图片与 VOC 标注直接以文件保存（见第 6 节） |
 | `models` | `models/` | 模型仓库：每个模型一个文件夹 `project-<项目ID>/v<版本号>/`，其中有 `model.pt`、`model.json` 与转换缓存 `onnx/`（见第 10 节） |
+| `reviews` | `reviews/` | 模型审图：每个审图任务一个文件夹 `review-<任务ID>/`，其中有任务说明 `review.json` 与审图标注（VOC），目录结构与审图包相同（见第 11 节） |
 | `runs` | `runs/` | 训练 / 评估运行产物（日志、曲线、中间权重） |
 | `exports` | `exports/` | 导出的训练集（YOLO / VOC / COCO）、打包导出与报告 |
 | `cache` | `cache/` | 缩略图等可再生的缓存，可随时删除，不需要备份 |
-| `tmp` | `tmp/` | 上传、解压等临时文件：数据集导入 `imports/`，模型上传 `model-uploads/<上传ID>/`，训练节点上传中的转换结果 `model-exports/<转换ID>/`，平台训练的模型入库前的副本 `model-registrations/` |
+| `tmp` | `tmp/` | 上传、解压等临时文件：数据集导入 `imports/`，模型上传 `model-uploads/<上传ID>/`，训练节点上传中的转换结果 `model-exports/<转换ID>/`，平台训练的模型入库前的副本 `model-registrations/`，上传中的审图结果 `review-uploads/` |
 
 平台框架阶段的 `images/` 目录已不再使用（从未写入过数据），旧部署中留下的空目录可以直接删除。
 
@@ -438,7 +488,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 因此迁移文件中**不要写 `BEGIN` / `COMMIT`**，也不能包含无法在事务中执行的语句（如 `CREATE INDEX CONCURRENTLY`）。
 - 迁移只向前：**已发布的迁移文件不要修改，也不要改名**，需要变更就新增一个文件。
 - 同一个版本号只能对应一个文件。执行器会比对 `schema_migrations` 中记录的文件名：数据库里已执行过的版本号在当前代码中对应另一个文件名时（典型情况是两个分支各自新增了 `0002_*.sql`，又共用一个开发数据库），启动直接失败并给出两个文件名，而不是悄悄跳过。此时给后合入的那个文件换一个新编号；开发数据库可以删掉 `data/postgres` 重建。
-- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）；`0008_create_models.sql` 建立模型仓库的 `models`、`model_uploads`、`model_exports`（转换任务，同时是转换结果的缓存），并为 `projects` 增加 `model_version_seq`（见第 10 节）；`0009_project_classes.sql` 把类别列表从数据集移到项目（`projects.classes`），带上每个项目中数据集原有的列表，然后删除 `datasets.classes`（见第 6 节“类别列表”）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
+- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）；`0008_create_models.sql` 建立模型仓库的 `models`、`model_uploads`、`model_exports`（转换任务，同时是转换结果的缓存），并为 `projects` 增加 `model_version_seq`（见第 10 节）；`0009_project_classes.sql` 把类别列表从数据集移到项目（`projects.classes`），带上每个项目中数据集原有的列表，然后删除 `datasets.classes`（见第 6 节“类别列表”）；`0010_create_reviews.sql` 建立模型审图的 `reviews`、`review_datasets`、`review_images`、`review_uploads`、`review_merges`（见第 11 节）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
 
 ## 8. 日志
 
@@ -448,7 +498,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 ## 9. 训练节点
 
-训练需要 GPU 和 Python 生态（PyTorch / Ultralytics），因此作为**独立的服务**接入，而不是放进 Go 服务：训练节点（`trainer/`，Python 包 `trainmaster_trainer`）运行在每台 GPU 机器上，主动向平台注册并上报心跳，并领取、执行平台的任务（目前是模型仓库的 ONNX 转换，见下方“任务协议”“模型转换”）。平台不连接节点，也不调度容器。
+训练需要 GPU 和 Python 生态（PyTorch / Ultralytics），因此作为**独立的服务**接入，而不是放进 Go 服务：训练节点（`trainer/`，Python 包 `trainmaster_trainer`）运行在每台 GPU 机器上，主动向平台注册并上报心跳，并领取、执行平台的任务（目前是模型仓库的 ONNX 转换与模型审图的识别，见下方“任务协议”“模型转换”与第 11 节）。平台不连接节点，也不调度容器。
 
 ### 部署形态
 
@@ -493,16 +543,16 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 ### 任务协议
 
-节点主动向平台领取任务，平台从不连接节点（接口见第 3 节“计算资源接口”）。任务记录在 PostgreSQL 中，目前只有一种：`model_export`（表 `model_exports`，模型仓库的 pt → ONNX 转换）。
+节点主动向平台领取任务，平台从不连接节点（接口见第 3 节“计算资源接口”）。任务记录在 PostgreSQL 中，目前有两种：`model_export`（表 `model_exports`，模型仓库的 pt → ONNX 转换）与 `review_inference`（表 `reviews`，模型审图的识别，见第 11 节“识别任务”）。下面以转换为例；审图识别使用同样的领取、身份、租约、重试与停止规则，接口与结果的上报方式不同。
 
-1. **能力**：任务线程（`trainmaster_trainer/tasks.py`）在第一次注册成功后启动。本机能找到 `torch`、`ultralytics` 与 `onnx`（`importlib.util.find_spec`，常驻进程不导入它们）时才在 `kinds` 中带上 `model_export`；缺少时记录一条日志，之后每 5 分钟重新检查（裸机节点可能随后补装了依赖）。
-2. **领取（长轮询）**：`POST …/agent/tasks/claim`，`wait_seconds=25`（平台最多等 30 秒，客户端超时为等待时间 + 15 秒），返回 `{"task": null}` 时立即再领。平台用 `UPDATE … WHERE id = (SELECT id FROM model_exports WHERE status = 'queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)` 取最早排队的转换，一个任务只会交给一个节点；任务入队或重新排队时通过进程内的通知唤醒正在等待的领取。平台关闭时（`http.Server.RegisterOnShutdown`）正在等待的领取立即返回 `{"task": null}`，节点在平台重启后再领。领取时 404 `unknown_node` → 请主循环重新注册；其它 404 / 405 / 501（旧版平台没有任务接口）→ 每 5 分钟重试一次，只记录一次日志；网络错误与 5xx → 与心跳相同的指数退避。
+1. **能力**：任务线程（`trainmaster_trainer/tasks.py`）在第一次注册成功后启动。本机能找到每类任务需要的模块（`REQUIRED_MODULES`，`importlib.util.find_spec`，常驻进程不导入它们）时才在 `kinds` 中带上这类任务：`model_export` 需要 `torch`、`ultralytics` 与 `onnx`，`review_inference` 需要 `torch` 与 `ultralytics`；缺少时记录一条日志，之后每 5 分钟重新检查（裸机节点可能随后补装了依赖）。
+2. **领取（长轮询）**：`POST …/agent/tasks/claim`，`wait_seconds=25`（平台最多等 30 秒，客户端超时为等待时间 + 15 秒），返回 `{"task": null}` 时立即再领。平台用 `UPDATE … WHERE id = (SELECT id FROM model_exports WHERE status = 'queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)` 取最早排队的转换，一个任务只会交给一个节点；节点同时提供几种类型时先取转换，没有转换时再按注册顺序问其它任务来源（`model.TaskSource`，目前是审图识别）；任务入队或重新排队时通过进程内的通知唤醒正在等待的领取。平台关闭时（`http.Server.RegisterOnShutdown`）正在等待的领取立即返回 `{"task": null}`，节点在平台重启后再领。领取时 404 `unknown_node` → 请主循环重新注册；其它 404 / 405 / 501（旧版平台没有任务接口）→ 每 5 分钟重试一次，只记录一次日志；网络错误与 5xx → 与心跳相同的指数退避。
 3. **身份**：领取的请求体带 `node_key`；之后关于这个任务的每个调用（任务中给出的 `input_url`、`progress_url`、`output_url`、`complete_url`、`fail_url`）都带请求头 `X-Node-Key`。平台只接受领取它的节点、且任务仍在执行中的调用：任务被删除（用户删除了转换或模型）时返回 404，已不属于该节点或已结束时返回 409，节点收到后结束子进程、放弃任务，不再上报。
 4. **租约**：领取后任务为 `running`，租约 60 秒（`lease_seconds`）。每次上报进度、下载输入与上传结果的过程中（每 15 秒）、结果上传完成时都会续租；节点在执行期间每 15 秒上报一次进度。平台每 15 秒检查一次：租约过期（节点崩溃、断网或被强制停止）的任务在领取次数少于 3 次时重新排队，否则失败（“训练节点在转换过程中失去联系（已尝试 3 次）”）。
 5. **失败与重试**：`fail` 带 `retryable`：网络错误、下载的文件大小或 SHA256 不一致、节点磁盘空间不足、平台返回 5xx（507 除外）或 401 等可能下次成功的失败为 true，领取次数少于 3 次时重新排队；转换本身的失败（模型无法加载、后处理方式不适用、超时、ONNX Runtime 验证失败等）与平台拒绝接收结果（上传前的预检或上传返回 413、507）为 false，直接失败，`error` 为中文说明，`error_detail` 为节点上的错误输出（截断到 8 KiB）。用户再次请求同样的转换时重新排队，尝试次数清零。
 6. **结果**：节点先计算结果文件的 SHA256，以 `{"stage": "uploading", "size_bytes": N}` 上报一次进度（预检，见第 3 节：404 / 409 放弃任务，413 / 507 为不可重试的失败，带平台的说明；不认识 `size_bytes` 的旧版平台照常续租），再用 `PUT output` 一次上传（带 `Content-Length` 与 `X-Content-Sha256`），平台边接收边计算并核对大小与 SHA256，不一致时丢弃（节点把 422 视为传输错误，可以重试）。上传中连接被重置时，节点再上报一次不带大小的进度来区分原因：404 / 409 放弃，507 不可重试，其它情况按网络错误重试；再 `POST complete`，平台把文件从 `tmp/model-exports/` 移入模型文件夹，转换成功。
 7. **停止**：节点停止（`docker stop`、`systemctl stop`）时结束正在运行的转换子进程，以 `retryable: true` 上报失败（超时 5 秒，不拖慢停止），任务立即重新排队（领取次数已满 3 次时为失败）；没能上报时由租约过期处理。空闲时停在长轮询中的领取不等待，直接退出。
-8. 一个节点同时只执行一个任务。“正在执行转换的节点数”（`workers_online`）是最近 60 秒内领取过或上报过转换任务的节点，只保存在 app 进程的内存中；与指标历史一样，目前只支持单实例部署。
+8. 一个节点同时只执行一个任务。“可以执行这类任务的节点数”（`workers_online`）按类型统计：最近 60 秒内在领取中提供过这类任务、或上报过任务的节点（正在执行审图识别的节点仍算作可以转换，反之亦然），只保存在 app 进程的内存中；与指标历史一样，目前只支持单实例部署。
 
 ### 模型转换
 
@@ -528,8 +578,8 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 ### 后续工作
 
 - **训练任务调度**：训练任务记录在 PostgreSQL 中，按上面的任务协议由节点领取并上报进度、日志与指标，训练完成后通过 `RegisterTrainedModel` 把最终权重存入模型仓库。`/api/v1/training/jobs` 目前仍返回 501。
-- **数据交换**：节点与 app 挂载同一个存储目录（compose 中训练节点已把它挂载为 `/data`），从 `datasets/` 或 `exports/` 读取训练集，把运行产物写入 `runs/`；其它机器上的节点通过 NFS 等共享存储挂载同一目录。（模型转换不需要共享存储：节点通过 HTTP 下载 pt、上传 ONNX。）
-- 评估、批量推理、预标注、TensorRT 等其它格式的转换等耗时任务也将复用同一套训练节点与任务协议。
+- **数据交换**：节点与 app 挂载同一个存储目录（compose 中训练节点已把它挂载为 `/data`），从 `datasets/` 或 `exports/` 读取训练集，把运行产物写入 `runs/`；其它机器上的节点通过 NFS 等共享存储挂载同一目录。（模型转换与审图识别都不需要共享存储：节点通过 HTTP 下载 pt 与图片，上传 ONNX 与识别结果。）
+- 模型审图的识别已经复用了这套协议（第 11 节）；评估、预标注、TensorRT 等其它格式的转换等耗时任务也将复用同一套训练节点与任务协议。
 
 ## 10. 模型仓库
 
@@ -605,3 +655,134 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 下载文件名：PT 为 `<项目名>_v<版本>.pt`；ONNX 为 `<项目名>_v<版本>_<高>x<宽>[_dynamic][_nms|_end2end][_opset<N>].onnx`，正方形时 `<高>x<宽>` 写作边长（如 `A线外观检测_v3_640_end2end.onnx`）。项目名中的 `\ / : * ? " < > |` 与控制字符替换为 `_`。
 
 节点上报的 `result`（版本、opset、输入输出、是否验证、耗时、节点名）由平台按类型与长度清洗后存储；动态维度的形状元素为字符串（如 `"batch"`）。
+
+## 11. 模型审图
+
+模型审图用模型仓库中的一个模型识别一个或多个数据集的图片，再由人逐张审核：识别正确的标为“已审核”（`approved`），需要参与后续训练的修正识别框后标为“需加样”（`needs_sample`），最后把审图标注合并进数据集。实现分几部分：`internal/review`（审图任务、识别任务、审核、审图包、上传结果、合并），`internal/reviewfile`（审图包的文件格式，平台与本地审图程序共用），本地审图程序 `cmd/trainmaster-reviewer` 与 `internal/reviewer`，前端 `src/features/reviews/` 与 `src/reviewer/`，训练节点 `trainmaster_trainer/review_inference.py`。接口见第 3 节“模型审图接口”与“计算资源接口”。
+
+### 数据模型
+
+`0010_create_reviews.sql`：
+
+| 表 | 内容 |
+|---|---|
+| `reviews` | 审图任务：名称、说明、`model_id` 与 `project_id`（模型或项目删除后为 NULL）、创建时的模型快照 `model_ref`（`{id, project_id, project_name, version, yolo_version, task, file_name, class_names}`，模型删除后仍能显示）、识别参数 `options`（`{conf, iou, imgsz: [高, 宽], max_det}`）、识别状态（`status`、`stage`、`node_id`、`attempts`、`lease_expires_at`、`error`、`error_detail`、`result`、开始与结束时间） |
+| `review_datasets` | 任务的数据集，按选择的顺序（`position`）；`folder` 是数据集在任务文件夹与审图包中的文件夹名，`dataset_name` 是创建时的名称 |
+| `review_images` | 任务的图片：创建时数据集图片的**快照**（`rel_path`、尺寸、`image_version`），`position` 为任务中的顺序；`package_path` / `annotation_path` 是图片与审图标注在任务文件夹（审图包）中的路径。识别结果 `inferred`、`inference_error`、`predictions`（模型的框，之后不再改变）；当前审图标注的 `object_count`、`labels`、`annotation_version`（文件内容的版本，没有文件时为 `""`）与 `edited`；审核状态 `status`、`reviewed_at`；`revision`（标注与状态各自每变一次加 1）；`merged_at` / `merged_revision`（最近一次合并） |
+| `review_uploads` | 上传的审图结果与应用结果：`file_name`、`overwrite`、`summary`、最多 100 条 `problems` |
+| `review_merges` | 合并到数据集的后台任务：`dataset_ids`、`statuses`、`on_existing`（`skip` / `overwrite`）、`status`（`running` → `succeeded` / `failed`）、进度 `total` / `done`、`summary`、`problems`、`error`；部分唯一索引保证一个任务同时只有一个合并在进行 |
+
+- **图片是快照**：创建时按所选数据集的顺序、数据集内按“图片顺序”（第 6 节）写入 `review_images`；之后数据集中新增的图片不会加入。数据集中的图片被删除（重新扫描、覆盖导入）或数据集被删除时，对应的审图图片级联删除。
+- **计数不存储**：各状态的图片数（`counts`：`total`、`inferred`、`inference_failed`、`pending`、`approved`、`needs_sample`、`edited`、`merged`）总是用 `GROUP BY` 现算，级联删除不会让计数过期。
+- **任务状态**：`queued` → `running` → `ready`；`running` 的任务在节点报告可重试的失败或租约过期时回到 `queued`（最多领取 3 次），否则 `failed`；`failed` 的任务可以“重新识别”（`POST …/retry`：清零尝试次数与错误后排队），继续识别还没有识别的图片。
+- **审核状态**：`pending`（待审核，默认）、`approved`（已审核：识别结果正确，模型不需要再学习这张图片）、`needs_sample`（需加样：这张图片需要参与后续的训练）。只有识别过的图片（`inferred`，包括识别失败的）可以审核与编辑。`edited` 表示审图标注与模型的识别结果不同：按类别名称与坐标作为多重集合比较（顺序、`difficult` / `truncated` 与置信度不算，`reviewfile.SameBoxes`）。
+
+### 存储
+
+```text
+reviews/
+├── review-<任务ID>/
+│   ├── review.json                     # 任务说明：任务、模型快照、识别参数、数据集、图片数、创建时间（创建时写入，之后不再更新）
+│   └── <数据集文件夹>/<子目录>/<图片名>.xml  # 审图标注（VOC），每张识别过的图片一个
+└── .deleting-<任务ID>/                  # 删除中的任务文件夹
+```
+
+- 任务文件夹只保存审图标注，图片始终从数据集读取（原图、缩略图都用数据集的接口与缓存）；文件夹中的 `review.json` 是任务的说明，不是审图包的清单格式。
+- **审图标注属于平台**：每次保存都用导入时的 VOC 写入器重新生成整个文件（不保留其它内容），同样的框总是得到同样的文件，`annotation_version` 随内容变化。文件通过 `os.Root` 访问（任务文件夹中的符号链接不能指向外面），先写同目录的隐藏临时文件再改名替换；同一张图片的修改串行执行（按图片加锁），先写文件、再在同一事务中更新这张图片的行，失败时恢复原来的文件。
+- **Windows 安全的路径**（`reviewfile/paths.go`，审图包要在 Windows 上解压）：数据集文件夹名为 `SafeSegment(数据集文件夹名)`，与已用的名称不区分大小写地重复时加 `~<数据集ID>`；图片的路径逐段 `SafeSegment`，同一文件夹中重复（不区分大小写，`FoldKey`）时在扩展名前加 `~2`、`~3`…；标注为 `<图片名去掉扩展名>.xml`，被占用时为 `<图片文件名>.xml`，仍被占用时为 `<图片名>~N.xml`。`SafeSegment` 把 `< > : " | ? * \ /`、控制字符与无效的 UTF-8 换成 `_`，末尾的点与空格换成 `_`，Windows 设备名（`CON`、`PRN`、`AUX`、`NUL`、`CONIN$`、`CONOUT$`、`COM0`–`COM9`、`LPT0`–`LPT9`，含上标数字的写法）前加 `_`，每段不超过 255 个 UTF-16 单元。顶层的 `review.json`、`review-progress.json`、`README.txt` 是保留的名称，数据集文件夹不会用它们。
+- **删除**：在事务中锁定任务、确认没有进行中的合并后删除记录，并把文件夹改名为 `reviews/.deleting-<任务ID>`，提交后再删除；没能完全删除时剩余的文件恢复为原来的名称（任务 ID 不复用），接口返回 200 与说明。数据集不受影响。
+- **后台任务**（`review.Service.Start` / `Stop`）：启动时把上次运行中断的合并记为失败（“服务重启，合并被中断（已合并的图片保留，可以再次合并）”）；每 15 秒处理租约过期的识别任务；启动时与每小时删除 `.deleting-*`、没有对应任务的文件夹与 1 小时前暂存、已不再使用的上传（`tmp/review-uploads/`）。审图包的下载链接、按图片的锁与合并任务都在进程内存中，**目前只支持单实例部署**。
+
+### 新建
+
+`POST /api/v1/reviews`（`internal/review/create.go`）：
+
+- **模型**：必须存在（否则 422）、模型文件还在磁盘上（否则 409），且有检测框：检测、分割、姿态、旋转框模型；分类、语义分割、深度估计模型返回 422（“分类模型没有检测框，不能用于审图”）。
+- **数据集**：1–50 个（重复的 ID 忽略），合计 1–200 000 张图片（没有图片时 422 “所选数据集中没有图片”）。
+- **名称与说明**：名称省略时为 `<项目名> v<版本> 审图`（项目名过长时截短）；规则同项目：名称最长 64 个字符、不能含控制字符，说明最长 500 个字符。名称不要求唯一。
+- **识别参数**：`conf` 0.01–1（默认 0.25）、`iou` 0.1–0.95（默认 0.7）、`max_det` 1–1000（默认 300）、`imgsz` 规则同 ONNX 转换（每边 32–4096 且为 32 的倍数，整数或 `[高, 宽]`，默认为训练时的尺寸，第 10 节“ONNX 转换”）。
+- 在一个事务中插入任务、数据集与图片（`COPY`），创建任务文件夹并写入 `review.json`，任务为 `queued`，然后唤醒正在等待的领取（`model.Service.NotifyTasks`）。创建期间有数据集图片被删除（外键错误）时整体重试，最多 3 次。
+
+### 识别任务
+
+`review.Service` 实现 `model.TaskSource`（`Kind()` 为 `review_inference`，`Claim(ctx, nodeID)`），创建时用 `model.Service.AddTaskSource` 注册，因此复用训练节点的领取接口、长轮询与唤醒（第 9 节“任务协议”）：
+
+1. **领取**：节点在 `kinds` 中带上 `review_inference`。平台先找转换任务（`model_export`），没有时再按注册顺序问各个任务来源；审图任务按 `SELECT … FROM reviews WHERE status = 'queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1` 取最早排队的，置为 `running`、记下节点、`attempts + 1`、租约 60 秒。模型已被删除或模型文件不在时，这个任务直接失败（“模型已被删除，无法识别” / “模型文件不存在，无法识别”），领取继续看下一个（一次最多跳过 20 个）。
+2. **任务**（`review.Task`）：`{kind, id, lease_seconds, model: {id, project_id, version, yolo_version, task, file_name, size_bytes, sha256, class_names}, options, image_count, remaining, model_url, images_url, progress_url, results_url, complete_url, fail_url}`，URL 都在 `/api/v1/compute/agent/review-inferences/<任务ID>/` 下。
+3. **执行**：节点下载模型（`GET model`，支持 Range，读取期间每 15 秒续租；这时才发现模型已删除或文件已不在时任务失败，返回 404），上报进度（`downloading` / `inferring`）；按页取还没有识别的图片（`GET images?after=<上一页最后的 ID>&limit=`，按 ID 排列，带 `remaining`），逐张下载（`GET images/{imageID}/file`）并识别，结果攒批上报（`POST results`，每批最多 500 张、请求体 1 MiB）。
+4. **写入结果**：每个请求在一个事务中处理：识别成功的图片写入 VOC 文件（模型的框，不带置信度与 `difficult` / `truncated` 标记）并记下 `predictions`、`object_count`、`labels`、`annotation_version`；识别失败的图片只记 `inference_error`（中文原因，没有文件）。已经识别过的、不属于这个任务的图片 ID 忽略，因此重发同一批结果是安全的；返回 `{lease_seconds, accepted, remaining}`。框按上报的值清洗：类别名称去掉控制字符与首尾空白、最长 255 个字符，名称为空或坐标不是有限值的框丢弃；坐标裁剪到图片范围并取整，面积为 0 的框丢弃；置信度限制在 0–1 并保留 4 位小数；每张图片最多保留置信度最高的 1000 个框。
+5. **完成**：`POST complete`（`{result}`）在还有没识别的图片时返回 409（“还有 N 张图片没有识别”），否则任务为 `ready`。`result` 只保留 `device`、`torch_version`、`ultralytics_version`、`node_name`、`elapsed_seconds`、`images_per_second`。
+6. **租约与失败**：同模型转换：每个调用都续租，平台每 15 秒检查一次，租约过期的任务在领取次数少于 3 次时重新排队，否则失败（“训练节点在识别过程中失去联系（已尝试 3 次）”）；`POST fail`（`{error, detail?, retryable?}`）可重试且领取次数少于 3 次时重新排队，否则失败。重新排队与重试都从还没有识别的图片继续，已经上报的结果保留。任务被删除时节点的调用得到 404，已不属于该节点或已结束时得到 409，节点随之放弃。
+7. **排队与在线节点**：排队中的任务带 `queue_position`（在排队的审图任务中的位置，从 1 起）；`workers_online` 是最近 60 秒内在领取中提供过 `review_inference`、或上报过任务的节点数（`model.Service.WorkersOnline(kind)`，按类型统计，正在执行转换的节点仍算作提供了审图识别）。为 0 时页面提示没有可以识别的训练节点。
+
+### 训练节点上的识别
+
+`review_inference` 任务由 `trainmaster_trainer/review_inference.py` 执行。节点在本机能找到 `torch` 与 `ultralytics` 时才提供这类任务（不需要 `onnx`，见第 9 节“任务协议”）。
+
+1. 工作目录为状态目录中的 `work/review-inference-<任务ID>/`（开始前清理残留，结束后删除，节点启动时也清理）；检查剩余空间（模型大小 + 256 MiB，不足时为可重试的失败）；下载 `model.pt` 并核对大小与 SHA256。
+2. 启动**子进程** `python -m trainmaster_trainer.review_inference --spec <JSON>`：环境变量的处理与模型转换相同（只继承运行 Python 需要的变量，没有节点令牌；`YOLO_OFFLINE=1`、`YOLO_AUTOINSTALL=False`、`ULTRALYTICS_SAFE_LOAD=1`，并确认安全加载已生效），只是**显卡可见**（节点自己设置了 `CUDA_VISIBLE_DEVICES` 时沿用）：有 CUDA 时在 `cuda:0` 上识别，否则在 CPU 上。子进程加载模型并预热一次后输出一行 `{"ready": true, "device", "names", "versions", …}`；之后父进程每张图片写一行 `{"id", "path"}`，子进程回答一行 `{"id", "ok": true, "width", "height", "boxes": [[x1, y1, x2, y2, 置信度, 类别], …]}`，或这张图片的 `{"id", "ok": false, "error"}`；显存不足、显卡出错等继续下去没有意义的错误输出不带 `id` 的失败后退出。
+3. 图片按存储的像素方向读取（OpenCV 的 `IMREAD_IGNORE_ORIENTATION`；TIFF 先把 Orientation 标签改为 1，因为 OpenCV 与 Pillow 读 TIFF 时都会按它旋转；OpenCV 读不了的格式（GIF、部分 AVIF 等）用 Pillow 读取第一帧，同样不旋转），坐标与平台显示、标注的图片一致；旋转框模型取旋转框的外接矩形（`obb.xyxy`）。torch、ultralytics 与 OpenCV 只在子进程中导入。
+4. 父进程按页（200 张）取图片，用 4 个线程预先下载（最多领先 8 张，工作目录中同时只有这么多张图片），依次交给子进程（最多 2 张在途），结果攒满 32 张、512 KB 或 5 秒时上报一批，期间定期上报进度（续租）。超过 1 GiB 的图片不下载，上报这张图片识别失败；单张图片下载时得到 404 时同样只是这张失败。平台不再列出图片时完成；一轮之后平台仍列出未识别的图片时再来一轮，连续 3 轮都有时放弃。
+5. **超时**：单张图片的识别（从子进程开始处理它算起）与启动子进程、加载模型都受 `TM_INFERENCE_IMAGE_TIMEOUT` 限制（默认 300 秒；启动至少 120 秒），超时后结束整个进程组，任务失败（不可重试，“识别超时（单张图片 N 秒内没有识别完成）…”）。
+6. **失败**：平台返回 404 / 409 时放弃任务；5xx（507 除外）、401、网络错误、磁盘不足等为可重试的失败；节点停止时结束子进程并上报可重试的失败（“训练节点正在停止，识别已中断”）；模型无法加载等识别本身的失败不可重试，`error` 为中文说明（翻译规则同模型转换），`detail` 为子进程 stderr 的最后部分。
+
+`python -m trainmaster_trainer infer --weights x.pt [--conf 0.25] [--iou 0.7] [--imgsz 640|高x宽] [--max-det 300] [--device cpu|cuda:0] [--task …] [--json] 图片…` 用同一个子进程在本机识别图片（离线，不连接平台），打印每张图片的尺寸、检测框与耗时，便于排查识别失败或结果不对的原因；任何一张失败时退出码为 1。
+
+### 审核
+
+- **读取**：图片列表与上一张 / 下一张按任务中的顺序（`position`），筛选：`status`（`all` / `pending` / `approved` / `needs_sample` / `reviewed` 即已审核与需加样）、`dataset_id`、`label`（审图标注中的类别）、`q`（数据集中的路径包含，不区分大小写）、`edited`（`all` / `edited` / `unedited`）、`boxes`（`all` / `with` / `without`）、`inference`（`all` / `failed`）；`limit` 默认 60、最多 200。图片详情的 `objects` 实时从任务文件夹中的 VOC 文件读取（文件无法使用时 `annotation_error` 说明原因，编辑器只读），并带 `predictions`。原图与缩略图来自数据集。
+- **候选类别**（`GET …/classes`）：模型所属项目的类别列表（带 `version`）不为空时用它，否则用模型的类别名称（`version` 为 `""`）。`GET …/labels` 是审图标注中各类别的目标数与图片数，按目标数从多到少。
+- **保存审图标注**（`PUT …/annotation`，请求体最多 8 MiB）：`{objects, base_version, force?}`，校验与裁剪同数据集的标注；`base_version` 与当前文件版本不同时返回 409 `annotation_conflict`（带 `force: true` 覆盖），还没有识别的图片返回 409 `conflict`。重新生成整个 VOC 文件，更新 `object_count`、`labels`、`edited` 与 `annotation_version`，`revision` 加 1；框与当前文件相同时不算修改。`objects` 为 `[]` 时写入没有目标的文件。
+- **审核状态**（`PUT …/status`，`{status}`）：改为 `approved` / `needs_sample` 时记下 `reviewed_at`，改回 `pending` 时清空；状态变化时 `revision` 加 1。还没有识别的图片返回 409。
+- **编辑器**（`src/features/reviews/review-editor.tsx`）与标注工作台共用画布、框编辑、工具栏部件、保存队列与离开前的保存（`features/annotation/` 中的 `box-editing.tsx`、`toolbar-parts.tsx`、`save-guard.tsx`、`use-editor-keys.ts`、`editor-common.ts`），只通过 `ReviewSource`（接口前缀与查询键）读写，平台（`/api/v1/reviews/<ID>`）与本地审图程序（`/api/review`）共用。审图时快捷键多了 <kbd>S</kbd> / <kbd>X</kbd> / <kbd>U</kbd>（已审核 / 需加样 / 待审核，`shortcuts.ts` 的 `review` 模式），<kbd>N</kbd>（空标注）不可用，<kbd>Shift</kbd>+<kbd>D</kbd> / <kbd>Shift</kbd>+<kbd>A</kbd>（没有选中框时还有 <kbd>Shift</kbd>+<kbd>→</kbd> / <kbd>←</kbd>）跳到当前数据集筛选下的下一张 / 上一张待审核图片。标记前先等这张图片的保存完成；“标记后自动跳到下一张”（默认开，记在浏览器中）开启时，标为已审核或需加样后跳到下一张符合筛选条件的图片，改回待审核不跳。
+
+### 审图包
+
+`POST …/packages`（`{statuses?, dataset_ids?}`，默认全部状态与数据集）检查后返回 201 `{url, file_name, expires_at, image_count}`；只打包识别过的图片，没有时 409。链接的令牌（`crypto/rand` 的 `rand.Text()`）保存在进程内存中，1 小时内可以重复下载，**每次下载都按当时的状态现场打包**：边打包边输出，没有 Content-Length，不占用磁盘空间；中途出错时中断连接（同数据集下载），链接过期后 404（“下载链接已失效，请重新下载”）。
+
+zip 中只有一个顶层文件夹 `审图-<任务ID>-<任务名>/`（`SafeSegment`，也是 zip 的文件名）：先是 `README.txt`（UTF-8 带 BOM、CRLF 换行的中文说明），然后按任务中的顺序依次是每张图片（`package_path`）与紧随其后的审图标注（`annotation_path`，有文件时），最后是清单 `review.json`。图片按数据集下载的规则选择存储或 Deflate（`dataset.ZipMethod`）；数据集中已不存在的图片文件同时从 zip 与清单中略去。
+
+**清单 `review.json`**（`reviewfile/manifest.go`，字段名是文件格式，同一版本的平台与本地审图程序必须能互相读取）：
+
+- `format: "trainmaster-review"`、`version: 1`、`kind`（`package` 审图包 / `results` 审图结果）、`package_id`（每次下载随机生成的 128 位十六进制，审图结果沿用）、`platform`（如 `trainMaster 0.1.0-dev (d62132f)`）、`exported_at`。
+- `review`（`{id, name, description, created_at}`）、`model`（模型快照）、`options`、`classes`（`[{name, color}]`，候选类别）、`datasets`（`[{id, name, folder}]`）。
+- `images`：按任务中的顺序，每张 `{id（审图图片）, dataset_id, image_id（数据集图片）, path（包中的图片）, source_path（数据集中的路径）, annotation（包中的标注文件）, has_annotation, width, height, predictions, inference_error, base_status, base_revision, base_annotation_version, status, reviewed_at, edited}`。`base_*` 是打包时平台上的状态、`revision` 与标注文件的版本，是之后上传结果时判断“谁改过”的依据。写入时每张图片一行，便于查看与比对。
+- 读取时校验：格式与版本（更新的版本提示升级程序）、`kind`、ID 为正数且不重复、数据集文件夹合法且不是保留的名称、每个路径都合法并位于自己的数据集文件夹中、路径不区分大小写不重复。zip 中的清单是最浅的 `review.json`（最多 3 层文件夹，忽略 `__MACOSX`），同一层有多个时报错。
+
+### 上传审图结果
+
+`POST …/results?overwrite=&file_name=`，请求体就是 zip 本身（`Content-Type: application/zip`，multipart 返回 400），必须带 `Content-Length`，最大 4 GiB（413）。剩余空间至少为大小 + 512 MiB（否则 507）；请求体先暂存到 `tmp/review-uploads/<随机名>.zip`，接收完之后的处理不再因浏览器断开而中断。清单最大 256 MiB；不是这个任务的结果时返回 422（“这是审图任务 #N 的审图结果，不是这个任务的”）。重新压缩的审图包也可以上传（其中的图片忽略，标注只在内容变化时才算修改）。
+
+逐张比较清单与打包时的状态：
+
+1. 清单中的图片不在任务中 → `unknown`；`image_id` 或标注路径与平台不符 → `invalid`。
+2. **本地的修改**：`status` 与 `base_status` 不同为状态修改；zip 中有这张图片的标注文件、且版本与 `base_annotation_version` 不同为标注修改（解析并按平台的规则规范化，文件无效时整张图片作为 `invalid` 跳过，大小上限同数据集的标注文件）。都没有 → `unchanged`。
+3. 在这张图片的锁内，只有与平台**当前内容**不同的部分才算数：都相同时为 `unchanged`（所以重复上传同一份结果不会重复应用）。平台上的 `revision` 与 `base_revision` 不同（下载之后平台上也改过）且没有 `overwrite=true` 时为冲突（“平台上的这张图片在下载审图包之后被修改过”），否则应用（写入标注文件、更新状态，规则同保存与审核，`reviewed_at` 为应用的时间）。
+
+每张图片单独处理，一张的问题不影响其它。返回并记录到 `review_uploads` 的结果为 `summary`（`images`、`applied`、`status_changes`、`annotation_changes`、`unchanged`、`conflicts`、`invalid`、`unknown`）与最多 100 条 `problems: [{path, kind, message}]`；`GET …/uploads` 列出最近 50 次上传。页面在有冲突时可以带 `overwrite=true` 再上传一次。
+
+### 合并到数据集
+
+`POST …/merges`（`{dataset_ids?, statuses, on_existing}`，`statuses` 至少一种，`on_existing` 为 `skip` / `overwrite`）返回 202 与合并记录，在后台按任务中的顺序处理所选数据集中这些状态的识别过的图片（页面提供需加样（默认）与已审核，接口也接受 `pending`）。已有合并在进行时 409，没有符合条件的图片时 409。进度至少每 50 张或每秒保存一次，`GET …/merges/{mergeID}` 查看，`GET …/merges` 列出最近 50 次。
+
+每张图片：
+
+- 审图图片已被删除、审图标注无法读取、数据集中这张图片不能在平台中保存标注（`annotation_blocked`）→ `failed`；
+- 没有审图标注文件（识别失败、之后也没有编辑过）→ `skipped_empty`；
+- 数据集中这张图片已有标注文件（含空标注与无效标注）且 `on_existing` 为 `skip` → `skipped_existing`；
+- 否则通过 `dataset.Service.SaveAnnotation` 写入（与标注工作台的保存相同：数据集索引与计数随之更新，`base_version` 为刚读到的版本，`overwrite` 时允许重新生成无法保留其它内容的文件）；框为空时写入空标注（负样本）。期间数据集中的标注被别人修改了 → `conflicts`（“数据集中这张图片的标注在合并时被其他人修改了，没有合并”）；成功 → `merged`，记下 `merged_at` 与 `merged_revision`。
+
+个别图片的失败不影响合并的结果（`succeeded`，`summary`：`merged`、`skipped_existing`、`skipped_empty`、`conflicts`、`failed`，以及最多 100 条 `problems`）；只有合并本身出错时为 `failed`。服务停止或重启时进行中的合并为失败，已合并的图片保留，可以再次合并。任务自己的审图标注不受影响；进行中的合并会阻止删除任务。
+
+### 本地审图程序
+
+`trainmaster-reviewer.exe`（`backend/cmd/trainmaster-reviewer`，Go，`GOOS=windows`、`-H windowsgui`）是在 Windows 电脑上离线审图的单个可执行文件：
+
+- **分发**：平台镜像中带着它（`/app/tools/trainmaster-reviewer.exe`，`TM_REVIEWER_TOOL`），`GET /api/v1/reviews/tool` 说明是否可以下载与版本（与平台同时构建，版本即平台的版本），`GET …/tool/download` 下载。页面（`frontend/reviewer.html`，`vite.reviewer.config.ts`）构建到 `cmd/trainmaster-reviewer/web/dist`，编译时用 `go:embed` 嵌入；没有构建时嵌入的是占位页。
+- **启动**：只监听本机地址（`-addr`，默认 `127.0.0.1:0`，端口为 0 时先试 47821，这样每次的地址相同，WebView2 保留页面的设置；被占用时随机选择）。Windows 上用 WebView2（`github.com/jchv/go-webview2`，数据目录为程序缓存目录 `%LOCALAPPDATA%\trainmaster-reviewer` 中的 `webview2\`）打开标题为“trainMaster 本地审图”的窗口；系统没有 WebView2 运行时、窗口打不开或带 `-browser` 时改用默认浏览器打开，并用一个消息框让程序保持运行，点“确定”退出。关闭窗口时先通知页面（`window.__tmReviewerRequestClose`），页面保存最后的修改后调用 `POST /api/quit`；3 秒内没有回应（页面没有加载）时直接关闭。命令行的参数（或拖到程序图标上的文件）是启动时要打开的审图包。`TM_REVIEWER_DEBUG` 不为空时启用开发者工具；其它系统上的构建用于开发，在浏览器中打开。
+- **访问控制**（`internal/reviewer/security.go`）：本机的任何程序与网页都能访问 127.0.0.1，所以只回应程序打开的页面：程序打开 `/?token=<随机令牌>`，服务器把令牌设为 Cookie（`HttpOnly`、`SameSite=Strict`，名称带端口）后重定向到不带令牌的地址，之后每个请求都必须带它（否则 401）；`Host` 必须是服务器自己的地址（`127.0.0.1:<端口>` 或 `localhost:<端口>`，防 DNS 重绑定，否则 403）；浏览器标为来自其它来源的请求（`Origin` 与本机地址不符，`Sec-Fetch-Site` 不是 `same-origin` / `none`）返回 403（127.0.0.1 的其它端口对 Cookie 来说是同一个站点）。
+- **接口**：`/api/review/*` 与平台的审图接口形状相同（审图编辑器直接复用），另有程序自己的 `/api/session`、`/api/browse`（打开对话框中浏览文件夹：下载、桌面、文档与各个盘符）、`/api/open`、`/api/open/cancel`、`/api/close`、`/api/export`、`/api/reveal`（在资源管理器中显示）、`/api/recent/remove`、`/api/closing`、`/api/quit`。
+- **打开审图包**（`extract.go`）：zip 解压到它旁边与 zip 同名的文件夹（`审图-12-外观.zip` → `审图-12-外观\`），只解压清单中列出的文件（以及 `README.txt` 与进度文件）；有任何不安全的条目（绝对路径、盘符、`..`、NUL、符号链接）时拒绝整个 zip。单个图片文件不超过 4 GiB、清单不超过 256 MiB，剩余空间至少为要解压的总大小 + 64 MiB。先解压到临时文件夹 `.tm-extracting-*`，全部完成后改名，因此最终名称的文件夹总是完整的（24 小时前的临时文件夹作为崩溃残留删除）。同名文件夹已存在且是同一个包（`package_id` 相同）时直接打开、接着审；否则改用 `<名称> (2)`、`<名称> (3)`…（最多到 100）。也可以直接打开解压好的文件夹、其中的 `review.json`，或只含一个审图包的文件夹；打开审图结果的 zip 时提示到平台上传。
+- **审核进度**：审图标注就是文件夹中的 VOC 文件（保存方式同平台）；审核状态保存在 `review-progress.json`（`format: "trainmaster-review-progress"`、`version: 1`、`package_id`、`review_id`、`updated_at`，只记状态与包中不同的图片 `[{id, status, reviewed_at}]`，以及最近一次导出 `last_export`），都是原子替换。进度文件损坏时不打开这个包。
+- **导出审图结果**（`export.go`）：在审图包文件夹旁边原子写入 `<文件夹名>-审图结果.zip`（再次导出时替换），其中顶层文件夹 `<审图包文件夹名>-审图结果/` 有 `README.txt`、`kind` 为 `results` 的 `review.json`（包中每张图片及其当前状态，`base_*` 与包中相同）与内容和包中不同的 VOC 文件；读不出的改动过的标注文件跳过并计数。
+- **其它**：缩略图 `sm`（320px）用平台的代码生成，缓存在程序缓存目录的 `thumbs\<package_id>\` 中（30 天没有再打开的包的缩略图删除）；`lg` 对浏览器能显示的格式直接返回原图，其它格式（如 TIFF）生成 1600px 的 JPEG。最近打开的包（最多 12 个）记在用户配置目录（`%APPDATA%\trainmaster-reviewer`）的 `recent.json` 中；日志写到程序缓存目录的 `reviewer.log`（超过 4 MiB 时另起，旧的保留为 `reviewer.log.1`）。开发时用 `TM_REVIEWER_WEB_DIR` 从磁盘读取页面（见开发指南）。

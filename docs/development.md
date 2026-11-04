@@ -73,9 +73,38 @@ TM_SERVER_URL=http://localhost:8080 TM_STATE_DIR=../data/trainer-dev .venv/bin/p
 - 在 `trainer/` 目录下运行 `python -m trainmaster_trainer` 即可导入本包，不需要安装；也可以 `pip install -e .` 后在任意目录运行 `trainmaster-trainer`。
 - 没有安装 PyTorch 时，硬件与实时指标照常上报，CUDA 环境显示为异常（`torch_missing`）。需要完整的环境时安装 CPU 版或与本机驱动匹配的 PyTorch 与 Ultralytics：`bash scripts/install-torch.sh cpu --python .venv/bin/python && .venv/bin/pip install -r requirements.txt`（变体见 [部署指南第 10.3 节](deployment.md#103-驱动与-pytorch-变体)）。
 - 本地后端默认不要求令牌；设置了 `TM_NODE_TOKEN` 时训练节点也要设置同一个值。`TM_STATE_DIR` 中保存节点标识，换一个目录就会作为新节点注册。
-- 其它子命令：`selftest`（中文的 CUDA 环境检测结果，`--json` 输出 JSON）、`export`（在本机把 pt 转换为 ONNX，与平台的转换任务使用同一个子进程）、`healthcheck`；配置变量见 [部署指南第 3.3 节](deployment.md#33-训练节点配置容器内由-compose-和镜像设置)。
+- 其它子命令：`selftest`（中文的 CUDA 环境检测结果，`--json` 输出 JSON）、`export`（在本机把 pt 转换为 ONNX，与平台的转换任务使用同一个子进程）、`infer`（在本机用 pt 识别图片并打印检测框，与平台的审图识别任务使用同一个子进程）、`healthcheck`；配置变量见 [部署指南第 3.3 节](deployment.md#33-训练节点配置容器内由-compose-和镜像设置)。
 - 模型仓库的 ONNX 转换：节点注册后自动领取本地后端的转换任务。`requirements-dev.txt` 不含 torch 与 onnx，此时节点不领取转换任务（日志中有说明）；要在本机跑真实的转换，按上一条安装 CPU 版 PyTorch 与 `requirements.txt`（含 onnx、onnxslim、onnxruntime），可以先用 `.venv/bin/python -m trainmaster_trainer export --weights best.pt --imgsz 320` 单独验证。
+- 模型审图的识别：同样只在能找到 torch 与 ultralytics 时领取（不需要 onnx）。按上一条安装 CPU 版 PyTorch 与 `requirements.txt` 后，节点领取本地后端的审图任务并在 CPU 上识别（下载模型与图片都走 HTTP，不需要访问 `data/storage`）；可以先用 `.venv/bin/python -m trainmaster_trainer infer --weights best.pt a.jpg b.jpg` 单独验证模型与图片。单张图片的超时为 `TM_INFERENCE_IMAGE_TIMEOUT`（默认 300 秒）。
 - 构建并运行镜像：`make docker-build-trainer`（使用 `.env` 中的 `TM_TORCH_VARIANT`），或不需要 GPU 的 CPU 版：`docker build --build-arg TORCH_VARIANT=cpu -t trainmaster-trainer:dev-cpu trainer`，再 `docker run --rm trainmaster-trainer:dev-cpu python -m trainmaster_trainer probe`。
+
+### 本地审图程序
+
+本地审图程序（`backend/cmd/trainmaster-reviewer`，见[架构说明 · 本地审图程序](architecture.md#本地审图程序)）是一个 Go 程序，界面是 `frontend/src/reviewer/`（与平台的审图编辑器共用 `src/features/reviews/` 与 `src/features/annotation/` 中的代码）。界面单独构建：入口 `frontend/reviewer.html`，配置 `frontend/vite.reviewer.config.ts`，输出到 `backend/cmd/trainmaster-reviewer/web/dist`（已被 git 忽略），编译程序时用 `go:embed` 嵌入；没有构建界面时嵌入的是仓库中的占位页，程序照样能编译（`go build ./...`、`go vet ./...` 不需要先构建前端）。
+
+```bash
+make reviewer      # npm run build:reviewer，再编译 Windows 版 backend/bin/trainmaster-reviewer.exe（amd64，-H windowsgui，带版本信息）
+```
+
+不使用 make 时的等价命令：
+
+```bash
+cd frontend && npm run build:reviewer     # tsc -b && vite build -c vite.reviewer.config.ts
+cd backend && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -H windowsgui" -o bin/trainmaster-reviewer.exe ./cmd/trainmaster-reviewer
+```
+
+- `TM_REVIEWER_OUT_DIR` 改变界面的输出目录（Docker 构建用它输出到 `/out/reviewer-web`，再复制到程序的 `web/dist`）。
+- 在开发机上试用：Linux / macOS 上构建的程序用于开发，不打开窗口，在浏览器中打开同样的页面（`-no-open` 时只打印地址），Ctrl+C 或在页面上“退出”结束。先在本地平台的审图任务页面“下载审图包”，然后：
+
+  ```bash
+  cd frontend && npm run build:reviewer
+  cd ../backend && go run ./cmd/trainmaster-reviewer -browser ~/Downloads/审图-1-测试.zip
+  ```
+
+  审图包解压到 zip 旁边的同名文件夹；导出的审图结果 `<文件夹名>-审图结果.zip` 在它旁边，再到本地平台的审图任务页面“上传审图结果”。不带审图包启动时在开始页中打开。在 Windows 上去掉 `-browser` 即为程序窗口（需要 WebView2 运行时），设置 `TM_REVIEWER_DEBUG=1` 时窗口中可以打开开发者工具。
+- 修改界面时设置 `TM_REVIEWER_WEB_DIR`（一个包含 `dist/` 的文件夹）让程序从磁盘读取页面：`TM_REVIEWER_WEB_DIR=cmd/trainmaster-reviewer/web go run ./cmd/trainmaster-reviewer -browser`，之后每次修改只需重新 `npm run build:reviewer` 并刷新页面，不需要重新编译程序。页面的接口（`/api/session`、`/api/review/*` 等）由程序提供，平台的 Vite 开发服务器（`npm run dev`）不提供它们。
+- 其它参数：`-addr 127.0.0.1:<端口>`（只能是本机地址；默认先试 47821，被占用时随机选择）、`-version`。日志写在用户缓存目录的 `trainmaster-reviewer/reviewer.log`（Go 的 `os.UserCacheDir()`，Linux 上为 `~/.cache`），最近打开的列表在用户配置目录的 `trainmaster-reviewer/recent.json`（`os.UserConfigDir()`）。
+- 让本地平台提供程序的下载：`make reviewer` 后带上 `TM_REVIEWER_TOOL="$PWD/backend/bin/trainmaster-reviewer.exe" make dev-backend`（在仓库根目录执行；没有设置时页面提示“平台没有附带本地审图程序”）。
 
 ## 3. 测试与检查
 
@@ -83,6 +112,7 @@ TM_SERVER_URL=http://localhost:8080 TM_STATE_DIR=../data/trainer-dev .venv/bin/p
 make test     # go test ./... + npm test + 训练节点（pytest 与 bash 测试）
 make lint     # gofmt、go vet、ESLint、TypeScript 类型检查、ruff、shellcheck
 make build    # frontend/dist + backend/bin/trainmaster
+make reviewer # 本地审图程序：界面 + backend/bin/trainmaster-reviewer.exe（见上文）
 ```
 
 只运行训练节点相关的部分：`make test-trainer`、`make lint-trainer`（第一次运行时创建虚拟环境 `trainer/.venv`，`requirements-dev.txt` 变化时重新安装；Python 版本过低、缺少 venv 模块或 shellcheck 时会提示安装方法，可用 `PYTHON=python3.12` 指定解释器）。
@@ -97,7 +127,7 @@ for t in trainer/scripts/tests/test-*.sh deploy/scripts/tests/test-*.sh; do bash
 shellcheck -x $(git ls-files '*.sh')
 ```
 
-后端单元测试不依赖数据库（数据集模块的压缩包、VOC、缩略图等测试使用 `backend/internal/dataset/testdata/` 中的小样本，来源见其中的 README）。数据库集成测试（迁移、并发加锁、`app_settings` 读写、数据集导入 / 扫描 / 接口，模型仓库的上传、版本分配、转换队列与租约）通过 `TM_TEST_DATABASE_URL` 启用，未设置时自动跳过。数据集相关的测试会为每个测试新建并删除一个独立的数据库，所以该账号需要 `CREATEDB` 权限（postgres 超级用户即可）。请使用一次性的数据库：
+后端单元测试不依赖数据库（数据集模块的压缩包、VOC、缩略图等测试使用 `backend/internal/dataset/testdata/` 中的小样本，来源见其中的 README）。数据库集成测试（迁移、并发加锁、`app_settings` 读写、数据集导入 / 扫描 / 接口，模型仓库的上传、版本分配、转换队列与租约，模型审图的各个流程）通过 `TM_TEST_DATABASE_URL` 启用，未设置时自动跳过。数据集相关的测试会为每个测试新建并删除一个独立的数据库，所以该账号需要 `CREATEDB` 权限（postgres 超级用户即可）。请使用一次性的数据库：
 
 ```bash
 docker run -d --rm --name tm-test-pg -e POSTGRES_PASSWORD=x -p 55432:5432 postgres:17-alpine
@@ -119,6 +149,18 @@ docker rm -f tm-test-pg
   go test ./internal/model/checkpoint -run '^$' -fuzz '^FuzzInspect$' -fuzztime 5m
   ```
 
+### 模型审图的测试
+
+- **后端**：`internal/reviewfile`（清单的读写与校验、Windows 安全的路径、VOC）是纯函数的单元测试；`internal/review`（创建、识别任务的领取与租约、结果写入、审核与并发保存、审图包、上传结果的冲突规则、合并）与 `internal/httpapi` 的 `reviews_test.go`、`review_exchange_test.go`（接口的完整流程、失败与重试）是数据库集成测试，按上面的方法用 `TM_TEST_DATABASE_URL` 启用。`internal/reviewer` 覆盖打开与解压（不安全的条目、剩余空间、zip 与文件夹的各种打开方式）、导出、本机接口与访问控制；`contract_test.go` 检查本机接口的 JSON 字段与平台的类型一致（编辑器两边共用，改了平台的类型这里会失败）；`platform_test.go` 的 `TestIntegrationPlatformRoundTrip` 在测试数据库上运行平台的审图服务，走完下载审图包 → 在本地审图程序中打开、审核、导出 → 上传到平台（同样需要 `TM_TEST_DATABASE_URL`）。
+- **训练节点**：`tests/test_review_inference.py` 覆盖识别子进程（图片读取与方向，包括 TIFF 的 Orientation 标签、框的提取、错误翻译、JSON lines 协议）、父进程对子进程的处理（超时、取消、崩溃）、结果的整理与攒批，以及 `infer` 子命令；`tests/test_review_tasks.py` 让任务线程对假平台（`tests/fake_platform.py`，含审图识别的接口）领取并执行审图任务（分页与攒批、从还没有识别的图片继续、续租、单张图片的错误、超时与显存不足、可重试的错误、停止与放弃、模型的校验与磁盘检查）。假的 `ultralytics`、`torch`、`numpy`、`cv2`、`PIL` 在 `tests/inference_fakes.py` 中：识别子进程只继承允许清单中的环境变量，所以它们以同名模块文件放在 `PYTHONPATH` 上，配置从同目录的 `fake_inference.json` 读取。`tests/task_harness.py` 是模型转换与审图识别共用的任务线程替身。只运行这部分：
+
+  ```bash
+  cd trainer && .venv/bin/python -m pytest tests/test_review_inference.py tests/test_review_tasks.py
+  ```
+
+  真实的识别（torch 与 Ultralytics）没有自动化测试，需要时在装好 CPU 版 PyTorch 的环境中用 `infer` 子命令或本地后端验证（见第 2 节“训练节点”）。
+- **前端**：`npm test` 包括 `src/features/reviews/` 中的纯函数（地址栏参数、审核状态与计数的更新、格式化、编辑器的缓存更新）、`src/reviewer/format.test.ts`，以及 `features/annotation/shortcuts.test.ts` 中审图模式的快捷键。
+
 ### 训练节点与脚本的测试
 
 - **pytest**（`trainer/tests/`）：不依赖 GPU、torch 与网络——NVML、torch、ultralytics 用假模块代替，平台用本地 `http.server` 模拟（`tests/fake_platform.py`，含任务的领取、下载、进度、上传、完成与失败接口）。模型转换的测试（`test_model_export.py`、`test_tasks.py`）用 `tests/export_fakes.py` 中假的 `ultralytics`（含 `ultralytics.nn.tasks._SafeLoad`）、`onnx`、`onnxruntime` 覆盖各 YOLO 版本与后处理方式的参数、结果核对、错误翻译、安全加载、子进程的环境变量（没有 `TM_NODE_TOKEN`）、超时、SHA256 校验、上传前的预检、停止与放弃任务。转换子进程只继承允许清单中的环境变量，所以假模块从同目录的 `fake_export.json` 读取配置，而不是从环境变量；真实的转换由 CPU 版训练节点镜像构建时的冒烟检查覆盖（也检查安全加载可用）。CI 在 Python 3.10（`requires-python` 的下限）与 3.12（镜像中的版本）上运行。
@@ -130,7 +172,7 @@ docker rm -f tm-test-pg
 
 在真实机器上调试 `make setup` 时，加 `SETUP_ARGS=--dry-run` 只检测、不修改任何文件，或用 `--env-file` 写到别的文件。
 
-CI（`.github/workflows/ci.yml`）在每次 push 到 main 和每个 Pull Request 上运行：后端（gofmt、vet、带 PostgreSQL 服务的测试、Windows/macOS 交叉编译）、前端（lint、typecheck、test、build）、训练节点（ruff、Python 3.10 与 3.12 上的 pytest、shellcheck、bash 测试），以及 Docker 镜像构建：应用镜像、CPU 版训练节点镜像（构建时执行一次 CPU 上的 YOLO 自检与一次离线的 ONNX 转换，再检查 `probe` 的输出），并分别在不启用训练节点、`COMPOSE_PROFILES=gpu`、`COMPOSE_PROFILES=cpu` 下检查 `docker compose config`。
+CI（`.github/workflows/ci.yml`）在每次 push 到 main 和每个 Pull Request 上运行：后端（gofmt、vet、带 PostgreSQL 服务的测试、Windows/macOS 交叉编译）、前端（lint、typecheck、test、build，以及本地审图程序的界面与 Windows 版程序，产物上传为 `trainmaster-reviewer`）、训练节点（ruff、Python 3.10 与 3.12 上的 pytest、shellcheck、bash 测试），以及 Docker 镜像构建：应用镜像、CPU 版训练节点镜像（构建时执行一次 CPU 上的 YOLO 自检与一次离线的 ONNX 转换，再检查 `probe` 的输出），并分别在不启用训练节点、`COMPOSE_PROFILES=gpu`、`COMPOSE_PROFILES=cpu` 下检查 `docker compose config`。
 
 ## 4. 添加新的后端 API
 
@@ -216,7 +258,7 @@ npx shadcn@latest add dialog
 **Python（训练节点）**
 
 - 提交前 `ruff check` 与 `ruff format --check` 必须通过（配置在 `trainer/pyproject.toml`，CI 会检查）；代码需兼容 Python 3.10。
-- 常驻进程只依赖标准库、`psutil` 与 `nvidia-ml-py`（HTTP 客户端用 `urllib`）；`torch`、`ultralytics`、`onnx` 只在环境检测与模型转换的子进程中导入，常驻进程不占用显存。
+- 常驻进程只依赖标准库、`psutil` 与 `nvidia-ml-py`（HTTP 客户端用 `urllib`）；`torch`、`ultralytics`、`onnx`（以及审图识别用的 OpenCV、Pillow）只在环境检测、模型转换与审图识别的子进程中导入，常驻进程不占用显存。
 - 运行依赖在 `requirements.txt` 中固定版本；`psutil`、`nvidia-ml-py` 的版本同时写在 `requirements-dev.txt` 中（有测试检查两者一致）。
 
 **Shell 脚本**

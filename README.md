@@ -4,7 +4,7 @@
 
 它是桌面工具 [ez_training](https://github.com/icaruszezen/ez_training)（PyQt 版，覆盖数据集、预标注、标注、数据准备、训练、验证等）的团队 Web 版。
 
-> **当前进度：** 平台框架（Go + React 工程骨架、shadcn/ui 界面框架、Docker 部署与数据持久化）已完成；**数据集管理**已上线：压缩包 / 文件夹导入（VOC、X-AnyLabeling、YOLO 标注，统一转换为 VOC 保存）、服务器上已有文件夹直接添加为数据集、缩略图浏览与标注预览、按 VOC / X-AnyLabeling / YOLO 格式下载；**项目管理**已上线：按检测任务把数据集组织成项目（一个数据集可以属于多个项目），项目页汇总其中的数据、标注与模型情况，并维护训练用的类别列表（顺序即 YOLO 的类别编号）；**标注工作台**已上线：在浏览器中逐张画矩形框，画完框按项目的类别列表和数据集中已有的标签提示类别，标注直接保存为数据集文件夹中的 VOC 文件；**计算资源**已上线：训练节点自动识别显卡、驱动、CPU 与内存并实时上报，按驱动与显卡自动准备好 YOLO 训练所需的 CUDA 版 PyTorch 环境并自检，`make setup` 自动检测并配置 Docker 的显卡支持；**模型仓库**已上线：按项目上传 Ultralytics YOLO 的 `.pt` 模型（YOLOv8 / v9 / v10 / 11 / 12 / 26）并按 v1、v2… 迭代版本，平台直接解析文件、校验所选的 YOLO 版本，下载时可选 PT 或由训练节点自动转换的 ONNX。其余模块已有占位页，将在后续迭代中逐个实现。
+> **当前进度：** 平台框架（Go + React 工程骨架、shadcn/ui 界面框架、Docker 部署与数据持久化）已完成；**数据集管理**已上线：压缩包 / 文件夹导入（VOC、X-AnyLabeling、YOLO 标注，统一转换为 VOC 保存）、服务器上已有文件夹直接添加为数据集、缩略图浏览与标注预览、按 VOC / X-AnyLabeling / YOLO 格式下载；**项目管理**已上线：按检测任务把数据集组织成项目（一个数据集可以属于多个项目），项目页汇总其中的数据、标注与模型情况，并维护训练用的类别列表（顺序即 YOLO 的类别编号）；**标注工作台**已上线：在浏览器中逐张画矩形框，画完框按项目的类别列表和数据集中已有的标签提示类别，标注直接保存为数据集文件夹中的 VOC 文件；**计算资源**已上线：训练节点自动识别显卡、驱动、CPU 与内存并实时上报，按驱动与显卡自动准备好 YOLO 训练所需的 CUDA 版 PyTorch 环境并自检，`make setup` 自动检测并配置 Docker 的显卡支持；**模型仓库**已上线：按项目上传 Ultralytics YOLO 的 `.pt` 模型（YOLOv8 / v9 / v10 / 11 / 12 / 26）并按 v1、v2… 迭代版本，平台直接解析文件、校验所选的 YOLO 版本，下载时可选 PT 或由训练节点自动转换的 ONNX；**模型审图**已上线：用模型仓库中的模型由训练节点识别所选数据集的图片，在网页上或用 Windows 本地审图程序（离线）逐张检查、修正识别框并标为已审核 / 需加样，再把审图标注合并回数据集。其余模块已有占位页，将在后续迭代中逐个实现。
 
 ## 功能模块
 
@@ -22,6 +22,7 @@
 | 模型训练 | 计算资源：训练节点自动接入、显卡 / CPU / 内存与 CUDA 环境识别、实时监控、重新检测 | `/training/compute` | `/api/v1/compute` | 已完成 |
 | 模型评估 | 模型评估：mAP/P/R/F1、混淆矩阵、PR 曲线、对比报告 | `/evaluation` | `/api/v1/evaluations` | 规划中 |
 | 模型管理 | 模型仓库：上传 .pt、按项目迭代版本、PT / ONNX 下载（训练节点自动转换） | `/models` | `/api/v1/models` | 已完成 |
+| 模型管理 | 模型审图：用模型识别数据集（训练节点执行）、网页审图与 Windows 本地审图程序（标为已审核 / 需加样、修正识别框）、审图包下载与结果上传、合并到数据集 | `/models/reviews` | `/api/v1/reviews` | 已完成 |
 | 模型管理 | 推理测试：在线推理、结果可视化、阈值调节 | `/models/inference` | — | 规划中 |
 | 系统管理 | 成员与权限：账号、角色、操作审计 | `/system/members` | — | 规划中 |
 | 系统管理 | 存储管理：存储目录与容量（已接入真实数据）、备份清理 | `/system/storage` | `GET /api/v1/system/info` | 部分完成 |
@@ -104,7 +105,7 @@ PyTorch 版本的选择规则（变体表 [`trainer/trainmaster_trainer/torch_va
 | 其它 GPU 机器（Docker） | 克隆本仓库，`make setup SETUP_ARGS="--server-url http://<平台IP>:8080 --token <令牌>"`（令牌即平台 `.env` 中的 `TM_NODE_TOKEN`），再只启动训练节点：`docker compose up -d --build trainer`（按 `make setup` 最后输出的服务名，选择 CPU 时为 `trainer-cpu`；需要时加 `--install-toolkit` 让脚本安装 NVIDIA Container Toolkit）。不要在这台机器上运行 `make up`，它会再启动一套平台 |
 | 不用 Docker | `sudo trainer/scripts/install.sh --server-url http://<平台IP>:8080 --token <令牌> --systemd`：安装到虚拟环境并注册为 systemd 服务 |
 
-完整说明（手动配置、只使用部分显卡、国内镜像、常见问题）见 [部署文档 · GPU 训练节点](docs/deployment.md#10-gpu-训练节点)。训练节点目前还负责模型仓库的 ONNX 转换（见下一节）；训练任务的排队与调度将在后续迭代中实现。
+完整说明（手动配置、只使用部分显卡、国内镜像、常见问题）见 [部署文档 · GPU 训练节点](docs/deployment.md#10-gpu-训练节点)。训练节点目前还负责模型仓库的 ONNX 转换（见下一节）与模型审图的识别（见“模型审图”）；训练任务的排队与调度将在后续迭代中实现。
 
 ## 模型仓库
 
@@ -135,6 +136,20 @@ PyTorch 版本的选择规则（变体表 [`trainer/trainmaster_trainer/torch_va
 
 存储方式、文件解析与接口见 [架构说明 · 模型仓库](docs/architecture.md#10-模型仓库)，转换任务的协议见 [架构说明 · 任务协议](docs/architecture.md#任务协议)。
 
+## 模型审图
+
+模型审图（`/models/reviews`）用模型仓库中的一个模型识别一个或多个数据集的图片，再由人逐张检查识别结果：识别正确的标为**已审核**，识别不对、需要参与后续训练的修正识别框后标为**需加样**，最后把审图标注合并回数据集，作为下一轮训练的样本。审图不改动数据集：识别结果与修改后的框保存在审图任务自己的文件夹中（存储目录的 `reviews/review-<任务ID>/` 下，每张图片一个 VOC `.xml`，目录结构与数据集相同），只有“合并到数据集”时才写进数据集的标注文件。
+
+- **新建**：在模型审图页点“新建审图任务”，或在模型详情页点“用这个模型审图”。选择模型（需要模型文件还在，且是检测、分割、姿态或旋转框模型：分类等没有检测框的模型不能用于审图）与数据集（默认选中模型所属项目的数据集；最多 50 个，合计不超过 20 万张图片），可以调整识别参数：置信度阈值（默认 0.25）、IoU 阈值（默认 0.7）、输入尺寸（默认为训练时的尺寸）、最多检测框数（默认 300）。图片按所选数据集的先后、数据集内按与数据集页相同的固定顺序排列。
+- **识别**：任务排队后由在线的训练节点识别（节点需要装有 PyTorch 与 Ultralytics，CPU 训练节点即可，有 GPU 时更快），页面显示排队位置与进度。已识别的图片可以马上开始审核，不必等全部识别完。没有这样的节点时任务一直排队，页面提示“没有可以识别的训练节点”，节点上线后自动开始。识别中的节点掉线时，任务在租约（60 秒）过期后重新排队，最多尝试 3 次；“识别失败”的任务可以“重新识别”，已经识别过的图片不会再识别一遍。个别图片无法识别（如文件损坏）时只记录这张图片的原因，审核时可以手动画框。
+- **网页审图**：在审图任务详情页点“网页审图”，进入与标注工作台相同的编辑器，从第一张待审核的图片开始。<kbd>S</kbd> 标为已审核，<kbd>X</kbd> 标为需加样，<kbd>U</kbd> 改回待审核；默认标记后自动跳到下一张（<kbd>U</kbd> 不跳，工具栏中可以关闭），<kbd>Shift</kbd>+<kbd>D</kbd> / <kbd>Shift</kbd>+<kbd>A</kbd> 跳到下一张 / 上一张待审核的图片。画框、改类别、撤销重做等操作与快捷键和标注工作台相同（<kbd>N</kbd> 空标注不可用），按 <kbd>?</kbd> 查看全部快捷键。右侧面板列出模型识别出的框与置信度，“恢复”把框换回模型的识别结果（可以撤销）；左侧列表可以按审核状态、数据集、类别、文件名筛选，或只看改过框的、没有框的、识别失败的图片。修改停止编辑后自动保存；多人同时审核同一张图片时不会悄悄覆盖，与标注工作台相同。
+- **本地审图（Windows，离线）**：图片很多或网络不便时，可以在 Windows 电脑上离线审图，步骤列在详情页的“本地审图”中：① 下载本地审图程序 `trainmaster-reviewer.exe`（单个文件，不需要安装）；② 下载审图包：一个 zip，包含图片、当前的审图标注与清单 `review.json`，可以只包含某些审核状态或某个数据集的图片（下载链接 1 小时内有效）；③ 运行程序打开审图包（也可以把 zip 拖到程序上），程序把它解压到 zip 旁边的同名文件夹，界面与快捷键和网页审图相同，审核进度随时保存在这个文件夹中，关闭后再打开会继续；审完后点“导出审图结果”，在旁边生成 `<文件夹名>-审图结果.zip`（审核状态与改过的标注，不含图片）；④ 回到平台“上传审图结果”。上传时只应用本地改过的内容，重复上传同一份结果不会重复应用；下载审图包之后平台上又被修改过的图片作为冲突跳过并列出，可以选择用本地结果覆盖。程序用 WebView2 显示窗口（Windows 11 与更新过的 Windows 10 已自带），没有时改用默认浏览器打开。
+- **合并到数据集**：把审图标注写进数据集的 VOC 标注文件（与在标注工作台中保存相同）。默认只合并需加样的图片，也可以加上已审核的图片、只合并某个数据集；数据集中已有标注（包括空标注）的图片默认跳过，也可以选择覆盖。合并在后台进行，页面显示进度，完成后列出合并、跳过与失败的图片数。没有框的图片合并为空标注（负样本）；识别失败、审核时也没有画框的图片跳过；合并时数据集中这张图片的标注正好被别人修改了的，不会覆盖。可以审完一批合并一批，多次合并。
+- **审核记录**：数据集详情页的“审核记录”列出包含这个数据集的审图任务，以及这个数据集中各审核状态的图片数与合并记录，可以直接审核或合并这个数据集的图片。
+- **删除**：删除审图任务同时删除它的文件夹（审图标注），数据集中的图片和已经合并到数据集的标注不受影响；正在合并时不能删除。
+
+数据模型、识别任务的协议、审图包格式与接口见 [架构说明 · 模型审图](docs/architecture.md#11-模型审图)，训练节点的配置与本地审图程序的运行要求见 [部署文档 · 模型审图](docs/deployment.md#1011-模型审图)。
+
 ## 技术栈
 
 | 层 | 选型 |
@@ -143,6 +158,7 @@ PyTorch 版本的选择规则（变体表 [`trainer/trainmaster_trainer/torch_va
 | 数据库 | PostgreSQL 17（只存元数据） |
 | 文件存储 | 宿主机本地目录（图片等文件直接以文件形式保存） |
 | 前端 | React 19、TypeScript、Vite、Tailwind CSS v4、[shadcn/ui](https://ui.shadcn.com)（new-york 风格，neutral 配色）、React Router、TanStack Query |
+| 本地审图程序 | Go（Windows 单个可执行文件，[WebView2](https://github.com/jchv/go-webview2) 窗口，没有时用默认浏览器），界面与平台的审图编辑器共用 React 代码 |
 | 训练节点 | Python 3.12、[PyTorch](https://pytorch.org)（按驱动自动选择 CUDA 版本）、[Ultralytics](https://github.com/ultralytics/ultralytics)（YOLO）、ONNX 与 ONNX Runtime（模型转换）、NVML（nvidia-ml-py）、psutil |
 | 部署 | Docker 多阶段构建（单镜像：Go 服务同时托管前端）、Docker Compose（训练节点为单独的镜像，按 profile 启用）、NVIDIA Container Toolkit |
 
@@ -184,6 +200,7 @@ data/
 ├── storage/           # 文件存储根目录（TM_HOST_STORAGE_DIR），挂载为容器内 /data
 │   ├── datasets/      # 数据集：每个数据集一个文件夹，图片与 VOC 标注直接以文件保存
 │   ├── models/        # 模型仓库：每个模型一个文件夹 project-<项目ID>/v<版本号>/（model.pt、model.json，onnx/ 为转换缓存）
+│   ├── reviews/       # 模型审图：每个审图任务一个文件夹 review-<任务ID>/（review.json 与审图标注 .xml）
 │   ├── runs/          # 训练/评估运行产物（日志、曲线、中间权重）
 │   ├── exports/       # 导出的训练集（YOLO / VOC / COCO）、打包导出与报告
 │   ├── cache/         # 缩略图等可再生缓存（可随时删除，无需备份）
@@ -191,7 +208,7 @@ data/
 └── trainer/           # 训练节点的状态目录（TM_HOST_TRAINER_DIR）：节点标识 node-key、心跳文件。不要拷贝到其它机器
 ```
 
-- **数据库只存元数据**（数据集、图片索引、导入记录、模型版本等），图片和模型等大文件都在 `storage/` 下，可以直接用文件管理器、`rsync` 等工具查看和备份。
+- **数据库只存元数据**（数据集、图片索引、导入记录、模型版本、审图任务与审核状态等），图片和模型等大文件都在 `storage/` 下，可以直接用文件管理器、`rsync` 等工具查看和备份。
 - 应用启动时会自动创建上述子目录并检查是否可写；应用进程以 `.env` 中的 `PUID:PGID` 运行，建议设为宿主机上存储目录属主的 UID/GID（`id` 命令查看）。
 - 存储目录可以放在任意磁盘，例如在 `.env` 中设置 `TM_HOST_STORAGE_DIR=/mnt/bigdisk/trainmaster`。
 - 默认的 `./data` 位于 git 检出目录内，适合试用。**正式部署建议把 `TM_HOST_STORAGE_DIR`、`TM_HOST_POSTGRES_DIR` 设为仓库之外的绝对路径**（如 `/srv/trainmaster/storage`、`/srv/trainmaster/postgres`）：在仓库里执行 `git clean -x` 之类的清理命令会把 `./data` 一并删除。
@@ -217,7 +234,7 @@ rsync -a --delete --exclude /cache/ --exclude /tmp/ "$BACKUP/storage/" "$STORAGE
 docker compose start app
 ```
 
-模型仓库的文件（`models/`）包含在存储目录的备份中；其中每个模型的 `onnx/` 文件夹只是 ONNX 转换的缓存，可以不备份（rsync 加 `--exclude '/models/*/*/onnx/'`），恢复后再次下载时会重新转换。
+模型仓库的文件（`models/`）包含在存储目录的备份中；其中每个模型的 `onnx/` 文件夹只是 ONNX 转换的缓存，可以不备份（rsync 加 `--exclude '/models/*/*/onnx/'`），恢复后再次下载时会重新转换。模型审图的审图标注在 `reviews/` 中、审核状态在数据库中，同样包含在上面的备份中；审图包不在服务器上保存（每次下载时现场打包）。
 
 迁移到新服务器时先 `make down`，再把 `.env` 与**两个数据目录**（`TM_HOST_STORAGE_DIR` 和 `TM_HOST_POSTGRES_DIR`，默认都在 `./data` 下）用 `sudo tar --numeric-owner` 打包拷贝过去，详见 [部署文档第 6 节](docs/deployment.md#6-备份与恢复)。直接拷贝 PostgreSQL 数据目录要求新旧环境的 PostgreSQL 主版本一致（当前为 17）；跨版本请使用 `pg_dump` / `pg_restore`。
 
@@ -231,7 +248,7 @@ make dev-backend   # 后端 http://localhost:8080（go run）
 make dev-frontend  # 前端 http://localhost:5173（Vite 热更新，/api 代理到后端）
 ```
 
-开发时访问 <http://localhost:5173>。常用命令：`make test`、`make lint`、`make build`，`make help` 查看全部。没有 `make` 的环境（如 Windows）可直接执行对应命令，见 [开发文档](docs/development.md)。
+开发时访问 <http://localhost:5173>。常用命令：`make test`、`make lint`、`make build`，`make reviewer`（构建 Windows 版本地审图程序），`make help` 查看全部。没有 `make` 的环境（如 Windows）可直接执行对应命令，见 [开发文档](docs/development.md)。
 
 ## 目录结构
 
@@ -239,6 +256,7 @@ make dev-frontend  # 前端 http://localhost:5173（Vite 热更新，/api 代理
 trainMaster/
 ├── backend/                     # Go 服务（module github.com/icaruszezen/trainmaster/backend）
 │   ├── cmd/trainmaster/         # 程序入口：配置 → 存储 → 数据库 → 迁移 → HTTP
+│   ├── cmd/trainmaster-reviewer/ # Windows 本地审图程序（WebView2 窗口；web/dist 为嵌入的页面，make reviewer 构建）
 │   └── internal/
 │       ├── buildinfo/           # 版本信息（构建时注入）
 │       ├── config/              # TM_* 环境变量加载与校验
@@ -249,6 +267,9 @@ trainMaster/
 │       ├── project/             # 项目：项目与数据集的多对多关系、合计统计
 │       ├── model/               # 模型仓库：上传、版本分配、下载、ONNX 转换队列与训练节点的任务接口
 │       │   └── checkpoint/      # 只读解析 Ultralytics 的 .pt（pickle，不执行代码）：任务、类别、YOLO 版本、引用的对象是否安全
+│       ├── review/              # 模型审图：审图任务、识别任务的接口、审核与审图标注、审图包、上传结果、合并到数据集
+│       ├── reviewfile/          # 审图包的文件格式（平台与本地审图程序共用）：清单 review.json、Windows 安全的路径、审图标注
+│       ├── reviewer/            # 本地审图程序的本机服务：打开与解压审图包、审核进度、导出审图结果、访问控制
 │       ├── compute/             # 计算资源：训练节点注册、心跳、在线状态、指标历史
 │       ├── hostinfo/            # 平台服务器自身的 CPU、内存、负载与 NVIDIA 显卡（/proc、/sys）
 │       ├── httpapi/             # 路由、中间件、统一响应与错误、handler
@@ -257,10 +278,11 @@ trainMaster/
 │   └── src/
 │       ├── config/navigation.ts # 导航与模块的唯一配置源
 │       ├── features/            # 各功能模块页面（每个模块一个页面文件）
+│       ├── reviewer/            # 本地审图程序的页面（入口 reviewer.html，vite.reviewer.config.ts 单独构建）
 │       ├── components/ui/       # shadcn/ui 组件
 │       └── ...
 ├── trainer/                     # 训练节点（Python）：硬件与 CUDA 环境检测、自检、注册与心跳、执行平台的任务
-│   ├── trainmaster_trainer/     # 节点程序；tasks.py 领取任务，model_export.py 执行 pt → ONNX 转换，torch_variants.txt 为 PyTorch 变体表
+│   ├── trainmaster_trainer/     # 节点程序；tasks.py 领取任务，model_export.py 执行 pt → ONNX 转换，review_inference.py 执行审图识别，torch_variants.txt 为 PyTorch 变体表
 │   ├── scripts/                 # install.sh（裸机安装）、install-torch.sh、lib/torch-variant.sh（选择变体）
 │   ├── tests/                   # pytest（不需要 GPU 与 torch）
 │   └── Dockerfile               # 训练节点镜像（构建上下文为 trainer/）
@@ -282,11 +304,11 @@ trainMaster/
 3. **标注**（进行中）：已完成标注工作台（矩形框、按项目类别列表提示类别、快捷键、自动保存为 VOC）；后续：标签体系（跨项目的缺陷类别、层级与别名）、标注任务分配与审核、智能预标注。
 4. **数据版本**：训练/验证/测试划分、版本快照、导出 YOLO / VOC / COCO。
 5. **训练**（进行中）：已完成训练节点（自动识别显卡与 CUDA 环境、自动选择 PyTorch 版本、注册与监控、Docker 显卡配置）；后续：训练任务队列与调度、实时日志与曲线。
-6. **评估与模型**（进行中）：已完成模型仓库（上传 .pt、按项目迭代版本、下载 PT 或由训练节点自动转换的 ONNX）；后续：训练产出的模型自动入库、溯源、TensorRT 导出、发布、推理测试，以及评估指标与报告、预标注。
+6. **评估与模型**（进行中）：已完成模型仓库（上传 .pt、按项目迭代版本、下载 PT 或由训练节点自动转换的 ONNX）、模型审图（训练节点识别数据集，网页或 Windows 本地审图，合并回数据集）；后续：训练产出的模型自动入库、溯源、TensorRT 导出、发布、推理测试，以及评估指标与报告、预标注。
 7. **成员与权限**：账号登录、角色权限、操作审计。
 
 ## 文档
 
-- [架构说明](docs/architecture.md)：组件、模块划分、API 约定、存储布局、迁移约定、训练节点与任务协议、模型仓库
-- [部署指南](docs/deployment.md)：环境变量、权限、升级、备份恢复、镜像加速、Windows、GPU 训练节点与模型转换、反向代理
-- [开发指南](docs/development.md)：本地开发、训练节点的开发与测试、添加 API 与页面、添加 shadcn 组件、代码规范
+- [架构说明](docs/architecture.md)：组件、模块划分、API 约定、存储布局、迁移约定、训练节点与任务协议、模型仓库、模型审图
+- [部署指南](docs/deployment.md)：环境变量、权限、升级、备份恢复、镜像加速、Windows、GPU 训练节点、模型转换与审图识别、本地审图程序、反向代理
+- [开发指南](docs/development.md)：本地开发、训练节点的开发与测试、本地审图程序、添加 API 与页面、添加 shadcn 组件、代码规范
