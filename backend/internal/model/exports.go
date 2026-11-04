@@ -118,7 +118,7 @@ func (s *Service) ListExports(ctx context.Context, modelID int64) ([]Export, err
 	if err != nil {
 		return nil, err
 	}
-	workers := s.workers.count(s.clock())
+	workers := s.workers.count(TaskModelExport, s.clock())
 	out := make([]Export, len(rows))
 	for i, r := range rows {
 		out[i] = r.Export
@@ -142,7 +142,7 @@ func (s *Service) getExport(ctx context.Context, modelID, exportID int64) (expor
 			return r, merr
 		}
 	}
-	r.WorkersOnline = s.workers.count(s.clock())
+	r.WorkersOnline = s.workers.count(TaskModelExport, s.clock())
 	return r, err
 }
 

@@ -159,7 +159,7 @@ def test_register_then_heartbeat_with_environment(platform, tmp_path, caplog):
         assert body["node_key"] == "node-key-1"
         assert body["name"] == "gpu-01"
         assert body["hostname"] == "host-1"
-        assert body["agent_version"] == __version__ == "0.2.0"
+        assert body["agent_version"] == __version__ == "0.3.0"
         assert body["hardware"]["probe"] == 1
         assert body["environment"] is None  # 检测还没有完成
         assert body["metrics"]["cpu_percent"] is None  # 第一次采集
@@ -418,8 +418,8 @@ def test_stop_cancels_running_detection(platform, tmp_path):
 def test_detector_crash_reports_error_environment(platform, tmp_path):
     with Harness(tmp_path, platform.url, detector=FakeDetector(error=RuntimeError("boom"))):
         node = wait_until(lambda: registered(platform))
-        wait_until(lambda: node.get("environment_updates") == 1)
-        env = node["environment"]
+        # 检测很快出错：结果可能在注册时就已上报，也可能在之后的心跳中上报
+        env = wait_until(lambda: node.get("environment"))
         assert env["status"] == "error"
         assert "boom" in env["self_test"]["message"]
 
@@ -493,7 +493,7 @@ def test_heartbeat_file_write_failure_is_logged_once(platform, tmp_path, caplog)
 
 
 def worker_factory(platform: FakePlatform, tmp_path: Path, created: list[TaskWorker], **kw: Any):
-    """创建能领取 model_export 的任务线程（不依赖测试环境是否安装了 torch / onnx）。"""
+    """创建能领取所有任务的任务线程（不依赖测试环境是否安装了 torch / ultralytics / onnx）。"""
 
     def factory(agent: Agent) -> TaskWorker:
         worker = TaskWorker(
@@ -525,7 +525,8 @@ def test_task_worker_starts_after_registration_and_stops(platform, tmp_path):
         wait_until(lambda: platform.claims)
         assert h.agent.tasks is created[0] and created[0].alive
         claim = platform.claims[0]
-        assert claim["node_key"] == "node-key-1" and claim["kinds"] == ["model_export"]
+        assert claim["node_key"] == "node-key-1"
+        assert claim["kinds"] == ["model_export", "review_inference"]
         with platform.lock:
             platform.nodes.clear()  # 重新注册不会再启动一个任务线程
         wait_until(lambda: (registered(platform) or {}).get("registrations"))

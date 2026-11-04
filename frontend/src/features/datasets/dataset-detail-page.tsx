@@ -60,6 +60,10 @@ import {
 import { DatasetImports } from "@/features/datasets/dataset-imports"
 import { DatasetLabels } from "@/features/datasets/dataset-labels"
 import {
+  DatasetReviews,
+  DatasetReviewsCount,
+} from "@/features/datasets/dataset-reviews"
+import {
   canExportDataset,
   ExportDialog,
 } from "@/features/datasets/export-dialog"
@@ -127,7 +131,9 @@ function DatasetNotFound() {
   )
 }
 
-type DetailTab = "images" | "labels" | "imports"
+type DetailTab = "images" | "labels" | "imports" | "reviews"
+
+const TABS: readonly DetailTab[] = ["images", "labels", "imports", "reviews"]
 
 const STATUS_VALUES: ImageStatusFilter[] = [
   "all",
@@ -142,8 +148,9 @@ function useDetailSearchParams() {
   const [params, setParams] = useSearchParams()
 
   const tabParam = params.get("tab")
-  const tab: DetailTab =
-    tabParam === "labels" || tabParam === "imports" ? tabParam : "images"
+  const tab: DetailTab = TABS.includes(tabParam as DetailTab)
+    ? (tabParam as DetailTab)
+    : "images"
   const status = params.get("status") as ImageStatusFilter | null
   const filters: ImageFilters = {
     status: status && STATUS_VALUES.includes(status) ? status : "all",
@@ -322,6 +329,10 @@ function DatasetDetail({ id }: { id: number }) {
           <TabsTrigger value="imports" className="px-3">
             导入记录
           </TabsTrigger>
+          <TabsTrigger value="reviews" className="px-3">
+            审核记录
+            <DatasetReviewsCount datasetId={dataset.id} />
+          </TabsTrigger>
         </TabsList>
         <TabsContent value="images">
           <DatasetImages
@@ -336,6 +347,9 @@ function DatasetDetail({ id }: { id: number }) {
         </TabsContent>
         <TabsContent value="imports">
           <DatasetImports dataset={dataset} />
+        </TabsContent>
+        <TabsContent value="reviews">
+          <DatasetReviews dataset={dataset} />
         </TabsContent>
       </Tabs>
 

@@ -49,11 +49,6 @@ import {
   type Viewport,
 } from "@/features/annotation/geometry"
 import { isTypingTarget, type Tool } from "@/features/annotation/shortcuts"
-import {
-  fileUrl,
-  thumbnailUrl,
-  type DatasetImage,
-} from "@/features/datasets/api"
 import { isBrowserNativeImage } from "@/features/datasets/files"
 import { readableTextColor } from "@/features/datasets/label-colors"
 import { useElementSize } from "@/hooks/use-element-size"
@@ -85,6 +80,15 @@ type SafariGestureEvent = UIEvent & {
 }
 
 export type ImageAdjustments = { brightness: number; contrast: number }
+
+/** 画布显示的图片：路径决定能否在浏览器中直接显示原图，文件名用于说明。 */
+export type CanvasImage = { path: string; file_name: string }
+
+/**
+ * 只用于对照、不能编辑的框（如审图时模型原始的识别框）：细虚线，点不中；
+ * `label` 只在突出显示时显示。
+ */
+export type ReferenceBox = Box & { key: string; name: string; label: string }
 
 export type CanvasHandle = {
   zoom: (direction: 1 | -1) => void
@@ -145,8 +149,11 @@ type Drag =
 
 type AnnotationCanvasProps = {
   ref?: Ref<CanvasHandle>
-  datasetId: number
-  image: DatasetImage
+  image: CanvasImage
+  /** 原图的地址（浏览器能直接显示的格式才加载）。 */
+  fileUrl: string
+  /** 大缩略图（`lg`）的地址：先显示它，原图载入后换成原图。 */
+  thumbnailUrl: string
   /** 原图尺寸（来自索引）；未知时加载原图读取。 */
   size: Size | null
   objects: EditorObject[]
@@ -159,6 +166,12 @@ type AnnotationCanvasProps = {
   showLabels: boolean
   /** 正在悬停的框（如在目标列表中），突出显示。 */
   highlight: string | null
+  /** 框的类别名称后面附加的文字（按 uid，如审图时模型给出的置信度）。 */
+  labelDetails?: ReadonlyMap<string, string>
+  /** 对照框（见 {@link ReferenceBox}），画在标注框下面。 */
+  references?: readonly ReferenceBox[]
+  /** 突出显示的对照框（`key`），显示它的 `label`。 */
+  highlightReference?: string | null
   /**
    * 刚画好、正在选择类别的框（选好后才加入，见类别选择框）：与正在画的框一样
    * 用虚线显示，选择时看得到框住了什么。
@@ -190,8 +203,9 @@ type ImageLoad = "loading" | "ok" | "error"
  */
 export function AnnotationCanvas({
   ref,
-  datasetId,
   image,
+  fileUrl,
+  thumbnailUrl,
   size,
   objects,
   selected,
@@ -201,6 +215,9 @@ export function AnnotationCanvas({
   showBoxes,
   showLabels,
   highlight,
+  labelDetails,
+  references,
+  highlightReference = null,
   pendingBox,
   adjustments,
   initialViewport,
@@ -935,7 +952,7 @@ export function AnnotationCanvas({
           排版后读排版尺寸，naturalWidth / naturalHeight 总是按 EXIF 方向旋转后的尺寸。 */}
       {!imageSize && native && (
         <img
-          src={fileUrl(datasetId, image)}
+          src={fileUrl}
           alt=""
           className="invisible absolute top-0 left-0 max-w-none"
           style={{ imageOrientation: "none" }}
@@ -953,7 +970,7 @@ export function AnnotationCanvas({
       {imageSize && viewport && (
         <>
           <img
-            src={thumbnailUrl(datasetId, image, "lg")}
+            src={thumbnailUrl}
             alt=""
             draggable={false}
             decoding="async"
@@ -967,7 +984,7 @@ export function AnnotationCanvas({
           />
           {native && original !== "error" && (
             <img
-              src={fileUrl(datasetId, image)}
+              src={fileUrl}
               alt={image.file_name}
               draggable={false}
               decoding="async"
@@ -989,6 +1006,14 @@ export function AnnotationCanvas({
           aria-hidden
         >
           <ImageFrame viewport={viewport} size={imageSize} />
+          {references && references.length > 0 && (
+            <ReferenceLayer
+              references={references}
+              viewport={viewport}
+              colorFor={colorFor}
+              highlight={highlightReference}
+            />
+          )}
           <BoxLayer
             objects={shownObjects}
             viewport={viewport}
@@ -1033,6 +1058,15 @@ export function AnnotationCanvas({
           viewport={viewport}
           colorFor={colorFor}
           selected={selected}
+          details={labelDetails}
+        />
+      )}
+      {viewport && loaded && highlightReference !== null && (
+        <ReferenceLabel
+          reference={references?.find((r) => r.key === highlightReference)}
+          viewport={viewport}
+          height={container.height}
+          colorFor={colorFor}
         />
       )}
 
@@ -1128,6 +1162,76 @@ const BoxLayer = memo(function BoxLayer({
   )
 })
 
+type ReferenceLayerProps = {
+  references: readonly ReferenceBox[]
+  viewport: Viewport
+  colorFor: (name: string) => string
+  highlight: string | null
+}
+
+const ReferenceLayer = memo(function ReferenceLayer({
+  references,
+  viewport,
+  colorFor,
+  highlight,
+}: ReferenceLayerProps) {
+  return (
+    <g>
+      {references.map((reference) => {
+        const color = colorFor(reference.name)
+        const emphasized = reference.key === highlight
+        return (
+          <rect
+            key={reference.key}
+            {...screenRect(viewport, reference)}
+            fill={color}
+            fillOpacity={emphasized ? 0.14 : 0}
+            stroke={color}
+            strokeOpacity={emphasized ? 1 : 0.85}
+            strokeWidth={emphasized ? 2.25 : 1.25}
+            strokeDasharray="3 3"
+          />
+        )
+      })}
+    </g>
+  )
+})
+
+/**
+ * 突出显示的对照框的名称：放在框的左下角外侧，避开标注框的名称（在框的上方）；
+ * 框贴着画布底部时放到框内。
+ */
+function ReferenceLabel({
+  reference,
+  viewport,
+  height,
+  colorFor,
+}: {
+  reference: ReferenceBox | undefined
+  viewport: Viewport
+  /** 画布的高度。 */
+  height: number
+  colorFor: (name: string) => string
+}) {
+  if (!reference) {
+    return null
+  }
+  const color = colorFor(reference.name)
+  const rect = boxToScreen(viewport, reference)
+  const bottom = rect.y + rect.height
+  const top = bottom + 20 > height ? bottom - 20 : bottom + 2
+  return (
+    <div className="pointer-events-none absolute inset-0 overflow-hidden">
+      <span
+        className="absolute max-w-56 truncate rounded-sm border border-dashed bg-background/90 px-1 text-[11px] leading-4 font-medium whitespace-nowrap text-foreground"
+        style={{ left: rect.x, top, borderColor: color }}
+      >
+        {reference.label}
+      </span>
+    </div>
+  )
+}
+
 function Handles({
   viewport,
   box,
@@ -1164,6 +1268,7 @@ type LabelLayerProps = {
   viewport: Viewport
   colorFor: (name: string) => string
   selected: string | null
+  details?: ReadonlyMap<string, string>
 }
 
 const LabelLayer = memo(function LabelLayer({
@@ -1171,6 +1276,7 @@ const LabelLayer = memo(function LabelLayer({
   viewport,
   colorFor,
   selected,
+  details,
 }: LabelLayerProps) {
   if (objects.length > MAX_LABELED_OBJECTS) {
     return null
@@ -1198,6 +1304,11 @@ const LabelLayer = memo(function LabelLayer({
           >
             {object.name}
             {object.difficult && " · 难例"}
+            {details?.has(object.uid) && (
+              <span className="ml-1 font-normal tabular-nums opacity-85">
+                {details.get(object.uid)}
+              </span>
+            )}
           </span>
         )
       })}

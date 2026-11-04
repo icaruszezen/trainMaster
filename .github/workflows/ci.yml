@@ -76,6 +76,20 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      # 本地审图程序的界面（嵌入 backend/cmd/trainmaster-reviewer），再编译 Windows 版程序
+      - run: npm run build:reviewer
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: build the local reviewer (windows)
+        working-directory: backend
+        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -H windowsgui" -o bin/trainmaster-reviewer.exe ./cmd/trainmaster-reviewer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trainmaster-reviewer
+          path: backend/bin/trainmaster-reviewer.exe
+          if-no-files-found: error
 
   trainer:
     name: Trainer (Python ${{ matrix.python }}) & scripts

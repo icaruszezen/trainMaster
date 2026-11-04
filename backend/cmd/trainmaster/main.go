@@ -22,6 +22,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/httpapi"
 	"github.com/icaruszezen/trainmaster/backend/internal/model"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
+	"github.com/icaruszezen/trainmaster/backend/internal/review"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 	"github.com/icaruszezen/trainmaster/backend/internal/web"
 )
@@ -86,8 +87,20 @@ func run() error {
 	// temporary files are cleaned up) runs until shutdown; Stop runs before
 	// the pool closes.
 	models := model.NewService(model.Options{DB: db.Pool, Storage: store, Logger: log})
+	projects := project.NewService(project.Options{DB: db.Pool, Logger: log})
+	// Model reviews. NewService registers the reviews as a source of tasks
+	// (review_inference) with the model service, before it starts. The
+	// background work (reviews whose training node stopped reporting are
+	// queued again, leftovers of deletes are removed) and merges run until
+	// shutdown; Stop runs before the model service's.
+	reviews := review.NewService(review.Options{DB: db.Pool, Storage: store, Logger: log, Datasets: datasets,
+		Models: models, Projects: projects})
 	models.Start(ctx)
 	defer models.Stop()
+	if err := reviews.Start(ctx); err != nil {
+		return interrupted(ctx, log, err)
+	}
+	defer reviews.Stop()
 
 	// CPU utilization of this machine for the compute page, sampled in the
 	// background until shutdown.
@@ -105,15 +118,18 @@ func run() error {
 		StartedAt:      startedAt,
 		TrustedProxies: cfg.TrustedProxies,
 		Datasets:       datasets,
-		Projects:       project.NewService(project.Options{DB: db.Pool, Logger: log}),
+		Projects:       projects,
 		Compute: compute.NewService(compute.Options{
 			DB: db.Pool, Logger: log, HeartbeatInterval: cfg.NodeHeartbeatInterval,
 		}),
 		Models:           models,
+		Reviews:          reviews,
+		ReviewerTool:     cfg.ReviewerTool,
 		Host:             host,
 		NodeToken:        cfg.NodeToken,
 		LocalTrainerMode: cfg.TrainerMode,
 	}
+	logReviewerTool(log, cfg.ReviewerTool)
 	if cfg.WebDir != "" {
 		h, err := web.New(cfg.WebDir)
 		if err != nil {
@@ -178,6 +194,23 @@ func interrupted(ctx context.Context, log *slog.Logger, err error) error {
 		return nil
 	}
 	return err
+}
+
+// logReviewerTool reports whether the local reviewer for Windows can be
+// downloaded (TM_REVIEWER_TOOL). A configured file that is missing is no
+// error, the download is just unavailable; the API looks for it again on
+// every request.
+func logReviewerTool(log *slog.Logger, path string) {
+	if path == "" {
+		log.Info("no local reviewer bundled (TM_REVIEWER_TOOL is not set)")
+		return
+	}
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		log.Warn("local reviewer not found; its download is unavailable", "path", path, "err", err)
+		return
+	}
+	log.Info("local reviewer bundled", "path", path, "size_bytes", fi.Size())
 }
 
 func newLogger(cfg *config.Config) *slog.Logger {

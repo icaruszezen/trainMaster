@@ -8,6 +8,9 @@ import { InferencePage } from "@/features/models/inference-page"
 import { ModelDetailPage } from "@/features/models/model-detail-page"
 import { ModelsPage } from "@/features/models/models-page"
 import { ProjectDetailPage } from "@/features/projects/project-detail-page"
+import { ReviewDetailPage } from "@/features/reviews/review-detail-page"
+import { ReviewWorkspacePage } from "@/features/reviews/review-workspace-page"
+import { ReviewsPage } from "@/features/reviews/reviews-page"
 import { NotFoundPage } from "@/pages/not-found-page"
 import { pages, routes } from "@/router"
 
@@ -55,6 +58,21 @@ describe("routes", () => {
     expect(leafComponent("/models/inference")).toBe(InferencePage)
     expect(leafComponent("/models/5/extra")).toBe(NotFoundPage)
     expect(leaf("/models/5")?.handle).toBeUndefined()
+  })
+
+  it("routes reviews under the datasets", () => {
+    expect(leafComponent("/datasets/reviews")).toBe(ReviewsPage)
+    expect(leafComponent("/datasets/reviews/3")).toBe(ReviewDetailPage)
+    expect(leaf("/datasets/reviews/3")?.handle).toBeUndefined()
+    expect(leafComponent("/datasets/reviews/3/workspace")).toBe(
+      ReviewWorkspacePage
+    )
+    expect(leaf("/datasets/reviews/3/workspace")?.handle).toEqual({
+      fullBleed: true,
+    })
+    expect(leafComponent("/datasets/reviews/3/extra")).toBe(NotFoundPage)
+    // 数据集详情不受影响。
+    expect(leafComponent("/datasets/12")).toBe(DatasetDetailPage)
   })
 
   it("marks only the 404 route as not found", () => {

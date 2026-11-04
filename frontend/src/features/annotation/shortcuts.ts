@@ -1,19 +1,26 @@
 /**
- * 标注工作台的快捷键：按键 → 命令的映射（纯函数，便于测试），以及帮助面板中
- * 的说明。
+ * 标注工作台与审图编辑器的快捷键：按键 → 命令的映射（纯函数，便于测试），以及
+ * 帮助面板中的说明。
  *
  * - 字母、数字按物理按键（`KeyboardEvent.code`）匹配，与大小写锁定、键盘布局
  *   无关；输入法正在组字时不处理。
  * - 沿用 LabelImg 的习惯（W 画框、A / D 切换图片、Ctrl+D 复制框、方向键移动），
  *   数字键切换类别（CVAT、X-AnyLabeling）。
  * - 不绑定浏览器保留的组合键（Ctrl+W / T / N / L / R、Ctrl+1–9、Alt+← / → 等）。
+ * - 审图时（`review`）另有 S / X / U 标记审核状态，N（空标注）不可用。
  */
 
 export type Tool = "select" | "rect" | "pan"
 
+/** 审图中图片的审核状态：待审核 / 已审核 / 需加样（见 `features/reviews`）。 */
+export type ReviewMark = "pending" | "approved" | "needs_sample"
+
 export type Command =
   | { type: "tool"; tool: Tool }
-  /** 上一张 / 下一张；`unannotated` 时跳到上一张 / 下一张未标注的图片。 */
+  /**
+   * 上一张 / 下一张；`unannotated` 时跳到上一张 / 下一张未标注的图片（审图时是
+   * 待审核的图片）。
+   */
   | { type: "image"; direction: 1 | -1; unannotated: boolean }
   /** 跳到第 N 张（聚焦图片序号输入框）。 */
   | { type: "goto" }
@@ -52,8 +59,10 @@ export type Command =
   | { type: "zoomToSelection" }
   | { type: "toggleLabels" }
   | { type: "toggleBoxes" }
-  /** 标为空标注（无目标，负样本）：写入没有目标的标注文件。 */
+  /** 标为空标注（无目标，负样本）：写入没有目标的标注文件。审图时没有。 */
   | { type: "negative" }
+  /** 审图时标记这张图片的审核状态（S 已审核、X 需加样、U 待审核）。 */
+  | { type: "review"; status: ReviewMark }
   | { type: "help" }
 
 /** 与 `KeyboardEvent` 中用到的字段一致，便于测试。 */
@@ -74,6 +83,8 @@ export type ShortcutContext = {
    * （H 隐藏所有框时）不算选中。
    */
   hasSelection: boolean
+  /** 审图编辑器：S / X / U 标记审核状态，N（空标注）不可用。 */
+  review?: boolean
 }
 
 export function isMac() {
@@ -225,7 +236,17 @@ export function commandForKey(
     case "KeyH":
       return { type: "toggleBoxes" }
     case "KeyN":
-      return { type: "negative" }
+      return context.review ? null : { type: "negative" }
+  }
+  if (context.review) {
+    switch (code) {
+      case "KeyS":
+        return { type: "review", status: "approved" }
+      case "KeyX":
+        return { type: "review", status: "needs_sample" }
+      case "KeyU":
+        return { type: "review", status: "pending" }
+    }
   }
   const index = digitIndex(code)
   return index === null ? null : { type: "class", index }
@@ -488,10 +509,32 @@ export type ShortcutHelp = {
   items: { keys: string[]; label: string }[]
 }
 
-/** 帮助面板（? 键）中的快捷键说明。 */
-export function shortcutHelp(mac: boolean): ShortcutHelp[] {
+/**
+ * 帮助面板（? 键）中的快捷键说明；`review` 时是审图编辑器的（多了审核状态，
+ * 没有空标注）。
+ */
+export function shortcutHelp(
+  mac: boolean,
+  { review = false }: { review?: boolean } = {}
+): ShortcutHelp[] {
   const mod = mac ? "⌘" : "Ctrl"
+  const reviewGroup: ShortcutHelp = {
+    title: "审核",
+    items: [
+      {
+        keys: ["S"],
+        label: "标为已审核（识别结果正确，模型不需要再学习这张图片）",
+      },
+      { keys: ["X"], label: "标为需加样（这张图片需要参与后续的训练）" },
+      { keys: ["U"], label: "改回待审核" },
+      {
+        keys: ["Shift+D", "Shift+A"],
+        label: "下一张 / 上一张待审核的图片",
+      },
+    ],
+  }
   return [
+    ...(review ? [reviewGroup] : []),
     {
       title: "画框与选择",
       items: [
@@ -557,13 +600,22 @@ export function shortcutHelp(mac: boolean): ShortcutHelp[] {
       title: "图片与保存",
       items: [
         { keys: ["D", "A"], label: "下一张 / 上一张（自动保存）" },
-        { keys: ["Shift+D", "Shift+A"], label: "下一张 / 上一张未标注的图片" },
+        ...(review
+          ? []
+          : [
+              {
+                keys: ["Shift+D", "Shift+A"],
+                label: "下一张 / 上一张未标注的图片",
+              },
+            ]),
         {
           keys: ["← / →"],
           label: "没有选中框（或选中的框已隐藏）时切换图片",
         },
         { keys: ["G"], label: "跳到第 N 张" },
-        { keys: ["N"], label: "标为空标注（图片上没有目标，负样本）" },
+        ...(review
+          ? []
+          : [{ keys: ["N"], label: "标为空标注（图片上没有目标，负样本）" }]),
         { keys: [`${mod}+S`], label: "立即保存（停止编辑后也会自动保存）" },
       ],
     },

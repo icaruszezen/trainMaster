@@ -51,6 +51,9 @@ func (s *server) datasetRoutes(r chi.Router) {
 			r.Put("/projects", s.setDatasetProjects)
 			r.Get("/classes", s.listDatasetClasses)
 		}
+		if s.reviews != nil {
+			r.Get("/reviews", s.listDatasetReviews)
+		}
 	})
 }
 

@@ -193,6 +193,79 @@ describe("commandForKey", () => {
   })
 })
 
+describe("commandForKey in the review editor", () => {
+  const review: ShortcutContext = {
+    mac: false,
+    hasSelection: false,
+    review: true,
+  }
+
+  it("marks the review status with S, X and U", () => {
+    expect(commandForKey(key("KeyS"), review)).toEqual({
+      type: "review",
+      status: "approved",
+    })
+    expect(commandForKey(key("KeyX"), review)).toEqual({
+      type: "review",
+      status: "needs_sample",
+    })
+    expect(commandForKey(key("KeyU"), review)).toEqual({
+      type: "review",
+      status: "pending",
+    })
+    // Also with a box selected, and on any layout (the physical key).
+    expect(
+      commandForKey(
+        { ...key("KeyS"), key: "ы" },
+        { ...review, hasSelection: true }
+      )
+    ).toEqual({ type: "review", status: "approved" })
+  })
+
+  it("leaves S, X and U unbound when annotating", () => {
+    for (const code of ["KeyS", "KeyX", "KeyU"]) {
+      expect(commandForKey(key(code), pc), code).toBeNull()
+    }
+  })
+
+  it("does not mark with modifiers, and Ctrl+S still saves", () => {
+    expect(commandForKey(key("KeyS", { shiftKey: true }), review)).toBeNull()
+    expect(commandForKey(key("KeyX", { altKey: true }), review)).toBeNull()
+    expect(commandForKey(key("KeyS", { ctrlKey: true }), review)).toEqual({
+      type: "save",
+    })
+    expect(
+      commandForKey(key("KeyS", { metaKey: true }), { ...review, mac: true })
+    ).toEqual({ type: "save" })
+  })
+
+  it("has no negative annotation", () => {
+    expect(commandForKey(key("KeyN"), review)).toBeNull()
+    expect(commandForKey(key("KeyN"), pc)).toEqual({ type: "negative" })
+  })
+
+  it("keeps the other keys, Shift+D / Shift+A skipping to pending images", () => {
+    expect(commandForKey(key("KeyW"), review)).toEqual({
+      type: "tool",
+      tool: "rect",
+    })
+    expect(commandForKey(key("KeyD", { shiftKey: true }), review)).toEqual({
+      type: "image",
+      direction: 1,
+      unannotated: true,
+    })
+    expect(commandForKey(key("KeyA", { shiftKey: true }), review)).toEqual({
+      type: "image",
+      direction: -1,
+      unannotated: true,
+    })
+    expect(commandForKey(key("Digit1"), review)).toEqual({
+      type: "class",
+      index: 0,
+    })
+  })
+})
+
 describe("allowsRepeat", () => {
   it("repeats moves and zooms, not image changes", () => {
     expect(allowsRepeat({ type: "nudge", dx: 1, dy: 0 })).toBe(true)
@@ -201,6 +274,7 @@ describe("allowsRepeat", () => {
       allowsRepeat({ type: "image", direction: 1, unannotated: false })
     ).toBe(false)
     expect(allowsRepeat({ type: "negative" })).toBe(false)
+    expect(allowsRepeat({ type: "review", status: "approved" })).toBe(false)
   })
 })
 
@@ -555,5 +629,28 @@ describe("shortcutHelp", () => {
     expect(keys(true)).toContain("⌘+S")
     expect(keys(true)).not.toContain("⌘+Y")
     expect(keys(false)).toContain("Ctrl+Y")
+  })
+
+  it("documents the review keys in the review editor, without N", () => {
+    const labels = (review: boolean) =>
+      new Map(
+        shortcutHelp(false, { review }).flatMap((group) =>
+          group.items.flatMap((item) =>
+            item.keys.map((k) => [k, item.label] as const)
+          )
+        )
+      )
+    const review = labels(true)
+    expect(review.get("S")).toContain("已审核")
+    expect(review.get("X")).toContain("需加样")
+    expect(review.get("U")).toContain("待审核")
+    expect(review.get("Shift+D")).toContain("待审核")
+    expect(review.has("N")).toBe(false)
+    expect(shortcutHelp(false, { review: true })[0].title).toBe("审核")
+
+    const annotate = labels(false)
+    expect(annotate.has("S")).toBe(false)
+    expect(annotate.get("N")).toContain("空标注")
+    expect(annotate.get("Shift+D")).toContain("未标注")
   })
 })

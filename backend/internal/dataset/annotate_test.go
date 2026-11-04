@@ -394,7 +394,7 @@ type annotationEnv struct {
 
 func newAnnotationEnv(t *testing.T, files map[string][]byte) *annotationEnv {
 	t.Helper()
-	e := newTestEnv(t, true)
+	e := newTestEnv(t, false)
 	dir := filepath.Join(e.datasetsDir(), "annotate")
 	writeFiles(t, dir, files)
 	dirName := "annotate"
@@ -402,6 +402,7 @@ func newAnnotationEnv(t *testing.T, files map[string][]byte) *annotationEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
+	e.start(t)
 	if job := e.waitJob(t, d.ID, d.ActiveImport.ID); job.Status != StatusSucceeded {
 		t.Fatalf("scan = %+v", job)
 	}

@@ -8,6 +8,7 @@
 # 白名单目录中仍需排除的内容
 **/node_modules
 frontend/dist
+backend/cmd/trainmaster-reviewer/web/dist
 **/coverage
 **/.env
 **/.env.*

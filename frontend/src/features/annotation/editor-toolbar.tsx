@@ -1,31 +1,24 @@
-import { useState, type ComponentProps, type ReactNode, type Ref } from "react"
+import type { Ref } from "react"
 import { Link } from "react-router"
 import {
   ArrowLeft,
-  Check,
   ChevronLeft,
   ChevronRight,
-  CircleAlert,
   ClipboardPaste,
   Ellipsis,
   FileX2,
   Hand,
   Keyboard,
-  Maximize,
   MousePointer2,
   PanelLeft,
   PanelRight,
   Redo2,
   RefreshCw,
   SkipForward,
-  SlidersHorizontal,
   Square,
   SquareDashed,
   Tags,
-  TriangleAlert,
   Undo2,
-  ZoomIn,
-  ZoomOut,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -40,69 +33,21 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { Input } from "@/components/ui/input"
-import { Kbd } from "@/components/ui/kbd"
-import { Label } from "@/components/ui/label"
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover"
-import { Slider } from "@/components/ui/slider"
 import { Spinner } from "@/components/ui/spinner"
-import { Switch } from "@/components/ui/switch"
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
-import type { ImageAdjustments } from "@/features/annotation/annotation-canvas"
+import { ToggleGroup } from "@/components/ui/toggle-group"
 import type { SaverState } from "@/features/annotation/autosave"
-import { focusCanvas, type Tool } from "@/features/annotation/shortcuts"
+import type { ViewOptions } from "@/features/annotation/editor-common"
+import type { Tool } from "@/features/annotation/shortcuts"
+import {
+  PositionField,
+  SaveStatus,
+  ToolbarSeparator,
+  ToolButton,
+  ToolToggle,
+  ViewPopover,
+  ZoomControls,
+} from "@/features/annotation/toolbar-parts"
 import type { DatasetProjectRef } from "@/features/datasets/api"
-import { formatNumber } from "@/lib/format"
-import { cn } from "@/lib/utils"
-
-export type ViewOptions = {
-  showLabels: boolean
-  showBoxes: boolean
-  /** 切换到同尺寸的图片时保持缩放与位置（固定相机拍摄的产线图片）。 */
-  keepViewport: boolean
-} & ImageAdjustments
-
-function ToolButton({
-  label,
-  keys,
-  children,
-  className,
-  ...props
-}: ComponentProps<typeof Button> & {
-  label: string
-  keys?: string[]
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label={label}
-          className={className}
-          {...props}
-        >
-          {children}
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent className="flex items-center gap-2">
-        {label}
-        {keys?.map((key) => (
-          <Kbd key={key}>{key}</Kbd>
-        ))}
-      </TooltipContent>
-    </Tooltip>
-  )
-}
 
 type EditorToolbarProps = {
   datasetId: number
@@ -232,7 +177,7 @@ export function EditorToolbar(props: EditorToolbarProps) {
         </ToolButton>
       </div>
 
-      <Separator />
+      <ToolbarSeparator />
 
       {/* 第二组：工具、撤销、缩放、视图 */}
       <div className="order-last flex w-full [scrollbar-width:none] items-center gap-1 overflow-x-auto md:order-none md:w-auto md:overflow-visible">
@@ -258,7 +203,7 @@ export function EditorToolbar(props: EditorToolbarProps) {
             <Hand />
           </ToolToggle>
         </ToggleGroup>
-        <Separator />
+        <ToolbarSeparator />
         <ToolButton
           label="撤销"
           keys={[`${mod}+Z`]}
@@ -275,62 +220,14 @@ export function EditorToolbar(props: EditorToolbarProps) {
         >
           <Redo2 />
         </ToolButton>
-        <Separator />
-        {/* 手机上用双指缩放与缩放比例菜单，省出宽度给“目标与图片信息”按钮。 */}
-        <ToolButton
-          label="缩小"
-          keys={["-"]}
-          onClick={() => onZoom(-1)}
-          className="hidden sm:inline-flex"
-        >
-          <ZoomOut />
-        </ToolButton>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="w-14 px-1 font-normal tabular-nums"
-              aria-label="缩放比例"
-            >
-              {zoom === null ? "—" : `${Math.round(zoom * 100)}%`}
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="center">
-            <DropdownMenuItem onSelect={() => onZoom(1)} className="sm:hidden">
-              放大
-              <DropdownMenuShortcut>+</DropdownMenuShortcut>
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => onZoom(-1)} className="sm:hidden">
-              缩小
-              <DropdownMenuShortcut>-</DropdownMenuShortcut>
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={onFit}>
-              适应窗口
-              <DropdownMenuShortcut>F</DropdownMenuShortcut>
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={onActualSize}>
-              原图大小（100%）
-              <DropdownMenuShortcut>{mod}+0</DropdownMenuShortcut>
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-        <ToolButton
-          label="放大"
-          keys={["+"]}
-          onClick={() => onZoom(1)}
-          className="hidden sm:inline-flex"
-        >
-          <ZoomIn />
-        </ToolButton>
-        <ToolButton
-          label="适应窗口"
-          keys={["F"]}
-          onClick={onFit}
-          className="hidden sm:inline-flex"
-        >
-          <Maximize />
-        </ToolButton>
+        <ToolbarSeparator />
+        <ZoomControls
+          zoom={zoom}
+          onZoom={onZoom}
+          onFit={onFit}
+          onActualSize={onActualSize}
+          mod={mod}
+        />
         <ViewPopover view={props.view} onChange={props.onViewChange} />
         <div className="ml-auto flex items-center gap-1 md:hidden">
           <MoreMenu {...props} />
@@ -361,230 +258,6 @@ export function EditorToolbar(props: EditorToolbarProps) {
           </ToolButton>
         </div>
       </div>
-    </div>
-  )
-}
-
-function Separator() {
-  return <span className="mx-0.5 hidden h-5 w-px bg-border sm:block" />
-}
-
-function ToolToggle({
-  value,
-  label,
-  keys,
-  disabled,
-  children,
-}: {
-  value: Tool
-  label: string
-  keys: string[]
-  disabled?: boolean
-  children: ReactNode
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <ToggleGroupItem
-          value={value}
-          aria-label={label}
-          disabled={disabled}
-          className="px-2"
-        >
-          {children}
-        </ToggleGroupItem>
-      </TooltipTrigger>
-      <TooltipContent className="flex items-center gap-2">
-        {label}
-        {keys.map((key) => (
-          <Kbd key={key}>{key}</Kbd>
-        ))}
-      </TooltipContent>
-    </Tooltip>
-  )
-}
-
-function PositionField({
-  position,
-  total,
-  inputRef,
-  onGoto,
-}: {
-  position: number | null
-  total: number | null
-  inputRef: Ref<HTMLInputElement>
-  onGoto: (index: number) => void
-}) {
-  const [draft, setDraft] = useState<string | null>(null)
-  const shown = position === null ? "" : String(position + 1)
-  const commit = () => {
-    if (draft === null) {
-      return
-    }
-    const value = Number(draft)
-    setDraft(null)
-    if (Number.isInteger(value) && value >= 1 && total && value <= total) {
-      if (value - 1 !== position) {
-        onGoto(value - 1)
-      }
-    }
-  }
-  return (
-    <span className="flex items-center gap-1 text-xs text-muted-foreground tabular-nums">
-      第
-      <Input
-        ref={inputRef}
-        value={draft ?? shown}
-        placeholder={position === null ? "—" : undefined}
-        inputMode="numeric"
-        onFocus={(event) => {
-          setDraft(shown)
-          event.currentTarget.select()
-        }}
-        onChange={(event) => setDraft(event.target.value.replace(/\D/g, ""))}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") {
-            commit()
-            event.currentTarget.blur()
-          } else if (event.key === "Escape") {
-            setDraft(null)
-            event.currentTarget.blur()
-          }
-        }}
-        onBlur={() => setDraft(null)}
-        aria-label="跳到第几张（G）"
-        className="h-5 w-14 rounded-sm px-1 text-center text-xs md:text-xs"
-      />
-      / {total === null ? "—" : formatNumber(total)} 张
-    </span>
-  )
-}
-
-function ViewPopover({
-  view,
-  onChange,
-}: {
-  view: ViewOptions
-  onChange: (view: ViewOptions) => void
-}) {
-  const adjusted = view.brightness !== 1 || view.contrast !== 1
-  return (
-    <Popover>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <PopoverTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label="视图设置"
-              className={cn(adjusted && "text-primary")}
-            >
-              <SlidersHorizontal />
-            </Button>
-          </PopoverTrigger>
-        </TooltipTrigger>
-        <TooltipContent>视图设置（亮度、对比度、显示）</TooltipContent>
-      </Tooltip>
-      <PopoverContent align="start" className="grid w-72 gap-4">
-        <ViewSwitch
-          id="view-labels"
-          label="显示类别名称"
-          shortcut="L"
-          checked={view.showLabels}
-          onCheckedChange={(showLabels) => onChange({ ...view, showLabels })}
-        />
-        <ViewSwitch
-          id="view-boxes"
-          label="显示标注框"
-          shortcut="H"
-          checked={view.showBoxes}
-          onCheckedChange={(showBoxes) => onChange({ ...view, showBoxes })}
-        />
-        <ViewSwitch
-          id="view-keep"
-          label="同尺寸图片保持缩放与位置"
-          checked={view.keepViewport}
-          onCheckedChange={(keepViewport) =>
-            onChange({ ...view, keepViewport })
-          }
-        />
-        <AdjustmentSlider
-          label="亮度"
-          value={view.brightness}
-          onChange={(brightness) => onChange({ ...view, brightness })}
-        />
-        <AdjustmentSlider
-          label="对比度"
-          value={view.contrast}
-          onChange={(contrast) => onChange({ ...view, contrast })}
-        />
-        <div className="flex items-center justify-between gap-2">
-          <p className="text-xs text-muted-foreground">
-            亮度、对比度只影响显示，不修改图片。
-          </p>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!adjusted}
-            onClick={() => onChange({ ...view, brightness: 1, contrast: 1 })}
-          >
-            重置
-          </Button>
-        </div>
-      </PopoverContent>
-    </Popover>
-  )
-}
-
-function ViewSwitch({
-  id,
-  label,
-  shortcut,
-  checked,
-  onCheckedChange,
-}: {
-  id: string
-  label: string
-  shortcut?: string
-  checked: boolean
-  onCheckedChange: (checked: boolean) => void
-}) {
-  return (
-    <div className="flex items-center justify-between gap-3">
-      <Label htmlFor={id} className="font-normal">
-        {label}
-        {shortcut && <Kbd>{shortcut}</Kbd>}
-      </Label>
-      <Switch id={id} checked={checked} onCheckedChange={onCheckedChange} />
-    </div>
-  )
-}
-
-function AdjustmentSlider({
-  label,
-  value,
-  onChange,
-}: {
-  label: string
-  value: number
-  onChange: (value: number) => void
-}) {
-  return (
-    <div className="grid gap-2">
-      <div className="flex items-center justify-between text-sm">
-        <span>{label}</span>
-        <span className="text-muted-foreground tabular-nums">
-          {Math.round(value * 100)}%
-        </span>
-      </div>
-      <Slider
-        min={0.2}
-        max={3}
-        step={0.05}
-        value={[value]}
-        onValueChange={([next]) => onChange(next)}
-        aria-label={label}
-      />
     </div>
   )
 }
@@ -690,85 +363,4 @@ function ManageClassesItem({ projects }: { projects: DatasetProjectRef[] }) {
       </DropdownMenuSubContent>
     </DropdownMenuSub>
   )
-}
-
-function formatTime(date: Date) {
-  return date.toLocaleTimeString("zh-CN", { hour12: false })
-}
-
-/** 保存状态：未保存 / 保存中 / 已保存（时间）/ 保存失败（重试）/ 冲突。 */
-export function SaveStatus({
-  state,
-  savedAt,
-  onRetry,
-}: {
-  state: SaverState
-  savedAt: Date | null
-  onRetry: () => void
-}) {
-  const base =
-    "flex h-8 items-center gap-1.5 rounded-md px-2 text-xs whitespace-nowrap"
-  switch (state.status) {
-    case "dirty":
-      return (
-        <span className={cn(base, "text-muted-foreground")} role="status">
-          <span className="size-2 rounded-full bg-amber-500" aria-hidden />
-          未保存
-        </span>
-      )
-    case "saving":
-      return (
-        <span className={cn(base, "text-muted-foreground")} role="status">
-          <Spinner className="size-3.5" />
-          保存中…
-        </span>
-      )
-    case "saved":
-      return (
-        <span className={cn(base, "text-muted-foreground")} role="status">
-          <Check className="size-3.5 text-emerald-600 dark:text-emerald-500" />
-          已保存
-          {savedAt && (
-            <span className="hidden tabular-nums sm:inline">
-              {formatTime(savedAt)}
-            </span>
-          )}
-        </span>
-      )
-    case "error":
-      return (
-        <button
-          type="button"
-          onClick={(event) => {
-            // 按钮随后变为“保存中”：焦点先移到画布上，不落到 body 上。
-            focusCanvas(event.currentTarget)
-            onRetry()
-          }}
-          title={state.error ?? undefined}
-          className={cn(
-            base,
-            "text-destructive hover:bg-destructive/10 focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
-          )}
-        >
-          <CircleAlert className="size-3.5" />
-          保存失败，重试
-        </button>
-      )
-    case "conflict":
-      return (
-        <span
-          className={cn(base, "text-amber-700 dark:text-amber-500")}
-          role="status"
-        >
-          <TriangleAlert className="size-3.5" />
-          保存冲突
-        </span>
-      )
-    default:
-      return (
-        <span className={cn(base, "text-muted-foreground")} role="status">
-          没有修改
-        </span>
-      )
-  }
 }

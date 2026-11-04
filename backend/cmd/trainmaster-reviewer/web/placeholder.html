@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>trainMaster 本地审图</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family:
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          "Microsoft YaHei",
+          sans-serif;
+      }
+      body {
+        margin: 0;
+        min-height: 100svh;
+        display: grid;
+        place-items: center;
+        background: Canvas;
+        color: CanvasText;
+      }
+      main {
+        max-width: 34rem;
+        padding: 1.5rem;
+        line-height: 1.7;
+      }
+      code {
+        padding: 0.1em 0.35em;
+        border-radius: 0.25rem;
+        background: color-mix(in srgb, CanvasText 10%, transparent);
+      }
+    </style>
+  </head>
+  <body>
+    <!-- 构建前端（npm run build:reviewer）后，这里是 web/dist/reviewer.html。
+         这个占位页面随代码提交，没有构建前端时程序照样能编译。 -->
+    <main>
+      <h1>trainMaster 本地审图</h1>
+      <p>这个本地审图程序构建时没有包含界面。</p>
+      <p>
+        请在仓库根目录运行 <code>make reviewer</code>（或先在
+        <code>frontend/</code> 中运行 <code>npm run build:reviewer</code>，再重新编译
+        <code>backend/cmd/trainmaster-reviewer</code>），详见 docs/development.md。
+      </p>
+    </main>
+  </body>
+</html>

@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .client import ApiError, Client, TransportError, json_safe
+from .client import ApiError, Client, Transfer, TransportError, json_safe
 from .environment import _kill, _short_error, _tail, child_env, summarize_exception
 
 log = logging.getLogger(__name__)
@@ -1022,6 +1022,22 @@ def file_sha256(path: Path, abort: Callable[[], bool] | None = None) -> str:
     return digest.hexdigest()
 
 
+def verify_download(got: Transfer, size_bytes: int, sha256: str) -> None:
+    """下载的模型文件与任务中的大小、sha256（小写）核对；不一致（传输出错）时抛出可重试的 TaskFailed。
+    模型转换与审图识别共用。"""
+    if got.size != size_bytes:
+        raise TaskFailed(
+            f"下载的模型文件大小不一致（收到 {got.size} 字节，应为 {size_bytes} 字节）",
+            retryable=True,
+        )
+    if got.sha256 != sha256:
+        raise TaskFailed(
+            "下载的模型文件校验失败（sha256 不一致），可能是传输出错",
+            f"expected {sha256}, got {got.sha256}",
+            retryable=True,
+        )
+
+
 def fail_url_of(task: Mapping[str, Any]) -> str | None:
     """任务数据不完整时仍尽量找到 fail_url，以便向平台说明原因。"""
     value = task.get("fail_url")
@@ -1321,17 +1337,7 @@ class ModelExportTask:
         except OSError as exc:
             raise TaskFailed(f"无法写入模型文件 {dest}：{exc}", retryable=True) from None
         self._check_interrupted()
-        if got.size != info.size_bytes:
-            raise TaskFailed(
-                f"下载的模型文件大小不一致（收到 {got.size} 字节，应为 {info.size_bytes} 字节）",
-                retryable=True,
-            )
-        if got.sha256 != info.sha256:
-            raise TaskFailed(
-                "下载的模型文件校验失败（sha256 不一致），可能是传输出错",
-                f"expected {info.sha256}, got {got.sha256}",
-                retryable=True,
-            )
+        verify_download(got, info.size_bytes, info.sha256)
 
     def _upload(self, info: ExportTaskInfo, path: Path, size: int) -> None:
         try:
@@ -1433,11 +1439,12 @@ class ModelExportTask:
             log.warning("cannot remove work directory %s: %s", work, exc)
 
 
-def clean_work_dirs(state_dir: Path) -> None:
-    """删除之前运行（进程崩溃、被强制结束）留下的转换工作目录。"""
+def clean_work_dirs(state_dir: Path, patterns: Sequence[str] = ("model-export-*",)) -> None:
+    """删除之前运行（进程崩溃、被强制结束）留下的任务工作目录：状态目录的 work/ 中与 patterns 匹配的
+    条目（默认为转换的工作目录；任务线程启动时传入每类任务的工作目录，见 tasks.WORK_DIR_PATTERNS）。"""
     root = state_dir / "work"
     try:
-        entries = list(root.glob("model-export-*"))
+        entries = [entry for pattern in patterns for entry in root.glob(pattern)]
     except OSError:
         return
     for entry in entries:

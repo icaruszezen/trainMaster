@@ -16,6 +16,7 @@ import {
   ListChecks,
   PenTool,
   Rocket,
+  ScanEye,
   ScanSearch,
   Server,
   Settings,
@@ -38,6 +39,7 @@ export type ModuleId =
   | "compute"
   | "evaluations"
   | "models"
+  | "reviews"
   | "inference"
   | "members"
   | "storage"
@@ -121,6 +123,23 @@ export const navGroups: NavGroup[] = [
           "把服务器数据目录下已有的文件夹添加为数据集",
           "缩略图浏览，按标注状态、标签筛选，查看标注框",
           "标签分布统计与导入记录",
+        ],
+      },
+      {
+        id: "reviews",
+        title: "模型审图",
+        path: "/datasets/reviews",
+        icon: ScanEye,
+        description:
+          "用模型识别一批数据集，逐张确认识别结果：标为已审核（识别正确）或需加样（参与后续训练），审图标注可选合并到数据集。",
+        status: "ready",
+        apiPath: "/api/v1/reviews",
+        features: [
+          "选择模型与一个或多个数据集创建审图任务，由训练节点自动识别并生成只属于这次审图的 VOC 标注",
+          "网页审图：S 已审核、X 需加样、U 待审核，标记后自动跳到下一张；框可以像标注工作台一样修改",
+          "按审核状态、数据集、类别、已修改、无框、识别失败与文件名筛选图片",
+          "下载审图包，用 Windows 本地审图程序离线审图后上传结果",
+          "数据集页面的审核记录，审图标注可选合并到数据集的标注中",
         ],
       },
       {

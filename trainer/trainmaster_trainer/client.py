@@ -1,7 +1,7 @@
 """平台的节点接口客户端（/api/v1/compute/agent/*），只用标准库 urllib。
 
-除 JSON 请求外还支持流式下载（边写文件边计算 sha256）与流式上传文件（PUT 原始字节），
-供任务（如模型转换）传输大文件；内存中只保留一个分块。
+除 JSON 请求（POST，以及读取任务数据的 GET）外还支持流式下载（边写文件边计算 sha256）与流式上传文件
+（PUT 原始字节），供任务（如模型转换、审图识别）传输大文件；内存中只保留一个分块。
 """
 
 from __future__ import annotations
@@ -160,6 +160,21 @@ class Client:
                 **{"Content-Type": "application/json; charset=utf-8", "Accept": "application/json"},
             ),
             method="POST",
+        )
+        return self._json_response(req, timeout)
+
+    def get(
+        self,
+        path: str,
+        *,
+        timeout: float | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """GET，返回解析后的 JSON 对象（如审图识别任务的图片列表）。错误与 post 相同。"""
+        req = urllib.request.Request(
+            self.base_url + path,
+            headers=self._headers(headers, Accept="application/json"),
+            method="GET",
         )
         return self._json_response(req, timeout)
 

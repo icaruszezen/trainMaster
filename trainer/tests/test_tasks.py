@@ -9,10 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
-import random
 import sys
-import textwrap
 import threading
 import time
 from pathlib import Path
@@ -21,56 +18,12 @@ from typing import Any
 import export_fakes
 import pytest
 from fake_platform import CLAIM, DROP, FakePlatform, wait_until
+from task_harness import NODE_KEY, TOKEN, FakeClock, Run, Waits, gone, script
 
 from trainmaster_trainer import model_export, tasks
-from trainmaster_trainer.client import Client
 from trainmaster_trainer.tasks import TaskWorker, missing_modules
 
-TOKEN = "right-token-0123456789"
-NODE_KEY = "node-key-1"
 PT = b"PK\x03\x04" + bytes(range(256)) * 40
-
-
-class FakeRegistration:
-    """主循环的替身：一直处于已注册状态；registration_lost 时在假平台上重新注册（epoch 加一）。"""
-
-    def __init__(self, platform: FakePlatform) -> None:
-        self.platform = platform
-        self.epoch = 1
-        self.lost: list[int] = []
-        platform.register({"node_key": NODE_KEY, "name": "gpu-01"})
-
-    def wait_registered(self, timeout: float) -> int | None:
-        return self.epoch
-
-    def registration_lost(self, epoch: int) -> None:
-        self.lost.append(epoch)
-        if epoch == self.epoch:
-            self.platform.register({"node_key": NODE_KEY, "name": "gpu-01"})
-            self.epoch += 1
-
-
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 1000.0
-
-    def __call__(self) -> float:
-        return self.now
-
-
-class Waits:
-    """TaskWorker 的 wait 替身：记录等待时间并推进假时钟，只真实等待一小会。"""
-
-    def __init__(self, clock: FakeClock | None = None) -> None:
-        self.clock = clock
-        self.calls: list[float] = []
-
-    def __call__(self, seconds: float) -> bool:
-        self.calls.append(seconds)
-        if self.clock is not None:
-            self.clock.now += seconds
-        time.sleep(0.005)
-        return False
 
 
 @pytest.fixture
@@ -95,45 +48,6 @@ def fake_ml(tmp_path, monkeypatch):
 
     configure()
     return configure
-
-
-def script(tmp_path: Path, body: str) -> list[str]:
-    path = tmp_path / "child.py"
-    path.write_text(textwrap.dedent(body), encoding="utf-8")
-    return [sys.executable, str(path)]
-
-
-class Run:
-    def __init__(self, tmp_path: Path, platform: FakePlatform, **kw: Any) -> None:
-        self.platform = platform
-        self.registration = FakeRegistration(platform)
-        self.waits: Waits = kw.pop("waits", None) or Waits()
-        self.state_dir = tmp_path / "state"
-        kw.setdefault("export_timeout", 60)
-        kw.setdefault("find_spec", lambda name: object())
-        self.worker = TaskWorker(
-            client=Client(platform.url, TOKEN),
-            node_key=NODE_KEY,
-            registration=self.registration,
-            state_dir=self.state_dir,
-            node_name="gpu-01",
-            wait=self.waits,
-            rng=random.Random(1),
-            **kw,
-        )
-
-    def __enter__(self) -> Run:
-        self.worker.start()
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self.worker.stop()
-        deadline = time.monotonic() + 15
-        while self.worker.alive and time.monotonic() < deadline:
-            # 正在进行的长轮询立即返回（停止前刚发出的领取请求可能还没到达服务端，所以重复几次）
-            self.platform.release_claims()
-            self.worker._thread.join(timeout=0.1)  # type: ignore[union-attr]
-        assert not self.worker.alive
 
 
 def finished(platform: FakePlatform, export_id: int, *statuses: str) -> dict[str, Any]:
@@ -203,7 +117,8 @@ def test_export_end_to_end(platform, tmp_path, fake_ml, caplog):
     assert all(r["headers"]["X-Node-Key"] == NODE_KEY for r in requests)
     assert all(r["headers"]["Authorization"] == f"Bearer {TOKEN}" for r in requests)
     claim = platform.claims[0]
-    assert claim == {"node_key": NODE_KEY, "kinds": ["model_export"], "wait_seconds": 25}
+    kinds = ["model_export", "review_inference"]
+    assert claim == {"node_key": NODE_KEY, "kinds": kinds, "wait_seconds": 25}
     messages = [r.getMessage() for r in caplog.records]
     assert any(f"model export {export_id} started" in m for m in messages)
     assert any(f"model export {export_id} succeeded" in m for m in messages)
@@ -308,7 +223,7 @@ def test_claim_uses_long_timeout():
     assert all(s["timeout"] == 25 + 15 for s in seen)
     assert seen[0]["payload"] == {
         "node_key": NODE_KEY,
-        "kinds": ["model_export"],
+        "kinds": ["model_export", "review_inference"],
         "wait_seconds": 25,
     }
     # 空结果立即返回（假时钟没有走）时稍等再领，避免空转
@@ -578,14 +493,6 @@ def _slow_child(tmp_path: Path) -> tuple[list[str], Path]:
     return cmd, pid_file
 
 
-def _gone(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    return False
-
-
 @pytest.mark.parametrize("how", ["conflict", "deleted"])
 def test_progress_conflict_abandons_the_task(platform, tmp_path, how, caplog):
     caplog.set_level(logging.INFO, logger="trainmaster_trainer")
@@ -604,7 +511,7 @@ def test_progress_conflict_abandons_the_task(platform, tmp_path, how, caplog):
         started = time.monotonic()
         wait_until(lambda: run.worker.tasks_run == 1, timeout=15)
         assert time.monotonic() - started < 10
-        assert _gone(pid)
+        assert gone(pid)
         assert not (run.state_dir / "work" / f"model-export-{export_id}").exists()
     actions = [r["path"].rsplit("/", 1)[1] for r in task_requests(platform, export_id)]
     assert "fail" not in actions and "complete" not in actions and "output" not in actions
@@ -643,7 +550,7 @@ def test_stop_during_a_task(platform, tmp_path):
         run.worker.join()
         assert time.monotonic() - started < 10
         assert not run.worker.alive
-        assert _gone(pid)
+        assert gone(pid)
     exp = platform.export(export_id)
     assert exp["status"] == "queued"  # 可重试的失败：立即重新排队，由其它节点或重启后的节点执行
     assert exp["fails"] == [
@@ -728,13 +635,15 @@ def test_disk_space_is_checked(platform, tmp_path, monkeypatch):
 
 
 def test_stale_work_dirs_are_removed(platform, tmp_path):
-    stale = tmp_path / "state" / "work" / "model-export-99"
-    stale.mkdir(parents=True)
-    (stale / "model.pt").write_bytes(b"left over")
-    keep = tmp_path / "state" / "work" / "other"
+    work = tmp_path / "state" / "work"
+    stale = [work / "model-export-99", work / "review-inference-12"]
+    for path in stale:
+        (path / "images").mkdir(parents=True)
+        (path / "model.pt").write_bytes(b"left over")
+    keep = work / "other"
     keep.mkdir()
     with Run(tmp_path, platform):
-        wait_until(lambda: not stale.exists())
+        wait_until(lambda: not any(path.exists() for path in stale))
     assert keep.exists()
 
 
@@ -791,7 +700,7 @@ def test_claim_errors_back_off(platform, tmp_path, caplog, mode):
 def test_missing_capabilities_are_rechecked(platform, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger="trainmaster_trainer")
     clock = FakeClock()
-    installed = {"torch", "ultralytics"}
+    installed = {"torch"}
     with Run(
         tmp_path,
         platform,
@@ -800,12 +709,31 @@ def test_missing_capabilities_are_rechecked(platform, tmp_path, caplog):
         find_spec=lambda name: object() if name in installed else None,
     ) as run:
         wait_until(lambda: run.waits.calls.count(300.0) >= 3)
-        assert platform.claims == []  # 缺少 onnx：不领取 model_export
-        installed.add("onnx")  # 之后安装了依赖（裸机节点）
+        assert platform.claims == []  # 缺少 ultralytics：两类任务都不领取
+        installed.add("ultralytics")  # 之后安装了依赖（裸机节点）：可以识别，还不能转换
         wait_until(lambda: platform.claims)
+        assert platform.claims[0]["kinds"] == ["review_inference"]
+        installed.add("onnx")
+        clock.now += 300  # 下一次检查时 model_export 也可以领取
+        wait_until(lambda: platform.claims[-1]["kinds"] == ["model_export", "review_inference"])
     messages = [r.getMessage() for r in caplog.records]
-    assert sum("not claiming model_export tasks: cannot find onnx" in m for m in messages) == 1
+    assert (
+        sum("not claiming model_export tasks: cannot find ultralytics, onnx" in m for m in messages)
+        == 1
+    )
+    assert (
+        sum("not claiming review_inference tasks: cannot find ultralytics" in m for m in messages)
+        == 1
+    )
+    assert any("review_inference tasks enabled" in m for m in messages)
     assert any("model_export tasks enabled" in m for m in messages)
+
+
+def test_review_inference_needs_torch_and_ultralytics_only():
+    assert tasks.REQUIRED_MODULES == {
+        "model_export": ("torch", "ultralytics", "onnx"),
+        "review_inference": ("torch", "ultralytics"),
+    }
 
 
 def test_missing_modules_does_not_import(monkeypatch):
@@ -825,8 +753,10 @@ def test_resident_modules_do_not_import_ml_packages():
     import subprocess
 
     code = (
-        "import sys, trainmaster_trainer.agent, trainmaster_trainer.tasks, trainmaster_trainer.model_export;"
-        "print(sorted(m for m in ('torch', 'ultralytics', 'onnx', 'onnxruntime', 'numpy') if m in sys.modules))"
+        "import sys, trainmaster_trainer.agent, trainmaster_trainer.tasks, trainmaster_trainer.model_export,"
+        " trainmaster_trainer.review_inference;"
+        "print(sorted(m for m in ('torch', 'ultralytics', 'onnx', 'onnxruntime', 'numpy', 'cv2', 'PIL')"
+        " if m in sys.modules))"
     )
     out = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=60,

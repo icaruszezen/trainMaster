@@ -58,15 +58,13 @@ export function editorImageQuery(datasetId: number, imageId: number) {
  * 打开图片时载入编辑器的详情：缓存中这张图片的详情；过期（超过 30 秒，或保存
  * 冲突后已失效）、正在重新读取时不用它，等读取完成后载入文件的当前内容，否则
  * 第一次保存就会冲突。重新读取失败时仍用缓存中的。只用于打开图片时：已经在
- * 编辑的图片在后台重新读取时，编辑器中的框不变。
+ * 编辑的图片在后台重新读取时，编辑器中的框不变。审图编辑器同样使用（`T` 为
+ * 审图图片的详情）。
  */
-export function openableDetail(
-  result: Pick<
-    QueryObserverResult<DatasetImageDetail>,
-    "data" | "isStale" | "isFetching"
-  >,
+export function openableDetail<T extends { id: number }>(
+  result: Pick<QueryObserverResult<T>, "data" | "isStale" | "isFetching">,
   imageId: number
-) {
+): T | undefined {
   if (result.data?.id !== imageId || (result.isStale && result.isFetching)) {
     return undefined
   }

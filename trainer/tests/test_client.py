@@ -324,6 +324,23 @@ def test_download_write_error_is_os_error(files, tmp_path):
         Client(server.url).download("/input", tmp_path / "missing-dir" / "model.pt")
 
 
+def test_get_json(files):
+    # 读取任务数据（如审图识别任务的图片列表）：GET，解析 JSON 对象，错误与 post 相同
+    page = {"items": [{"id": 3, "file_name": "a.jpg"}], "remaining": 1}
+    server = files(json.dumps(page).encode())
+    client = Client(server.url, "secret-token-0123456789")
+    assert client.get("/images?after=0&limit=200", headers={"X-Node-Key": "k1"}) == page
+    headers = server.get_headers
+    assert headers["Accept"] == "application/json" and headers["X-Node-Key"] == "k1"
+    assert headers["Authorization"] == "Bearer secret-token-0123456789"
+    with pytest.raises(ApiError) as info:
+        Client(files(b"[1, 2]").url).get("/images")
+    assert info.value.code == "invalid_response"
+    with pytest.raises(ApiError) as info:
+        Client(files(status=404).url).get("/images")
+    assert (info.value.status, info.value.code) == (404, "not_found")
+
+
 def test_put_file_streams_with_headers(files, tmp_path, monkeypatch):
     from trainmaster_trainer import client as client_mod
 

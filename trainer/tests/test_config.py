@@ -31,6 +31,7 @@ def test_defaults(tmp_path):
     assert cfg.self_test is True
     assert cfg.self_test_timeout == 300.0
     assert cfg.export_timeout == 900.0
+    assert cfg.inference_image_timeout == 300.0
     assert cfg.log_level == logging.INFO
     assert cfg.torch_variant is None
     assert cfg.state_dir_warning is None
@@ -49,6 +50,7 @@ def test_full_configuration(tmp_path):
             TM_SELF_TEST="off",
             TM_SELF_TEST_TIMEOUT="5m",
             TM_EXPORT_TIMEOUT=" 20m ",
+            TM_INFERENCE_IMAGE_TIMEOUT="90s",
             TM_LOG_LEVEL="DEBUG",
         ),
         require_server=True,
@@ -60,6 +62,7 @@ def test_full_configuration(tmp_path):
     assert cfg.self_test is False
     assert cfg.self_test_timeout == 300.0
     assert cfg.export_timeout == 1200.0
+    assert cfg.inference_image_timeout == 90.0
     assert cfg.log_level == logging.DEBUG
 
 
@@ -111,6 +114,7 @@ def test_all_problems_reported_together(tmp_path):
         TM_SELF_TEST="maybe",
         TM_SELF_TEST_TIMEOUT="soon",
         TM_EXPORT_TIMEOUT="25h",
+        TM_INFERENCE_IMAGE_TIMEOUT="0",
         TM_LOG_LEVEL="loud",
     )
     with pytest.raises(ConfigError) as info:
@@ -122,10 +126,11 @@ def test_all_problems_reported_together(tmp_path):
         "TM_SELF_TEST：",
         "TM_SELF_TEST_TIMEOUT",
         "TM_EXPORT_TIMEOUT",
+        "TM_INFERENCE_IMAGE_TIMEOUT",
         "TM_LOG_LEVEL",
     ):
         assert key in text
-    assert text.count("；") == 5
+    assert text.count("；") == 6
 
 
 @pytest.mark.parametrize(
@@ -218,6 +223,24 @@ def test_export_timeout_invalid(tmp_path, raw):
     with pytest.raises(ConfigError) as info:
         config.load(base_env(tmp_path, TM_EXPORT_TIMEOUT=raw))
     assert str(info.value).startswith("TM_EXPORT_TIMEOUT：")
+
+
+@pytest.mark.parametrize(("raw", "seconds"), [("300", 300.0), ("2m", 120.0), (" 45 ", 45.0)])
+def test_inference_image_timeout(tmp_path, raw, seconds):
+    # 审图识别时单张图片（与加载模型）的超时，规则同 TM_EXPORT_TIMEOUT
+    cfg = config.load(base_env(tmp_path, TM_INFERENCE_IMAGE_TIMEOUT=raw))
+    assert cfg.inference_image_timeout == seconds
+    assert (
+        config.load(base_env(tmp_path, TM_INFERENCE_IMAGE_TIMEOUT="")).inference_image_timeout
+        == 300
+    )
+
+
+@pytest.mark.parametrize("raw", ["0", "86401", "1h", "never"])
+def test_inference_image_timeout_invalid(tmp_path, raw):
+    with pytest.raises(ConfigError) as info:
+        config.load(base_env(tmp_path, TM_INFERENCE_IMAGE_TIMEOUT=raw))
+    assert str(info.value).startswith("TM_INFERENCE_IMAGE_TIMEOUT：")
 
 
 def test_parse_log_level():

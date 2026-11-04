@@ -49,6 +49,28 @@ func TestNewCreatesLayout(t *testing.T) {
 	}
 }
 
+func TestKeys(t *testing.T) {
+	var got []string
+	for _, k := range Keys {
+		got = append(got, string(k))
+	}
+	want := []string{"datasets", "models", "reviews", "runs", "exports", "cache", "tmp"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("Keys = %v, want %v", got, want)
+	}
+	// The container entrypoint creates (and chowns) every directory before
+	// the service starts as PUID:PGID.
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "docker", "entrypoint.sh"))
+	if err != nil {
+		t.Skipf("entrypoint not found: %v", err)
+	}
+	for _, k := range Keys {
+		if !strings.Contains(string(data), `"$DATA_DIR/`+string(k)+`"`) {
+			t.Errorf("deploy/docker/entrypoint.sh does not create $DATA_DIR/%s", k)
+		}
+	}
+}
+
 func TestNewFailsWhenSubdirIsAFile(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, string(Models)), nil, 0o644); err != nil {

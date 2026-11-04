@@ -202,21 +202,46 @@ func TestTruncate(t *testing.T) {
 func TestWorkerSet(t *testing.T) {
 	var w workerSet
 	now := time.Date(2026, 11, 3, 8, 0, 0, 0, time.UTC)
-	if w.count(now) != 0 {
+	if w.count(TaskModelExport, now) != 0 {
 		t.Error("empty set should count 0")
 	}
-	w.touch(1, now)
-	w.touch(2, now.Add(-50*time.Second))
-	w.touch(3, now.Add(-61*time.Second))
-	if n := w.count(now); n != 2 {
+	w.touch(1, TaskModelExport, now)
+	w.touch(2, TaskModelExport, now.Add(-50*time.Second))
+	w.touch(3, TaskModelExport, now.Add(-61*time.Second))
+	if n := w.count(TaskModelExport, now); n != 2 {
 		t.Errorf("count = %d, want 2", n)
 	}
 	if _, ok := w.seen[3]; ok {
 		t.Error("stale nodes should be forgotten")
 	}
-	w.touch(2, now) // seen again
-	if n := w.count(now.Add(30 * time.Second)); n != 2 {
+	w.touch(2, TaskModelExport, now) // seen again
+	if n := w.count(TaskModelExport, now.Add(30*time.Second)); n != 2 {
 		t.Errorf("count later = %d, want 2", n)
+	}
+
+	// Kinds: a claim replaces the kinds a node offers, work on a task adds
+	// its kind, and any activity keeps all of them.
+	var k workerSet
+	k.offer(1, []string{TaskModelExport, "review_inference"}, now)
+	k.offer(2, []string{"review_inference"}, now)
+	k.offer(3, []string{"training_job"}, now)
+	k.touch(4, TaskModelExport, now) // a node that kept working after a restart
+	for kind, want := range map[string]int{TaskModelExport: 2, "review_inference": 2, "training_job": 1, "other": 0} {
+		if n := k.count(kind, now); n != want {
+			t.Errorf("count(%s) = %d, want %d", kind, n, want)
+		}
+	}
+	later := now.Add(50 * time.Second)
+	k.touch(1, "review_inference", later) // busy inferring: still a conversion worker
+	k.offer(2, []string{TaskModelExport}, later)
+	if n := k.count(TaskModelExport, later.Add(20*time.Second)); n != 2 {
+		t.Errorf("count(model_export) later = %d, want 2", n)
+	}
+	if n := k.count("review_inference", later.Add(20*time.Second)); n != 1 {
+		t.Errorf("count(review_inference) later = %d, want 1", n)
+	}
+	if len(k.seen) != 2 {
+		t.Errorf("%d nodes remembered, want 2", len(k.seen))
 	}
 }
 

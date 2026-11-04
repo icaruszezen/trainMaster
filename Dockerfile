@@ -1,4 +1,6 @@
 # trainMaster 镜像：前端（Vite 构建产物）+ 后端（Go 单二进制），运行于 Alpine。
+# 镜像中还附带 Windows 版本地审图程序（/app/tools/trainmaster-reviewer.exe，
+# 平台的审图任务页面提供下载）。
 #
 #   docker build -t trainmaster:latest .
 #
@@ -20,7 +22,9 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm config set registry "${NPM_REGISTRY}" \
  && npm ci --no-audit --no-fund
 COPY frontend/ ./
-RUN npm run build
+# 平台的界面，以及嵌入本地审图程序的界面（类型检查已在 npm run build 中完成）。
+RUN npm run build \
+ && TM_REVIEWER_OUT_DIR=/out/reviewer-web npx vite build -c vite.reviewer.config.ts
 
 # ---- 2. 后端 ----
 FROM ${GO_IMAGE} AS backend
@@ -38,6 +42,13 @@ RUN BI=github.com/icaruszezen/trainmaster/backend/internal/buildinfo \
  && go build -trimpath \
       -ldflags "-s -w ${VERSION:+-X $BI.Version=$VERSION} ${COMMIT:+-X $BI.Commit=$COMMIT} ${BUILD_TIME:+-X $BI.BuildTime=$BUILD_TIME}" \
       -o /out/trainmaster ./cmd/trainmaster
+# 本地审图程序（Windows，窗口程序：-H windowsgui 不弹出控制台）。在平台二进制之后构建：
+# 只改前端时平台二进制的构建缓存仍然有效。
+COPY --from=frontend /out/reviewer-web ./cmd/trainmaster-reviewer/web/dist
+RUN BI=github.com/icaruszezen/trainmaster/backend/internal/buildinfo \
+ && GOOS=windows GOARCH=amd64 go build -trimpath \
+      -ldflags "-s -w -H windowsgui ${VERSION:+-X $BI.Version=$VERSION} ${COMMIT:+-X $BI.Commit=$COMMIT} ${BUILD_TIME:+-X $BI.BuildTime=$BUILD_TIME}" \
+      -o /out/trainmaster-reviewer.exe ./cmd/trainmaster-reviewer
 
 # ---- 3. 运行镜像 ----
 FROM ${RUNTIME_IMAGE}
@@ -51,10 +62,12 @@ COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod 0755 /usr/local/bin/entrypoint.sh
 COPY --from=backend /out/trainmaster /app/trainmaster
 COPY --from=frontend /src/frontend/dist /app/web
+COPY --from=backend /out/trainmaster-reviewer.exe /app/tools/trainmaster-reviewer.exe
 
 ENV TM_HTTP_ADDR=:8080 \
     TM_DATA_DIR=/data \
     TM_WEB_DIR=/app/web \
+    TM_REVIEWER_TOOL=/app/tools/trainmaster-reviewer.exe \
     TM_LOG_FORMAT=json
 WORKDIR /app
 EXPOSE 8080

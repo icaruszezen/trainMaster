@@ -30,12 +30,15 @@ import type {
 import { formatNumber } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
-function Section({
+/** 侧边面板中的一节：小标题加内容（`action` 放在标题右侧）。 */
+export function PanelSection({
   title,
+  action,
   children,
   className,
 }: {
   title: ReactNode
+  action?: ReactNode
   children: ReactNode
   className?: string
 }) {
@@ -43,6 +46,7 @@ function Section({
     <section className={cn("grid gap-2", className)}>
       <div className="flex min-h-7 items-center justify-between gap-2">
         <h2 className="text-xs font-medium text-muted-foreground">{title}</h2>
+        {action}
       </div>
       {children}
     </section>
@@ -78,7 +82,7 @@ export function ObjectPanel({
 }: ObjectPanelProps) {
   const selectedObject = objects.find((object) => object.uid === selected)
   return (
-    <Section
+    <PanelSection
       title={`本图的框（${formatNumber(objects.length)}）`}
       className="min-h-0"
     >
@@ -148,7 +152,7 @@ export function ObjectPanel({
           onDelete={() => onDelete(selectedObject.uid)}
         />
       )}
-    </Section>
+    </PanelSection>
   )
 }
 
@@ -400,7 +404,7 @@ export function ImageInfo({ detail, size, notices }: ImageInfoProps) {
     invalid: "标注文件无法解析",
   }
   return (
-    <Section title="图片">
+    <PanelSection title="图片">
       <dl className="grid gap-1.5 text-xs">
         <InfoRow label="路径">
           <span className="font-mono break-all">{detail.path}</span>
@@ -426,7 +430,7 @@ export function ImageInfo({ detail, size, notices }: ImageInfoProps) {
       {notices.map((notice, index) => (
         <NoticeBox key={index} notice={notice} />
       ))}
-    </Section>
+    </PanelSection>
   )
 }
 
@@ -457,7 +461,14 @@ export function NoticeBox({ notice }: { notice: Notice }) {
   )
 }
 
-function InfoRow({ label, children }: { label: string; children: ReactNode }) {
+/** 信息列表（`<dl>`）中的一行。 */
+export function InfoRow({
+  label,
+  children,
+}: {
+  label: string
+  children: ReactNode
+}) {
   return (
     <div className="grid grid-cols-[4rem_minmax(0,1fr)] gap-2">
       <dt className="text-muted-foreground">{label}</dt>

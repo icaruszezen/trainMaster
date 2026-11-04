@@ -30,6 +30,7 @@ func TestLoadDefaults(t *testing.T) {
 		NodeToken:             "",
 		NodeHeartbeatInterval: 10 * time.Second,
 		TrainerMode:           "",
+		ReviewerTool:          "",
 	}
 	if !reflect.DeepEqual(*cfg, want) {
 		t.Errorf("Load defaults\n got %+v\nwant %+v", *cfg, want)
@@ -41,6 +42,7 @@ func TestLoadOverrides(t *testing.T) {
 		"TM_HTTP_ADDR":       "127.0.0.1:9000",
 		"TM_DATA_DIR":        "/data",
 		"TM_WEB_DIR":         "/app/web",
+		"TM_REVIEWER_TOOL":   " /app/tools/trainmaster-reviewer.exe ",
 		"TM_DB_HOST":         "postgres",
 		"TM_DB_PORT":         "6543",
 		"TM_DB_SSLMODE":      "require",
@@ -51,7 +53,8 @@ func TestLoadOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.HTTPAddr != "127.0.0.1:9000" || cfg.DataDir != "/data" || cfg.WebDir != "/app/web" {
+	if cfg.HTTPAddr != "127.0.0.1:9000" || cfg.DataDir != "/data" || cfg.WebDir != "/app/web" ||
+		cfg.ReviewerTool != "/app/tools/trainmaster-reviewer.exe" {
 		t.Errorf("unexpected paths/addr: %+v", cfg)
 	}
 	if cfg.AutoMigrate || cfg.LogLevel != slog.LevelDebug || cfg.LogFormat != "json" {

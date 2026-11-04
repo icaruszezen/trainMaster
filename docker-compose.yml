@@ -65,6 +65,8 @@ x-trainer: &trainer
     TM_TRAINER_VARIANT: ${TM_TRAINER_VARIANT:-auto}
     # 单次模型转换（pt → ONNX）的时间上限，留空为 15 分钟
     TM_EXPORT_TIMEOUT: ${TM_EXPORT_TIMEOUT:-}
+    # 审图识别时单张图片（以及加载模型）的时间上限，留空为 5 分钟
+    TM_INFERENCE_IMAGE_TIMEOUT: ${TM_INFERENCE_IMAGE_TIMEOUT:-}
     TM_DATA_DIR: /data
     TM_LOG_LEVEL: ${TM_LOG_LEVEL:-info}
     # 容器以 root 启动，修正状态目录属主后以 PUID:PGID 运行（与 app 相同，才能读写 /data 中的文件）

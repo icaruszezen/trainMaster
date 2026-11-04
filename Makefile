@@ -45,7 +45,7 @@ LDFLAGS   := -s -w \
 
 .PHONY: help dev-db dev-backend dev-frontend \
 	test test-backend test-frontend test-trainer lint lint-backend lint-frontend lint-trainer \
-	build build-backend build-frontend docker-build docker-build-trainer setup up down logs ps
+	build build-backend build-frontend reviewer docker-build docker-build-trainer setup up down logs ps
 
 help: ## 显示可用命令
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  %-22s %s\n", $$1, $$2}' $(firstword $(MAKEFILE_LIST))
@@ -148,6 +148,13 @@ build-frontend: frontend/node_modules
 
 build-backend:
 	cd backend && CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/trainmaster ./cmd/trainmaster
+
+# 界面构建到 backend/cmd/trainmaster-reviewer/web/dist，编译时嵌入程序；-H windowsgui：窗口程序，不弹出控制台。
+# 在本机试用：cd backend && go run ./cmd/trainmaster-reviewer -browser [审图包.zip]（Linux / macOS 在浏览器中打开）。
+reviewer: frontend/node_modules ## 构建 Windows 版本地审图程序（backend/bin/trainmaster-reviewer.exe）
+	cd frontend && npm run build:reviewer
+	cd backend && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS) -H windowsgui" \
+		-o bin/trainmaster-reviewer.exe ./cmd/trainmaster-reviewer
 
 docker-build: ## 构建应用镜像 trainmaster:$TM_IMAGE_TAG
 	$(COMPOSE) build app

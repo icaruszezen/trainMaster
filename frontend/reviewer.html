@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>trainMaster 本地审图</title>
+    <script>
+      // 在 React 挂载前应用主题，避免深色模式下首屏闪白。
+      try {
+        const theme = localStorage.getItem("trainmaster-theme")
+        const dark =
+          theme === "dark" ||
+          (theme !== "light" &&
+            matchMedia("(prefers-color-scheme: dark)").matches)
+        document.documentElement.classList.add(dark ? "dark" : "light")
+      } catch {}
+    </script>
+  </head>
+  <body>
+    <!-- 本地审图程序（backend/cmd/trainmaster-reviewer）的界面，
+         npm run build:reviewer 构建后嵌入程序。 -->
+    <div id="root"></div>
+    <script type="module" src="/src/reviewer/main.tsx"></script>
+  </body>
+</html>
