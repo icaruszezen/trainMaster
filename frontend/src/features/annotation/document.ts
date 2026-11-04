@@ -182,20 +182,6 @@ export function removeObject(
   return next.length === objects.length ? objects : next
 }
 
-/** 把多个框的类别一起改掉（如重命名了类别列表中的类别）。 */
-export function renameLabel(
-  objects: EditorObject[],
-  from: string,
-  to: string
-): EditorObject[] {
-  if (!objects.some((object) => object.name === from)) {
-    return objects
-  }
-  return objects.map((object) =>
-    object.name === from ? { ...object, name: to } : object
-  )
-}
-
 /** 复制一个框，向右下错开 `offset` 像素（放不下时贴着图片边缘）。 */
 export function duplicateBox(box: Box, size: Size, offset = 10): Box {
   return moveBox(box, offset, offset, size)
@@ -241,13 +227,4 @@ export function cycleSelection(
     return direction === 1 ? objects[0].uid : objects[objects.length - 1].uid
   }
   return objects[index + direction]?.uid ?? null
-}
-
-/** 按类别统计框数，按数量降序、名称升序。 */
-export function countLabels(objects: readonly { name: string }[]) {
-  const counts = new Map<string, number>()
-  for (const object of objects) {
-    counts.set(object.name, (counts.get(object.name) ?? 0) + 1)
-  }
-  return counts
 }

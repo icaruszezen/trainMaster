@@ -66,6 +66,18 @@ export type ProjectLabel = {
   dataset_count: number
 }
 
+/**
+ * 项目类别列表中的一个类别。列表的顺序就是训练时 YOLO 的类别编号（第 1 个
+ * 为 0）。`color` 为 `#rrggbb`，`""` 表示按名称自动配色。
+ */
+export type ProjectClass = { name: string; color: string }
+
+/**
+ * 类别列表接口的响应。`version` 标识列表的内容（不透明的字符串，空列表也有），
+ * 整体替换时作为 `base_version` 带上，列表已被别人修改时返回 409 `conflict`。
+ */
+export type ProjectClassList = ListResponse<ProjectClass> & { version: string }
+
 const BASE = "/api/v1/projects"
 
 export const projectPath = (id: number) => `${BASE}/${id}`
@@ -82,6 +94,7 @@ export const projectKeys = {
   detail: (id: number) => [...projectKeys.all, "detail", id] as const,
   datasets: (id: number) => [...projectKeys.detail(id), "datasets"] as const,
   labels: (id: number) => [...projectKeys.detail(id), "labels"] as const,
+  classes: (id: number) => [...projectKeys.detail(id), "classes"] as const,
 }
 
 /** 项目列表（`q` 按名称 / 描述筛选），按更新时间倒序。 */
@@ -119,6 +132,82 @@ export function projectLabelsQuery(id: number) {
       apiGet<ListResponse<ProjectLabel>>(`${projectPath(id)}/labels`, {
         signal,
       }),
+  })
+}
+
+/** 项目的类别列表（带版本）。 */
+export function projectClassesQuery(id: number) {
+  return queryOptions({
+    queryKey: projectKeys.classes(id),
+    queryFn: ({ signal }) =>
+      apiGet<ProjectClassList>(`${projectPath(id)}/classes`, { signal }),
+  })
+}
+
+/**
+ * 标注数据集时优先提示的类别：数据集所属各项目的类别列表，按项目名称依次
+ * 合并，同名类别只保留第一个（颜色以它为准）。数据集不属于任何项目时为空。
+ * 只读：类别列表在项目页面中修改。
+ */
+export function datasetClassesQuery(datasetId: number) {
+  return queryOptions({
+    queryKey: datasetKeys.classes(datasetId),
+    queryFn: ({ signal }) =>
+      apiGet<ListResponse<ProjectClass>>(
+        `/api/v1/datasets/${datasetId}/classes`,
+        { signal }
+      ),
+  })
+}
+
+/**
+ * 设置项目的类别列表（整体替换），返回保存后的列表。`baseVersion` 是编辑
+ * 开始时列表的 `version`：列表在此之后被修改过时返回 409 `conflict`，不做任何
+ * 改动。
+ */
+export function setProjectClasses(
+  id: number,
+  classes: ProjectClass[],
+  baseVersion: string
+) {
+  return apiSend<ProjectClassList>("PUT", `${projectPath(id)}/classes`, {
+    classes,
+    base_version: baseVersion,
+  })
+}
+
+/**
+ * 在类别列表末尾加入一个类别（已有同名类别时列表不变），返回加入后的列表。
+ * 只追加，不会覆盖别人同时做的修改。
+ */
+export function addProjectClass(id: number, name: string, color = "") {
+  return apiSend<ProjectClassList>("POST", `${projectPath(id)}/classes`, {
+    name,
+    color,
+  })
+}
+
+/**
+ * 项目的类别列表保存后：写入缓存，并刷新各数据集的标注候选类别（数据集可能
+ * 属于这个项目）与项目信息（更新时间）。
+ */
+export function cacheProjectClasses(id: number, list: ProjectClassList) {
+  queryClient.setQueryData(projectKeys.classes(id), list)
+  invalidateDatasetClasses()
+  void queryClient.invalidateQueries({
+    queryKey: projectKeys.detail(id),
+    exact: true,
+  })
+  void queryClient.invalidateQueries({ queryKey: projectKeys.lists() })
+}
+
+/** 所有数据集的标注候选类别（项目的类别列表或数据集所属的项目变化后）。 */
+function invalidateDatasetClasses() {
+  void queryClient.invalidateQueries({
+    queryKey: datasetKeys.details(),
+    predicate: (query) =>
+      query.queryKey.length === datasetKeys.classes(0).length &&
+      query.queryKey[query.queryKey.length - 1] === "classes",
   })
 }
 
@@ -184,8 +273,8 @@ export function cacheNewProject(project: Project) {
 
 /**
  * 项目与数据集的关系、或项目名称变化后刷新：所有项目查询、数据集列表（项目标记
- * 与筛选结果），以及各数据集的详情（只是详情本身，不含图片等子查询；只有正在
- * 显示的会立即重新请求）。
+ * 与筛选结果），各数据集的详情（只是详情本身，不含图片等子查询；只有正在
+ * 显示的会立即重新请求）与标注候选类别。
  */
 export function refreshMembership() {
   void queryClient.invalidateQueries({ queryKey: projectKeys.all })
@@ -195,4 +284,6 @@ export function refreshMembership() {
     predicate: (query) =>
       query.queryKey.length === datasetKeys.details().length + 1,
   })
+  // 数据集所属的项目变了，标注时的候选类别（来自这些项目）也随之变化。
+  invalidateDatasetClasses()
 }

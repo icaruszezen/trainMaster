@@ -8,7 +8,7 @@ import {
   useState,
   type MouseEvent,
 } from "react"
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { useBlocker, useSearchParams, type BlockerFunction } from "react-router"
 import { toast } from "sonner"
 
@@ -53,8 +53,11 @@ import {
   isConflictError,
   type SaverState,
 } from "@/features/annotation/autosave"
-import { ClassManagerDialog } from "@/features/annotation/class-manager-dialog"
-import { appendClass, colorResolver } from "@/features/annotation/classes"
+import {
+  buildClassOptions,
+  colorResolver,
+  unlistedNames,
+} from "@/features/annotation/classes"
 import {
   cycleSelection,
   documentReducer,
@@ -78,7 +81,10 @@ import {
   type Viewport,
 } from "@/features/annotation/geometry"
 import { ImageListPanel } from "@/features/annotation/image-list-panel"
-import { LabelPicker } from "@/features/annotation/label-picker"
+import {
+  LabelPicker,
+  type CandidateStatus,
+} from "@/features/annotation/label-picker"
 import {
   allowsRepeat,
   commandForKey,
@@ -92,11 +98,9 @@ import {
 } from "@/features/annotation/shortcuts"
 import { ShortcutsDialog } from "@/features/annotation/shortcuts-dialog"
 import {
-  ClassPanel,
   ImageInfo,
   NoticeBox,
   ObjectPanel,
-  type ClassListStatus,
   type Notice,
 } from "@/features/annotation/side-panel"
 import {
@@ -106,20 +110,18 @@ import {
   updateParams,
 } from "@/features/annotation/workspace-params"
 import {
-  addDatasetClass,
-  classesQuery,
-  datasetKeys,
   deleteAnnotation,
   imageNeighborsQuery,
+  labelsQuery,
   thumbnailUrl,
   type AnnotationObject,
   type Dataset,
-  type DatasetClass,
-  type DatasetClassList,
   type DatasetImage,
   type DatasetImageDetail,
+  type DatasetLabel,
   type ImageFilters,
 } from "@/features/datasets/api"
+import { datasetClassesQuery, type ProjectClass } from "@/features/projects/api"
 import { useMediaQuery } from "@/hooks/use-media-query"
 import { formatNumber } from "@/lib/format"
 import { readPreference, writePreference } from "@/lib/storage"
@@ -167,7 +169,8 @@ function readTool(): Tool {
   return value === "rect" || value === "pan" ? value : "select"
 }
 
-const EMPTY_CLASSES: DatasetClass[] = []
+const EMPTY_CLASSES: ProjectClass[] = []
+const EMPTY_LABELS: DatasetLabel[] = []
 
 /** 正在编辑的图片：载入时的详情；`token` 在重新读取时递增。 */
 type Loaded = { detail: DatasetImageDetail; token: number }
@@ -180,7 +183,7 @@ const PANEL_QUERY = "(min-width: 64rem)"
 const IMAGES_QUERY = "(min-width: 80rem)"
 
 type Picker =
-  /** 画了新框但还没有类别（类别列表为空）：选择后才加入。 */
+  /** 刚画好的框：选择类别后才加入，关闭选择框时放弃。 */
   | { mode: "new"; box: Box }
   /** 修改选中框的类别。 */
   | { mode: "relabel"; uid: string }
@@ -211,19 +214,32 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   const [mac] = useState(isMac)
   const mod = mac ? "⌘" : "Ctrl"
 
-  // 类别列表读取完成前（或读取失败时）不能修改它：不能把它当作空列表。
-  const classesQ = useQuery(classesQuery(datasetId))
-  const classList = classesQ.data
-  const classes = classList?.items ?? EMPTY_CLASSES
-  const listStatus: ClassListStatus = classList
-    ? { state: "ready" }
-    : classesQ.error
-      ? {
-          state: "error",
-          message: classesQ.error.message,
-          retrying: classesQ.isFetching,
-        }
-      : { state: "pending" }
+  // 候选类别：数据集所属项目的类别列表（在项目页面中管理）与数据集中已有的
+  // 标签。读取中、读取失败时照样可以画框、输入类别名称，只是候选少一些。
+  const projectClassesQ = useQuery(datasetClassesQuery(datasetId))
+  const labelsQ = useQuery(labelsQuery(datasetId))
+  const projectClasses = projectClassesQ.data?.items ?? EMPTY_CLASSES
+  const datasetLabels = labelsQ.data?.items ?? EMPTY_LABELS
+  const candidateError =
+    (projectClassesQ.data ? null : projectClassesQ.error) ??
+    (labelsQ.data ? null : labelsQ.error)
+  const candidateStatus: CandidateStatus | null = candidateError
+    ? {
+        state: "error",
+        message: candidateError.message,
+        retrying: projectClassesQ.isFetching || labelsQ.isFetching,
+        onRetry: () => {
+          if (!projectClassesQ.data) {
+            void projectClassesQ.refetch()
+          }
+          if (!labelsQ.data) {
+            void labelsQ.refetch()
+          }
+        },
+      }
+    : projectClassesQ.isPending || labelsQ.isPending
+      ? { state: "loading" }
+      : null
   const detailQ = useQuery(editorImageQuery(datasetId, imageId))
   const neighborsQ = useQuery(imageNeighborsQuery(datasetId, imageId, filters))
 
@@ -233,9 +249,12 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     readPreference(classKey(datasetId))
   )
   const [view, setViewState] = useState<ViewOptions>(readView)
-  const [hiddenClasses, setHiddenClasses] = useState<ReadonlySet<string>>(
-    () => new Set()
-  )
+  // 这次标注中输入的新类别名称：保存后数据集的标签统计才会刷新，在此之前（包括
+  // 切换到别的图片后）它们也是候选。
+  const [typedNames, setTypedNames] = useState<readonly string[]>([])
+  // 这次标注中给出过的、不在类别列表中的候选，保持它们的顺序（见
+  // buildClassOptions 的 shown）：数字键对应的类别不会因为目标数的变化而改变。
+  const [shownNames, setShownNames] = useState<readonly string[]>([])
   const [carry, setCarry] = useState<Carry>(null)
   const [zoom, setZoom] = useState<number | null>(null)
   const [naturalSize, setNaturalSize] = useState<{
@@ -258,7 +277,6 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
 
   // 对话框与面板。
   const [helpOpen, setHelpOpen] = useState(false)
-  const [classDialogOpen, setClassDialogOpen] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
   const [imagesOpen, setImagesOpen] = useState(false)
   const [panelOpen, setPanelOpen] = useState(false)
@@ -424,7 +442,45 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     }
   }, [datasetId, next, prev, queryClient])
 
-  const colorFor = useMemo(() => colorResolver(classes), [classes])
+  const colorFor = useMemo(
+    () => colorResolver(projectClasses),
+    [projectClasses]
+  )
+  // 类别选择框、数字键（前 10 个）、框的类别下拉框共用的候选，见 buildClassOptions。
+  const classOptions = useMemo(
+    () =>
+      buildClassOptions({
+        projectClasses,
+        datasetLabels,
+        // 标签统计里可能还没有的名称：这次输入的、当前类别（上次用的，可能还没有
+        // 保存过）、本图上的。
+        extraNames: [
+          ...typedNames,
+          ...(activeClass === null ? [] : [activeClass]),
+          ...doc.objects.map((object) => object.name),
+        ],
+        shown: shownNames,
+      }),
+    [
+      projectClasses,
+      datasetLabels,
+      typedNames,
+      activeClass,
+      doc.objects,
+      shownNames,
+    ]
+  )
+  // 候选都读取到之后才记下顺序：第一次记下的就是按目标数排好的顺序，而不是
+  // 读取完成前只有本图类别的顺序。记下后再算一次结果不变，不会反复更新。
+  if (projectClassesQ.data && labelsQ.data) {
+    const unlisted = unlistedNames(classOptions)
+    if (
+      unlisted.length !== shownNames.length ||
+      unlisted.some((name, index) => name !== shownNames[index])
+    ) {
+      setShownNames(unlisted)
+    }
+  }
   const size =
     (current && imageSizeOf(current)) ??
     (naturalSize && naturalSize.id === imageId ? naturalSize.size : null)
@@ -513,10 +569,6 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     setActiveClassState(name)
     writePreference(classKey(datasetId), name)
   }
-  const effectiveClass =
-    activeClass !== null && classes.some((cls) => cls.name === activeClass)
-      ? activeClass
-      : (classes[0]?.name ?? null)
 
   // ---- 编辑 ----
   const newUid = () => {
@@ -533,37 +585,10 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   }
   const select = (uid: string | null) => dispatch({ type: "select", uid })
   const selectedObject = doc.objects.find((o) => o.uid === doc.selected)
-  const isShown = (object: EditorObject) =>
-    view.showBoxes && !hiddenClasses.has(object.name)
-  // 键盘操作的对象：隐藏的框（H 隐藏所有框，或隐藏了它的类别）不算选中，
-  // 不会被看不见地移动、删除，← / → 照常切换图片。
+  // 键盘操作的对象：隐藏的框（H 隐藏所有框时）不算选中，不会被看不见地移动、
+  // 删除，← / → 照常切换图片。
   const activeObject =
-    selectedObject && isShown(selectedObject) ? selectedObject : undefined
-
-  // 类别列表还没有读取到时，不能新建类别或打开类别管理。
-  const classListNotReady = () => {
-    if (classesQ.error) {
-      toast.error("无法读取类别列表", {
-        description: classesQ.error.message,
-        action: {
-          label: "重试",
-          onClick: (event) => {
-            focusCanvas(event.currentTarget) // 提示随即关闭
-            void classesQ.refetch()
-          },
-        },
-      })
-    } else {
-      toast.info("正在读取类别列表，请稍候")
-    }
-  }
-  const openClassManager = () => {
-    if (!classList) {
-      classListNotReady()
-      return
-    }
-    setClassDialogOpen(true)
-  }
+    selectedObject && view.showBoxes ? selectedObject : undefined
 
   const addObject = (box: Box, name: string) => {
     const object: EditorObject = {
@@ -576,65 +601,14 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     change([...doc.objects, object], object.uid)
   }
 
-  // 在类别列表末尾加入一个类别（POST 只追加，不会覆盖别人同时做的修改）。
-  // 先更新页面上的列表，不等待请求：画好的框、改好的类别立即生效。
-  const addClassKey = ["annotation", "add-class", datasetId] as const
-  const addClass = useMutation({
-    mutationKey: addClassKey,
-    mutationFn: (name: string) => addDatasetClass(datasetId, name),
-    onMutate: async (name) => {
-      const queryKey = datasetKeys.classes(datasetId)
-      await queryClient.cancelQueries({ queryKey })
-      queryClient.setQueryData<DatasetClassList>(
-        queryKey,
-        (list) => list && appendClass(list, name)
-      )
-    },
-    onSuccess: (list, name) => {
-      // 同时加入几个类别时，以最后完成的结果为准（之前的结果不完整）。
-      if (queryClient.isMutating({ mutationKey: addClassKey }) === 1) {
-        queryClient.setQueryData(datasetKeys.classes(datasetId), list)
-      }
-      toast.success(`已把“${name}”加入类别列表`)
-    },
-    onError: (error, name) => {
-      toast.error(`无法把“${name}”加入类别列表`, {
-        description: error.message,
-      })
-      void queryClient.invalidateQueries({
-        queryKey: datasetKeys.classes(datasetId),
-      })
-    },
-  })
-
-  /** 把类别加入列表（后台进行）；类别列表还没有读取到时不加入，返回 false。 */
-  const addClassToList = (name: string) => {
-    if (!classList) {
-      classListNotReady()
-      return false
-    }
-    if (!classes.some((cls) => cls.name === name)) {
-      addClass.mutate(name)
-    }
-    return true
-  }
-
   const relabel = (uid: string, name: string) =>
     change(updateObject(doc.objects, uid, { name }))
 
-  const onCreate = (box: Box) => {
-    if (effectiveClass === null) {
-      if (!classList) {
-        classListNotReady() // 不能把“还没读取到”当作“没有类别”，让用户新建
-        return
-      }
-      setPicker({ mode: "new", box })
-      return
-    }
-    addObject(box, effectiveClass)
-  }
+  // 与 LabelImg 一样，画好框后总是选择它的类别：默认高亮当前类别（Enter 直接
+  // 确定），也可以输入筛选或新的名称；关闭选择框（Esc、点击别处）时放弃这个框。
+  const onCreate = (box: Box) => setPicker({ mode: "new", box })
 
-  // 不等待网络请求：新建的类别在后台加入列表，框立即用新类别加上 / 改好。
+  // 输入的新名称只是框的类别，不会加入任何类别列表（类别列表在项目页面中管理）。
   const onPick = (name: string, created: boolean) => {
     const target = picker
     setPicker(null)
@@ -642,7 +616,9 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       return
     }
     if (created) {
-      addClassToList(name)
+      setTypedNames((names) =>
+        names.includes(name) ? names : [...names, name]
+      )
     }
     if (target.mode === "new") {
       addObject(target.box, name)
@@ -652,14 +628,6 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     } else {
       setActiveClass(name)
       toast(`当前类别：${name}`, { duration: 1200 })
-    }
-  }
-
-  const pickClass = (name: string) => {
-    if (activeObject && editable) {
-      relabel(activeObject.uid, name)
-    } else {
-      setActiveClass(name)
     }
   }
 
@@ -1141,7 +1109,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         return
       case "cycle": {
         const uid = cycleSelection(
-          doc.objects.filter(isShown),
+          view.showBoxes ? doc.objects : [],
           doc.selected,
           command.direction
         )
@@ -1165,32 +1133,41 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         }
         return
       case "class": {
-        const cls = classes[command.index]
-        if (!cls) {
-          if (!classList) {
-            classListNotReady()
-            return
+        // 前 10 个候选：项目的类别列表在前，其次是数据集中已有的类别。
+        const option = classOptions[command.index]
+        if (!option) {
+          if (candidateStatus?.state === "error") {
+            const { message, onRetry } = candidateStatus
+            toast.error("无法读取候选类别", {
+              description: message,
+              action: {
+                label: "重试",
+                onClick: (event) => {
+                  focusCanvas(event.currentTarget) // 提示随即关闭
+                  onRetry()
+                },
+              },
+            })
+          } else if (candidateStatus?.state === "loading") {
+            toast.info("候选类别还在读取中")
+          } else {
+            toast.info(
+              classOptions.length === 0
+                ? "还没有候选类别：画框后输入类别名称"
+                : `只有 ${formatNumber(classOptions.length)} 个候选类别`
+            )
           }
-          toast.info(
-            classes.length === 0
-              ? "还没有类别，请先在右侧添加类别"
-              : `只有 ${classes.length} 个类别`
-          )
           return
         }
         if (activeObject && editable) {
-          relabel(activeObject.uid, cls.name)
+          relabel(activeObject.uid, option.name)
         } else {
-          setActiveClass(cls.name)
-          toast(`当前类别：${cls.name}`, { duration: 1200 })
+          setActiveClass(option.name)
+          toast(`当前类别：${option.name}`, { duration: 1200 })
         }
         return
       }
       case "pickClass":
-        if (!classList) {
-          classListNotReady() // 选择框中可以新建类别：要先读取到列表
-          return
-        }
         setPicker(
           activeObject && editable
             ? { mode: "relabel", uid: activeObject.uid }
@@ -1341,33 +1318,10 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
           ))}
         </div>
       )}
-      <ClassPanel
-        classes={classes}
-        listStatus={listStatus}
-        onRetry={() => void classesQ.refetch()}
-        objects={doc.objects}
-        activeClass={effectiveClass}
-        colorFor={colorFor}
-        hiddenClasses={hiddenClasses}
-        hasSelection={activeObject !== undefined}
-        readOnly={readOnly}
-        onPick={pickClass}
-        onToggleHidden={(name) => {
-          const nextHidden = new Set(hiddenClasses)
-          if (nextHidden.has(name)) {
-            nextHidden.delete(name)
-          } else {
-            nextHidden.add(name)
-          }
-          setHiddenClasses(nextHidden)
-        }}
-        onAddToList={(name) => void addClassToList(name)}
-        onManage={openClassManager}
-      />
       <ObjectPanel
         objects={doc.objects}
         selected={doc.selected}
-        classes={classes}
+        options={classOptions}
         colorFor={colorFor}
         size={size}
         readOnly={readOnly}
@@ -1395,6 +1349,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       <EditorToolbar
         datasetId={datasetId}
         datasetName={dataset.name}
+        projects={dataset.projects}
         fileName={current?.file_name ?? "加载中…"}
         path={current?.path ?? ""}
         position={position}
@@ -1432,7 +1387,6 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         }
         onClearFile={() => setConfirmClear(true)}
         onReload={() => void reload()}
-        onManageClasses={openClassManager}
         onHelp={() => setHelpOpen(true)}
         onOpenImages={() => setImagesOpen(true)}
         onOpenPanel={() => setPanelOpen(true)}
@@ -1466,8 +1420,8 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
               colorFor={colorFor}
               showBoxes={view.showBoxes}
               showLabels={view.showLabels}
-              hiddenClasses={hiddenClasses}
               highlight={highlight}
+              pendingBox={picker?.mode === "new" ? picker.box : null}
               adjustments={view}
               initialViewport={initialViewport}
               onViewportChange={onViewportChange}
@@ -1495,13 +1449,13 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
                 const point = box ? anchor(box) : null
                 return (
                   <LabelPicker
-                    classes={classes}
-                    colorFor={colorFor}
+                    options={classOptions}
+                    flagUnlisted={projectClasses.length > 0}
                     current={
                       picker.mode === "relabel"
                         ? (doc.objects.find((o) => o.uid === picker.uid)
                             ?.name ?? null)
-                        : effectiveClass
+                        : activeClass
                     }
                     title={
                       picker.mode === "new"
@@ -1510,7 +1464,8 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
                           ? "修改类别"
                           : "切换当前类别"
                     }
-                    onPick={(name, created) => void onPick(name, created)}
+                    status={candidateStatus}
+                    onPick={onPick}
                     onClose={() => setPicker(null)}
                     anchor={point}
                   />
@@ -1552,9 +1507,9 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       <Sheet open={panelOpen && !panelDocked} onOpenChange={setPanelOpen}>
         <SheetContent side="right" className="w-80 gap-0 overflow-y-auto p-0">
           <SheetHeader className="border-b">
-            <SheetTitle>类别与目标</SheetTitle>
+            <SheetTitle>目标与图片信息</SheetTitle>
             <SheetDescription className="sr-only">
-              类别列表、本图的框与图片信息
+              本图的框（类别、坐标与属性）与图片信息
             </SheetDescription>
           </SheetHeader>
           {sidePanel}
@@ -1562,12 +1517,6 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       </Sheet>
 
       <ShortcutsDialog open={helpOpen} onOpenChange={setHelpOpen} mac={mac} />
-      <ClassManagerDialog
-        datasetId={datasetId}
-        classes={classList}
-        open={classDialogOpen}
-        onOpenChange={setClassDialogOpen}
-      />
       <AlertDialog
         open={leavePromptOpen}
         onOpenChange={(open) => {

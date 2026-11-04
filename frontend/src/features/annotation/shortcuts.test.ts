@@ -3,11 +3,13 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   allowsRepeat,
   classHotkey,
+  closesOnBlur,
   commandForKey,
   copiesSelectedText,
   focusAfterDialog,
   focusCanvas,
   leaveOverlay,
+  pickerDigitIndex,
   preventTypeahead,
   shortcutHelp,
   shouldIgnoreKey,
@@ -208,6 +210,39 @@ describe("classHotkey", () => {
     expect(classHotkey(9)).toBe("0")
     expect(classHotkey(10)).toBeNull()
     expect(classHotkey(-1)).toBeNull()
+  })
+})
+
+describe("pickerDigitIndex", () => {
+  const typed = (key: string, modifiers: Partial<KeyInput> = {}) => ({
+    key,
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    ...modifiers,
+  })
+
+  it("matches the hotkeys shown next to the candidates", () => {
+    for (let index = 0; index < 10; index++) {
+      expect(pickerDigitIndex(typed(classHotkey(index)!))).toBe(index)
+    }
+  })
+
+  it("goes by the typed character, not the physical key", () => {
+    // AZERTY: the unshifted digit row types letters, Shift types the digits.
+    expect(pickerDigitIndex(typed("é"))).toBeNull()
+    expect(pickerDigitIndex(typed("2", { shiftKey: true }))).toBe(1)
+    // US layout: Shift+2 types "@"; numpad without NumLock moves.
+    expect(pickerDigitIndex(typed("@"))).toBeNull()
+    expect(pickerDigitIndex(typed("ArrowDown"))).toBeNull()
+    expect(pickerDigitIndex(typed("Process"))).toBeNull()
+    expect(pickerDigitIndex(typed("a"))).toBeNull()
+  })
+
+  it("leaves browser shortcuts alone", () => {
+    expect(pickerDigitIndex(typed("2", { ctrlKey: true }))).toBeNull()
+    expect(pickerDigitIndex(typed("2", { metaKey: true }))).toBeNull()
+    expect(pickerDigitIndex(typed("2", { altKey: true }))).toBeNull()
   })
 })
 
@@ -416,6 +451,37 @@ describe("leaveOverlay", () => {
     remove()
     await settle()
     expect(target.focus).not.toHaveBeenCalled()
+  })
+})
+
+describe("closesOnBlur", () => {
+  /** A picker with an input in it, in a window that has the focus or not. */
+  const picker = (windowFocused: boolean) => {
+    const input = {} as Node
+    const overlay = {
+      ownerDocument: { hasFocus: () => windowFocused },
+      contains: (node: Node | null) => node === input,
+    } as unknown as Element
+    return { overlay, input }
+  }
+
+  it("closes when the focus moves out of the picker", () => {
+    const { overlay } = picker(true)
+    expect(closesOnBlur(overlay, {} as Node)).toBe(true)
+    // A click on a part of the page that cannot take the focus.
+    expect(closesOnBlur(overlay, null)).toBe(true)
+  })
+
+  it("stays open while the focus moves inside it", () => {
+    const { overlay, input } = picker(true)
+    expect(closesOnBlur(overlay, input)).toBe(false)
+  })
+
+  it("stays open when the whole window loses the focus", () => {
+    // Switching to another tab or app: the browser gives the focus back to
+    // the input on return, and the drawn box must still be there.
+    const { overlay } = picker(false)
+    expect(closesOnBlur(overlay, null)).toBe(false)
   })
 })
 

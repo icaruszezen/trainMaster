@@ -26,7 +26,19 @@ func (e *apiEnv) registerFolder(t *testing.T, name string, files map[string]stri
 		}
 	}
 	ds := want[dataset.Dataset](t, e.do("POST", "/api/v1/datasets", map[string]any{"name": name, "directory": name}), 201)
-	if job := e.waitImport(t, ds.ID, ds.ActiveImport.ID); job.Status != dataset.StatusSucceeded {
+	var job dataset.Import
+	if ds.ActiveImport != nil {
+		job = e.waitImport(t, ds.ID, ds.ActiveImport.ID)
+	} else {
+		// The import runner can finish scanning a few small files before
+		// the response reads the dataset back; the scan is its only job.
+		jobs := want[List[dataset.Import]](t, e.do("GET", fmt.Sprintf("/api/v1/datasets/%d/imports", ds.ID), nil), 200).Items
+		if len(jobs) != 1 {
+			t.Fatalf("imports = %+v", jobs)
+		}
+		job = jobs[0]
+	}
+	if job.Status != dataset.StatusSucceeded {
 		t.Fatalf("scan = %+v", job)
 	}
 	return ds
@@ -147,59 +159,4 @@ func TestAnnotationRegenerateAPI(t *testing.T) {
 	if len(saved.Objects) != 1 || saved.Objects[0].Name != "划痕" || saved.AnnotationVersion == version {
 		t.Errorf("regenerated = %+v", saved)
 	}
-}
-
-func TestClassesAPI(t *testing.T) {
-	e := newAPIEnv(t, false)
-	ds := want[dataset.Dataset](t, e.do("POST", "/api/v1/datasets", map[string]any{"name": "classes"}), 201)
-	base := fmt.Sprintf("/api/v1/datasets/%d/classes", ds.ID)
-
-	wantKeys(t, "class list", want[map[string]any](t, e.do("GET", base, nil), 200), "items", "total", "version")
-	empty := want[classListResponse](t, e.do("GET", base, nil), 200)
-	if empty.Total != 0 || empty.Items == nil || empty.Version == "" {
-		t.Errorf("empty classes = %+v", empty)
-	}
-	raw := want[map[string]any](t, e.do("PUT", base, map[string]any{"classes": []any{
-		map[string]any{"name": " 划痕 ", "color": "#AABBCC"}, map[string]any{"name": "dent"}}, "base_version": empty.Version}), 200)
-	wantKeys(t, "class", raw["items"].([]any)[0].(map[string]any), "name", "color")
-	list := want[classListResponse](t, e.do("GET", base, nil), 200)
-	if list.Total != 2 || list.Items[0] != (dataset.Class{Name: "划痕", Color: "#aabbcc"}) || list.Items[1] != (dataset.Class{Name: "dent"}) ||
-		list.Version != raw["version"] || list.Version == empty.Version {
-		t.Errorf("classes = %+v", list)
-	}
-
-	// A replacement from an older version is refused.
-	wantError(t, e.do("PUT", base, map[string]any{"classes": []any{}, "base_version": empty.Version}),
-		409, codeConflict, "类别列表已被其他人修改，请载入最新的列表后再保存")
-	wantError(t, e.do("PUT", base, map[string]any{"classes": []any{}, "base_version": ""}), 409, codeConflict, "类别列表已被其他人修改")
-	if got := want[classListResponse](t, e.do("GET", base, nil), 200); got.Version != list.Version {
-		t.Errorf("a refused replacement changed the list: %+v", got)
-	}
-
-	// Adding one class keeps the others.
-	added := want[classListResponse](t, e.do("POST", base, map[string]any{"name": " 孔洞 "}), 200)
-	if added.Total != 3 || added.Items[2] != (dataset.Class{Name: "孔洞"}) || added.Version == list.Version {
-		t.Errorf("added = %+v", added)
-	}
-	if again := want[classListResponse](t, e.do("POST", base, map[string]any{"name": "孔洞", "color": "#123456"}), 200); again.Version != added.Version || again.Total != 3 {
-		t.Errorf("added again = %+v", again)
-	}
-	wantError(t, e.do("POST", base, map[string]any{}), 422, codeValidationFailed, "缺少 name")
-	wantError(t, e.do("POST", base, map[string]any{"name": " "}), 422, codeValidationFailed, "类别名称为空")
-	wantError(t, e.do("POST", base, map[string]any{"name": "x", "color": "blue"}), 422, codeValidationFailed, "#rrggbb")
-	wantError(t, e.do("POST", base, "{"), 400, codeBadRequest, "请求格式不正确")
-
-	wantError(t, e.do("PUT", base, map[string]any{}), 422, codeValidationFailed, "缺少 classes")
-	wantError(t, e.do("PUT", base, map[string]any{"classes": []any{map[string]any{"name": "a", "color": "blue"}}}),
-		422, codeValidationFailed, "#rrggbb")
-	wantError(t, e.do("PUT", base, map[string]any{"classes": []any{map[string]any{"name": "a"}, map[string]any{"name": "a"}}}),
-		422, codeValidationFailed, "重复")
-	// Without base_version the list is replaced whatever it is.
-	if cleared := want[classListResponse](t, e.do("PUT", base, map[string]any{"classes": []any{}}), 200); cleared.Total != 0 || cleared.Version != empty.Version {
-		t.Errorf("cleared = %+v", cleared)
-	}
-	wantError(t, e.do("GET", "/api/v1/datasets/999999/classes", nil), 404, codeNotFound, "数据集不存在")
-	wantError(t, e.do("PUT", "/api/v1/datasets/999999/classes", map[string]any{"classes": []any{}}), 404, codeNotFound, "数据集不存在")
-	wantError(t, e.do("POST", "/api/v1/datasets/999999/classes", map[string]any{"name": "a"}), 404, codeNotFound, "数据集不存在")
-	wantError(t, e.do("DELETE", base, nil), 405, codeMethodNotAllowed, "")
 }

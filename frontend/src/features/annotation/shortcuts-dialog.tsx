@@ -27,7 +27,7 @@ export function ShortcutsDialog({
           <DialogTitle>快捷键</DialogTitle>
           <DialogDescription>
             快捷键沿用 LabelImg 的习惯（W 画框、A / D
-            切换图片），在输入框中输入时不生效。
+            切换图片），在输入框中输入时不生效。候选类别依次是数据集所属项目的类别列表（在项目页面中管理）和数据集中已有的类别。
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-x-8 gap-y-6 md:grid-cols-2">

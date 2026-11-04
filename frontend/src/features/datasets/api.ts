@@ -139,15 +139,6 @@ export type ImageNeighbors = {
   total: number
 }
 
-/** 数据集的类别列表（标注时可选的类别）。`color` 为 `#rrggbb`，`""` 表示按名称自动配色。 */
-export type DatasetClass = { name: string; color: string }
-
-/**
- * 类别列表接口的响应。`version` 标识列表的内容（不透明的字符串，空列表也有），
- * 整体替换时作为 `base_version` 带上，列表已被别人修改时返回 409 `conflict`。
- */
-export type DatasetClassList = ListResponse<DatasetClass> & { version: string }
-
 export type DatasetLabel = {
   name: string
   object_count: number
@@ -313,6 +304,7 @@ export const datasetKeys = {
   neighbors: (id: number, imageId: number, filters: ImageFilters) =>
     [...datasetKeys.image(id, imageId), "neighbors", filters] as const,
   labels: (id: number) => [...datasetKeys.detail(id), "labels"] as const,
+  /** 数据集所属项目的类别（标注时的候选），见 projects/api 的 datasetClassesQuery。 */
   classes: (id: number) => [...datasetKeys.detail(id), "classes"] as const,
   imports: (id: number) => [...datasetKeys.detail(id), "imports"] as const,
   lastYoloImport: (id: number) =>
@@ -357,6 +349,22 @@ export function datasetQuery(id: number) {
   return queryOptions({
     queryKey: datasetKeys.detail(id),
     queryFn: ({ signal }) => apiGet<Dataset>(datasetPath(id), { signal }),
+  })
+}
+
+/**
+ * 对话框中显示的数据集：以打开时传入的数据集为初始数据的 `datasetQuery`。
+ *
+ * 列表页打开对话框时传入的是当时列表项的副本，之后列表刷新了它也不会变；
+ * 改为读取数据集详情的查询后，refreshMembership 等刷新会反映到打开着的对话框
+ * 中（详情页上就是页面本身的查询）。传入的数据可能是一段时间前读取的（例如
+ * 所属项目已被别人修改），视为已过期：打开时在后台重新读取一次。
+ */
+export function liveDatasetQuery(dataset: Dataset) {
+  return queryOptions({
+    ...datasetQuery(dataset.id),
+    initialData: dataset,
+    initialDataUpdatedAt: 0,
   })
 }
 
@@ -445,14 +453,6 @@ export function labelsQuery(id: number) {
   })
 }
 
-export function classesQuery(id: number) {
-  return queryOptions({
-    queryKey: datasetKeys.classes(id),
-    queryFn: ({ signal }) =>
-      apiGet<DatasetClassList>(`${datasetPath(id)}/classes`, { signal }),
-  })
-}
-
 export const IMPORTS_PAGE_SIZE = 20
 
 export function importsQuery(id: number) {
@@ -469,7 +469,10 @@ export function importsQuery(id: number) {
   })
 }
 
-/** 最近一次成功的 YOLO 导入（下载为 YOLO 时沿用它的类别顺序）；没有时为 null。 */
+/**
+ * 最近一次成功的 YOLO 导入（不属于任何项目的数据集下载为 YOLO 时，默认沿用
+ * 它的类别顺序）；没有时为 null。
+ */
 export function lastYoloImportQuery(id: number) {
   return queryOptions({
     queryKey: datasetKeys.lastYoloImport(id),
@@ -579,7 +582,12 @@ export function cancelImport(datasetId: number, importId: number) {
 
 export type CreateExportInput = {
   format: AnnotationFormat
-  /** `format` 为 `yolo` 时必填。 */
+  /**
+   * `format` 为 `yolo` 时与 `classes` 二选一：类别编号按这个项目的类别列表的
+   * 顺序（第 1 个类别为 0）。项目必须包含这个数据集，且类别列表不为空。
+   */
+  project_id?: number
+  /** `format` 为 `yolo` 且数据集不属于任何项目时：手动填写的类别顺序。 */
   classes?: string[]
 }
 
@@ -599,33 +607,6 @@ export function createExport(datasetId: number, input: CreateExportInput) {
     `${datasetPath(datasetId)}/exports`,
     input
   )
-}
-
-/**
- * 设置数据集的类别列表（整体替换），返回保存后的列表。`baseVersion` 是编辑
- * 开始时列表的 `version`：列表在此之后被修改过时返回 409 `conflict`，不做任何
- * 改动。
- */
-export function setDatasetClasses(
-  id: number,
-  classes: DatasetClass[],
-  baseVersion: string
-) {
-  return apiSend<DatasetClassList>("PUT", `${datasetPath(id)}/classes`, {
-    classes,
-    base_version: baseVersion,
-  })
-}
-
-/**
- * 在类别列表末尾加入一个类别（已有同名类别时列表不变），返回加入后的列表。
- * 只追加，不会覆盖别人同时做的修改。
- */
-export function addDatasetClass(id: number, name: string, color = "") {
-  return apiSend<DatasetClassList>("POST", `${datasetPath(id)}/classes`, {
-    name,
-    color,
-  })
 }
 
 export type SaveAnnotationInput = {

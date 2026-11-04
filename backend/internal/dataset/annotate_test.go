@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 func TestNormalizeObjects(t *testing.T) {
@@ -381,31 +380,6 @@ func TestReadVersionedAnnotation(t *testing.T) {
 	}
 	if _, missing, _, err := readVersionedAnnotation(root, "missing.xml"); !errors.Is(err, fs.ErrNotExist) || missing != "" {
 		t.Errorf("missing.xml = %q, %v", missing, err)
-	}
-}
-
-func TestNormalizeClassList(t *testing.T) {
-	got, err := NormalizeClassList([]Class{{Name: " 划痕 ", Color: "#EF4444"}, {Name: "dent"}, {Name: "Dent", Color: " #00ff00 "}})
-	want := []Class{{Name: "划痕", Color: "#ef4444"}, {Name: "dent"}, {Name: "Dent", Color: "#00ff00"}}
-	if err != nil || !reflect.DeepEqual(got, want) {
-		t.Errorf("NormalizeClassList = %+v, %v; want %+v", got, err, want)
-	}
-	if got, err := NormalizeClassList(nil); err != nil || got == nil || len(got) != 0 {
-		t.Errorf("empty list = %#v, %v", got, err)
-	}
-	for _, tc := range []struct {
-		classes []Class
-		msg     string
-	}{
-		{[]Class{{Name: "a"}, {Name: " a"}}, "类别“a”重复"},
-		{[]Class{{Name: ""}}, "第 1 个类别名称为空"},
-		{[]Class{{Name: "a\tb"}}, "控制字符"},
-		{[]Class{{Name: "a", Color: "red"}}, "类别“a”的颜色必须是 #rrggbb 格式"},
-		{[]Class{{Name: "a", Color: "#12345"}}, "#rrggbb"},
-		{make([]Class, maxClasses+1), "类别数量不能超过 1000 个"},
-	} {
-		_, err := NormalizeClassList(tc.classes)
-		wantKind(t, err, ErrInvalid, tc.msg)
 	}
 }
 
@@ -1736,107 +1710,5 @@ func TestIntegrationImageNeighbors(t *testing.T) {
 	}
 	if _, err := e.svc.ImageNeighbors(ctx, 1<<40, ids["img1"], ImageQuery{}); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unknown dataset: %v", err)
-	}
-}
-
-func TestIntegrationClasses(t *testing.T) {
-	e := newTestEnv(t, false)
-	ctx := context.Background()
-	d, err := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "classes"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	empty, err := e.svc.ListClasses(ctx, d.ID)
-	if err != nil || empty.Classes == nil || len(empty.Classes) != 0 || len(empty.Version) != 32 {
-		t.Errorf("new dataset classes = %#v, %v", empty, err)
-	}
-	time.Sleep(2 * time.Millisecond)
-	set, err := e.svc.SetClasses(ctx, d.ID, []Class{{Name: " scratch ", Color: "#EF4444"}, {Name: "凹坑"}}, &empty.Version)
-	want := []Class{{Name: "scratch", Color: "#ef4444"}, {Name: "凹坑"}}
-	if err != nil || !reflect.DeepEqual(set.Classes, want) || set.Version == empty.Version {
-		t.Errorf("SetClasses = %+v, %v", set, err)
-	}
-	if got, _ := e.svc.ListClasses(ctx, d.ID); !reflect.DeepEqual(got, set) {
-		t.Errorf("ListClasses = %+v, want %+v", got, set)
-	}
-	if after, _ := e.svc.GetDataset(ctx, d.ID); !after.UpdatedAt.After(d.UpdatedAt) {
-		t.Errorf("updated_at not touched: %v, was %v", after.UpdatedAt, d.UpdatedAt)
-	}
-	// A replacement from an older version is refused and changes nothing.
-	_, err = e.svc.SetClasses(ctx, d.ID, []Class{{Name: "crack"}}, &empty.Version)
-	wantKind(t, err, ErrConflict, "类别列表已被其他人修改，请载入最新的列表后再保存")
-	_, err = e.svc.SetClasses(ctx, d.ID, []Class{{Name: "a"}, {Name: "a"}}, nil)
-	wantKind(t, err, ErrInvalid, "重复")
-	if got, _ := e.svc.ListClasses(ctx, d.ID); !reflect.DeepEqual(got, set) {
-		t.Errorf("a refused list changed the classes: %+v", got)
-	}
-
-	// Adding a class appends it; adding it again changes nothing.
-	added, err := e.svc.AddClass(ctx, d.ID, Class{Name: " 孔洞 ", Color: "#00FF00"})
-	want = append(want, Class{Name: "孔洞", Color: "#00ff00"})
-	if err != nil || !reflect.DeepEqual(added.Classes, want) || added.Version == set.Version {
-		t.Errorf("AddClass = %+v, %v", added, err)
-	}
-	before, _ := e.svc.GetDataset(ctx, d.ID)
-	if again, err := e.svc.AddClass(ctx, d.ID, Class{Name: "孔洞", Color: "#123456"}); err != nil || !reflect.DeepEqual(again, added) {
-		t.Errorf("AddClass again = %+v, %v", again, err)
-	}
-	if after, _ := e.svc.GetDataset(ctx, d.ID); !after.UpdatedAt.Equal(before.UpdatedAt) {
-		t.Error("adding an existing class touched the dataset")
-	}
-	for _, tc := range []struct {
-		class Class
-		msg   string
-	}{
-		{Class{Name: " "}, "类别名称为空"},
-		{Class{Name: "a\nb"}, "类别名称包含换行或控制字符"},
-		{Class{Name: strings.Repeat("长", 256)}, "类别名称不能超过 255 个字符"},
-		{Class{Name: "a", Color: "red"}, "类别“a”的颜色必须是 #rrggbb 格式"},
-	} {
-		_, err := e.svc.AddClass(ctx, d.ID, tc.class)
-		wantKind(t, err, ErrInvalid, tc.msg)
-	}
-
-	// Concurrent additions all arrive.
-	var wg sync.WaitGroup
-	for i := range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if _, err := e.svc.AddClass(ctx, d.ID, Class{Name: fmt.Sprintf("c%d", i)}); err != nil {
-				t.Errorf("AddClass c%d: %v", i, err)
-			}
-		}()
-	}
-	wg.Wait()
-	if got, _ := e.svc.ListClasses(ctx, d.ID); len(got.Classes) != 3+8 {
-		t.Errorf("after concurrent additions: %+v", got.Classes)
-	}
-
-	// At most maxClasses.
-	full := make([]Class, maxClasses)
-	for i := range full {
-		full[i] = Class{Name: fmt.Sprintf("k%d", i)}
-	}
-	if _, err := e.svc.SetClasses(ctx, d.ID, full, nil); err != nil {
-		t.Fatal(err)
-	}
-	_, err = e.svc.AddClass(ctx, d.ID, Class{Name: "one more"})
-	wantKind(t, err, ErrInvalid, "类别数量不能超过 1000 个")
-	if _, err := e.svc.AddClass(ctx, d.ID, Class{Name: "k0"}); err != nil {
-		t.Errorf("adding an existing class to a full list: %v", err)
-	}
-
-	if got, err := e.svc.SetClasses(ctx, d.ID, []Class{}, nil); err != nil || len(got.Classes) != 0 || got.Version != empty.Version {
-		t.Errorf("clear = %+v, %v", got, err)
-	}
-	if _, err := e.svc.ListClasses(ctx, 1<<40); !errors.Is(err, ErrNotFound) {
-		t.Errorf("ListClasses(unknown) = %v", err)
-	}
-	if _, err := e.svc.SetClasses(ctx, 1<<40, nil, nil); !errors.Is(err, ErrNotFound) {
-		t.Errorf("SetClasses(unknown) = %v", err)
-	}
-	if _, err := e.svc.AddClass(ctx, 1<<40, Class{Name: "a"}); !errors.Is(err, ErrNotFound) {
-		t.Errorf("AddClass(unknown) = %v", err)
 	}
 }

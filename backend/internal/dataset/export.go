@@ -41,8 +41,11 @@ var errExportExpired = &Error{Kind: ErrNotFound, Message: "下载链接已失效
 
 // ExportInput selects the format of a download.
 type ExportInput struct {
-	Format  string   // Format*
-	Classes []string // YOLO: the class names by id
+	Format string // Format*
+	// YOLO: the class names by id, the class list of the project the
+	// dataset is exported for (see project.Service.ExportClasses) or, for
+	// a dataset in no project, an order given by hand.
+	Classes []string
 }
 
 // ExportTicket is a prepared download.

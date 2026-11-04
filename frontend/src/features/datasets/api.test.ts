@@ -1,3 +1,4 @@
+import { QueryObserver } from "@tanstack/react-query"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
@@ -7,9 +8,14 @@ import {
   deleteDataset,
   imagesQuery,
   lastYoloImportQuery,
+  liveDatasetQuery,
   parseProjectFilter,
   setDatasetProjects,
+  type Dataset,
+  type DatasetProjectRef,
 } from "@/features/datasets/api"
+import { refreshMembership } from "@/features/projects/api"
+import { queryClient } from "@/lib/query-client"
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -163,7 +169,7 @@ describe("createExport", () => {
     }
     const fetchMock = mockFetch(() => Response.json(link, { status: 201 }))
     await expect(
-      createExport(4, { format: "yolo", classes: ["scratch"] })
+      createExport(4, { format: "yolo", project_id: 3 })
     ).resolves.toEqual(link)
     const [path, init] = fetchMock.mock.calls[0] as unknown as [
       string,
@@ -173,7 +179,7 @@ describe("createExport", () => {
     expect(init.method).toBe("POST")
     expect(JSON.parse(init.body as string)).toEqual({
       format: "yolo",
-      classes: ["scratch"],
+      project_id: 3,
     })
   })
 })
@@ -196,5 +202,60 @@ describe("lastYoloImportQuery", () => {
   it("is null when there is none", async () => {
     mockFetch(() => Response.json({ items: [], total: 0 }))
     await expect(run(5)).resolves.toBeNull()
+  })
+})
+
+describe("liveDatasetQuery", () => {
+  // refreshMembership 刷新的是全局的 queryClient。
+  afterEach(() => {
+    queryClient.clear()
+  })
+
+  const dataset = (projects: DatasetProjectRef[]) =>
+    ({ id: 7, name: "批次1", projects }) as unknown as Dataset
+  const inP = [{ id: 3, name: "P" }]
+
+  function observe(opened: Dataset) {
+    const observer = new QueryObserver(queryClient, liveDatasetQuery(opened))
+    return { observer, unsubscribe: observer.subscribe(() => undefined) }
+  }
+
+  it("starts from the dataset it was opened with and reads the latest one", async () => {
+    // 列表是项目 P 删除之前读取的。
+    const opened = dataset(inP)
+    const fetchMock = mockFetch(() => Response.json(dataset([])))
+    const { observer, unsubscribe } = observe(opened)
+    try {
+      expect(observer.getCurrentResult().data).toBe(opened)
+      await vi.waitFor(() =>
+        expect(observer.getCurrentResult().data?.projects).toEqual([])
+      )
+      expect(requestOf(fetchMock).path).toBe("/api/v1/datasets/7")
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it("follows refreshMembership while the dialog is open", async () => {
+    let projects = inP
+    const fetchMock = mockFetch(() => Response.json(dataset(projects)))
+    const { observer, unsubscribe } = observe(dataset(projects))
+    try {
+      await vi.waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledTimes(1)
+        expect(observer.getCurrentResult().isFetching).toBe(false)
+      })
+      expect(observer.getCurrentResult().data?.projects).toEqual(inP)
+
+      // 下载时服务端回答项目已不存在：刷新后对话框改为手动指定类别顺序。
+      projects = []
+      refreshMembership()
+      await vi.waitFor(() =>
+        expect(observer.getCurrentResult().data?.projects).toEqual([])
+      )
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+    } finally {
+      unsubscribe()
+    }
   })
 })

@@ -764,12 +764,76 @@ func TestDatasetAPIAnnotationFormats(t *testing.T) {
 	wantError(t, e.do("GET", base+"/exports/not-a-token", nil), 404, codeNotFound, "下载链接已失效")
 	wantError(t, e.do("GET", strings.Replace(url, base, "/api/v1/datasets/999", 1), nil), 404, codeNotFound, "下载链接已失效")
 
+	// Download it as YOLO. A dataset has no class order of its own: the
+	// class ids follow an order given by hand (for a dataset in no
+	// project) ...
+	files := e.exportFiles(t, base, map[string]any{"format": "yolo", "classes": []string{" ng ", "ok"}})
+	if files["yolo/classes.txt"] != "ng\nok\n" || !strings.HasPrefix(files["yolo/labels/a.txt"], "0 ") {
+		t.Errorf("YOLO in a hand-written order: classes.txt %q, a.txt %q", files["yolo/classes.txt"], files["yolo/labels/a.txt"])
+	}
+	wantError(t, e.do("POST", base+"/exports", map[string]any{"format": "yolo", "classes": []string{"ng", "ng"}}),
+		422, codeValidationFailed, "类别“ng”重复")
+	// ... or the class list of one of the dataset's projects.
+	training := want[project.Project](t, e.do("POST", "/api/v1/projects", map[string]any{"name": "训练", "dataset_ids": []int64{ds.ID}}), 201)
+	byProject := map[string]any{"format": "yolo", "project_id": training.ID}
+	wantError(t, e.do("POST", base+"/exports", byProject), 409, codeConflict, "项目“训练”还没有类别列表")
+	want[classListResponse](t, e.do("PUT", fmt.Sprintf("/api/v1/projects/%d/classes", training.ID), map[string]any{"classes": []any{
+		map[string]any{"name": "ok"}, map[string]any{"name": "ng", "color": "#ff0000"}, map[string]any{"name": "unused"}}}), 200)
+	files = e.exportFiles(t, base, byProject)
+	if files["yolo/classes.txt"] != "ok\nng\nunused\n" || !strings.HasPrefix(files["yolo/labels/a.txt"], "1 ") ||
+		!strings.Contains(files["yolo/data.yaml"], "nc: 3\n") {
+		t.Errorf("YOLO in the project's order: classes.txt %q, a.txt %q, data.yaml %q",
+			files["yolo/classes.txt"], files["yolo/labels/a.txt"], files["yolo/data.yaml"])
+	}
+	// The project's order wins over one given by hand as well.
+	byProject["classes"] = []string{"ng"}
+	if files = e.exportFiles(t, base, byProject); files["yolo/classes.txt"] != "ok\nng\nunused\n" {
+		t.Errorf("YOLO with project_id and classes: classes.txt %q", files["yolo/classes.txt"])
+	}
+	other := want[project.Project](t, e.do("POST", "/api/v1/projects", map[string]any{"name": "其他"}), 201)
+	wantError(t, e.do("POST", base+"/exports", map[string]any{"format": "yolo", "project_id": other.ID}),
+		422, codeValidationFailed, "数据集不在项目“其他”中，请选择数据集所属的项目")
+	wantError(t, e.do("POST", base+"/exports", map[string]any{"format": "yolo", "project_id": 999999}),
+		422, codeValidationFailed, "所选项目不存在或已被删除")
+	wantError(t, e.do("POST", "/api/v1/datasets/999/exports", byProject), 404, codeNotFound, "数据集不存在")
+	wantError(t, e.do("POST", base+"/exports", map[string]any{"format": "yolo", "project_id": nil}),
+		422, codeValidationFailed, "YOLO 格式需要提供类别顺序（每行一个类别名称）")
+
 	// A folder that disappeared after the link was made: JSON error, not a broken zip.
 	dir := filepath.Join(e.st.Dir(storage.Datasets), "yolo")
 	if err := os.Rename(dir, dir+"-moved"); err != nil {
 		t.Fatal(err)
 	}
 	wantError(t, e.do("GET", url, nil), 409, codeConflict, "数据集文件夹不存在")
+}
+
+// exportFiles prepares a download of the dataset at base, fetches it and
+// returns the files of the zip by name.
+func (e *apiEnv) exportFiles(t *testing.T, base string, req map[string]any) map[string]string {
+	t.Helper()
+	ticket := want[exportResponse](t, e.do("POST", base+"/exports", req), 201)
+	rec := e.do("GET", ticket.URL, nil)
+	if rec.Code != 200 {
+		t.Fatalf("download %s: %d %s", ticket.URL, rec.Code, rec.Body)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(rec.Body.Bytes()), int64(rec.Body.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[string]string, len(zr.File))
+	for _, f := range zr.File {
+		r, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(r)
+		r.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[f.Name] = string(data)
+	}
+	return files
 }
 
 func TestInlineDisposition(t *testing.T) {

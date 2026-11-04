@@ -32,6 +32,7 @@ import { watchImport } from "@/features/datasets/import-watch"
 import { LoadError } from "@/features/datasets/load-error"
 import { yoloVersionLabel } from "@/features/models/yolo-versions"
 import {
+  projectClassesQuery,
   projectDatasetsQuery,
   projectLabelsQuery,
   projectQuery,
@@ -43,8 +44,8 @@ import {
   EditProjectDialog,
   ProjectActionsMenu,
 } from "@/features/projects/project-dialogs"
+import { ProjectClasses } from "@/features/projects/project-classes"
 import { ProjectDatasets } from "@/features/projects/project-datasets"
-import { ProjectLabels } from "@/features/projects/project-labels"
 import { ProjectModels } from "@/features/projects/project-models"
 import { usePageTitle } from "@/hooks/use-page-title"
 import { ApiError } from "@/lib/api"
@@ -101,14 +102,19 @@ function ProjectNotFound() {
   )
 }
 
-type DetailTab = "datasets" | "labels" | "models"
+type DetailTab = "datasets" | "classes" | "models"
 
 /** 当前标签页保存在地址栏中，刷新、分享链接、前进后退都能保留。 */
 function useDetailTab() {
   const [params, setParams] = useSearchParams()
   const value = params.get("tab")
+  // labels 是以前“标签分布”标签页的链接，标签分布现在显示在“类别”中。
   const tab: DetailTab =
-    value === "labels" || value === "models" ? value : "datasets"
+    value === "classes" || value === "labels"
+      ? "classes"
+      : value === "models"
+        ? value
+        : "datasets"
 
   const setTab = (next: DetailTab) => {
     setParams(
@@ -130,7 +136,8 @@ function useDetailTab() {
 function ProjectDetail({ id }: { id: number }) {
   const navigate = useNavigate()
   const query = useQuery(projectQuery(id))
-  // 标签数量显示在标签页上，所以随页面一起加载。
+  // 类别数量显示在标签页上，所以随页面一起加载；“类别”中还会显示标签分布。
+  const classes = useQuery(projectClassesQuery(id))
   const labels = useQuery(projectLabelsQuery(id))
   const [tab, setTab] = useDetailTab()
 
@@ -198,11 +205,11 @@ function ProjectDetail({ id }: { id: number }) {
               {formatNumber(project.dataset_count)}
             </span>
           </TabsTrigger>
-          <TabsTrigger value="labels" className="px-3">
-            标签分布
-            {labels.data && (
+          <TabsTrigger value="classes" className="px-3">
+            类别
+            {classes.data && (
               <span className="text-xs text-muted-foreground tabular-nums">
-                {formatNumber(labels.data.total)}
+                {formatNumber(classes.data.total)}
               </span>
             )}
           </TabsTrigger>
@@ -219,8 +226,12 @@ function ProjectDetail({ id }: { id: number }) {
             onAddDatasets={() => setAddOpen(true)}
           />
         </TabsContent>
-        <TabsContent value="labels">
-          <ProjectLabels query={labels} />
+        <TabsContent value="classes">
+          <ProjectClasses
+            projectId={project.id}
+            classes={classes}
+            labels={labels}
+          />
         </TabsContent>
         <TabsContent value="models">
           <ProjectModels project={project} />

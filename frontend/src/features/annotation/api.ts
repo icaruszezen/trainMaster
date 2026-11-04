@@ -263,7 +263,8 @@ function labelKey(detail: DatasetImageDetail | undefined) {
 
 /**
  * 保存后更新缓存：编辑器与查看大图的图片详情直接替换；标注状态或标签变了
- * 时（数据集计数、图片列表的状态、标签分布随之变化）让数据集的查询失效。
+ * 时（数据集计数、图片列表的状态、标签分布随之变化）让数据集的查询失效，
+ * 其中的标签统计也是标注时的候选类别，新输入的类别名称保存后随即成为候选。
  * 写入请求发出之前开始的读取由调用方先取消（{@link cancelImageReads}）。
  */
 export async function applySavedDetail(

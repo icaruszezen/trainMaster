@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest"
 
 import {
-  countLabels,
   cycleSelection,
   documentReducer,
   duplicateBox,
@@ -9,7 +8,6 @@ import {
   HISTORY_LIMIT,
   pasteObjects,
   removeObject,
-  renameLabel,
   serializeObjects,
   updateObject,
   type DocumentState,
@@ -166,14 +164,9 @@ describe("object edits", () => {
     expect(next[1]).toBe(objects[1])
   })
 
-  it("removeObject and renameLabel", () => {
+  it("removeObject", () => {
     expect(removeObject(objects, "missing")).toBe(objects)
     expect(removeObject(objects, "img:0").map((o) => o.name)).toEqual([
-      "scratch",
-    ])
-    expect(renameLabel(objects, "none", "x")).toBe(objects)
-    expect(renameLabel(objects, "dent", "凹坑").map((o) => o.name)).toEqual([
-      "凹坑",
       "scratch",
     ])
   })
@@ -224,16 +217,5 @@ describe("cycleSelection", () => {
     expect(cycleSelection(objects, "a", -1)).toBeNull()
     expect(cycleSelection([], null, 1)).toBeNull()
     expect(cycleSelection([], null, -1)).toBeNull()
-  })
-})
-
-describe("countLabels", () => {
-  it("counts boxes per label", () => {
-    expect(countLabels([{ name: "a" }, { name: "b" }, { name: "a" }])).toEqual(
-      new Map([
-        ["a", 2],
-        ["b", 1],
-      ])
-    )
   })
 })
