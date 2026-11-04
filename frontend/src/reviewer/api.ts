@@ -151,9 +151,16 @@ export function browseQuery(path: string) {
   })
 }
 
-/** 审图编辑器读写打开的审图包：查询键带着 package_id，换了审图包时缓存不混用。 */
+/**
+ * 审图编辑器读写打开的审图包：查询键带着 package_id，换了审图包时缓存不混用；
+ * 修改带着 X-Review-Package，程序已经换成另一个审图包时拒绝（409），不会写进新的审图包。
+ */
 export function localReviewSource(packageId: string): ReviewSource {
-  return { key: ["local-review", packageId], base: "/api/review" }
+  return {
+    key: ["local-review", packageId],
+    base: "/api/review",
+    headers: { "X-Review-Package": packageId },
+  }
 }
 
 /** 开始打开审图包（zip 或文件夹）；进度见会话的 `opening`。 */

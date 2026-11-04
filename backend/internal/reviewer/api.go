@@ -346,7 +346,7 @@ func (s *Server) saveAnnotation(w http.ResponseWriter, r *http.Request) {
 	if req.BaseVersion != nil {
 		in.BaseVersion = *req.BaseVersion
 	}
-	p, err := s.current()
+	p, err := s.currentFor(r)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -370,7 +370,7 @@ func (s *Server) setStatus(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req, maxJSONBody) {
 		return
 	}
-	p, err := s.current()
+	p, err := s.currentFor(r)
 	if err != nil {
 		s.fail(w, r, err)
 		return

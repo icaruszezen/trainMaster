@@ -409,7 +409,12 @@ export const reviewKeys = {
  * 的前缀（`GET base` 本身的查询键就是 `key`）。编辑器只依赖它和普通的属性，平台
  * 与本地审图程序因此共用同一个编辑器。
  */
-export type ReviewSource = { key: readonly unknown[]; base: string }
+export type ReviewSource = {
+  key: readonly unknown[]
+  base: string
+  /** 修改（标注、审核状态）时带上的请求头：本地审图程序用它确认修改的是打开的审图包。 */
+  headers?: Record<string, string>
+}
 
 /** 平台上的审图任务。查询键与 {@link reviewQuery} 相同，两者共用缓存。 */
 export function reviewSource(id: number): ReviewSource {
@@ -596,7 +601,7 @@ export function saveReviewAnnotation(
     "PUT",
     `${source.base}/images/${imageId}/annotation`,
     input,
-    init
+    withSourceHeaders(source, init)
   )
 }
 
@@ -609,8 +614,23 @@ export function setReviewImageStatus(
   return apiSend<ReviewImageDetail>(
     "PUT",
     `${source.base}/images/${imageId}/status`,
-    { status }
+    { status },
+    withSourceHeaders(source)
   )
+}
+
+function withSourceHeaders(
+  source: ReviewSource,
+  init?: RequestInit
+): RequestInit | undefined {
+  if (!source.headers) {
+    return init
+  }
+  const headers = new Headers(init?.headers)
+  for (const [name, value] of Object.entries(source.headers)) {
+    headers.set(name, value)
+  }
+  return { ...init, headers }
 }
 
 // ---- 平台：审图任务 ----

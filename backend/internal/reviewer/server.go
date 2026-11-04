@@ -117,6 +117,25 @@ func (s *Server) current() (*Package, error) {
 	return s.pkg, nil
 }
 
+// PackageHeader names the package a write was made for (its package_id).
+// The page sends it with every edit, so an edit queued just before another
+// package was opened is refused instead of landing in the new package.
+// Requests without it (tests, scripts) act on the open package.
+const PackageHeader = "X-Review-Package"
+
+// currentFor is current for a write: when the request names a package, it
+// must be the open one.
+func (s *Server) currentFor(r *http.Request) (*Package, error) {
+	p, err := s.current()
+	if err != nil {
+		return nil, err
+	}
+	if want := r.Header.Get(PackageHeader); want != "" && want != p.manifest.PackageID {
+		return nil, errPackageSwitched
+	}
+	return p, nil
+}
+
 // ---- session ----
 
 // Session is what the start page shows (GET /api/session).

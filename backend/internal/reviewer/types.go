@@ -158,9 +158,11 @@ func newError(kind error, format string, args ...any) *Error {
 }
 
 var (
-	errNoPackage    = &Error{Kind: ErrNotFound, Message: "没有打开审图包，请先在开始页打开一个审图包"}
-	errImageMissing = &Error{Kind: ErrNotFound, Message: "图片不存在"}
-	errFileMissing  = &Error{Kind: ErrNotFound, Message: "图片文件不存在（审图包中没有它，或者已被移动或删除）"}
+	errNoPackage = &Error{Kind: ErrNotFound, Message: "没有打开审图包，请先在开始页打开一个审图包"}
+	// errPackageSwitched: a write for a package that is no longer open.
+	errPackageSwitched = &Error{Kind: ErrConflict, Message: "程序中已经打开了另一个审图包，这次修改没有保存；请回到开始页重新打开要审的审图包"}
+	errImageMissing    = &Error{Kind: ErrNotFound, Message: "图片不存在"}
+	errFileMissing     = &Error{Kind: ErrNotFound, Message: "图片文件不存在（审图包中没有它，或者已被移动或删除）"}
 	// errAnnotationChanged: the VOC file changed since the version an edit
 	// started from (another window, or another program such as LabelImg).
 	errAnnotationChanged = &Error{Kind: ErrAnnotationChanged,

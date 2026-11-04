@@ -513,7 +513,14 @@ func TestBrowse(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	past := time.Now().Add(-time.Hour)
+	// Same time for the new zips (so they sort by name), an hour earlier for old.zip.
+	now := time.Now().Truncate(time.Second)
+	for _, f := range []string{"new.ZIP", "审图-7-外观检测-审图结果.zip"} {
+		if err := os.Chtimes(filepath.Join(dir, f), now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := now.Add(-time.Hour)
 	if err := os.Chtimes(old, past, past); err != nil {
 		t.Fatal(err)
 	}
