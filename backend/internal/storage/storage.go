@@ -20,6 +20,7 @@ type Key string
 const (
 	Datasets Key = "datasets" // one folder per dataset: images with their VOC annotations next to them
 	Models   Key = "models"   // model weights
+	Reviews  Key = "reviews"  // model reviews: one folder per review with the VOC files of its predictions as reviewed
 	Runs     Key = "runs"     // training/evaluation run artifacts (logs, curves, checkpoints)
 	Exports  Key = "exports"  // exported training sets (YOLO/VOC/COCO), packaged exports and reports
 	Cache    Key = "cache"    // regenerable data such as thumbnails; safe to delete at any time
@@ -27,7 +28,7 @@ const (
 )
 
 // Keys lists every managed subdirectory in display order.
-var Keys = []Key{Datasets, Models, Runs, Exports, Cache, Tmp}
+var Keys = []Key{Datasets, Models, Reviews, Runs, Exports, Cache, Tmp}
 
 // ErrInvalidPath is returned by Resolve for paths that are absolute or
 // would escape the target directory.

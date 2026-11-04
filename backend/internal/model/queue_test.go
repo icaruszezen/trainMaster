@@ -41,11 +41,24 @@ func (e *testEnv) requestExport(t *testing.T, modelID int64, req ExportRequest) 
 // claim claims a conversion for the node without waiting.
 func (e *testEnv) claim(t *testing.T, nodeID int64) *Task {
 	t.Helper()
-	task, err := e.svc.ClaimTask(context.Background(), nodeID, []string{TaskModelExport}, 0)
+	task, err := e.claimTask(context.Background(), nodeID, []string{TaskModelExport}, 0)
 	if err != nil {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 	return task
+}
+
+// claimTask is ClaimTask for tests that expect conversions (or nothing).
+func (e *testEnv) claimTask(ctx context.Context, nodeID int64, kinds []string, wait time.Duration) (*Task, error) {
+	task, err := e.svc.ClaimTask(ctx, nodeID, kinds, wait)
+	if task == nil {
+		return nil, err
+	}
+	conv, ok := task.(*Task)
+	if !ok {
+		return nil, fmt.Errorf("claimed a %T, want *Task", task)
+	}
+	return conv, err
 }
 
 func (e *testEnv) export(t *testing.T, modelID, exportID int64) Export {
@@ -688,7 +701,7 @@ func TestIntegrationBackgroundLoop(t *testing.T) {
 	e.svc.Start(ctx)
 	claimed := make(chan *Task, 1)
 	go func() {
-		task, _ := e.svc.ClaimTask(ctx, other, []string{TaskModelExport}, 20*time.Second)
+		task, _ := e.claimTask(ctx, other, []string{TaskModelExport}, 20*time.Second)
 		claimed <- task
 	}()
 	select {
@@ -704,7 +717,7 @@ func TestIntegrationBackgroundLoop(t *testing.T) {
 	waiting := make(chan error, 1)
 	start := time.Now()
 	go func() {
-		_, err := e.svc.ClaimTask(ctx, node, []string{TaskModelExport}, 20*time.Second)
+		_, err := e.claimTask(ctx, node, []string{TaskModelExport}, 20*time.Second)
 		waiting <- err
 	}()
 	time.Sleep(100 * time.Millisecond)
@@ -737,7 +750,7 @@ func TestIntegrationClaimWaits(t *testing.T) {
 		{[]string{strings.Repeat("k", 65)}, 0, "无效的任务类型"},
 		{slices.Repeat([]string{"k"}, 17), 0, "kinds 最多 16 项"},
 	} {
-		_, err := e.svc.ClaimTask(ctx, node, tt.kinds, tt.wait)
+		_, err := e.claimTask(ctx, node, tt.kinds, tt.wait)
 		wantKind(t, err, ErrInvalid, tt.msg)
 	}
 
@@ -746,7 +759,7 @@ func TestIntegrationClaimWaits(t *testing.T) {
 		t.Fatalf("task = %+v", task)
 	}
 	start := time.Now()
-	task, err := e.svc.ClaimTask(ctx, node, []string{TaskModelExport}, 300*time.Millisecond)
+	task, err := e.claimTask(ctx, node, []string{TaskModelExport}, 300*time.Millisecond)
 	if task != nil || err != nil || time.Since(start) < 250*time.Millisecond {
 		t.Errorf("timed out claim = %+v, %v after %v", task, err, time.Since(start))
 	}
@@ -755,20 +768,20 @@ func TestIntegrationClaimWaits(t *testing.T) {
 	// those gets nothing, and does not count as a conversion worker.
 	e.requestExport(t, m.ID, ExportRequest{ImgSize: []int{320}})
 	other := e.node(t, "trainer-only")
-	if task, err := e.svc.ClaimTask(ctx, other, []string{"training_job"}, 0); task != nil || err != nil {
+	if task, err := e.claimTask(ctx, other, []string{"training_job"}, 0); task != nil || err != nil {
 		t.Errorf("unknown kind claim = %+v, %v", task, err)
 	}
-	if n := e.svc.workers.count(e.clock.Now()); n != 1 {
+	if n := e.svc.WorkersOnline(TaskModelExport); n != 1 {
 		t.Errorf("workers = %d, want 1", n)
 	}
-	if task, err := e.svc.ClaimTask(ctx, node, []string{"training_job", TaskModelExport}, 0); task == nil || err != nil {
+	if task, err := e.claimTask(ctx, node, []string{"training_job", TaskModelExport}, 0); task == nil || err != nil {
 		t.Errorf("mixed kinds claim = %+v, %v", task, err)
 	}
 
 	// A waiting claim is woken by a new conversion.
 	claimed := make(chan *Task, 1)
 	go func() {
-		task, err := e.svc.ClaimTask(ctx, node, []string{TaskModelExport}, 20*time.Second)
+		task, err := e.claimTask(ctx, node, []string{TaskModelExport}, 20*time.Second)
 		if err != nil {
 			t.Error(err)
 		}
@@ -789,7 +802,7 @@ func TestIntegrationClaimWaits(t *testing.T) {
 	// ... and by a conversion queued again after a retryable failure.
 	third := e.node(t, "c")
 	go func() {
-		task, _ := e.svc.ClaimTask(ctx, third, []string{TaskModelExport}, 20*time.Second)
+		task, _ := e.claimTask(ctx, third, []string{TaskModelExport}, 20*time.Second)
 		claimed <- task
 	}()
 	time.Sleep(100 * time.Millisecond)
@@ -809,7 +822,7 @@ func TestIntegrationClaimWaits(t *testing.T) {
 	cctx, cancel := context.WithCancel(ctx)
 	errc := make(chan error, 1)
 	go func() {
-		_, err := e.svc.ClaimTask(cctx, node, []string{TaskModelExport}, 20*time.Second)
+		_, err := e.claimTask(cctx, node, []string{TaskModelExport}, 20*time.Second)
 		errc <- err
 	}()
 	time.Sleep(100 * time.Millisecond)
@@ -825,7 +838,7 @@ func TestIntegrationClaimWaits(t *testing.T) {
 
 	// StopLongPolls ends waiting claims, and later ones do not wait.
 	go func() {
-		_, err := e.svc.ClaimTask(ctx, node, []string{TaskModelExport}, 20*time.Second)
+		_, err := e.claimTask(ctx, node, []string{TaskModelExport}, 20*time.Second)
 		errc <- err
 	}()
 	time.Sleep(100 * time.Millisecond)
@@ -841,7 +854,7 @@ func TestIntegrationClaimWaits(t *testing.T) {
 		t.Fatal("StopLongPolls did not end the claim")
 	}
 	start = time.Now()
-	if task, err := e.svc.ClaimTask(ctx, node, []string{TaskModelExport}, 20*time.Second); task != nil || err != nil ||
+	if task, err := e.claimTask(ctx, node, []string{TaskModelExport}, 20*time.Second); task != nil || err != nil ||
 		time.Since(start) > 5*time.Second {
 		t.Errorf("claim after shutdown = %+v, %v after %v", task, err, time.Since(start))
 	}
@@ -873,7 +886,7 @@ func TestIntegrationConcurrentClaims(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for {
-				task, err := e.svc.ClaimTask(ctx, node, []string{TaskModelExport}, 0)
+				task, err := e.claimTask(ctx, node, []string{TaskModelExport}, 0)
 				if err != nil {
 					t.Error(err)
 					return
@@ -975,5 +988,171 @@ func TestLeaseReaderWriter(t *testing.T) {
 	fail = nil
 	if n, err := w.Write([]byte("onnx")); err != nil || n != 4 || out.String() != "onnx" {
 		t.Errorf("write = %d, %v", n, err)
+	}
+}
+
+// fakeSource is a TaskSource with an in-memory queue.
+type fakeSource struct {
+	kind string
+	mu   sync.Mutex
+	next []string
+	err  error
+	nil_ bool // return a typed nil
+}
+
+type fakeTask struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	Node int64  `json:"node"`
+}
+
+func (f *fakeSource) Kind() string { return f.kind }
+
+func (f *fakeSource) Claim(_ context.Context, nodeID int64) (any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch {
+	case f.err != nil:
+		return nil, f.err
+	case f.nil_:
+		return (*fakeTask)(nil), nil
+	case len(f.next) == 0:
+		return nil, nil
+	}
+	name := f.next[0]
+	f.next = f.next[1:]
+	return &fakeTask{Kind: f.kind, Name: name, Node: nodeID}, nil
+}
+
+func (f *fakeSource) push(names ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.next = append(f.next, names...)
+}
+
+func TestAddTaskSourceRejects(t *testing.T) {
+	s := NewService(Options{})
+	s.AddTaskSource(&fakeSource{kind: "a"})
+	for _, kind := range []string{"a", "", TaskModelExport, strings.Repeat("k", 65)} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("AddTaskSource(%q) did not panic", kind)
+				}
+			}()
+			s.AddTaskSource(&fakeSource{kind: kind})
+		}()
+	}
+}
+
+func TestIntegrationTaskSources(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	m := e.addModel(t, e.project(t, "p"), "yolo11")
+	node := e.node(t, "a")
+	other := e.node(t, "b")
+	first := &fakeSource{kind: "first"}
+	second := &fakeSource{kind: "second"}
+	e.svc.AddTaskSource(first)
+	e.svc.AddTaskSource(second)
+
+	// Nothing queued anywhere.
+	if task, err := e.svc.ClaimTask(ctx, node, []string{"first", "second", TaskModelExport}, 0); task != nil || err != nil {
+		t.Fatalf("empty claim = %#v, %v", task, err)
+	}
+	// Conversions go first, then the sources in registration order, and
+	// only the kinds the node offers.
+	exp, _ := e.requestExport(t, m.ID, ExportRequest{})
+	first.push("f1")
+	second.push("s1", "s2")
+	kinds := []string{"second", "first", TaskModelExport}
+	var got []string
+	for {
+		task, err := e.svc.ClaimTask(ctx, node, kinds, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if task == nil {
+			break
+		}
+		switch task := task.(type) {
+		case *Task:
+			if task.ID != exp.ID {
+				t.Errorf("claimed export %d", task.ID)
+			}
+			got = append(got, "export")
+		case *fakeTask:
+			if task.Node != node {
+				t.Errorf("task for node %d", task.Node)
+			}
+			got = append(got, task.Name)
+		default:
+			t.Fatalf("claimed a %T", task)
+		}
+		if len(got) == 1 {
+			kinds = kinds[:2] // the export is held; offer only the sources from now on
+		}
+	}
+	if want := []string{"export", "f1", "s1", "s2"}; !slices.Equal(got, want) {
+		t.Errorf("claimed %q, want %q", got, want)
+	}
+	second.push("s3")
+	if task, err := e.svc.ClaimTask(ctx, node, []string{"first"}, 0); task != nil || err != nil {
+		t.Errorf("claim of first only = %#v, %v", task, err)
+	}
+
+	// A typed nil is no task; an error ends the claim.
+	first.nil_ = true
+	if task, err := e.svc.ClaimTask(ctx, node, []string{"first"}, 0); task != nil || err != nil {
+		t.Errorf("typed nil claim = %#v, %v", task, err)
+	}
+	first.nil_ = false
+	first.err = errors.New("database down")
+	if _, err := e.svc.ClaimTask(ctx, node, []string{"first", "second"}, 0); err == nil || !strings.Contains(err.Error(), "database down") {
+		t.Errorf("failing source: %v", err)
+	}
+	first.err = nil
+	if task, err := e.svc.ClaimTask(ctx, node, []string{TaskModelExport, "first", "second"}, 0); err != nil ||
+		task.(*fakeTask).Name != "s3" {
+		t.Errorf("claim after the failure = %#v, %v", task, err)
+	}
+
+	// NotifyTasks wakes a waiting claim.
+	claimed := make(chan any, 1)
+	go func() {
+		task, err := e.svc.ClaimTask(ctx, other, []string{"first"}, 20*time.Second)
+		if err != nil {
+			t.Error(err)
+		}
+		claimed <- task
+	}()
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	first.push("f2")
+	e.svc.NotifyTasks()
+	select {
+	case task := <-claimed:
+		if ft, ok := task.(*fakeTask); !ok || ft.Name != "f2" || time.Since(start) > 5*time.Second {
+			t.Errorf("woken claim = %#v", task)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("NotifyTasks did not wake the claim")
+	}
+
+	// Workers by kind: node last offered all three kinds, other only
+	// "first".
+	for kind, want := range map[string]int{TaskModelExport: 1, "first": 2, "second": 1, "unknown": 0} {
+		if n := e.svc.WorkersOnline(kind); n != want {
+			t.Errorf("WorkersOnline(%s) = %d, want %d", kind, n, want)
+		}
+	}
+	third := e.node(t, "c")
+	e.svc.TouchWorker(third, "second")
+	if n := e.svc.WorkersOnline("second"); n != 2 {
+		t.Errorf("WorkersOnline(second) after TouchWorker = %d", n)
+	}
+	e.clock.Advance(61 * time.Second)
+	if n := e.svc.WorkersOnline("first"); n != 0 {
+		t.Errorf("WorkersOnline(first) a minute later = %d", n)
 	}
 }

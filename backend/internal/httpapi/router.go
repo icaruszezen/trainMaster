@@ -16,6 +16,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/hostinfo"
 	"github.com/icaruszezen/trainmaster/backend/internal/model"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
+	"github.com/icaruszezen/trainmaster/backend/internal/review"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 )
 
@@ -54,6 +55,16 @@ type Options struct {
 	// (/api/v1/compute/agent/tasks, /model-exports) also need Compute,
 	// which identifies the nodes. If nil, those routes are not mounted.
 	Models *model.Service
+	// Reviews serves /api/v1/reviews (model reviews) and the review
+	// records of a dataset (/api/v1/datasets/{id}/reviews, with Datasets).
+	// The inference calls of the training nodes
+	// (/api/v1/compute/agent/review-inferences) also need Compute. If nil,
+	// those routes are not mounted.
+	Reviews *review.Service
+	// ReviewerTool is the path of the bundled local reviewer for Windows
+	// (TM_REVIEWER_TOOL), served by GET /api/v1/reviews/tool/download.
+	// Empty, or a file that is not there: none is bundled.
+	ReviewerTool string
 	// Host describes the server machine for GET /api/v1/compute/server,
 	// which is mounted only when Host and Compute are both set.
 	Host *hostinfo.Host
@@ -84,18 +95,21 @@ type server struct {
 	projects  *project.Service // nil unless datasets is set
 	compute   *compute.Service
 	models    *model.Service
+	reviews   *review.Service
 	host      *hostinfo.Host
 	nodeToken string
 	startedAt time.Time
 	// localTrainerMode is Options.LocalTrainerMode.
 	localTrainerMode string
+	// reviewerTool is Options.ReviewerTool.
+	reviewerTool string
 }
 
 // NewHandler returns the root HTTP handler.
 func NewHandler(o Options) http.Handler {
 	s := &server{log: o.Logger, db: o.DB, storage: o.Storage, datasets: o.Datasets, compute: o.Compute,
-		models: o.Models, host: o.Host, nodeToken: o.NodeToken, localTrainerMode: o.LocalTrainerMode,
-		startedAt: o.StartedAt}
+		models: o.Models, reviews: o.Reviews, reviewerTool: o.ReviewerTool, host: o.Host, nodeToken: o.NodeToken,
+		localTrainerMode: o.LocalTrainerMode, startedAt: o.StartedAt}
 	if o.Datasets != nil {
 		s.projects = o.Projects
 	}
@@ -133,6 +147,9 @@ func NewHandler(o Options) http.Handler {
 			}
 			if s.models != nil {
 				r.Route("/models", s.modelRoutes)
+			}
+			if s.reviews != nil {
+				r.Route("/reviews", s.reviewRoutes)
 			}
 
 			for _, p := range plannedModules {

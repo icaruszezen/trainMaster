@@ -16,6 +16,9 @@ import { InferencePage } from "@/features/models/inference-page"
 import { ModelDetailPage } from "@/features/models/model-detail-page"
 import { ModelsPage } from "@/features/models/models-page"
 import { ProjectDetailPage } from "@/features/projects/project-detail-page"
+import { ReviewDetailPage } from "@/features/reviews/review-detail-page"
+import { ReviewWorkspacePage } from "@/features/reviews/review-workspace-page"
+import { ReviewsPage } from "@/features/reviews/reviews-page"
 import { ProjectsPage } from "@/features/projects/projects-page"
 import { MembersPage } from "@/features/system/members-page"
 import { SettingsPage } from "@/features/system/settings-page"
@@ -28,7 +31,7 @@ import { RouteErrorPage } from "@/pages/route-error-page"
 
 /**
  * 路由的 handle：404 路由带 notFound，标题与面包屑据此显示“页面不存在”；
- * fullBleed 的页面（标注工作台）占满顶栏以下的区域，没有内边距、不滚动。
+ * fullBleed 的页面（标注工作台、网页审图）占满顶栏以下的区域，没有内边距、不滚动。
  */
 export type RouteHandle = { notFound?: boolean; fullBleed?: boolean }
 
@@ -46,6 +49,7 @@ export const pages: Record<ModuleId, ComponentType> = {
   compute: ComputePage,
   evaluations: EvaluationsPage,
   models: ModelsPage,
+  reviews: ReviewsPage,
   inference: InferencePage,
   members: MembersPage,
   storage: StoragePage,
@@ -69,10 +73,16 @@ export const routes: RouteObject[] = [
             Component: pages[item.id],
           })),
           // 模块的子页面。静态路径优先于动态参数，/datasets/versions 仍是数据版本页，
-          // /models/inference 仍是推理测试页。
+          // /models/inference 仍是推理测试页，/models/reviews 仍是模型审图。
           { path: "/projects/:projectId", Component: ProjectDetailPage },
           { path: "/datasets/:datasetId", Component: DatasetDetailPage },
           { path: "/models/:modelId", Component: ModelDetailPage },
+          { path: "/models/reviews/:reviewId", Component: ReviewDetailPage },
+          {
+            path: "/models/reviews/:reviewId/workspace",
+            Component: ReviewWorkspacePage,
+            handle: { fullBleed: true } satisfies RouteHandle,
+          },
           {
             path: "/annotation/workspace/:datasetId",
             Component: AnnotationEditorPage,

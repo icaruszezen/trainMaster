@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -49,11 +50,64 @@ var msgLeaseLost = fmt.Sprintf("训练节点在转换过程中失去联系（已
 
 func leaseSeconds() int { return int(LeaseDuration / time.Second) }
 
+// TaskSource hands out the tasks of one kind other than model_export
+// through the claim long-poll (package review hands out review_inference
+// tasks this way). Register sources with AddTaskSource before Start.
+type TaskSource interface {
+	// Kind is the task kind nodes offer in their claims.
+	Kind() string
+	// Claim hands the oldest queued task of the kind to the node, or
+	// returns nil, nil (an untyped nil) when none is queued. The value is
+	// encoded as the "task" of the claim response.
+	Claim(ctx context.Context, nodeID int64) (any, error)
+}
+
+// AddTaskSource registers a source of tasks. Claims try conversions first,
+// then the sources in registration order. A kind can be registered once.
+func (s *Service) AddTaskSource(src TaskSource) {
+	kind := src.Kind()
+	s.sourcesMu.Lock()
+	defer s.sourcesMu.Unlock()
+	if kind == "" || len(kind) > maxTaskKindRunes || kind == TaskModelExport ||
+		slices.ContainsFunc(s.sources, func(o TaskSource) bool { return o.Kind() == kind }) {
+		panic(fmt.Sprintf("model: invalid or duplicate task source kind %q", kind))
+	}
+	s.sources = append(s.sources, src)
+}
+
+// NotifyTasks wakes the waiting claims: a task of a source was queued (or
+// queued again).
+func (s *Service) NotifyTasks() { s.waiters.notify() }
+
+// TouchWorker records that the node is working on a task of the kind (it
+// reported on it), for WorkersOnline.
+func (s *Service) TouchWorker(nodeID int64, kind string) { s.workers.touch(nodeID, kind, s.clock()) }
+
+// WorkersOnline returns the nodes that recently claimed tasks of the kind
+// or worked on one: within the last minute they offered the kind in a
+// claim, or reported on any task since.
+func (s *Service) WorkersOnline(kind string) int { return s.workers.count(kind, s.clock()) }
+
+// claimSources returns the registered sources of the kinds.
+func (s *Service) claimSources(kinds []string) []TaskSource {
+	s.sourcesMu.Lock()
+	defer s.sourcesMu.Unlock()
+	var out []TaskSource
+	for _, src := range s.sources {
+		if slices.Contains(kinds, src.Kind()) {
+			out = append(out, src)
+		}
+	}
+	return out
+}
+
 // ClaimTask hands the oldest queued task of one of kinds to the node, or
-// nil if none arrives within wait. Unknown kinds are ignored (newer nodes
-// may offer more). The wait ends early, without a task, when the service
-// stops or StopLongPolls is called.
-func (s *Service) ClaimTask(ctx context.Context, nodeID int64, kinds []string, wait time.Duration) (*Task, error) {
+// nil if none arrives within wait: a conversion (*Task) when the node
+// offers model_export, else (or when no conversion is queued) a task of
+// the registered sources of the kinds, in their order. Unknown kinds are
+// ignored (newer nodes may offer more). The wait ends early, without a
+// task, when the service stops or StopLongPolls is called.
+func (s *Service) ClaimTask(ctx context.Context, nodeID int64, kinds []string, wait time.Duration) (any, error) {
 	switch {
 	case len(kinds) == 0:
 		return nil, &Error{Kind: ErrInvalid, Message: "kinds 不能为空"}
@@ -68,11 +122,19 @@ func (s *Service) ClaimTask(ctx context.Context, nodeID int64, kinds []string, w
 		}
 	}
 	exports := slices.Contains(kinds, TaskModelExport)
+	sources := s.claimSources(kinds)
+	var known []string // the kinds offered that this server hands out
 	if exports {
-		// Waiting in a claim counts as working on conversions, at its start
+		known = append(known, TaskModelExport)
+	}
+	for _, src := range sources {
+		known = append(known, src.Kind())
+	}
+	if len(known) > 0 {
+		// Waiting in a claim counts as working on its kinds, at its start
 		// and at its end.
-		s.workers.touch(nodeID, s.clock())
-		defer func() { s.workers.touch(nodeID, s.clock()) }()
+		s.workers.offer(nodeID, known, s.clock())
+		defer func() { s.workers.offer(nodeID, known, s.clock()) }()
 	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
@@ -80,8 +142,20 @@ func (s *Service) ClaimTask(ctx context.Context, nodeID int64, kinds []string, w
 		woken := s.waiters.wait()
 		if exports {
 			task, err := s.claimExport(ctx, nodeID)
-			if task != nil || err != nil {
-				return task, err
+			if err != nil {
+				return nil, err
+			}
+			if task != nil {
+				return task, nil
+			}
+		}
+		for _, src := range sources {
+			task, err := src.Claim(ctx, nodeID)
+			if err != nil {
+				return nil, fmt.Errorf("claim %s task: %w", src.Kind(), err)
+			}
+			if !isNil(task) {
+				return task, nil
 			}
 		}
 		select {
@@ -96,6 +170,19 @@ func (s *Service) ClaimTask(ctx context.Context, nodeID int64, kinds []string, w
 			return nil, nil
 		}
 	}
+}
+
+// isNil reports whether v is nil or a nil pointer, map or slice (a source
+// returning a typed nil has no task either).
+func isNil(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch r := reflect.ValueOf(v); r.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Interface:
+		return r.IsNil()
+	}
+	return false
 }
 
 // claimExport claims the oldest queued conversion for the node.
@@ -144,7 +231,7 @@ func (s *Service) renewLease(ctx context.Context, exportID, nodeID int64, stage 
 	if err != nil {
 		return err
 	}
-	s.workers.touch(nodeID, s.clock())
+	s.workers.touch(nodeID, TaskModelExport, s.clock())
 	if tag.RowsAffected() == 0 {
 		return s.taskError(ctx, exportID)
 	}
@@ -348,7 +435,7 @@ func (s *Service) PutTaskOutput(ctx context.Context, exportID, nodeID, size int6
 		_ = os.Remove(path)
 		return 0, err
 	}
-	s.workers.touch(nodeID, s.clock())
+	s.workers.touch(nodeID, TaskModelExport, s.clock())
 	return n, nil
 }
 
@@ -415,7 +502,7 @@ func (s *Service) CompleteTask(ctx context.Context, exportID, nodeID int64, resu
 		return Export{}, err
 	}
 	s.removeExportTemp(exportID)
-	s.workers.touch(nodeID, s.clock())
+	s.workers.touch(nodeID, TaskModelExport, s.clock())
 	e, err := s.GetExport(ctx, modelID, exportID)
 	if err == nil {
 		var size int64
@@ -473,7 +560,7 @@ func (s *Service) FailTask(ctx context.Context, exportID, nodeID int64, in FailI
 		return Export{}, err
 	}
 	s.removeExportTemp(exportID)
-	s.workers.touch(nodeID, s.clock())
+	s.workers.touch(nodeID, TaskModelExport, s.clock())
 	if requeued {
 		s.waiters.notify()
 		s.log.Warn("model export attempt failed; queued again", "export_id", exportID, "node_id", nodeID, "error", msg)

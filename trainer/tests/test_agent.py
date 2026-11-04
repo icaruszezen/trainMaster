@@ -493,7 +493,7 @@ def test_heartbeat_file_write_failure_is_logged_once(platform, tmp_path, caplog)
 
 
 def worker_factory(platform: FakePlatform, tmp_path: Path, created: list[TaskWorker], **kw: Any):
-    """创建能领取 model_export 的任务线程（不依赖测试环境是否安装了 torch / onnx）。"""
+    """创建能领取所有任务的任务线程（不依赖测试环境是否安装了 torch / ultralytics / onnx）。"""
 
     def factory(agent: Agent) -> TaskWorker:
         worker = TaskWorker(
@@ -525,7 +525,8 @@ def test_task_worker_starts_after_registration_and_stops(platform, tmp_path):
         wait_until(lambda: platform.claims)
         assert h.agent.tasks is created[0] and created[0].alive
         claim = platform.claims[0]
-        assert claim["node_key"] == "node-key-1" and claim["kinds"] == ["model_export"]
+        assert claim["node_key"] == "node-key-1"
+        assert claim["kinds"] == ["model_export", "review_inference"]
         with platform.lock:
             platform.nodes.clear()  # 重新注册不会再启动一个任务线程
         wait_until(lambda: (registered(platform) or {}).get("registrations"))

@@ -47,6 +47,12 @@ type Config struct {
 	// training node on this machine: auto, gpu, cpu or off (docker compose
 	// passes it from .env). Empty: not known, e.g. outside docker compose.
 	TrainerMode string
+	// ReviewerTool is the path of the bundled local reviewer for Windows,
+	// trainmaster-reviewer.exe (TM_REVIEWER_TOOL; the Docker image sets
+	// /app/tools/trainmaster-reviewer.exe). Empty: none is bundled. Like
+	// TM_WEB_DIR it is not checked here: a missing file only makes the
+	// download unavailable.
+	ReviewerTool string
 }
 
 // Limits of the training node settings.
@@ -115,6 +121,8 @@ func Load(getenv func(string) string) (*Config, error) {
 		DataDir:   get("TM_DATA_DIR", "./data"),
 		WebDir:    get("TM_WEB_DIR", ""),
 		LogFormat: strings.ToLower(get("TM_LOG_FORMAT", "text")),
+		// A path, so trimmed like the other paths.
+		ReviewerTool: get("TM_REVIEWER_TOOL", ""),
 	}
 
 	if err := checkListenAddr(cfg.HTTPAddr); err != nil {

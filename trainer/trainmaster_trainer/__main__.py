@@ -1,9 +1,10 @@
-"""命令行入口：python -m trainmaster_trainer [run|probe|selftest|export|healthcheck]
+"""命令行入口：python -m trainmaster_trainer [run|probe|selftest|export|infer|healthcheck]
 
 run          注册到平台并持续上报心跳、执行平台的任务（默认；需要 TM_SERVER_URL）
 probe        打印完整的检测报告（硬件、CUDA 环境、实时指标，JSON），不连接平台，便于排障
 selftest     检测 CUDA / PyTorch / YOLO 环境并执行自检；--json 输出 Environment
 export       在本机把 pt 转换为 ONNX（与平台的转换任务使用同一个子进程），不连接平台，便于排障
+infer        在本机用 pt 识别图片（与平台的审图识别任务使用同一个子进程），不连接平台，便于排障
 healthcheck  最近一次心跳是否及时（Docker HEALTHCHECK 使用）
 """
 
@@ -15,6 +16,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -299,6 +301,134 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0 if outcome["ok"] else 1
 
 
+def parse_fraction(low: float, high: float) -> Any:
+    """--conf / --iou：low–high 之间的数（与平台创建审图任务时的范围相同）。"""
+
+    def parse(raw: str) -> float:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = float("nan")
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(f"{raw!r}：应为 {low:g}–{high:g} 之间的数")
+        return value
+
+    return parse
+
+
+def parse_max_det(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if not 1 <= value <= 1000:
+        raise argparse.ArgumentTypeError(f"{raw!r}：应为 1–1000 的整数")
+    return value
+
+
+def format_inference(
+    ready: dict[str, Any], outcomes: list[tuple[str, dict[str, Any], float]]
+) -> str:
+    """infer 的中文摘要：模型与设备，每张图片的尺寸、目标（类别 置信度 [x1, y1, x2, y2]）与用时。"""
+    from .model_export import TASK_LABELS
+
+    versions = ready.get("versions") or {}
+    facts = [
+        f"{name} {versions[key]}"
+        for name, key in (("Ultralytics", "ultralytics"), ("PyTorch", "torch"))
+        if versions.get(key)
+    ]
+    device = str(ready.get("device"))
+    if ready.get("device_name"):
+        device += f"（{ready['device_name']}）"
+    task = TASK_LABELS.get(str(ready.get("task")), str(ready.get("task")))
+    lines = [f"模型已加载：{task}模型，{device}" + (f"（{' · '.join(facts)}）" if facts else "")]
+    for path, result, elapsed in outcomes:
+        if not result.get("ok"):
+            lines.append(f"{path}：{result.get('error')}")
+            continue
+        boxes = result.get("boxes") or []
+        lines.append(
+            f"{path}：{result['width']}×{result['height']}，{len(boxes)} 个目标，"
+            f"用时 {elapsed:.2f} 秒"
+        )
+        for box in boxes:
+            coords = ", ".join(str(round(box[k])) for k in ("xmin", "ymin", "xmax", "ymax"))
+            lines.append(f"  {box['name']} {box['confidence']:.3f} [{coords}]")
+    return "\n".join(lines)
+
+
+def cmd_infer(args: argparse.Namespace) -> int:
+    cfg = _load_config()
+    if cfg is None:
+        return 2
+    setup_logging(_quiet_level(cfg))
+    from .review_inference import (
+        InferenceError,
+        InferenceProcess,
+        InferenceSpec,
+        class_names,
+        translate_reply,
+    )
+
+    spec = InferenceSpec(
+        weights=str(Path(args.weights).resolve()),
+        task=args.task,
+        conf=args.conf,
+        iou=args.iou,
+        imgsz=args.imgsz,
+        max_det=args.max_det,
+        device=args.device,
+    )
+    process = InferenceProcess(state_dir=cfg.state_dir, image_timeout=cfg.inference_image_timeout)
+    outcomes: list[tuple[str, dict[str, Any], float]] = []
+    failure: InferenceError | None = None
+    finished = False
+    # Ctrl+C / docker stop 时结束识别子进程（finally 中结束整个进程组）。
+    signal.signal(signal.SIGTERM, _raise_interrupt)
+    try:
+        ready = process.start(spec)
+        names = class_names(ready)
+        for index, image in enumerate(args.images, 1):
+            started = time.monotonic()
+            process.send(index, str(Path(image).resolve()))
+            reply = None
+            while reply is None:
+                reply = process.next_reply(1.0)
+            outcomes.append((image, translate_reply(reply, names), time.monotonic() - started))
+        finished = True
+    except InferenceError as exc:
+        failure = exc
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        process.close(kill=not finished)  # 识别完成时让子进程自行退出，否则立即结束
+    if failure is not None:
+        if args.json:
+            report = {"ok": False, "error": failure.message, "detail": failure.detail}
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            lines = [f"识别失败：{failure.message}"]
+            if failure.detail:
+                lines.append("  错误详情：")
+                lines.extend("    " + line for line in failure.detail.splitlines())
+            print("\n".join(lines), file=sys.stderr)
+        return 1
+    ok = all(result.get("ok") for _, result, _ in outcomes)
+    if args.json:
+        images = []
+        for path, result, elapsed in outcomes:
+            entry = {"path": path, **result, "elapsed_ms": int(elapsed * 1000)}
+            entry.pop("id")
+            images.append(entry)
+        keys = ("device", "device_name", "task", "versions")
+        report = {"ok": ok, **{k: ready.get(k) for k in keys}, "images": images}
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(format_inference(ready, outcomes))
+    return 0 if ok else 1
+
+
 def cmd_healthcheck() -> int:
     from .agent import check_heartbeat
 
@@ -312,7 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m trainmaster_trainer",
         description="trainMaster 训练节点：自动识别显卡、CPU 与 CUDA 环境，向平台注册并上报心跳，"
-        "执行平台的任务（如模型的 ONNX 转换）。",
+        "执行平台的任务（模型的 ONNX 转换、审图识别）。",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="命令")
@@ -348,6 +478,45 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", metavar="ONNX", help="输出文件，默认与 pt 文件同目录、同名的 .onnx"
     )
     export.add_argument("--json", action="store_true", help="以 JSON 输出转换结果")
+    infer = sub.add_parser(
+        "infer",
+        help="在本机用 pt 识别图片（与平台的审图识别相同），不连接平台",
+        description="在本机用 Ultralytics 的 pt 模型识别图片（有 CUDA 时在 cuda:0 上，离线），打印检测框。"
+        "与平台的审图识别任务使用同一个子进程（安全加载模型、按存储的像素方向读取图片），"
+        "便于排查识别失败或结果不对的原因。",
+    )
+    infer.add_argument("--weights", required=True, metavar="PT", help="模型文件（pt）")
+    infer.add_argument("images", nargs="+", metavar="图片", help="要识别的图片文件")
+    infer.add_argument(
+        "--conf",
+        type=parse_fraction(0.01, 1),
+        default=0.25,
+        metavar="置信度",
+        help="置信度阈值（0.01–1），默认 0.25",
+    )
+    infer.add_argument(
+        "--iou",
+        type=parse_fraction(0.1, 0.95),
+        default=0.7,
+        metavar="IoU",
+        help="NMS 的 IoU 阈值（0.1–0.95），默认 0.7",
+    )
+    infer.add_argument(
+        "--imgsz",
+        type=parse_imgsz,
+        metavar="尺寸",
+        help="输入尺寸：640 或 高x宽（如 480x640）；默认为模型训练时的尺寸",
+    )
+    infer.add_argument(
+        "--max-det",
+        type=parse_max_det,
+        default=300,
+        metavar="N",
+        help="每张图片最多的检测框数（1–1000），默认 300",
+    )
+    infer.add_argument("--device", help="设备（cpu、cuda:0 …），默认有 CUDA 时为 cuda:0，否则 cpu")
+    infer.add_argument("--task", help="模型任务（detect、segment 等），默认从模型文件读取")
+    infer.add_argument("--json", action="store_true", help="以 JSON 输出识别结果")
     sub.add_parser("healthcheck", help="检查最近一次心跳是否及时（Docker HEALTHCHECK 使用）")
     return parser
 
@@ -363,6 +532,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_selftest(args.json)
     if command == "export":
         return cmd_export(args)
+    if command == "infer":
+        return cmd_infer(args)
     return cmd_healthcheck()
 
 

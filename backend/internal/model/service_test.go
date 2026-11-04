@@ -817,7 +817,7 @@ func TestIntegrationCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task, err := e.svc.ClaimTask(ctx, node, []string{TaskModelExport}, 0); err != nil || task == nil {
+	if task, err := e.claimTask(ctx, node, []string{TaskModelExport}, 0); err != nil || task == nil {
 		t.Fatalf("ClaimTask = %v, %v", task, err)
 	}
 	part := e.svc.outputPath(exp.ID)

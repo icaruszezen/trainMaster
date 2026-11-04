@@ -1,5 +1,5 @@
 """训练节点主循环：注册 → 定期心跳（上报实时指标）→ 按需重新检测硬件与 CUDA 环境。
-第一次注册成功后启动任务线程（tasks.TaskWorker），领取并执行平台的任务（如 pt → ONNX 转换）。
+第一次注册成功后启动任务线程（tasks.TaskWorker），领取并执行平台的任务（pt → ONNX 转换、审图识别）。
 
 - 服务端不可达、5xx、401（令牌不对）、422 都不会让进程退出：记录清晰的日志后指数退避重试
   （1 秒起，最长 60 秒，带抖动），配置在服务端修正后自动恢复。
@@ -72,6 +72,7 @@ def default_task_worker(agent: Agent) -> TaskWorker:
         state_dir=cfg.state_dir,
         node_name=cfg.node_name,
         export_timeout=cfg.export_timeout,
+        inference_image_timeout=cfg.inference_image_timeout,
     )
 
 

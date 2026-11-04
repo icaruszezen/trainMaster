@@ -21,6 +21,8 @@ DEFAULT_SELF_TEST_TIMEOUT = 300.0
 MAX_SELF_TEST_TIMEOUT = 86400.0
 # 一次模型转换（pt → ONNX 子进程）的时间上限；大模型在慢 CPU 上加 nms=True 也只需要几分钟。
 DEFAULT_EXPORT_TIMEOUT = 900.0
+# 审图识别时单张图片（以及启动识别进程、加载模型）的时间上限；CPU 上的大模型一张图片也只需要几秒。
+DEFAULT_INFERENCE_IMAGE_TIMEOUT = 300.0
 MAX_NODE_NAME = 64
 MAX_TOKEN = 256
 
@@ -55,6 +57,7 @@ class Config:
     self_test: bool = True
     self_test_timeout: float = DEFAULT_SELF_TEST_TIMEOUT
     export_timeout: float = DEFAULT_EXPORT_TIMEOUT
+    inference_image_timeout: float = DEFAULT_INFERENCE_IMAGE_TIMEOUT
     log_level: int = logging.INFO
     # 以下三项由 docker-compose.yml 传入，只用于生成修复建议中的命令：
     # 所在的 compose 服务（trainer / trainer-cpu）、make setup 保存的模式（TM_TRAINER_MODE）
@@ -120,7 +123,7 @@ def parse_bool(raw: str) -> bool:
 
 
 def parse_timeout(raw: str) -> float:
-    """自检 / 转换超时：秒数，可带 s / m 后缀（300、300s、5m），大于 0 且不超过 24 小时。"""
+    """自检 / 转换 / 识别超时：秒数，可带 s / m 后缀（300、300s、5m），大于 0 且不超过 24 小时。"""
     m = _DURATION.fullmatch(raw.strip().lower())
     if not m:
         raise ValueError(f"{raw!r} 不是合法的时长（秒数，例如 300 或 5m）")
@@ -267,6 +270,13 @@ def load(
         except ValueError as exc:
             fail("TM_EXPORT_TIMEOUT", exc)
 
+    inference_image_timeout = DEFAULT_INFERENCE_IMAGE_TIMEOUT
+    if _clean(env, "TM_INFERENCE_IMAGE_TIMEOUT"):
+        try:
+            inference_image_timeout = parse_timeout(env["TM_INFERENCE_IMAGE_TIMEOUT"])
+        except ValueError as exc:
+            fail("TM_INFERENCE_IMAGE_TIMEOUT", exc)
+
     service: str | None = None
     if _clean(env, "TM_TRAINER_SERVICE"):
         try:
@@ -308,6 +318,7 @@ def load(
         self_test=self_test,
         self_test_timeout=timeout,
         export_timeout=export_timeout,
+        inference_image_timeout=inference_image_timeout,
         log_level=level,
         trainer_service=service,
         trainer_mode=mode,

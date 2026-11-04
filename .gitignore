@@ -18,6 +18,8 @@ Thumbs.db
 # Build output & dependencies
 /backend/bin/
 /frontend/dist/
+# 本地审图程序嵌入的界面（npm run build:reviewer 生成）
+/backend/cmd/trainmaster-reviewer/web/dist/
 node_modules/
 *.tsbuildinfo
 

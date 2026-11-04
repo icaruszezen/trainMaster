@@ -56,8 +56,16 @@ const (
 )
 
 // Task kinds a training node can claim (POST /api/v1/compute/agent/tasks/claim).
-// Training jobs will add theirs.
+// Other packages add theirs as task sources (AddTaskSource; e.g.
+// review_inference); training jobs will too.
 const TaskModelExport = "model_export"
+
+// HasBoxes reports whether models of the task predict boxes (detect,
+// segment, pose, obb): the models a review can use.
+func HasBoxes(task string) bool { return hasBoxes(task) }
+
+// TaskLabel names a task in messages, e.g. "分类" for classify.
+func TaskLabel(task string) string { return taskLabel(task) }
 
 // Model is a weights file in the repository, bound to one project.
 type Model struct {

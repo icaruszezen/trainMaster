@@ -9,7 +9,7 @@ import {
   type MouseEvent,
 } from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { useBlocker, useSearchParams, type BlockerFunction } from "react-router"
+import { useSearchParams } from "react-router"
 import { toast } from "sonner"
 
 import {
@@ -58,41 +58,37 @@ import {
   colorResolver,
   unlistedNames,
 } from "@/features/annotation/classes"
+import { UNHANDLED, useBoxEditing } from "@/features/annotation/box-editing"
 import {
-  cycleSelection,
   documentReducer,
-  duplicateBox,
   emptyDocument,
-  pasteObjects,
   removeObject,
-  toAnnotationObject,
   updateObject,
-  type EditorObject,
 } from "@/features/annotation/document"
 import {
-  EditorToolbar,
+  candidateStatusOf,
+  IMAGES_QUERY,
+  imageSizeOf,
+  PANEL_QUERY,
+  readTool,
+  readView,
+  writeTool,
+  writeView,
+  type Carry,
+  type Picker,
   type ViewOptions,
-} from "@/features/annotation/editor-toolbar"
-import {
-  moveBox,
-  resizeEdges,
-  type Box,
-  type Size,
-  type Viewport,
-} from "@/features/annotation/geometry"
+} from "@/features/annotation/editor-common"
+import { EditorToolbar } from "@/features/annotation/editor-toolbar"
+import type { Size, Viewport } from "@/features/annotation/geometry"
 import { ImageListPanel } from "@/features/annotation/image-list-panel"
 import {
-  LabelPicker,
-  type CandidateStatus,
-} from "@/features/annotation/label-picker"
+  UnsavedChangesDialog,
+  useSaveGuard,
+} from "@/features/annotation/save-guard"
 import {
-  allowsRepeat,
-  commandForKey,
-  copiesSelectedText,
   focusAfterDialog,
   focusCanvas,
   isMac,
-  shouldIgnoreKey,
   type Command,
   type Tool,
 } from "@/features/annotation/shortcuts"
@@ -103,18 +99,18 @@ import {
   ObjectPanel,
   type Notice,
 } from "@/features/annotation/side-panel"
+import { useEditorKeys } from "@/features/annotation/use-editor-keys"
 import {
-  leavesImage,
   NO_FILTERS,
   parseFilters,
   updateParams,
 } from "@/features/annotation/workspace-params"
 import {
   deleteAnnotation,
+  fileUrl,
   imageNeighborsQuery,
   labelsQuery,
   thumbnailUrl,
-  type AnnotationObject,
   type Dataset,
   type DatasetImage,
   type DatasetImageDetail,
@@ -126,48 +122,10 @@ import { useMediaQuery } from "@/hooks/use-media-query"
 import { formatNumber } from "@/lib/format"
 import { readPreference, writePreference } from "@/lib/storage"
 
-const VIEW_KEY = "trainmaster.annotation.view"
-const TOOL_KEY = "trainmaster.annotation.tool"
 const classKey = (datasetId: number) =>
   `trainmaster.annotation.class.${datasetId}`
 export const lastImageKey = (datasetId: number) =>
   `trainmaster.annotation.last.${datasetId}`
-
-const DEFAULT_VIEW: ViewOptions = {
-  showLabels: true,
-  showBoxes: true,
-  keepViewport: true,
-  brightness: 1,
-  contrast: 1,
-}
-
-function readView(): ViewOptions {
-  try {
-    const saved = JSON.parse(readPreference(VIEW_KEY) ?? "{}") as unknown
-    if (typeof saved !== "object" || saved === null) {
-      return DEFAULT_VIEW
-    }
-    const s = saved as Partial<Record<keyof ViewOptions, unknown>>
-    const bool = (value: unknown, fallback: boolean) =>
-      typeof value === "boolean" ? value : fallback
-    const ratio = (value: unknown) =>
-      typeof value === "number" && value >= 0.2 && value <= 3 ? value : 1
-    return {
-      showLabels: bool(s.showLabels, true),
-      showBoxes: true, // 每次打开都显示框
-      keepViewport: bool(s.keepViewport, true),
-      brightness: ratio(s.brightness),
-      contrast: ratio(s.contrast),
-    }
-  } catch {
-    return DEFAULT_VIEW
-  }
-}
-
-function readTool(): Tool {
-  const value = readPreference(TOOL_KEY)
-  return value === "rect" || value === "pan" ? value : "select"
-}
 
 const EMPTY_CLASSES: ProjectClass[] = []
 const EMPTY_LABELS: DatasetLabel[] = []
@@ -177,29 +135,6 @@ type Loaded = { detail: DatasetImageDetail; token: number }
 
 /** 文档的 key：哪张图片、第几次载入（异步操作完成时据此判断是否还是同一份）。 */
 const docKey = (loaded: Loaded) => `${loaded.detail.id}:${loaded.token}`
-
-/** 与 Tailwind 的 `lg:`、`xl:` 一致：侧边面板、图片列表固定显示的宽度。 */
-const PANEL_QUERY = "(min-width: 64rem)"
-const IMAGES_QUERY = "(min-width: 80rem)"
-
-type Picker =
-  /** 刚画好的框：选择类别后才加入，关闭选择框时放弃。 */
-  | { mode: "new"; box: Box }
-  /** 修改选中框的类别。 */
-  | { mode: "relabel"; uid: string }
-  /** 切换当前类别。 */
-  | { mode: "active" }
-
-type Carry = { size: Size; viewport: Viewport } | null
-
-function imageSizeOf(image: {
-  width: number | null
-  height: number | null
-}): Size | null {
-  return image.width && image.height
-    ? { width: image.width, height: image.height }
-    : null
-}
 
 /**
  * 标注工作台：一个数据集中按固定顺序逐张标注。当前图片与筛选条件在地址栏
@@ -220,26 +155,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   const labelsQ = useQuery(labelsQuery(datasetId))
   const projectClasses = projectClassesQ.data?.items ?? EMPTY_CLASSES
   const datasetLabels = labelsQ.data?.items ?? EMPTY_LABELS
-  const candidateError =
-    (projectClassesQ.data ? null : projectClassesQ.error) ??
-    (labelsQ.data ? null : labelsQ.error)
-  const candidateStatus: CandidateStatus | null = candidateError
-    ? {
-        state: "error",
-        message: candidateError.message,
-        retrying: projectClassesQ.isFetching || labelsQ.isFetching,
-        onRetry: () => {
-          if (!projectClassesQ.data) {
-            void projectClassesQ.refetch()
-          }
-          if (!labelsQ.data) {
-            void labelsQ.refetch()
-          }
-        },
-      }
-    : projectClassesQ.isPending || labelsQ.isPending
-      ? { state: "loading" }
-      : null
+  const candidateStatus = candidateStatusOf([projectClassesQ, labelsQ])
   const detailQ = useQuery(editorImageQuery(datasetId, imageId))
   const neighborsQ = useQuery(imageNeighborsQuery(datasetId, imageId, filters))
 
@@ -287,12 +203,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   const canvasRef = useRef<CanvasHandle>(null)
   const positionRef = useRef<HTMLInputElement>(null)
   const sessionRef = useRef<SaveContext | null>(null)
-  const clipboard = useRef<{ imageId: number; objects: AnnotationObject[] }>({
-    imageId: 0,
-    objects: [],
-  })
   const lastViewport = useRef<{ size: Size; viewport: Viewport } | null>(null)
-  const uidCounter = useRef(0)
 
   const [saver] = useState(
     () =>
@@ -354,81 +265,20 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     }
   }, [doc.objects, loaded, saver])
 
-  // 离开这张图片（浏览器后退 / 前进、站内链接、侧边栏等）前先保存；保存失败
-  // 或有冲突时不离开，提示可以留下处理或放弃修改。上一张 / 下一张等按钮自己
-  // 先保存（navigateTo），保存成功后这里不再拦截。
-  const shouldBlock = useCallback<BlockerFunction>(
-    ({ currentLocation, nextLocation }) =>
-      leavesImage(currentLocation, nextLocation) && saver.hasPendingWork(),
-    [saver]
-  )
-  const blocker = useBlocker(shouldBlock)
-  // 保存失败、拦下的是这一次离开：显示提示。
-  const [leaveFailed, setLeaveFailed] = useState<typeof blocker | null>(null)
-  useEffect(() => {
-    if (blocker.state !== "blocked") {
-      return
-    }
-    let active = true
-    void saver.flush().then((ok) => {
-      if (!active) {
-        return
-      }
-      if (ok) {
-        blocker.proceed()
-      } else {
-        setLeaveFailed(blocker)
-      }
-    })
-    return () => {
-      active = false
-    }
-  }, [blocker, saver])
-  const leavePromptOpen = blocker.state === "blocked" && leaveFailed === blocker
-
-  // 离开工作台时保存未保存的修改。
-  useEffect(
-    () => () => {
-      void saver.flush().then((ok) => {
-        if (!ok && saver.isDirty()) {
-          toast.error("离开标注工作台前，最后的修改没有保存成功", {
-            description: saver.getState().error ?? undefined,
-          })
-        }
-      })
-    },
-    [saver]
-  )
-
-  // 关闭 / 刷新页面：有未保存的修改时提示，并尽量用 keepalive 请求补发。
-  useEffect(() => {
-    const onBeforeUnload = (event: BeforeUnloadEvent) => {
-      const { status } = saver.getState()
-      if (saver.isDirty() || status === "saving") {
-        event.preventDefault()
-      }
-    }
-    const onPageHide = () => {
-      const pending = saver.pending()
-      if (!pending || saver.getState().status === "saving") {
-        return
-      }
-      // 与平时的保存规则相同（包括删除本次创建、框又全部删掉的文件）。
-      void persistAnnotation(
+  // 离开这张图片、离开工作台、关闭页面前先保存（见 useSaveGuard）。上一张 /
+  // 下一张等按钮自己先保存（navigateTo），保存成功后不再拦截。
+  const { blocker, leavePromptOpen } = useSaveGuard(saver, {
+    leaveError: "离开标注工作台前，最后的修改没有保存成功",
+    // 与平时的保存规则相同（包括删除本次创建、框又全部删掉的文件）。
+    persist: (pending, init) =>
+      persistAnnotation(
         pending.objects,
         pending.baseVersion,
         false,
         pending.context,
-        { keepalive: true }
-      ).catch(() => undefined)
-    }
-    window.addEventListener("beforeunload", onBeforeUnload)
-    window.addEventListener("pagehide", onPageHide)
-    return () => {
-      window.removeEventListener("beforeunload", onBeforeUnload)
-      window.removeEventListener("pagehide", onPageHide)
-    }
-  }, [saver])
+        init
+      ),
+  })
 
   // 预加载前后的图片（详情与大图）。
   const prev = neighborsQ.data?.prev ?? null
@@ -559,11 +409,11 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       return
     }
     setToolState(value)
-    writePreference(TOOL_KEY, value)
+    writeTool(value)
   }
   const setView = (value: ViewOptions) => {
     setViewState(value)
-    writePreference(VIEW_KEY, JSON.stringify(value))
+    writeView(value)
   }
   const setActiveClass = (name: string) => {
     setActiveClassState(name)
@@ -571,126 +421,33 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   }
 
   // ---- 编辑 ----
-  const newUid = () => {
-    uidCounter.current += 1
-    return `n${uidCounter.current}`
-  }
   // 正在载入下一张图片时（current 为 null）框列表还是上一张的，不能修改。
   const editable = current !== null && !readOnly
-  const change = (objects: EditorObject[], select?: string | null) => {
-    if (!editable) {
-      return
-    }
-    dispatch({ type: "change", objects, select })
-  }
-  const select = (uid: string | null) => dispatch({ type: "select", uid })
-  const selectedObject = doc.objects.find((o) => o.uid === doc.selected)
-  // 键盘操作的对象：隐藏的框（H 隐藏所有框时）不算选中，不会被看不见地移动、
-  // 删除，← / → 照常切换图片。
-  const activeObject =
-    selectedObject && view.showBoxes ? selectedObject : undefined
-
-  const addObject = (box: Box, name: string) => {
-    const object: EditorObject = {
-      ...box,
-      name,
-      difficult: false,
-      truncated: false,
-      uid: newUid(),
-    }
-    change([...doc.objects, object], object.uid)
-  }
-
-  const relabel = (uid: string, name: string) =>
-    change(updateObject(doc.objects, uid, { name }))
-
-  // 与 LabelImg 一样，画好框后总是选择它的类别：默认高亮当前类别（Enter 直接
-  // 确定），也可以输入筛选或新的名称；关闭选择框（Esc、点击别处）时放弃这个框。
-  const onCreate = (box: Box) => setPicker({ mode: "new", box })
-
-  // 输入的新名称只是框的类别，不会加入任何类别列表（类别列表在项目页面中管理）。
-  const onPick = (name: string, created: boolean) => {
-    const target = picker
-    setPicker(null)
-    if (!target) {
-      return
-    }
-    if (created) {
+  const boxes = useBoxEditing({
+    doc,
+    dispatch,
+    editable,
+    size,
+    imageId,
+    view,
+    onViewChange: setView,
+    tool,
+    onToolChange: setTool,
+    picker,
+    onPickerChange: setPicker,
+    classOptions,
+    candidateStatus,
+    flagUnlisted: projectClasses.length > 0,
+    activeClass,
+    onActiveClassChange: setActiveClass,
+    onTypedName: (name: string) =>
       setTypedNames((names) =>
         names.includes(name) ? names : [...names, name]
-      )
-    }
-    if (target.mode === "new") {
-      addObject(target.box, name)
-      setActiveClass(name)
-    } else if (target.mode === "relabel") {
-      relabel(target.uid, name)
-    } else {
-      setActiveClass(name)
-      toast(`当前类别：${name}`, { duration: 1200 })
-    }
-  }
-
-  const toggleFlag = (flag: "difficult" | "truncated") => {
-    if (!activeObject) {
-      toast.info("请先选中一个框")
-      return
-    }
-    if (!editable) {
-      return
-    }
-    const value = !activeObject[flag]
-    change(updateObject(doc.objects, activeObject.uid, { [flag]: value }))
-    const label =
-      flag === "difficult" ? "难例（difficult）" : "截断（truncated）"
-    toast(value ? `已标记为${label}` : `已取消${label}`, { duration: 1200 })
-  }
-
-  const copy = () => {
-    const objects = activeObject ? [activeObject] : doc.objects
-    if (objects.length === 0) {
-      toast.info("这张图片上没有框可以复制")
-      return
-    }
-    clipboard.current = {
-      imageId,
-      objects: objects.map(toAnnotationObject),
-    }
-    toast(`已复制 ${formatNumber(objects.length)} 个框`, { duration: 1200 })
-  }
-
-  /** 粘贴到 `key` 对应的文档（异步操作开始时的文档；之后切换了图片则不粘贴）。 */
-  const paste = (source = clipboard.current, key = doc.key) => {
-    if (!size || !editable) {
-      return
-    }
-    if (source.objects.length === 0) {
-      toast.info("还没有复制框（先选中框按 Ctrl+C）")
-      return
-    }
-    const sameImage = source.imageId === imageId
-    const shifted = sameImage
-      ? source.objects.map((object) => ({
-          ...object,
-          ...duplicateBox(object, size),
-        }))
-      : source.objects
-    const { objects, dropped } = pasteObjects(shifted, size, newUid)
-    if (objects.length > 0) {
-      // 加到此刻的框列表后面，而不是调用时的（异步操作期间可能又有修改）。
-      dispatch({
-        type: "append",
-        key,
-        objects,
-        select: objects.at(-1)?.uid ?? null,
-      })
-    }
-    if (dropped > 0) {
-      toast.warning(
-        `${formatNumber(dropped)} 个框在这张图片的范围之外，没有粘贴`
-      )
-    }
-  }
+      ),
+    canvasRef,
+    mod,
+  })
+  const { change, select, activeObject } = boxes
 
   const copyPrevious = async () => {
     const start = loaded
@@ -719,7 +476,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         toast.info(`上一张（${previous.file_name}）没有框`)
         return
       }
-      paste({ imageId: previous.id, objects: previous.objects }, key)
+      boxes.paste({ imageId: previous.id, objects: previous.objects }, key)
       toast.success(
         `已沿用上一张的 ${formatNumber(previous.objects.length)} 个框`
       )
@@ -1067,10 +824,11 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
   // ---- 快捷键 ----
   /** 执行命令；返回 false 时这次按键交给浏览器（不阻止默认行为）。 */
   const run = (command: Command): false | void => {
+    const result = boxes.run(command)
+    if (result !== UNHANDLED) {
+      return result
+    }
     switch (command.type) {
-      case "tool":
-        setTool(command.tool)
-        return
       case "image":
         void step(command.direction, command.unannotated)
         return
@@ -1079,148 +837,6 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
         return
       case "save":
         void save()
-        return
-      case "undo":
-        if (editable) dispatch({ type: "undo" })
-        return
-      case "redo":
-        if (editable) dispatch({ type: "redo" })
-        return
-      case "copy":
-        copy()
-        return
-      case "paste":
-        paste()
-        return
-      case "duplicate":
-        if (activeObject && size && editable) {
-          const object = {
-            ...activeObject,
-            ...duplicateBox(activeObject, size),
-            uid: newUid(),
-          }
-          change([...doc.objects, object], object.uid)
-        }
-        return
-      case "delete":
-        if (activeObject && editable) {
-          change(removeObject(doc.objects, activeObject.uid), null)
-        }
-        return
-      case "cycle": {
-        const uid = cycleSelection(
-          view.showBoxes ? doc.objects : [],
-          doc.selected,
-          command.direction
-        )
-        select(uid)
-        const object = doc.objects.find((o) => o.uid === uid)
-        if (!object) {
-          return false // 到头了：取消选中，Tab 照常把焦点移出画布
-        }
-        canvasRef.current?.reveal(object)
-        return
-      }
-      case "escape":
-        if (picker) {
-          setPicker(null)
-        } else if (canvasRef.current?.cancelDrawing()) {
-          // 已取消正在画的框
-        } else if (doc.selected !== null) {
-          select(null)
-        } else if (tool !== "select") {
-          setTool("select")
-        }
-        return
-      case "class": {
-        // 前 10 个候选：项目的类别列表在前，其次是数据集中已有的类别。
-        const option = classOptions[command.index]
-        if (!option) {
-          if (candidateStatus?.state === "error") {
-            const { message, onRetry } = candidateStatus
-            toast.error("无法读取候选类别", {
-              description: message,
-              action: {
-                label: "重试",
-                onClick: (event) => {
-                  focusCanvas(event.currentTarget) // 提示随即关闭
-                  onRetry()
-                },
-              },
-            })
-          } else if (candidateStatus?.state === "loading") {
-            toast.info("候选类别还在读取中")
-          } else {
-            toast.info(
-              classOptions.length === 0
-                ? "还没有候选类别：画框后输入类别名称"
-                : `只有 ${formatNumber(classOptions.length)} 个候选类别`
-            )
-          }
-          return
-        }
-        if (activeObject && editable) {
-          relabel(activeObject.uid, option.name)
-        } else {
-          setActiveClass(option.name)
-          toast(`当前类别：${option.name}`, { duration: 1200 })
-        }
-        return
-      }
-      case "pickClass":
-        setPicker(
-          activeObject && editable
-            ? { mode: "relabel", uid: activeObject.uid }
-            : { mode: "active" }
-        )
-        return
-      case "toggleDifficult":
-        toggleFlag("difficult")
-        return
-      case "toggleTruncated":
-        toggleFlag("truncated")
-        return
-      case "nudge":
-        if (activeObject && size && editable) {
-          change(
-            updateObject(
-              doc.objects,
-              activeObject.uid,
-              moveBox(activeObject, command.dx, command.dy, size)
-            )
-          )
-        }
-        return
-      case "resize":
-        if (activeObject && size && editable) {
-          change(
-            updateObject(
-              doc.objects,
-              activeObject.uid,
-              resizeEdges(activeObject, command.dx, command.dy, size)
-            )
-          )
-        }
-        return
-      case "zoom":
-        canvasRef.current?.zoom(command.direction)
-        return
-      case "fit":
-        canvasRef.current?.fit()
-        return
-      case "actualSize":
-        canvasRef.current?.actualSize()
-        return
-      case "zoomToSelection":
-        if (activeObject) {
-          canvasRef.current?.zoomToBox(activeObject)
-        }
-        return
-      case "toggleLabels":
-        setView({ ...view, showLabels: !view.showLabels })
-        return
-      case "toggleBoxes":
-        setView({ ...view, showBoxes: !view.showBoxes })
         return
       case "negative":
         void markNegative()
@@ -1231,42 +847,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
     }
   }
 
-  const runRef = useRef(run)
-  useEffect(() => {
-    runRef.current = run
-  })
-  const hasSelectionRef = useRef(false)
-  useEffect(() => {
-    hasSelectionRef.current = activeObject !== undefined
-  })
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      const command = commandForKey(event, {
-        mac,
-        hasSelection: hasSelectionRef.current,
-      })
-      if (!command || shouldIgnoreKey(event, command)) {
-        return
-      }
-      if (
-        command.type === "copy" &&
-        copiesSelectedText(event.target, window.getSelection())
-      ) {
-        return // 复制页面上选中的文字
-      }
-      if (event.repeat && !allowsRepeat(command)) {
-        event.preventDefault()
-        return
-      }
-      if (runRef.current(command) === false) {
-        return
-      }
-      event.preventDefault()
-    }
-    window.addEventListener("keydown", onKeyDown)
-    return () => window.removeEventListener("keydown", onKeyDown)
-  }, [mac])
+  useEditorKeys(run, { mac, hasSelection: activeObject !== undefined })
 
   const sizeWidth = size?.width ?? 0
   const sizeHeight = size?.height ?? 0
@@ -1410,8 +991,9 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
             <AnnotationCanvas
               key={`${current.id}:${loaded?.token ?? 0}`}
               ref={canvasRef}
-              datasetId={datasetId}
               image={current}
+              fileUrl={fileUrl(datasetId, current)}
+              thumbnailUrl={thumbnailUrl(datasetId, current, "lg")}
               size={size}
               objects={doc.objects}
               selected={doc.selected}
@@ -1427,7 +1009,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
               onViewportChange={onViewportChange}
               onSizeKnown={onSizeKnown}
               onSelect={select}
-              onCreate={onCreate}
+              onCreate={boxes.onCreate}
               onRejectBox={() =>
                 toast.info("框太小（宽或高不足 1 像素），已忽略", {
                   duration: 1500,
@@ -1436,41 +1018,7 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
               onCommitBox={(uid, box) =>
                 change(updateObject(doc.objects, uid, box))
               }
-              overlay={(anchor) => {
-                if (!picker) {
-                  return null
-                }
-                const box =
-                  picker.mode === "new"
-                    ? picker.box
-                    : picker.mode === "relabel"
-                      ? doc.objects.find((o) => o.uid === picker.uid)
-                      : undefined
-                const point = box ? anchor(box) : null
-                return (
-                  <LabelPicker
-                    options={classOptions}
-                    flagUnlisted={projectClasses.length > 0}
-                    current={
-                      picker.mode === "relabel"
-                        ? (doc.objects.find((o) => o.uid === picker.uid)
-                            ?.name ?? null)
-                        : activeClass
-                    }
-                    title={
-                      picker.mode === "new"
-                        ? "选择这个框的类别"
-                        : picker.mode === "relabel"
-                          ? "修改类别"
-                          : "切换当前类别"
-                    }
-                    status={candidateStatus}
-                    onPick={onPick}
-                    onClose={() => setPicker(null)}
-                    anchor={point}
-                  />
-                )
-              }}
+              overlay={boxes.overlay}
             />
           ) : detailQ.error ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
@@ -1517,43 +1065,13 @@ export function AnnotationEditor({ dataset }: { dataset: Dataset }) {
       </Sheet>
 
       <ShortcutsDialog open={helpOpen} onOpenChange={setHelpOpen} mac={mac} />
-      <AlertDialog
+      <UnsavedChangesDialog
+        blocker={blocker}
         open={leavePromptOpen}
-        onOpenChange={(open) => {
-          if (!open) {
-            blocker.reset?.()
-          }
-        }}
-      >
-        <AlertDialogContent
-          onCloseAutoFocus={(event) => focusAfterDialog(event)}
-        >
-          <AlertDialogHeader>
-            <AlertDialogTitle>修改还没有保存</AlertDialogTitle>
-            <AlertDialogDescription>
-              {saveState.status === "conflict"
-                ? "这张图片的标注文件已被修改（可能有其他人同时在标注它），你的修改没有保存。留在这里可以载入最新版本或用你的版本覆盖；离开则放弃这些修改。"
-                : `最后的修改没有保存成功（${saveState.error ?? "未知错误"}）。留在这里可以重试保存；离开则放弃这些修改。`}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>留在这里</AlertDialogCancel>
-            <AlertDialogAction
-              variant="destructive"
-              onClick={(event) => {
-                // 不经过 onOpenChange（那里会取消这次离开）：继续离开后提示随
-                // 拦截状态一起关闭。放弃后，卸载时的保存、自动保存都不再写入
-                // 这些修改。
-                event.preventDefault()
-                discardChanges()
-                blocker.proceed?.()
-              }}
-            >
-              放弃修改并离开
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        saveState={saveState}
+        conflictMessage="这张图片的标注文件已被修改（可能有其他人同时在标注它），你的修改没有保存。留在这里可以载入最新版本或用你的版本覆盖；离开则放弃这些修改。"
+        onDiscard={discardChanges}
+      />
       <AlertDialog open={confirmClear} onOpenChange={setConfirmClear}>
         <AlertDialogContent
           onCloseAutoFocus={(event) => focusAfterDialog(event)}

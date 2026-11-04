@@ -569,7 +569,9 @@ type claimTaskRequest struct {
 }
 
 type claimTaskResponse struct {
-	Task *model.Task `json:"task"` // null: nothing to do within the wait
+	// Task is a *model.Task (model_export) or a task of another source
+	// (e.g. review_inference); null: nothing to do within the wait.
+	Task any `json:"task"`
 }
 
 // claimAgentTask long-polls for a task. It returns {"task": null} when

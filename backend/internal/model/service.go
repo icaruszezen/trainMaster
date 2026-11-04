@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,8 +66,8 @@ type Service struct {
 
 	uploads keyedMutex // serializes the writes to one upload's staged file (chunks, commit)
 	outputs keyedMutex // serializes the result uploads of one export, its completion and cleanup
-	waiters notifier   // wakes long-polling claims when a conversion is queued
-	workers workerSet  // nodes that recently claimed or worked on conversions
+	waiters notifier   // wakes long-polling claims when a task is queued
+	workers workerSet  // nodes that recently claimed or worked on tasks, by kind
 	busy    pathSet    // temporary paths in use that the janitor must not remove
 
 	// base ends with the service: long-polling claims return, and work that
@@ -78,6 +79,9 @@ type Service struct {
 	closeMu sync.Once
 
 	removeAll func(path string) error // os.RemoveAll; tests make it fail
+
+	sourcesMu sync.Mutex
+	sources   []TaskSource // AddTaskSource
 }
 
 // NewService creates a Service. It does not touch the database yet.
@@ -509,37 +513,67 @@ func (n *notifier) notify() {
 }
 
 // workerWindow is how long after its last claim or report a node counts
-// as working on conversions (workers_online). Nodes claim again at once
+// as working on a kind of task (workers_online). Nodes claim again at once
 // after an empty long poll (at most 30 seconds) and report progress every
-// 15 seconds while converting.
+// 15 seconds while working.
 const workerWindow = 60 * time.Second
 
-// workerSet remembers when nodes last claimed or worked on conversions.
+// workerSet remembers when nodes last claimed or worked on tasks, and the
+// kinds they offered. A node busy with a task of one kind still counts for
+// the other kinds it offered: it claims them again when it is done.
 type workerSet struct {
 	mu   sync.Mutex
-	seen map[int64]time.Time
+	seen map[int64]*worker
 }
 
-func (w *workerSet) touch(nodeID int64, now time.Time) {
+type worker struct {
+	at    time.Time
+	kinds []string
+}
+
+func (w *workerSet) entry(nodeID int64) *worker {
+	if w.seen == nil {
+		w.seen = map[int64]*worker{}
+	}
+	e := w.seen[nodeID]
+	if e == nil {
+		e = &worker{}
+		w.seen[nodeID] = e
+	}
+	return e
+}
+
+// offer records a claim of the node for the kinds (those it offers now).
+func (w *workerSet) offer(nodeID int64, kinds []string, now time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.seen == nil {
-		w.seen = map[int64]time.Time{}
-	}
-	w.seen[nodeID] = now
+	e := w.entry(nodeID)
+	e.at, e.kinds = now, slices.Clone(kinds)
 }
 
-// count returns the nodes seen within workerWindow before now and forgets
-// the others.
-func (w *workerSet) count(now time.Time) int {
+// touch records that the node worked on a task of the kind.
+func (w *workerSet) touch(nodeID int64, kind string, now time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	e := w.entry(nodeID)
+	e.at = now
+	if !slices.Contains(e.kinds, kind) {
+		e.kinds = append(e.kinds, kind)
+	}
+}
+
+// count returns the nodes of the kind seen within workerWindow before now
+// and forgets the nodes not seen within it.
+func (w *workerSet) count(kind string, now time.Time) int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	n := 0
-	for id, t := range w.seen {
-		if now.Sub(t) <= workerWindow {
-			n++
-		} else {
+	for id, e := range w.seen {
+		switch {
+		case now.Sub(e.at) > workerWindow:
 			delete(w.seen, id)
+		case slices.Contains(e.kinds, kind):
+			n++
 		}
 	}
 	return n

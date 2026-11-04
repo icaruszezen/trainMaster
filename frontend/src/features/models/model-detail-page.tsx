@@ -110,6 +110,10 @@ import {
   taskLabel,
   yoloVersionLabel,
 } from "@/features/models/yolo-versions"
+import {
+  ModelReviewsLink,
+  ReviewWithModelButton,
+} from "@/features/reviews/model-review-entry"
 import { CopyButton } from "@/features/training/command-block"
 import { useMediaQuery } from "@/hooks/use-media-query"
 import { usePageTitle } from "@/hooks/use-page-title"
@@ -206,6 +210,7 @@ function ModelDetail({ id }: { id: number }) {
           description={model.description || undefined}
           actions={
             <>
+              <ReviewWithModelButton model={model} />
               <Button
                 variant="outline"
                 onClick={() => actions.download(model, "pt")}
@@ -273,6 +278,7 @@ function ModelMeta({ model, onEdit }: { model: Model; onEdit: () => void }) {
         {model.source === "training" ? "保存于" : "上传于"}{" "}
         {formatRelativeTime(model.created_at)}
       </span>
+      <ModelReviewsLink modelId={model.id} />
       <Button
         variant="ghost"
         size="xs"
