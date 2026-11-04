@@ -39,14 +39,24 @@ func newTestEnv(t *testing.T, start bool) *testEnv {
 		t.Fatal(err)
 	}
 	svc := NewService(Options{DB: db.Pool, Storage: st, Logger: slog.New(slog.DiscardHandler)})
+	e := &testEnv{svc: svc, db: db, st: st}
 	if start {
-		ctx, cancel := context.WithCancel(context.Background())
-		if err := svc.Start(ctx); err != nil {
-			t.Fatalf("Start: %v", err)
-		}
-		t.Cleanup(func() { cancel(); svc.Stop() }) // runs before the database is dropped
+		e.start(t)
 	}
-	return &testEnv{svc: svc, db: db, st: st}
+	return e
+}
+
+// start runs the job workers. A test that reads the queued scan from
+// CreateDataset's result starts them only after CreateDataset returns: a
+// running worker can finish a small scan before CreateDataset reads the
+// dataset back, and ActiveImport is then nil.
+func (e *testEnv) start(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := e.svc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { cancel(); e.svc.Stop() }) // runs before the database is dropped
 }
 
 func (e *testEnv) datasetsDir() string { return e.st.Dir(storage.Datasets) }
@@ -188,7 +198,7 @@ func TestIntegrationCreateAndUpdateDataset(t *testing.T) {
 }
 
 func TestIntegrationRegisterAndScan(t *testing.T) {
-	e := newTestEnv(t, true)
+	e := newTestEnv(t, false)
 	ctx := context.Background()
 	dir := filepath.Join(e.datasetsDir(), "line1")
 	writeFiles(t, dir, map[string][]byte{
@@ -219,6 +229,7 @@ func TestIntegrationRegisterAndScan(t *testing.T) {
 	if d.Origin != OriginDirectory || d.DirName != "line1" || d.ActiveImport == nil || d.ActiveImport.Source != SourceScan {
 		t.Fatalf("dataset = %+v", d)
 	}
+	e.start(t)
 	job := e.waitJob(t, d.ID, d.ActiveImport.ID)
 	if job.Status != StatusSucceeded || job.FinishedAt == nil || job.StartedAt == nil {
 		t.Fatalf("scan job = %+v", job)
@@ -913,7 +924,7 @@ func TestIntegrationCancelRunningJob(t *testing.T) {
 }
 
 func TestIntegrationImageDetailReadsAnnotationNow(t *testing.T) {
-	e := newTestEnv(t, true)
+	e := newTestEnv(t, false)
 	ctx := context.Background()
 	dir := filepath.Join(e.datasetsDir(), "fresh")
 	writeFiles(t, dir, map[string][]byte{
@@ -925,6 +936,7 @@ func TestIntegrationImageDetailReadsAnnotationNow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	e.start(t)
 	if job := e.waitJob(t, d.ID, d.ActiveImport.ID); job.Status != StatusSucceeded {
 		t.Fatalf("scan = %+v", job)
 	}
@@ -967,7 +979,7 @@ func TestIntegrationImageDetailReadsAnnotationNow(t *testing.T) {
 }
 
 func TestIntegrationNonUTF8Names(t *testing.T) {
-	e := newTestEnv(t, true)
+	e := newTestEnv(t, false)
 	ctx := context.Background()
 	gbk := "\xbb\xae\xba\xdb" // 划痕 in GBK, as `unzip` leaves names from Chinese Windows
 	dir := filepath.Join(e.datasetsDir(), "lineA")
@@ -989,6 +1001,7 @@ func TestIntegrationNonUTF8Names(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	e.start(t)
 	job := e.waitJob(t, d.ID, d.ActiveImport.ID)
 	if job.Status != StatusSucceeded {
 		t.Fatalf("scan = %+v", job)

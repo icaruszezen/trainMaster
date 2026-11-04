@@ -91,21 +91,11 @@ func newReviewEnvWith(t *testing.T, token string, adjust func(o *Options)) *revi
 // scan.
 func (e *reviewEnv) dataset(t *testing.T, name string, files ...string) dataset.Dataset {
 	t.Helper()
-	dir := filepath.Join(e.st.Dir(storage.Datasets), name)
+	content := make(map[string]string, len(files))
 	for _, f := range files {
-		p := filepath.Join(dir, filepath.FromSlash(f))
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, testPNG(t, 64, 48), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		content[f] = string(testPNG(t, 64, 48))
 	}
-	ds := want[dataset.Dataset](t, e.do("POST", "/api/v1/datasets", map[string]any{"name": name, "directory": name}), 201)
-	if job := e.waitImport(t, ds.ID, ds.ActiveImport.ID); job.Status != dataset.StatusSucceeded {
-		t.Fatalf("scan = %+v", job)
-	}
-	return ds
+	return e.registerFolder(t, name, content)
 }
 
 func (e *reviewEnv) project(t *testing.T, name string) project.Project {
