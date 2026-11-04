@@ -73,13 +73,13 @@ export const routes: RouteObject[] = [
             Component: pages[item.id],
           })),
           // 模块的子页面。静态路径优先于动态参数，/datasets/versions 仍是数据版本页，
-          // /models/inference 仍是推理测试页，/models/reviews 仍是模型审图。
+          // /datasets/reviews 仍是模型审图，/models/inference 仍是推理测试页。
           { path: "/projects/:projectId", Component: ProjectDetailPage },
           { path: "/datasets/:datasetId", Component: DatasetDetailPage },
           { path: "/models/:modelId", Component: ModelDetailPage },
-          { path: "/models/reviews/:reviewId", Component: ReviewDetailPage },
+          { path: "/datasets/reviews/:reviewId", Component: ReviewDetailPage },
           {
-            path: "/models/reviews/:reviewId/workspace",
+            path: "/datasets/reviews/:reviewId/workspace",
             Component: ReviewWorkspacePage,
             handle: { fullBleed: true } satisfies RouteHandle,
           },

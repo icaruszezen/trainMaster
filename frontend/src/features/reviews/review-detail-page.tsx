@@ -1,5 +1,5 @@
 /**
- * 审图任务详情（`/models/reviews/:reviewId`）：识别进度或失败原因、各审核状态的
+ * 审图任务详情（`/datasets/reviews/:reviewId`）：识别进度或失败原因、各审核状态的
  * 图片数、每个数据集的情况、本地审图的步骤与上传、合并记录。排队、识别中或正在
  * 合并时自动刷新。
  */
@@ -133,7 +133,7 @@ function ReviewNotFound() {
       </EmptyHeader>
       <EmptyContent>
         <Button asChild>
-          <Link to="/models/reviews">
+          <Link to="/datasets/reviews">
             <ArrowLeft />
             返回审图任务列表
           </Link>
@@ -154,7 +154,7 @@ function ReviewDetail({ id }: { id: number }) {
   const navigate = useNavigate()
   const query = useQuery(reviewQuery(id))
   const { actions, dialogs } = useReviewActions({
-    onDeleted: () => navigate("/models/reviews", { replace: true }),
+    onDeleted: () => navigate("/datasets/reviews", { replace: true }),
   })
   const [dialog, setDialog] = useState<DialogState>(null)
 

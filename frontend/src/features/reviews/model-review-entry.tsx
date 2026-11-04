@@ -53,7 +53,7 @@ export function ModelReviewsLink({ modelId }: { modelId: number }) {
   }
   return (
     <Link
-      to={`/models/reviews?model=${modelId}`}
+      to={`/datasets/reviews?model=${modelId}`}
       className="inline-flex items-center gap-1 underline-offset-4 hover:text-foreground hover:underline"
     >
       <ScanEye className="size-3.5 shrink-0" />

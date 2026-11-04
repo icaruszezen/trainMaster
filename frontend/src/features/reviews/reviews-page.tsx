@@ -1,5 +1,5 @@
 /**
- * 模型审图（`/models/reviews`）：所有审图任务，可按项目与关键字筛选。项目与模型的
+ * 模型审图（`/datasets/reviews`）：所有审图任务，可按项目与关键字筛选。项目与模型的
  * 筛选保存在地址栏中（`?project=12`、`?model=7`），模型页面可以直接链接过来。
  */
 import { useMemo, useState } from "react"

@@ -113,7 +113,7 @@ export function sameReviewFilters(
 
 /** 审图任务的详情页。 */
 export function reviewDetailPath(reviewId: number) {
-  return `/models/reviews/${reviewId}`
+  return `/datasets/reviews/${reviewId}`
 }
 
 /**

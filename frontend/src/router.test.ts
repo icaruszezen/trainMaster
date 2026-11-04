@@ -60,17 +60,19 @@ describe("routes", () => {
     expect(leaf("/models/5")?.handle).toBeUndefined()
   })
 
-  it("routes reviews under the model repository", () => {
-    expect(leafComponent("/models/reviews")).toBe(ReviewsPage)
-    expect(leafComponent("/models/reviews/3")).toBe(ReviewDetailPage)
-    expect(leaf("/models/reviews/3")?.handle).toBeUndefined()
-    expect(leafComponent("/models/reviews/3/workspace")).toBe(
+  it("routes reviews under the datasets", () => {
+    expect(leafComponent("/datasets/reviews")).toBe(ReviewsPage)
+    expect(leafComponent("/datasets/reviews/3")).toBe(ReviewDetailPage)
+    expect(leaf("/datasets/reviews/3")?.handle).toBeUndefined()
+    expect(leafComponent("/datasets/reviews/3/workspace")).toBe(
       ReviewWorkspacePage
     )
-    expect(leaf("/models/reviews/3/workspace")?.handle).toEqual({
+    expect(leaf("/datasets/reviews/3/workspace")?.handle).toEqual({
       fullBleed: true,
     })
-    expect(leafComponent("/models/reviews/3/extra")).toBe(NotFoundPage)
+    expect(leafComponent("/datasets/reviews/3/extra")).toBe(NotFoundPage)
+    // 数据集详情不受影响。
+    expect(leafComponent("/datasets/12")).toBe(DatasetDetailPage)
   })
 
   it("marks only the 404 route as not found", () => {

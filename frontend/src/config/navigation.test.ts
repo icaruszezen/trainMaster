@@ -75,17 +75,22 @@ describe("navigation config", () => {
     })
   })
 
-  it("lists model review under the model management group", () => {
+  it("lists model review under the data management group", () => {
     expect(getNavItem("reviews")).toMatchObject({
       status: "ready",
       title: "模型审图",
-      path: "/models/reviews",
+      path: "/datasets/reviews",
       apiPath: "/api/v1/reviews",
     })
-    const group = navGroups.find((g) => g.id === "models")
-    expect(group?.items.map((item) => item.id)).toEqual([
-      "models",
+    const data = navGroups.find((g) => g.id === "data")
+    expect(data?.items.map((item) => item.id)).toEqual([
+      "datasets",
       "reviews",
+      "dataset-versions",
+    ])
+    const models = navGroups.find((g) => g.id === "models")
+    expect(models?.items.map((item) => item.id)).toEqual([
+      "models",
       "inference",
     ])
   })
@@ -113,8 +118,8 @@ describe("findActiveNavItem", () => {
     expect(activeId("/models/inference")).toBe("inference")
     expect(activeId("/models/abc")).toBe("models")
     expect(activeId("/models/12")).toBe("models")
-    expect(activeId("/models/reviews")).toBe("reviews")
-    expect(activeId("/models/reviews/3/workspace")).toBe("reviews")
+    expect(activeId("/datasets/reviews")).toBe("reviews")
+    expect(activeId("/datasets/reviews/3/workspace")).toBe("reviews")
   })
 
   it("matches whole path segments only", () => {

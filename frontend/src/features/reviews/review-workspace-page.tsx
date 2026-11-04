@@ -30,7 +30,7 @@ import { usePageTitle } from "@/hooks/use-page-title"
 import { ApiError } from "@/lib/api"
 import { formatNumber, percentOf } from "@/lib/format"
 
-/** `/models/reviews/:reviewId/workspace?image=`：网页审图。 */
+/** `/datasets/reviews/:reviewId/workspace?image=`：网页审图。 */
 export function ReviewWorkspacePage() {
   const { reviewId } = useParams()
   const id = parseId(reviewId)
@@ -139,7 +139,7 @@ function Missing() {
       </EmptyHeader>
       <EmptyContent>
         <Button asChild>
-          <Link to="/models/reviews">
+          <Link to="/datasets/reviews">
             <ArrowLeft />
             审图任务列表
           </Link>

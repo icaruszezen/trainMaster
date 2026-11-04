@@ -367,13 +367,13 @@ describe("requests and links", () => {
       ],
     }
     expect(reviewEntryPath(review)).toBe(
-      "/models/reviews/4/workspace?status=pending"
+      "/datasets/reviews/4/workspace?status=pending"
     )
     expect(reviewEntryPath(review, 1)).toBe(
-      "/models/reviews/4/workspace?status=pending&dataset_id=1"
+      "/datasets/reviews/4/workspace?status=pending&dataset_id=1"
     )
     expect(reviewEntryPath(review, 2)).toBe(
-      "/models/reviews/4/workspace?dataset_id=2"
+      "/datasets/reviews/4/workspace?dataset_id=2"
     )
   })
 })

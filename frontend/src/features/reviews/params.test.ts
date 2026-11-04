@@ -138,16 +138,16 @@ describe("sameReviewFilters", () => {
 
 describe("paths", () => {
   it("builds the detail and workspace paths", () => {
-    expect(reviewDetailPath(5)).toBe("/models/reviews/5")
-    expect(reviewWorkspacePath(5)).toBe("/models/reviews/5/workspace")
+    expect(reviewDetailPath(5)).toBe("/datasets/reviews/5")
+    expect(reviewWorkspacePath(5)).toBe("/datasets/reviews/5/workspace")
     expect(reviewWorkspacePath(5, { status: "pending" })).toBe(
-      "/models/reviews/5/workspace?status=pending"
+      "/datasets/reviews/5/workspace?status=pending"
     )
     expect(
       reviewWorkspacePath(5, { image: 9, status: "pending", datasetId: 2 })
-    ).toBe("/models/reviews/5/workspace?image=9&status=pending&dataset_id=2")
+    ).toBe("/datasets/reviews/5/workspace?image=9&status=pending&dataset_id=2")
     expect(reviewWorkspacePath(5, { status: "all", q: "" })).toBe(
-      "/models/reviews/5/workspace"
+      "/datasets/reviews/5/workspace"
     )
   })
 
