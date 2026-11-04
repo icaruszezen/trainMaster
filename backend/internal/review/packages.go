@@ -52,6 +52,18 @@ const packageBatch = 500
 
 var errPackageExpired = &Error{Kind: ErrNotFound, Message: "下载链接已失效，请重新下载"}
 
+// maxPackageManifest bounds the estimated size of review.json in a
+// package (manifestImageBytes): below the 256 MiB the platform and the
+// local reviewer read, since it is an estimate. Tests lower it.
+var maxPackageManifest int64 = maxManifestBytes - 16<<20
+
+// manifestImageBytes estimates the bytes of an image of review_images ri
+// in review.json: about 400 for the names and values of its fields, its
+// paths and error, and about 100 for each prediction.
+const manifestImageBytes = `400 + octet_length(ri.package_path) + octet_length(ri.rel_path) +
+	octet_length(ri.annotation_path) + octet_length(ri.inference_error) +
+	100 * CASE jsonb_typeof(ri.predictions) WHEN 'array' THEN jsonb_array_length(ri.predictions) ELSE 0 END`
+
 // PackageInput selects the images of a package. Only inferred images are
 // packed.
 type PackageInput struct {
@@ -179,7 +191,8 @@ func selectionFilter(reviewID int64, datasetIDs []int64, statuses []string, args
 }
 
 // CreatePackage prepares the download of a package of the review's
-// inferred images matching in.
+// inferred images matching in. A selection whose review.json would be too
+// large to be read again (maxPackageManifest) is refused.
 func (s *Service) CreatePackage(ctx context.Context, reviewID int64, in PackageInput) (PackageTicket, error) {
 	statuses, err := normalizeStatuses(in.Statuses, "statuses")
 	if err != nil {
@@ -207,12 +220,18 @@ func (s *Service) CreatePackage(ctx context.Context, reviewID int64, in PackageI
 	}
 	var args sqlArgs
 	var count int
-	if err := s.db.QueryRow(ctx, "SELECT count(*) FROM review_images ri WHERE "+
-		selectionFilter(reviewID, datasetIDs, statuses, &args), args...).Scan(&count); err != nil {
+	var size int64 // of review.json, estimated
+	if err := s.db.QueryRow(ctx, "SELECT count(*), coalesce(sum("+manifestImageBytes+"), 0) FROM review_images ri WHERE "+
+		selectionFilter(reviewID, datasetIDs, statuses, &args), args...).Scan(&count, &size); err != nil {
 		return PackageTicket{}, err
 	}
 	if count == 0 {
 		return PackageTicket{}, &Error{Kind: ErrConflict, Message: "没有符合条件的图片（只有识别完成的图片可以下载）"}
+	}
+	if size > maxPackageManifest {
+		return PackageTicket{}, newError(ErrConflict,
+			"选中的图片太多：审图包中的 review.json 会超过 %d MiB，本地审图程序无法打开，请按数据集或审核状态分批下载",
+			maxManifestBytes>>20)
 	}
 	now := s.clock()
 	r := packageRequest{reviewID: reviewID, statuses: statuses, datasetIDs: datasetIDs,
@@ -535,29 +554,40 @@ func (p *Package) writeManifest(ctx context.Context, zw *zip.Writer, packed map[
 		if err != nil {
 			return err
 		}
-		var n int
-		var img reviewfile.ManifestImage
-		var position int
-		if _, err := pgx.ForEachRow(rows, []any{&img.ID, &img.DatasetID, &img.ImageID, &position, &img.Path,
-			&img.SourcePath, &img.Annotation, &img.Width, &img.Height, &img.Predictions, &img.InferenceError}, func() error {
-			n++
-			last = position
+		// The batch is read before any of it is written: a write blocks while
+		// the client does not read, which must not hold a database
+		// connection.
+		type row struct {
+			img      reviewfile.ManifestImage
+			position int
+		}
+		batch, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (row, error) {
+			var b row
+			img := &b.img
+			err := r.Scan(&img.ID, &img.DatasetID, &img.ImageID, &b.position, &img.Path, &img.SourcePath,
+				&img.Annotation, &img.Width, &img.Height, &img.Predictions, &img.InferenceError)
+			return b, err
+		})
+		if err != nil {
+			return err
+		}
+		for i := range batch {
+			img := &batch[i].img
 			st := packed[img.ID]
 			if st == nil {
-				return nil // not packed: missing, or not selected
+				continue // not packed: missing, or not selected
 			}
 			img.HasAnnotation = st.version != ""
 			img.BaseStatus, img.BaseRevision, img.BaseAnnotationVersion = st.status, st.revision, st.version
 			img.Status, img.ReviewedAt, img.Edited = st.status, st.reviewedAt, st.edited
-			err := mw.Add(&img)
-			img = reviewfile.ManifestImage{}
-			return err
-		}); err != nil {
-			return err
+			if err := mw.Add(img); err != nil {
+				return err
+			}
 		}
-		if n < packageBatch {
+		if len(batch) < packageBatch {
 			return mw.Close()
 		}
+		last = batch[len(batch)-1].position
 	}
 }
 
@@ -626,6 +656,7 @@ func packageReadme(m *reviewfile.Manifest, statuses []string, exportedAt time.Ti
 	line("- 审图结果只更新这个审图任务自己的标注，不会直接改动数据集；需要时在平台上点“合并到数据集”。")
 	line("- 下载审图包之后，如果平台上有人修改了同一张图片，上传时会提示冲突，可以选择用本地结果覆盖。")
 	line("- 也可以用 LabelImg 等工具直接修改 .xml 文件，再把整个文件夹重新压缩成 zip 上传；这样只会更新")
-	line("  标注，审核状态需要在本地审图程序或平台上标记。")
+	line("  标注，审核状态需要在本地审图程序或平台上标记。在本地审图程序中标记过状态的文件夹不能这样")
+	line("  上传，请在程序中点“导出审图结果”。")
 	return []byte(b.String())
 }

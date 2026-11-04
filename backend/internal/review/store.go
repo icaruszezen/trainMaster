@@ -334,12 +334,25 @@ func sortedLabels(counts map[string]int) []dataset.LabelCount {
 type imageRow struct {
 	Image
 	predictions []Prediction
+	// The package whose uploaded results last changed the image and the
+	// revision they made (nil: none did).
+	uploadPackageID *string
+	uploadRevision  *int
+}
+
+// continues reports whether an upload of results from the package
+// packageID continues from the image's state: an earlier upload of the
+// same package made it, and nothing changed it since.
+func (r *imageRow) continues(packageID string) bool {
+	return packageID != "" && r.uploadPackageID != nil && *r.uploadPackageID == packageID &&
+		r.uploadRevision != nil && *r.uploadRevision == r.Revision
 }
 
 // queryImageRow reads a review image with its predictions; forUpdate
 // locks the row.
 func queryImageRow(ctx context.Context, q querier, reviewID, imageID int64, forUpdate bool) (imageRow, error) {
-	sql := "SELECT " + imageColumns + ", ri.predictions FROM review_images ri WHERE ri.id = $1 AND ri.review_id = $2"
+	sql := "SELECT " + imageColumns + ", ri.predictions, ri.upload_package_id, ri.upload_revision" +
+		" FROM review_images ri WHERE ri.id = $1 AND ri.review_id = $2"
 	if forUpdate {
 		sql += " FOR UPDATE"
 	}
@@ -350,7 +363,7 @@ func queryImageRow(ctx context.Context, q querier, reviewID, imageID int64, forU
 		&img.Position, &img.Path, &img.FileName, &img.PackagePath, &img.AnnotationPath, &img.Width, &img.Height,
 		&img.ImageVersion, &img.Inferred, &img.InferenceError, &img.ObjectCount, &labels, &img.PredictionCount,
 		&img.Edited, &img.Status, &img.Revision, &img.ReviewedAt, &img.MergedAt, &img.AnnotationVersion,
-		&r.predictions)
+		&r.predictions, &r.uploadPackageID, &r.uploadRevision)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return r, errImageNotFound
 	}

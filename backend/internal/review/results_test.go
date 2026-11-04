@@ -5,10 +5,15 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/fs"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 	"github.com/icaruszezen/trainmaster/backend/internal/reviewfile"
@@ -25,7 +30,8 @@ type localEdits struct {
 
 // makeResults turns a package into the results the local reviewer would
 // export after the edits: review.json of kind results and the VOC files
-// that changed, in "<package folder>-审图结果/".
+// of the edits (the local reviewer adds the others too, which change
+// nothing), in "<package folder>-审图结果/".
 func makeResults(t *testing.T, pkg []byte, edits localEdits) []byte {
 	t.Helper()
 	files, content := zipEntries(t, pkg)
@@ -59,9 +65,10 @@ func makeResults(t *testing.T, pkg []byte, edits localEdits) []byte {
 		if raw, ok := edits.raw[img.ID]; ok {
 			data = raw
 		}
-		if data != nil && reviewfile.AnnotationVersion(data) != img.BaseAnnotationVersion {
+		if data != nil {
 			add(img.Annotation, data)
-			img.Edited = true
+			img.HasAnnotation = true
+			img.Edited = img.Edited || reviewfile.AnnotationVersion(data) != img.BaseAnnotationVersion
 		}
 	}
 	if edits.manifest != nil {
@@ -79,24 +86,44 @@ func makeResults(t *testing.T, pkg []byte, edits localEdits) []byte {
 }
 
 // rezip zips a package again below the folder outer/, replacing the
-// content of some entries (by their name in the package folder).
+// content of some entries (by their name in the package folder) and
+// adding those of replace it does not have.
 func rezip(t *testing.T, pkg []byte, replace map[string][]byte) []byte {
+	t.Helper()
+	return rezipNamed(t, pkg, replace, func(name string) zip.FileHeader { return zip.FileHeader{Name: "outer/" + name} })
+}
+
+// rezipNamed is rezip with the zip entries' headers made by header from
+// the names in the package zip.
+func rezipNamed(t *testing.T, pkg []byte, replace map[string][]byte, header func(name string) zip.FileHeader) []byte {
 	t.Helper()
 	files, content := zipEntries(t, pkg)
 	top := strings.TrimSuffix(files[0].Name, "/"+reviewfile.ReadmeFile)
 	var b bytes.Buffer
 	zw := zip.NewWriter(&b)
-	for _, f := range files {
-		data := content[f.Name]
-		if r, ok := replace[strings.TrimPrefix(f.Name, top+"/")]; ok {
-			data = r
-		}
-		w, err := zw.Create("outer/" + f.Name)
+	add := func(name string, data []byte) {
+		h := header(name)
+		w, err := zw.CreateHeader(&h)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, err := w.Write(data); err != nil {
 			t.Fatal(err)
+		}
+	}
+	seen := map[string]bool{}
+	for _, f := range files {
+		data := content[f.Name]
+		rel := strings.TrimPrefix(f.Name, top+"/")
+		if r, ok := replace[rel]; ok {
+			data = r
+			seen[rel] = true
+		}
+		add(f.Name, data)
+	}
+	for _, rel := range slices.Sorted(maps.Keys(replace)) {
+		if !seen[rel] {
+			add(top+"/"+rel, replace[rel])
 		}
 	}
 	if err := zw.Close(); err != nil {
@@ -233,8 +260,9 @@ func TestIntegrationResultsRoundTrip(t *testing.T) {
 		dataset.AnnotationObject{Name: "scratch", Xmin: 3, Ymin: 3, Xmax: 20, Ymax: 20, Difficult: true}, obj("dent", 1, 1, 9, 9))) {
 		t.Errorf("a after the re-zipped package = %+v", got.Objects)
 	}
-	if uploads, err := e.svc.ListUploads(ctx, r.ID); err != nil || len(uploads) != 5 || uploads[0].ID != up.ID {
-		t.Errorf("ListUploads = %+v, %v", uploads, err)
+	if uploads, total, err := e.svc.ListUploads(ctx, r.ID); err != nil || len(uploads) != 5 || uploads[0].ID != up.ID ||
+		total != 5 {
+		t.Errorf("ListUploads = %+v, %d, %v", uploads, total, err)
 	}
 }
 
@@ -308,6 +336,10 @@ func TestIntegrationResultsProblems(t *testing.T) {
 	if err != nil {
 		t.Errorf("re-zipped package: %v", err)
 	}
+	// The folder the local reviewer works in, zipped: the statuses set
+	// there are only in its progress file.
+	_, err = e.upload(r.ID, rezip(t, pkg, map[string][]byte{reviewfile.ProgressFile: []byte(`{}`)}), false)
+	wantKind(t, err, ErrInvalid, "请在本地审图程序中点“导出审图结果”")
 	_, contents := zipEntries(t, pkg)
 	otherPackage := rezip(t, pkg, map[string][]byte{"review.json": bytes.Replace(
 		contents[fmt.Sprintf("审图-%d-外观检测 v1 审图/review.json", r.ID)],
@@ -351,10 +383,10 @@ func TestIntegrationResultsProblems(t *testing.T) {
 	if up.Summary != (UploadSummary{Images: 5, Applied: 1, StatusChanges: 1, Unchanged: 3, Unknown: 1}) {
 		t.Errorf("upload after a removal = %+v", up)
 	}
-	if uploads, err := e.svc.ListUploads(ctx, r.ID); err != nil || len(uploads) != 4 {
-		t.Errorf("ListUploads = %d, %v", len(uploads), err)
+	if uploads, total, err := e.svc.ListUploads(ctx, r.ID); err != nil || len(uploads) != 4 || total != 4 {
+		t.Errorf("ListUploads = %d, %d, %v", len(uploads), total, err)
 	}
-	_, err = e.svc.ListUploads(ctx, 999)
+	_, _, err = e.svc.ListUploads(ctx, 999)
 	wantKind(t, err, ErrNotFound, "审图任务不存在")
 }
 
@@ -383,5 +415,209 @@ func TestIntegrationStagedUploadsCleanup(t *testing.T) {
 	e.svc.cleanUploadTemp()
 	if exists(old) || !exists(fresh) || !exists(busy) {
 		t.Errorf("after cleanup: old %v, fresh %v, busy %v", exists(old), exists(fresh), exists(busy))
+	}
+}
+
+// TestIntegrationResultsContinuation uploads results of one package again
+// while the review goes on: the platform takes the local state, changes
+// back to the package's included, without reporting its own earlier
+// upload as a conflict; changes made on the platform meanwhile still
+// conflict.
+func TestIntegrationResultsContinuation(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	r, images, _, _ := e.exchangeReview(t)
+	b, a, c, d := images[0], images[1], images[2], images[3]
+	pkg, _ := e.downloadPackage(t, r.ID, PackageInput{})
+	_, contents := zipEntries(t, pkg)
+	top := fmt.Sprintf("审图-%d-外观检测 v1 审图/", r.ID)
+	packagedB := contents[top+b.AnnotationPath]
+	if packagedB == nil {
+		t.Fatalf("b has no VOC file in the package")
+	}
+
+	up := e.mustUpload(t, r.ID, makeResults(t, pkg, localEdits{
+		statuses: map[int64]string{a.ID: reviewfile.StatusApproved, d.ID: reviewfile.StatusNeedsSample},
+		objects:  map[int64][]dataset.AnnotationObject{b.ID: objs(obj("dent", 2, 2, 20, 20))},
+	}), false)
+	if up.Summary != (UploadSummary{Images: 5, Applied: 3, StatusChanges: 2, AnnotationChanges: 1, Unchanged: 2}) {
+		t.Fatalf("first upload = %+v", up)
+	}
+
+	// Later results of the package: a back to pending, b with its packaged
+	// VOC file again, d approved, c approved.
+	later := makeResults(t, pkg, localEdits{
+		statuses: map[int64]string{d.ID: reviewfile.StatusApproved, c.ID: reviewfile.StatusApproved},
+		raw:      map[int64][]byte{b.ID: packagedB},
+	})
+	up = e.mustUpload(t, r.ID, later, false)
+	if up.Summary != (UploadSummary{Images: 5, Applied: 4, StatusChanges: 3, AnnotationChanges: 1, Unchanged: 1}) ||
+		len(up.Problems) != 0 {
+		t.Errorf("later upload = %+v", up)
+	}
+	for _, tt := range []struct {
+		img     Image
+		status  string
+		objects []dataset.AnnotationObject
+	}{
+		{a, reviewfile.StatusPending, objs(obj("scratch", 3, 3, 20, 20))},
+		{b, reviewfile.StatusPending, objs(obj("scratch", 1, 1, 10, 10), obj("dent", 2, 2, 12, 12))},
+		{c, reviewfile.StatusApproved, objs()},
+		{d, reviewfile.StatusApproved, objs()},
+	} {
+		got := e.detail(t, r.ID, tt.img.ID)
+		if got.Status != tt.status || !reviewfile.SameObjects(got.Objects, tt.objects) ||
+			(tt.status != reviewfile.StatusPending) != (got.ReviewedAt != nil) {
+			t.Errorf("%s after the later upload = %+v", tt.img.Path, got)
+		}
+	}
+	if got := e.detail(t, r.ID, b.ID); got.Edited {
+		t.Errorf("b with the packaged boxes again is edited: %+v", got)
+	}
+	if again := e.mustUpload(t, r.ID, later, false); again.Summary != (UploadSummary{Images: 5, Unchanged: 5}) {
+		t.Errorf("later upload repeated = %+v", again)
+	}
+
+	// The package zipped again (LabelImg) continues for its VOC files, but
+	// it has no statuses of its own: d keeps the status uploaded before.
+	up = e.mustUpload(t, r.ID, rezip(t, pkg, map[string][]byte{
+		d.AnnotationPath: reviewfile.EncodeAnnotation(d.Path, d.Width, d.Height, objs(obj("dent", 5, 5, 15, 15))),
+	}), false)
+	if up.Summary != (UploadSummary{Images: 5, Applied: 1, AnnotationChanges: 1, Unchanged: 4}) {
+		t.Errorf("re-zipped package upload = %+v", up)
+	}
+	if got := e.detail(t, r.ID, d.ID); got.Status != reviewfile.StatusApproved || got.ObjectCount != 1 {
+		t.Errorf("d after the re-zipped package = %+v", got)
+	}
+
+	// Changed on the platform meanwhile: a conflict, also for an image the
+	// package's results changed before; the others still continue.
+	if _, err := e.svc.SetStatus(ctx, r.ID, c.ID, reviewfile.StatusNeedsSample); err != nil {
+		t.Fatal(err)
+	}
+	up = e.mustUpload(t, r.ID, makeResults(t, pkg, localEdits{
+		statuses: map[int64]string{c.ID: reviewfile.StatusApproved, d.ID: reviewfile.StatusPending},
+	}), false)
+	if up.Summary != (UploadSummary{Images: 5, Applied: 1, StatusChanges: 1, Unchanged: 3, Conflicts: 1}) ||
+		len(up.Problems) != 1 || up.Problems[0] != (Problem{Path: c.PackagePath, Kind: ProblemConflict, Message: msgUploadConflict}) {
+		t.Errorf("upload after a change on the platform = %+v", up)
+	}
+	if got := e.detail(t, r.ID, c.ID); got.Status != reviewfile.StatusNeedsSample {
+		t.Errorf("c after the conflict = %+v", got)
+	}
+	if got := e.detail(t, r.ID, d.ID); got.Status != reviewfile.StatusPending {
+		t.Errorf("d after the upload = %+v", got)
+	}
+
+	// Results of another package of the review do not continue from this
+	// one's: d changed since that package was made.
+	pkg2, _ := e.downloadPackage(t, r.ID, PackageInput{})
+	if _, err := e.svc.SetStatus(ctx, r.ID, d.ID, reviewfile.StatusApproved); err != nil {
+		t.Fatal(err)
+	}
+	other := makeResults(t, pkg2, localEdits{statuses: map[int64]string{d.ID: reviewfile.StatusNeedsSample}})
+	if up := e.mustUpload(t, r.ID, other, false); up.Summary.Conflicts != 1 || up.Summary.Applied != 0 {
+		t.Errorf("upload of another package = %+v", up)
+	}
+}
+
+// TestIntegrationResultsGBKNames uploads a package zipped again by a zip
+// tool of Chinese Windows, which writes the entry names in GBK (and "\"
+// between folders): the VOC files under Chinese names are still found.
+func TestIntegrationResultsGBKNames(t *testing.T) {
+	e := newTestEnv(t)
+	m := e.addModel(t, e.project(t, "外观检测"), testModel{})
+	ds := e.addDataset(t, "产线", "产线", testImage{rel: "划痕.png"}, testImage{rel: "NG/凹陷.png"})
+	r := e.create(t, CreateInput{ModelID: m.ID, DatasetIDs: []int64{ds}})
+	node := e.node(t, "node-1")
+	e.claim(t, node)
+	e.inferAll(t, r.ID, node)
+	images := e.images(t, r.ID, ImageQuery{})
+	var scratch Image
+	for _, img := range images {
+		if img.AnnotationPath == "产线/划痕.xml" {
+			scratch = img
+		}
+	}
+	if scratch.ID == 0 {
+		t.Fatalf("images = %+v", images)
+	}
+	pkg, _ := e.downloadPackage(t, r.ID, PackageInput{})
+	gbk := simplifiedchinese.GBK.NewEncoder()
+	zipped := rezipNamed(t, pkg, map[string][]byte{
+		scratch.AnnotationPath: reviewfile.EncodeAnnotation(scratch.Path, scratch.Width, scratch.Height,
+			objs(obj("划痕", 2, 2, 30, 20))),
+	}, func(name string) zip.FileHeader {
+		encoded, err := gbk.String(strings.ReplaceAll("压缩/"+name, "/", `\`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return zip.FileHeader{Name: encoded, NonUTF8: true}
+	})
+	up := e.mustUpload(t, r.ID, zipped, false)
+	if up.Summary != (UploadSummary{Images: 2, Applied: 1, AnnotationChanges: 1, Unchanged: 1}) || len(up.Problems) != 0 {
+		t.Errorf("upload = %+v", up)
+	}
+	if got := e.detail(t, r.ID, scratch.ID); !reviewfile.SameObjects(got.Objects, objs(obj("划痕", 2, 2, 30, 20))) {
+		t.Errorf("划痕.png after the upload = %+v", got.Objects)
+	}
+}
+
+// TestReadResultsFolderEntries reads zips whose review.json entry is a
+// folder by its mode, without a "/" at the end of its name: it is no
+// review.json.
+func TestReadResultsFolderEntries(t *testing.T) {
+	for name, header := range map[string]func() *zip.FileHeader{
+		"unix mode": func() *zip.FileHeader {
+			h := &zip.FileHeader{Name: "top/review.json"}
+			h.SetMode(fs.ModeDir | 0o755)
+			return h
+		},
+		"MS-DOS attribute": func() *zip.FileHeader {
+			return &zip.FileHeader{Name: "top/review.json", CreatorVersion: 0, ExternalAttrs: 0x10}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var b bytes.Buffer
+			zw := zip.NewWriter(&b)
+			h := header()
+			if _, err := zw.CreateHeader(h); err != nil {
+				t.Fatal(err)
+			}
+			w, _ := zw.Create("top/README.txt")
+			_, _ = w.Write([]byte("x"))
+			if err := zw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			zr, err := zip.NewReader(bytes.NewReader(b.Bytes()), int64(b.Len()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !zr.File[0].FileInfo().IsDir() {
+				t.Fatalf("the entry is no folder: %v", zr.File[0].Mode())
+			}
+			_, err = (&Service{}).readResults(1, zr)
+			wantKind(t, err, ErrInvalid, "压缩包中没有 review.json")
+		})
+	}
+}
+
+func TestIntegrationListedTotals(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	r, _, _, _ := e.exchangeReview(t)
+	if _, err := e.db.Exec(ctx, `INSERT INTO review_uploads (review_id, file_name, overwrite, summary)
+		SELECT $1, 'x.zip', false, '{}' FROM generate_series(1, 51)`, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Exec(ctx, `INSERT INTO review_merges (review_id, dataset_ids, statuses, on_existing, status)
+		SELECT $1, '{1}', '{approved}', 'skip', 'succeeded' FROM generate_series(1, 52)`, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if uploads, total, err := e.svc.ListUploads(ctx, r.ID); err != nil || len(uploads) != 50 || total != 51 {
+		t.Errorf("ListUploads = %d, %d, %v", len(uploads), total, err)
+	}
+	if merges, total, err := e.svc.ListMerges(ctx, r.ID); err != nil || len(merges) != 50 || total != 52 {
+		t.Errorf("ListMerges = %d, %d, %v", len(merges), total, err)
 	}
 }

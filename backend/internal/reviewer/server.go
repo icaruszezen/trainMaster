@@ -264,7 +264,7 @@ func (s *Server) runOpen(ctx context.Context, job *openJob, target openTarget) {
 		dir, resumed, err = extractPackage(ctx, target.zipPath, job.progress)
 	}
 	var pkg *Package
-	if err == nil {
+	if err == nil && !s.isOpen(dir) {
 		job.setStage(stageLoading)
 		pkg, err = loadPackage(ctx, dir, loadOptions{zipPath: target.zipPath, resumed: resumed, now: s.now,
 			progress: job.progress})
@@ -273,6 +273,11 @@ func (s *Server) runOpen(ctx context.Context, job *openJob, target openTarget) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.opening = nil
+	if err == nil && pkg == nil {
+		// The zip of the package open now: it stays open, as when its
+		// folder is opened again (see Open; the folder is locked by it).
+		return
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			s.log.Info("opening canceled", "path", job.path)
@@ -294,6 +299,13 @@ func (s *Server) runOpen(ctx context.Context, job *openJob, target openTarget) {
 	s.putRecent(info, true)
 	s.log.Info("package opened", "path", info.Path, "zip", info.ZipPath, "review_id", info.Review.ID,
 		"images", info.Counts.Total, "resumed", info.Resumed, "elapsed", s.now().Sub(started).Round(time.Millisecond))
+}
+
+// isOpen reports whether the package in the folder dir is the one open.
+func (s *Server) isOpen(dir string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pkg != nil && samePath(dir, s.pkg.dir)
 }
 
 // Close closes the open package.

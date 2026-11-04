@@ -48,6 +48,18 @@ import { cn } from "@/lib/utils"
 
 type Transfer = { loaded: number; total: number; speed: number }
 
+/**
+ * 上传失败时的提示，只在对话框已经关闭（传完后选了“在后台继续”）时显示：对话框
+ * 开着时错误显示在其中。平台收到整个文件后才检查它（不是 zip、不是这个任务的
+ * 审图结果等），这些错误正是在后台继续之后返回的。取消的上传不提示。
+ */
+export function notifyUploadFailure(error: Error, dialogOpen: boolean) {
+  if (dialogOpen || isAbortError(error)) {
+    return
+  }
+  toast.error("审图结果没有应用", { description: error.message })
+}
+
 export function UploadResultsDialog({
   review,
   open,
@@ -84,6 +96,8 @@ function UploadForm({
   const [overwrite, setOverwrite] = useState(false)
   const [dragging, setDragging] = useState(false)
   const [transfer, setTransfer] = useState<Transfer | null>(null)
+  // 对话框（这个表单）是否还开着，见 notifyUploadFailure。
+  const openRef = useRef(false)
 
   const mutation = useMutation({
     mutationFn: ({
@@ -136,6 +150,8 @@ function UploadForm({
         })
       }
     },
+    // 与 onSuccess 一样在对话框关闭后照常调用（属于这次上传，不随组件卸载）。
+    onError: (error) => notifyUploadFailure(error, openRef.current),
     onSettled: () => {
       abortRef.current = null
     },
@@ -146,19 +162,21 @@ function UploadForm({
   const sent = transfer !== null && transfer.loaded >= transfer.total
   const result = mutation.data
 
-  // 关闭对话框时取消还没有传完的上传；已经传完的由平台继续处理（结果见上传记录）。
+  // 关闭对话框时取消还没有传完的上传；已经传完的由平台继续处理（结果见上传记录，
+  // 失败时提示）。
   const sentRef = useRef(sent)
   useEffect(() => {
     sentRef.current = sent
   }, [sent])
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    openRef.current = true
+    return () => {
+      openRef.current = false
       if (!sentRef.current) {
         abortRef.current?.abort()
       }
-    },
-    []
-  )
+    }
+  }, [])
 
   const choose = (next: File | null) => {
     setFile(next)

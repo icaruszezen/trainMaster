@@ -163,12 +163,12 @@ func (s *server) listReviewUploads(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	items, err := s.reviews.ListUploads(r.Context(), id)
+	items, total, err := s.reviews.ListUploads(r.Context(), id)
 	if err != nil {
 		s.reviewError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, NewList(items, len(items)))
+	writeJSON(w, http.StatusOK, NewList(items, total))
 }
 
 // ---- merges ----
@@ -202,12 +202,12 @@ func (s *server) listReviewMerges(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	items, err := s.reviews.ListMerges(r.Context(), id)
+	items, total, err := s.reviews.ListMerges(r.Context(), id)
 	if err != nil {
 		s.reviewError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, NewList(items, len(items)))
+	writeJSON(w, http.StatusOK, NewList(items, total))
 }
 
 func (s *server) getReviewMerge(w http.ResponseWriter, r *http.Request) {

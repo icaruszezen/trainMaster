@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { FileArchive, X } from "lucide-react"
 import { Navigate, useNavigate } from "react-router"
@@ -21,9 +21,12 @@ import {
   sessionQuery,
   type PackageInfo,
 } from "@/reviewer/api"
-import { registerEditorControls } from "@/reviewer/editor-controls"
+import {
+  discardEditor,
+  registerEditorControls,
+} from "@/reviewer/editor-controls"
 import { useExportResults } from "@/reviewer/export-dialog"
-import { pageTitle } from "@/reviewer/format"
+import { packageKey, pageTitle } from "@/reviewer/format"
 import { usePageTitle } from "@/reviewer/start-page"
 
 /** `/review?image=`：审打开的审图包（编辑器与平台的网页审图相同）。 */
@@ -48,10 +51,36 @@ export function ReviewPage() {
     )
   }
   const pkg = session.data.package
-  if (!pkg) {
+  // 没有打开的审图包，或正在打开另一个审图包：回到开始页（那里显示打开的进度，
+  // 打开完成后进入新的审图包）。编辑器随之卸载并保存最后的修改：程序在打开完成
+  // 时才关闭这个审图包，在那之前保存的修改都还写进它。
+  if (!pkg || session.data.opening) {
     return <Navigate to="/" replace />
   }
-  return <PackageReview key={pkg.package_id + pkg.path} pkg={pkg} />
+  return <PackageGate pkg={pkg} />
+}
+
+/**
+ * 审着的审图包被换掉了（如在另一个页面打开了别的审图包，这里没有看到打开的
+ * 过程）：程序已经关闭了它，这时保存的修改会写进新的审图包。所以放弃还没有保存
+ * 的修改（提示用户），回到开始页。
+ */
+function PackageGate({ pkg }: { pkg: PackageInfo }) {
+  const navigate = useNavigate()
+  const [shown] = useState(pkg)
+  const switched = packageKey(pkg) !== packageKey(shown)
+  useEffect(() => {
+    if (!switched) {
+      return
+    }
+    if (discardEditor()) {
+      toast.warning("已打开另一个审图包", {
+        description: `“${shown.review.name}”中最后的修改没有保存。`,
+      })
+    }
+    navigate("/", { replace: true })
+  }, [switched, shown, navigate])
+  return <PackageReview pkg={switched ? shown : pkg} />
 }
 
 function PackageReview({ pkg }: { pkg: PackageInfo }) {

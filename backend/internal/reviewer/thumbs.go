@@ -2,6 +2,8 @@ package reviewer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -52,12 +54,20 @@ func newThumbnailer(cacheDir string) *thumbnailer {
 	return t
 }
 
-// packageDir returns the cache folder of a package (its ID is hex).
+// packageDir returns the cache folder of a package: named by its ID (32
+// lowercase hex digits, as the platform makes them), or by a hash of an ID
+// that is not one, so that review.json (from a zip the user opened) can
+// never name a folder outside the cache.
 func (t *thumbnailer) packageDir(packageID string) string {
-	if t.dir == "" {
-		return filepath.Join(os.TempDir(), "trainmaster-reviewer-thumbs", packageID)
+	name := packageID
+	if len(name) != 32 || strings.Trim(name, "0123456789abcdef") != "" {
+		sum := sha256.Sum256([]byte(packageID))
+		name = hex.EncodeToString(sum[:16])
 	}
-	return filepath.Join(t.dir, packageID)
+	if t.dir == "" {
+		return filepath.Join(os.TempDir(), "trainmaster-reviewer-thumbs", name)
+	}
+	return filepath.Join(t.dir, name)
 }
 
 // touch marks the cache of a package as used (cleanup keeps it).

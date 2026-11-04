@@ -97,6 +97,12 @@ CREATE TABLE review_images (
     reviewed_at        timestamptz,                  -- last change to approved / needs_sample; NULL when pending
     merged_at          timestamptz,                  -- last merge into the dataset
     merged_revision    integer,                      -- the revision merged then
+    -- The package (review.json package_id) whose uploaded results last
+    -- changed the image, and the revision they made: while the revision is
+    -- still that one, a later upload from the same package continues from
+    -- it (no conflict; the local state counts, reverts included).
+    upload_package_id  text,
+    upload_revision    integer,
     updated_at         timestamptz NOT NULL DEFAULT now(),
     FOREIGN KEY (review_id, dataset_id) REFERENCES review_datasets (review_id, dataset_id) ON DELETE CASCADE,
     UNIQUE (review_id, image_id),

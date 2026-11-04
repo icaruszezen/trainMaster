@@ -16,10 +16,13 @@ import (
 // The results (审图结果) are a zip next to the package folder,
 // "<folder>-审图结果.zip", with one top folder "<package folder>-审图结果/"
 // holding review.json of kind results (every image of the package with
-// its status now; the base_* fields as in the package) and the VOC files
-// whose content differs from the package, at their paths in the package.
-// The platform applies them when the zip is uploaded on the review's page
-// (internal/review/results.go). Exporting again replaces the file.
+// its status now; the base_* fields as in the package) and the VOC file of
+// every image that has one that can be read, at its path in the package
+// (has_annotation). The platform applies them when the zip is uploaded on
+// the review's page (internal/review/results.go): a VOC file as in the
+// package is no change, except for an image that an earlier upload of
+// these results changed, where it is the change back to the package's
+// annotation. Exporting again replaces the file.
 
 // resultsSuffix ends the names of the results zip and its top folder.
 const resultsSuffix = "-审图结果"
@@ -29,7 +32,7 @@ type ExportResult struct {
 	ExportInfo
 	Images            int `json:"images"`             // in review.json
 	StatusChanges     int `json:"status_changes"`     // images whose status differs from the package
-	AnnotationChanges int `json:"annotation_changes"` // VOC files in the zip
+	AnnotationChanges int `json:"annotation_changes"` // VOC files that differ from the package
 	// Skipped counts changed VOC files left out because they cannot be read
 	// (the platform would refuse the whole image; its status still counts).
 	Skipped       int      `json:"skipped"`
@@ -74,7 +77,6 @@ func (p *Package) Export() (ExportResult, error) {
 		img.setAnnotation(a)
 		mi := *img.m
 		mi.Status, mi.ReviewedAt, mi.Edited = img.status, img.reviewedAt, img.edited
-		mi.HasAnnotation = false
 		changedStatus := img.status != img.m.BaseStatus
 		changedVOC := a.version != img.m.BaseAnnotationVersion && a.data != nil
 		switch {
@@ -85,9 +87,13 @@ func (p *Package) Export() (ExportResult, error) {
 			}
 			changedVOC = false
 		case changedVOC:
-			vocs = append(vocs, vocFile{rel: img.m.Annotation, data: a.data})
-			mi.HasAnnotation = true
 			res.AnnotationChanges++
+		}
+		// Every VOC file that can be read, also one as in the package (see
+		// the top of this file).
+		mi.HasAnnotation = a.data != nil && a.err == ""
+		if mi.HasAnnotation {
+			vocs = append(vocs, vocFile{rel: img.m.Annotation, data: a.data})
 		}
 		if changedStatus {
 			res.StatusChanges++
@@ -171,7 +177,8 @@ func resultsReadme(m *reviewfile.Manifest, res ExportResult, exportedAt time.Tim
 	line("这个压缩包是本地审图程序导出的审图结果。请回到平台上这个审图任务的页面，点“上传审图结果”，")
 	line("选择这个压缩包（不用解压）。平台读取后才会更新图片的审核状态和审图标注。")
 	line("")
-	line("review.json 记录了每张图片的审核状态；只包含在本地修改过的标注文件。请不要修改压缩包中的内容。")
+	line("review.json 记录了每张图片的审核状态，压缩包中还有各图片现在的标注文件（平台只更新有变化的）。")
+	line("请不要修改压缩包中的内容。")
 	return []byte(b.String())
 }
 

@@ -19,12 +19,15 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	stdlog "log"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -83,13 +86,20 @@ func run() int {
 	configDir, cacheDir := appDir(os.UserConfigDir), appDir(os.UserCacheDir)
 	log, closeLog := newLogger(cacheDir)
 	defer closeLog()
+	// go-webview2 reports with the standard log package (and ends the
+	// program with log.Fatal when WebView2 fails, see ui_windows.go).
+	libLog := &libraryLog{log: log}
+	stdlog.SetFlags(0)
+	stdlog.SetOutput(libLog)
 
 	u := newUI(*browser, *noOpen, cacheDir, log)
+	u.libLog = libLog
 	ln, err := listen(*addr)
 	if err != nil {
 		u.fatal(fmt.Sprintf("本地审图程序无法启动：%v", err))
 		return 1
 	}
+	hosts, base := serverAddress(ln.Addr().(*net.TCPAddr))
 	port := ln.Addr().(*net.TCPAddr).Port
 	token := rand.Text()
 	webFS, err := fs.Sub(web, "web")
@@ -105,7 +115,7 @@ func run() int {
 	srv := reviewer.New(reviewer.Options{
 		Web:        webFS,
 		Token:      token,
-		Hosts:      []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), net.JoinHostPort("localhost", strconv.Itoa(port))},
+		Hosts:      hosts,
 		CookieName: "tm_reviewer_" + strconv.Itoa(port),
 		Version:    version(),
 		ConfigDir:  configDir,
@@ -137,20 +147,23 @@ func run() int {
 	if open != "" {
 		page = "/review"
 	}
-	u.url = fmt.Sprintf("http://127.0.0.1:%d%s?token=%s", port, page, token)
-	uiErr := u.run(served)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = httpSrv.Shutdown(ctx)
-	srv.Shutdown()
-	if uiErr != nil {
-		log.Error("local reviewer stopped", "err", uiErr)
-		u.fatal(fmt.Sprintf("本地审图程序出错：%v", uiErr))
-		return 1
+	u.url = base + page + "?token=" + token
+	// stop ends the program once the page is closed (also called by the
+	// window when WebView2 fails where go-webview2 would end the program).
+	u.stop = func(uiErr error) int {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(ctx)
+		srv.Shutdown()
+		if uiErr != nil {
+			log.Error("local reviewer stopped", "err", uiErr)
+			u.fatal(fmt.Sprintf("本地审图程序出错：%v", uiErr))
+			return 1
+		}
+		log.Info("local reviewer stopped")
+		return 0
 	}
-	log.Info("local reviewer stopped")
-	return 0
+	return u.stop(u.run(served))
 }
 
 // version is the program's version: that of the platform it is built with.
@@ -177,6 +190,19 @@ func listen(addr string) (net.Listener, error) {
 		}
 	}
 	return net.Listen("tcp", net.JoinHostPort(host, port))
+}
+
+// serverAddress returns the Host headers the server accepts and the URL
+// of the page (without a path) for the address it listens on: its own
+// address, and localhost for 127.0.0.1 and ::1.
+func serverAddress(addr *net.TCPAddr) (hosts []string, base string) {
+	port := strconv.Itoa(addr.Port)
+	host := net.JoinHostPort(addr.IP.String(), port)
+	hosts = []string{host}
+	if addr.IP.Equal(net.IPv4(127, 0, 0, 1)) || addr.IP.Equal(net.IPv6loopback) {
+		hosts = append(hosts, net.JoinHostPort("localhost", port))
+	}
+	return hosts, "http://" + host
 }
 
 // appDir returns the program's folder inside a user folder ("" when there
@@ -209,6 +235,55 @@ func newLogger(cacheDir string) (*slog.Logger, func()) {
 	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo})), closeLog
 }
 
+// libraryLog takes the output of the standard log package, which
+// go-webview2 logs with, into the program's log. A line of log.Fatal (the
+// program ends right after it is written) is handed to onFatal first,
+// which can keep the program running by not returning.
+type libraryLog struct {
+	log     *slog.Logger
+	mu      sync.Mutex
+	onFatal func(msg string)
+}
+
+func (l *libraryLog) Write(p []byte) (int, error) {
+	msg := strings.TrimSpace(string(p))
+	if !calledByLogFatal() {
+		l.log.Warn("library", "msg", msg)
+		return len(p), nil
+	}
+	l.log.Error("library: fatal", "msg", msg)
+	l.mu.Lock()
+	onFatal := l.onFatal
+	l.mu.Unlock()
+	if onFatal != nil {
+		onFatal(msg)
+	}
+	return len(p), nil
+}
+
+// setOnFatal sets (or with nil removes) the handler of log.Fatal.
+func (l *libraryLog) setOnFatal(f func(msg string)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.onFatal = f
+}
+
+// calledByLogFatal reports whether log.Fatal, Fatalf or Fatalln (of the
+// package or of a log.Logger) is writing.
+func calledByLogFatal() bool {
+	pcs := make([]uintptr, 16)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(2, pcs)])
+	for {
+		f, more := frames.Next()
+		if strings.HasPrefix(f.Function, "log.Fatal") || strings.HasPrefix(f.Function, "log.(*Logger).Fatal") {
+			return true
+		}
+		if !more {
+			return false
+		}
+	}
+}
+
 // ui is the program's window (or the browser it opened) around the
 // server's page. Its platform parts are in ui_windows.go and ui_other.go.
 type ui struct {
@@ -218,7 +293,10 @@ type ui struct {
 	window    bool // the page is shown in the program's own window
 	cacheDir  string
 	log       *slog.Logger
+	libLog    *libraryLog
 	setWindow func(bool) // tells the server when the window falls back to a browser
+	// stop shuts the server down and returns the exit code (see run).
+	stop func(uiErr error) int
 
 	quitOnce sync.Once
 	quit     chan struct{} // closed when the page asks to quit

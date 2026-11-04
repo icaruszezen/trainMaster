@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	webview2 "github.com/jchv/go-webview2"
 	"github.com/jchv/go-webview2/webviewloader"
@@ -28,6 +29,15 @@ import (
 // which saves the last edit and then quits through POST /api/quit; it
 // answers POST /api/closing at once to say it took over. A page that does
 // not answer within closeAckTimeout (it did not load) is closed anyway.
+//
+// go-webview2 creates and shows its window before it starts WebView2. When
+// starting it fails at once, NewWithOptions returns nil and leaves the
+// window: it is destroyed before the browser opens. When it fails later
+// (creating the environment or the controller, as for a data folder that
+// cannot be written, or a runtime being updated), go-webview2 ends the
+// program with log.Fatal: the program's log writer (libraryLog) calls
+// webviewFailed first, which opens the browser instead and ends the
+// program itself.
 
 func init() {
 	// The window and WebView2 belong to the thread that creates them: keep
@@ -48,10 +58,15 @@ var (
 	procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
 	procSetProcessDPIAware            = user32.NewProc("SetProcessDPIAware")
 	procGetDpiForSystem               = user32.NewProc("GetDpiForSystem")
+	procEnumThreadWindows             = user32.NewProc("EnumThreadWindows")
+	procDestroyWindow                 = user32.NewProc("DestroyWindow")
+	procPeekMessageW                  = user32.NewProc("PeekMessageW")
 )
 
 const (
 	wmClose           = 0x0010
+	wmQuit            = 0x0012
+	pmRemove          = 0x0001
 	smCxScreen        = 0
 	smCyScreen        = 1
 	mbOK              = 0x00000000
@@ -118,6 +133,9 @@ func (u *ui) runWindow(served <-chan error) (ok bool, err error) {
 	if u.cacheDir != "" {
 		dataPath = filepath.Join(u.cacheDir, "webview2")
 	}
+	if u.libLog != nil {
+		u.libLog.setOnFatal(func(string) { u.webviewFailed(served) })
+	}
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		DataPath:  dataPath,
 		AutoFocus: true,
@@ -126,7 +144,11 @@ func (u *ui) runWindow(served <-chan error) (ok bool, err error) {
 			Title: windowTitle, Width: uint(max(width, 640)), Height: uint(max(height, 480)), Center: true,
 		},
 	})
+	if u.libLog != nil {
+		u.libLog.setOnFatal(nil)
+	}
 	if w == nil {
+		destroyThreadWindows()
 		return false, nil
 	}
 	w.SetSize(int(800*scale), int(560*scale), webview2.HintMin)
@@ -147,6 +169,45 @@ func (u *ui) runWindow(served <-chan error) (ok bool, err error) {
 		return true, err
 	default:
 		return true, nil
+	}
+}
+
+// webviewFailed is called on the UI thread instead of log.Fatal of
+// go-webview2 while the window is created: it destroys the window, shows
+// the page in the browser (as without WebView2) and ends the program as
+// run does once the user quits. It does not return, so log.Fatal does not
+// end the program; the server goes on in its goroutines meanwhile.
+func (u *ui) webviewFailed(served <-chan error) {
+	destroyThreadWindows()
+	u.log.Warn("WebView2 failed after the window was created; using the browser")
+	u.window = false
+	u.setWindow(false)
+	os.Exit(u.stop(u.runBrowser(served)))
+}
+
+// destroyThreadWindows destroys the windows of go-webview2 (class
+// "webview") of this thread. Destroying one posts a quit message (as when
+// the window is closed), which is taken off the queue: it would close the
+// next message box of the thread at once.
+func destroyThreadWindows() {
+	var hwnds []uintptr
+	name := make([]uint16, 64)
+	enum := windows.NewCallback(func(hwnd, _ uintptr) uintptr {
+		if n, err := windows.GetClassName(windows.HWND(hwnd), &name[0], int32(len(name))); err == nil &&
+			windows.UTF16ToString(name[:n]) == "webview" {
+			hwnds = append(hwnds, hwnd)
+		}
+		return 1 // go on
+	})
+	_, _, _ = procEnumThreadWindows.Call(uintptr(windows.GetCurrentThreadId()), enum, 0)
+	for _, hwnd := range hwnds {
+		_, _, _ = procDestroyWindow.Call(hwnd)
+	}
+	var msg [8]uintptr // room for a MSG
+	for {
+		if r, _, _ := procPeekMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, wmQuit, wmQuit, pmRemove); r == 0 {
+			return
+		}
 	}
 }
 

@@ -259,14 +259,44 @@ func (s *Service) cleanup(ctx context.Context) {
 }
 
 func (s *Service) cleanReviewFolders(ctx context.Context) error {
-	// List the folders before reading the reviews: a folder is created
-	// before its row commits, but marked busy until then.
+	// A review's folder is created before its row commits, and marked busy
+	// from before it is created until after the commit. So the folders are
+	// listed and the busy ones left out first, and the reviews are read only
+	// then: a listed folder that was not busy belongs to a review that is
+	// committed already (and read below), or to none.
 	entries, err := os.ReadDir(s.reviewsDir())
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	type candidate struct {
+		path   string
+		review bool  // a review folder (else trash, .deleting-*)
+		id     int64 // of the review
+	}
+	var candidates []candidate
+	for _, e := range entries {
+		name := e.Name()
+		c := candidate{path: filepath.Join(s.reviewsDir(), name)}
+		switch {
+		case strings.HasPrefix(name, deletingPrefix):
+		case strings.HasPrefix(name, reviewDirPrefix):
+			id, err := strconv.ParseInt(strings.TrimPrefix(name, reviewDirPrefix), 10, 64)
+			if err != nil || strconv.FormatInt(id, 10) != strings.TrimPrefix(name, reviewDirPrefix) {
+				continue
+			}
+			c.review, c.id = true, id
+		default:
+			continue
+		}
+		if !s.busy.has(c.path) {
+			candidates = append(candidates, c)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
 	}
 	rows, err := s.db.Query(ctx, "SELECT id FROM reviews")
 	if err != nil {
@@ -280,22 +310,22 @@ func (s *Service) cleanReviewFolders(ctx context.Context) error {
 	for _, id := range ids {
 		exists[id] = true
 	}
-	for _, e := range entries {
-		name := e.Name()
-		p := filepath.Join(s.reviewsDir(), name)
-		var stale bool
-		switch {
-		case strings.HasPrefix(name, deletingPrefix):
-			stale = true
-		case strings.HasPrefix(name, reviewDirPrefix):
-			id, err := strconv.ParseInt(strings.TrimPrefix(name, reviewDirPrefix), 10, 64)
-			stale = err == nil && strconv.FormatInt(id, 10) == strings.TrimPrefix(name, reviewDirPrefix) && !exists[id]
-		}
-		if !stale || s.busy.has(p) {
+	for _, c := range candidates {
+		if (c.review && exists[c.id]) || s.busy.has(c.path) {
 			continue
 		}
-		if err := s.removeAll(p); err != nil {
-			s.log.Warn("remove leftover review folder", "path", p, "err", err)
+		if c.review {
+			// Removing the folders before this one may have taken long: make
+			// sure the review still does not exist.
+			if err := s.reviewExists(ctx, s.db, c.id); !errors.Is(err, ErrNotFound) {
+				if err != nil {
+					return err
+				}
+				continue
+			}
+		}
+		if err := s.removeAll(c.path); err != nil {
+			s.log.Warn("remove leftover review folder", "path", c.path, "err", err)
 		}
 	}
 	return nil

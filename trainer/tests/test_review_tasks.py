@@ -89,6 +89,15 @@ def results_posted(platform: FakePlatform, review_id: int) -> list[list[dict[str
     ]
 
 
+def retry(platform: FakePlatform, review_id: int) -> None:
+    """用户点“重新识别”（平台的 RetryReview）：failed → queued，次数清零；已经识别的图片保持不变。"""
+    with platform.lock:
+        review = platform.reviews[review_id]
+        assert review["status"] == "failed", review
+        review.update(status="queued", attempts=0, error="", node_key=None)
+        platform.task_changed.notify_all()
+
+
 def ready_child(tmp_path: Path, body: str) -> list[str]:
     """脚本子进程：输出 ready，然后按 body 处理每个请求 req（body 缩进 4 个空格）。"""
     return script(
@@ -466,8 +475,79 @@ def test_image_timeout_fails_the_task(platform, tmp_path, fake_ml):
     fail = review["fails"][0]
     assert fail["retryable"] is False
     assert fail["error"].startswith("识别超时（单张图片 1 秒内没有识别完成）")
-    # 超时之前识别的结果已经交给平台
-    assert [img["inferred"] for img in review["images"].values()] == [True, False, False]
+    assert fail["detail"].endswith(
+        "出错的图片：img-2.jpg（已记为识别失败，重新识别时继续识别其余的图片）"
+    )
+    # 超时之前识别的结果、以及超时的这张图片的失败已经交给平台；在途的第三张没有结果
+    assert [img["inferred"] for img in review["images"].values()] == [True, True, False]
+    assert review["images"][2]["result"]["ok"] is False
+    assert review["images"][2]["result"]["error"] == fail["error"]
+
+
+def test_image_timeout_is_skipped_when_retried(platform, tmp_path, fake_ml):
+    # 超时的那张图片已经记为识别失败：用户重新识别时从其余的图片继续，任务可以完成
+    calls = fake_ml(slow_seconds=30)
+    review_id = platform.add_review(
+        PT, {1: fake_image(40, 30, "slow"), 2: fake_image(40, 30, "bus"), 3: fake_image(40, 30)}
+    )
+    with Run(tmp_path, platform, inference_image_timeout=1):
+        assert finished(platform, review_id)["status"] == "failed"
+        retry(platform, review_id)
+        review = finished(platform, review_id)
+    assert review["status"] == "ready", review
+    assert review["images"][1]["result"]["error"].startswith("识别超时")
+    assert review["images"][2]["result"]["ok"] is True
+    assert review["images"][3]["result"]["ok"] is True
+    tags = [c["tag"] for c in recorded(calls) if c["call"] == "predict" and c["tag"] != "warmup"]
+    assert tags.count("slow") == 1  # 重新识别时没有再交给模型
+
+
+def test_child_crash_on_one_image_is_skipped_when_retried(platform, tmp_path):
+    # 子进程识别第 2 张图片时崩溃（如解码器出错）：这张图片记为识别失败，任务失败（不可重试，换一个节点
+    # 也会崩溃）；用户重新识别时跳过它，继续识别其余的图片
+    body = (
+        '    if req["id"] == 2:\n'
+        "        import signal\n"
+        "        print('decoder crashed', file=sys.stderr, flush=True)\n"
+        "        os.kill(os.getpid(), signal.SIGSEGV)\n"
+        "        time.sleep(5)\n" + ANSWER
+    )
+    cmd = ready_child(tmp_path, body)
+    review_id = platform.add_review(PT, {i: fake_image(40, 30) for i in range(1, 6)})
+    with Run(tmp_path, platform, inference_command=cmd):
+        review = finished(platform, review_id)
+        assert review["status"] == "failed", review
+        assert review["attempts"] == 1
+        fail = review["fails"][0]
+        assert fail["error"] == "识别进程崩溃（信号 SIGSEGV）"  # 不是“可能是内存不足”
+        assert fail["retryable"] is False
+        assert "decoder crashed" in fail["detail"]
+        assert fail["detail"].endswith(
+            "出错的图片：img-2.jpg（已记为识别失败，重新识别时继续识别其余的图片）"
+        )
+        assert review["images"][2]["result"] == {
+            "id": 2,
+            "ok": False,
+            "error": "识别这张图片时识别进程崩溃（信号 SIGSEGV）",
+        }
+        assert [img["inferred"] for img in review["images"].values()] == [
+            True,
+            True,
+            False,
+            False,
+            False,
+        ]
+
+        retry(platform, review_id)
+        review = finished(platform, review_id)
+    assert review["status"] == "ready", review
+    assert review["attempts"] == 1 and len(review["fails"]) == 1
+    assert all(review["images"][i]["result"]["ok"] is True for i in (1, 3, 4, 5))
+    assert review["images"][2]["result"]["ok"] is False
+    files = [
+        action(r) for r in review_requests(platform, review_id) if action(r).startswith("file ")
+    ]
+    assert files.count("file 2") == 1  # 重新识别时没有再下载、识别它
 
 
 def test_out_of_memory_stops_the_task(platform, tmp_path, fake_ml):
@@ -604,6 +684,59 @@ def test_image_too_large(platform, tmp_path, fake_ml, monkeypatch):
         action(r) for r in review_requests(platform, review_id) if action(r).startswith("file ")
     ]
     assert files == ["file 2"]  # 没有下载
+
+
+def test_image_conflict_fails_only_that_image(platform, tmp_path, fake_ml):
+    # 数据集文件夹已不存在（被移动、删除或没有挂载）时平台对这张图片返回 409：只是这张图片识别失败，
+    # 其余照常（之前会当作任务已不属于本节点而放弃，结果全部丢失）
+    message = "数据集文件夹不存在：/data/datasets/ds"
+
+    def file(review, request):
+        if action(request) == "file 5":
+            return 409, {"error": {"code": "conflict", "message": message}}
+        return None
+
+    platform.hooks["review:file"] = file
+    review_id = platform.add_review(PT, {i: fake_image(20, 10) for i in range(1, 8)})
+    with Run(tmp_path, platform):
+        review = finished(platform, review_id)
+    assert review["status"] == "ready", review
+    assert review["attempts"] == 1 and review["fails"] == []
+    assert review["images"][5]["result"] == {
+        "id": 5,
+        "ok": False,
+        "error": f"无法下载图片：{message}",
+    }
+    assert all(review["images"][i]["result"]["ok"] is True for i in (1, 2, 3, 4, 6, 7))
+    assert review["result"]["images_inferred"] == 7
+    assert review["result"]["images_failed"] == 1
+
+
+def test_lost_lease_during_downloads_abandons_the_task(platform, tmp_path, fake_ml, caplog):
+    # 下载到第 3 张图片时任务转给了其它节点（租约过期后被重新领取）：之后的下载都得到 409（记为这些
+    # 图片的失败），但上报结果时同样得到 409，节点放弃任务，不上报失败，这些失败也没有被平台记录
+    caplog.set_level(logging.INFO, logger="trainmaster_trainer")
+
+    def file(review, request) -> None:  # 之后由平台照常回答（409）
+        if action(request) == "file 3":
+            with platform.lock:
+                review["node_key"] = "other-node"
+
+    platform.hooks["review:file"] = file
+    # 固定时序：第二页（空）不受租约影响，任务只能在上报结果（或进度）时发现租约已经丢失
+    platform.hooks["review:images"] = lambda review, request: (
+        None if "after=0&" in request["path"] else (200, {"items": [], "remaining": 5})
+    )
+    review_id = platform.add_review(PT, {i: fake_image(20, 10) for i in range(1, 6)})
+    with Run(tmp_path, platform) as run:
+        wait_until(lambda: run.worker.tasks_run == 1, timeout=15)
+        assert not (run.state_dir / "work" / f"review-inference-{review_id}").exists()
+    review = platform.review(review_id)
+    assert review["status"] == "running" and review["fails"] == []  # 留给新的节点
+    assert not any(img["inferred"] for img in review["images"].values())
+    actions = [action(r) for r in review_requests(platform, review_id)]
+    assert "results" in actions and "fail" not in actions and "complete" not in actions
+    assert any(f"review inference {review_id} abandoned" in r.getMessage() for r in caplog.records)
 
 
 # ---- 模型 ----

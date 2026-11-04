@@ -20,10 +20,11 @@ import (
 )
 
 // Review results (审图结果): what the local reviewer exports from a package
-// (review.json of kind results plus the VOC files it changed), uploaded
+// (review.json of kind results plus the VOC files of its images), uploaded
 // back as a zip. The original package zipped again is accepted too: its
 // images are ignored, and its VOC files count only where their content
-// changed.
+// changed. Not the folder the local reviewer worked in, though: the
+// statuses set there are only in its progress file.
 //
 // Every image of the manifest is compared with its state in the package
 // (the base_* fields): a status other than base_status, or a VOC file whose
@@ -33,6 +34,15 @@ import (
 // unless the platform has what the upload brings already (uploading the
 // same results again changes nothing) or the upload overwrites. Images
 // are applied one by one: a problem with one does not stop the others.
+//
+// The local reviewer keeps the package's base_* fields when it exports
+// again, so results of one package can be uploaded more than once while
+// the review goes on. An image whose platform state an earlier upload of
+// the same package made (and that nobody changed since, see
+// imageRow.continues) continues from there: the local state is compared
+// with the platform's state now, so a change back to the package's state
+// counts too, and it is never a conflict. A package zipped again has no
+// statuses of its own; only its VOC files count then.
 
 // MaxResultsBytes bounds an uploaded results zip (4 GiB).
 const MaxResultsBytes = 4 << 30
@@ -218,12 +228,13 @@ func (s *Service) readResults(reviewID int64, zr *zip.Reader) (*results, error) 
 	r := &results{files: make(map[string]*zip.File, 2*len(zr.File))}
 	names := make([]string, 0, len(zr.File))
 	for _, f := range zr.File {
-		// Some Windows tools write "\" between folders.
-		name := strings.ReplaceAll(f.Name, `\`, "/")
-		names = append(names, name)
-		if f.FileInfo().IsDir() {
+		if f.FileInfo().IsDir() { // also an entry with a folder's mode and no "/" at its end
 			continue
 		}
+		// Zip tools of Chinese Windows write GBK names; some Windows tools
+		// write "\" between folders.
+		name := strings.ReplaceAll(dataset.DecodeEntryName(f.Name), `\`, "/")
+		names = append(names, name)
 		if r.files[name] == nil {
 			r.files[name] = f
 		}
@@ -237,6 +248,9 @@ func (s *Service) readResults(reviewID int64, zr *zip.Reader) (*results, error) 
 	}
 	r.prefix = prefix
 	f := r.files[prefix+reviewfile.ManifestFile]
+	if f == nil {
+		return nil, &Error{Kind: ErrInvalid, Message: "压缩包中没有 review.json，这不是 trainMaster 的审图包或审图结果"}
+	}
 	rc, err := f.Open()
 	if err != nil {
 		return nil, newError(ErrInvalid, "压缩包中的 review.json 无法读取：%v", err)
@@ -258,6 +272,12 @@ func (s *Service) readResults(reviewID int64, zr *zip.Reader) (*results, error) 
 		return nil, newError(ErrInvalid, "这是审图任务 #%d 的%s，不是这个任务的", m.Review.ID, what)
 	}
 	r.manifest = m
+	if m.Kind == reviewfile.KindPackage && r.entry(reviewfile.ProgressFile) != nil {
+		// The folder the local reviewer works in, zipped: the statuses set
+		// there are only in its progress file, which is not read here.
+		return nil, &Error{Kind: ErrInvalid, Message: "这是在本地审图程序中打开过的审图包文件夹，其中标记的审核状态只保存在本地审图程序中，" +
+			"不能这样上传：请在本地审图程序中点“导出审图结果”，再上传导出的“…-审图结果.zip”"}
+	}
 	return r, nil
 }
 
@@ -269,8 +289,8 @@ func manifestProblem(err error) error {
 	return err
 }
 
-// localChange is what an uploaded image changes, compared with its state
-// in the package.
+// localChange is what an uploaded image changes, compared with the state
+// it started from (see readLocalChange).
 type localChange struct {
 	status     string                     // the new status; "" unchanged
 	objects    []dataset.AnnotationObject // the new annotation, normalized, if setObjects
@@ -281,6 +301,7 @@ type localChange struct {
 // summary and problems of up.
 func (s *Service) applyResults(ctx context.Context, reviewID int64, res *results, overwrite bool, up *Upload) error {
 	images := res.manifest.Images
+	packageID := res.manifest.PackageID
 	up.Summary.Images = len(images)
 	problem := func(img *reviewfile.ManifestImage, kind, msg string) {
 		if len(up.Problems) < MaxProblems {
@@ -289,7 +310,7 @@ func (s *Service) applyResults(ctx context.Context, reviewID int64, res *results
 	}
 	for start := 0; start < len(images); start += manifestQueryBatch {
 		batch := images[start:min(start+manifestQueryBatch, len(images))]
-		known, err := s.knownImages(ctx, reviewID, batch)
+		known, err := s.knownImages(ctx, reviewID, packageID, batch)
 		if err != nil {
 			return err
 		}
@@ -309,7 +330,17 @@ func (s *Service) applyResults(ctx context.Context, reviewID int64, res *results
 				problem(img, ProblemInvalid, "review.json 中这张图片的信息与审图任务不一致（图片 ID 或标注文件路径不同）")
 				continue
 			}
-			lc, msg := readLocalChange(res, img)
+			// Compared with the package, or for an image continuing from an
+			// earlier upload of this package, with the platform now (a
+			// package zipped again has the package's statuses).
+			baseStatus, baseVersion := img.BaseStatus, img.BaseAnnotationVersion
+			if k.continues {
+				baseVersion = k.annotationVersion
+				if res.manifest.Kind == reviewfile.KindResults {
+					baseStatus = k.status
+				}
+			}
+			lc, msg := readLocalChange(res, img, baseStatus, baseVersion)
 			if msg != "" {
 				up.Summary.Invalid++
 				problem(img, ProblemInvalid, msg)
@@ -319,7 +350,7 @@ func (s *Service) applyResults(ctx context.Context, reviewID int64, res *results
 				up.Summary.Unchanged++
 				continue
 			}
-			what, err := s.applyResult(ctx, reviewID, img, lc, overwrite)
+			what, err := s.applyResult(ctx, reviewID, packageID, img, lc, overwrite)
 			var re *Error
 			switch {
 			case errors.Is(err, errUploadConflict):
@@ -354,39 +385,49 @@ func (s *Service) applyResults(ctx context.Context, reviewID int64, res *results
 	return nil
 }
 
-// knownImage is what must match between an uploaded image and the review.
+// knownImage is what must match between an uploaded image and the review,
+// and the image's state on the platform.
 type knownImage struct {
 	imageID        int64
 	annotationPath string
+	// The state now, and whether an earlier upload of the package made it
+	// (see imageRow.continues).
+	status, annotationVersion string
+	continues                 bool
 }
 
 // knownImages returns the images of batch that are still in the review,
-// by review image ID.
-func (s *Service) knownImages(ctx context.Context, reviewID int64, batch []reviewfile.ManifestImage) (map[int64]knownImage, error) {
+// by review image ID; packageID is the package of the upload.
+func (s *Service) knownImages(ctx context.Context, reviewID int64, packageID string,
+	batch []reviewfile.ManifestImage) (map[int64]knownImage, error) {
 	ids := make([]int64, len(batch))
 	for i, img := range batch {
 		ids[i] = img.ID
 	}
-	rows, err := s.db.Query(ctx, "SELECT id, image_id, annotation_path FROM review_images WHERE review_id = $1 AND id = ANY($2)",
-		reviewID, ids)
+	rows, err := s.db.Query(ctx, `SELECT id, image_id, annotation_path,
+			$3 <> '' AND coalesce(upload_package_id = $3 AND upload_revision = revision, false),
+			status, annotation_version
+		FROM review_images WHERE review_id = $1 AND id = ANY($2)`, reviewID, ids, packageID)
 	if err != nil {
 		return nil, err
 	}
 	known := make(map[int64]knownImage, len(ids))
 	var id int64
 	var k knownImage
-	_, err = pgx.ForEachRow(rows, []any{&id, &k.imageID, &k.annotationPath}, func() error {
+	scans := []any{&id, &k.imageID, &k.annotationPath, &k.continues, &k.status, &k.annotationVersion}
+	_, err = pgx.ForEachRow(rows, scans, func() error {
 		known[id] = k
 		return nil
 	})
 	return known, err
 }
 
-// readLocalChange compares an uploaded image with its state in the
-// package. A VOC file that cannot be used makes the whole image invalid
-// (msg says why).
-func readLocalChange(res *results, img *reviewfile.ManifestImage) (lc localChange, msg string) {
-	if img.Status != img.BaseStatus {
+// readLocalChange compares an uploaded image with the state it started
+// from: the status baseStatus and the VOC file of version baseVersion
+// (those of the package, see applyResults). A VOC file that cannot be used
+// makes the whole image invalid (msg says why).
+func readLocalChange(res *results, img *reviewfile.ManifestImage, baseStatus, baseVersion string) (lc localChange, msg string) {
+	if img.Status != baseStatus {
 		lc.status = img.Status
 	}
 	f := res.entry(img.Annotation)
@@ -405,7 +446,7 @@ func readLocalChange(res *results, img *reviewfile.ManifestImage) (lc localChang
 	if err != nil {
 		return lc, fmt.Sprintf("标注文件 %s 无法读取（压缩包可能已损坏）：%v", img.Annotation, err)
 	}
-	if reviewfile.AnnotationVersion(data) == img.BaseAnnotationVersion {
+	if reviewfile.AnnotationVersion(data) == baseVersion {
 		return lc, ""
 	}
 	voc, err := reviewfile.DecodeAnnotation(data)
@@ -424,13 +465,15 @@ func readLocalChange(res *results, img *reviewfile.ManifestImage) (lc localChang
 	return lc, ""
 }
 
-// applyResult applies the local change of one image under its lock and
-// reports what changed. errUploadConflict: the image changed on both
-// sides.
-func (s *Service) applyResult(ctx context.Context, reviewID int64, img *reviewfile.ManifestImage, lc localChange,
-	overwrite bool) (changed, error) {
+// applyResult applies the local change of one image, uploaded from the
+// package packageID, under its lock and reports what changed.
+// errUploadConflict: the image changed on both sides.
+func (s *Service) applyResult(ctx context.Context, reviewID int64, packageID string, img *reviewfile.ManifestImage,
+	lc localChange, overwrite bool) (changed, error) {
 	_, what, err := s.changeImageRow(ctx, reviewID, img.ID, func(r imageRow, a annotationFile) (imageChange, error) {
-		var ch imageChange
+		// The revision the change makes is noted with the package, so that a
+		// later upload of it continues from there.
+		ch := imageChange{uploadPackageID: packageID}
 		// Only what differs from the platform now is a change.
 		if lc.status != "" && lc.status != r.Status {
 			ch.status = lc.status
@@ -441,7 +484,9 @@ func (s *Service) applyResult(ctx context.Context, reviewID int64, img *reviewfi
 		if ch.status == "" && !ch.setObjects {
 			return ch, nil // the platform has it already
 		}
-		if r.Revision != img.BaseRevision && !overwrite {
+		// Changed on the platform since the download; unless by an earlier
+		// upload of this package, which this one continues.
+		if r.Revision != img.BaseRevision && !overwrite && !r.continues(packageID) {
 			return ch, errUploadConflict
 		}
 		if ch.setObjects {
@@ -457,16 +502,29 @@ func (s *Service) applyResult(ctx context.Context, reviewID int64, img *reviewfi
 	return what, err
 }
 
+// maxListedRecords bounds the uploads and merges ListUploads and
+// ListMerges return.
+const maxListedRecords = 50
+
 // ListUploads returns the newest results uploads of a review (at most
-// 50), newest first.
-func (s *Service) ListUploads(ctx context.Context, reviewID int64) ([]Upload, error) {
+// maxListedRecords), newest first, and how many the review has.
+func (s *Service) ListUploads(ctx context.Context, reviewID int64) ([]Upload, int, error) {
 	if err := s.reviewExists(ctx, s.db, reviewID); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	uploads, err := collectUploads(s.db.Query(ctx, "SELECT "+uploadColumns+
-		" FROM review_uploads WHERE review_id = $1 ORDER BY id DESC LIMIT 50", reviewID))
+		" FROM review_uploads WHERE review_id = $1 ORDER BY id DESC LIMIT $2", reviewID, maxListedRecords))
+	if err != nil {
+		return nil, 0, err
+	}
 	if uploads == nil {
 		uploads = []Upload{}
 	}
-	return uploads, err
+	total := len(uploads)
+	if total == maxListedRecords {
+		if err := s.db.QueryRow(ctx, "SELECT count(*) FROM review_uploads WHERE review_id = $1", reviewID).Scan(&total); err != nil {
+			return nil, 0, err
+		}
+	}
+	return uploads, total, nil
 }

@@ -38,7 +38,7 @@ import {
   type BrowseEntryKind,
   type Place,
 } from "@/reviewer/api"
-import { isOpenable } from "@/reviewer/format"
+import { isOpenable, typedPath } from "@/reviewer/format"
 
 const LAST_FOLDER_KEY = "trainmaster.reviewer.folder"
 
@@ -114,12 +114,13 @@ function Browser({
     setSelected(null)
     writePreference(LAST_FOLDER_KEY, path)
   }
-  const start = async (path: string) => {
-    if (!path.trim() || opening) {
+  const start = async (text: string) => {
+    const path = typedPath(text)
+    if (!path || opening) {
       return
     }
     setOpening(true)
-    const ok = await onOpen(path.trim())
+    const ok = await onOpen(path)
     setOpening(false)
     if (ok) {
       onCancel()

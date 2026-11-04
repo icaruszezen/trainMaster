@@ -1,6 +1,8 @@
 package reviewer
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -8,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/reviewfile"
 )
@@ -352,5 +356,82 @@ func TestSafeEntryName(t *testing.T) {
 		if got := safeEntryName(name); got != want {
 			t.Errorf("safeEntryName(%q) = %v", name, got)
 		}
+	}
+}
+
+// TestOpenGBKZip opens a package zipped again by a zip tool of Chinese
+// Windows, which writes the entry names in GBK (without the UTF-8 flag)
+// and "\" between folders: the files under Chinese names are found.
+func TestOpenGBKZip(t *testing.T) {
+	m, files := newTestPackage().build(t)
+	folders := strings.NewReplacer("line_a/", "外观A/", "line_b/", "外观B/")
+	for i := range m.Datasets {
+		m.Datasets[i].Folder = strings.TrimSuffix(folders.Replace(m.Datasets[i].Folder+"/"), "/")
+	}
+	renamed := map[string][]byte{}
+	for rel, data := range files {
+		renamed[folders.Replace(rel)] = data
+	}
+	for i := range m.Images {
+		m.Images[i].Path, m.Images[i].Annotation = folders.Replace(m.Images[i].Path), folders.Replace(m.Images[i].Annotation)
+	}
+	var mb bytes.Buffer
+	if err := reviewfile.WriteManifest(&mb, m); err != nil {
+		t.Fatal(err)
+	}
+	renamed[reviewfile.ManifestFile] = mb.Bytes()
+	gbk := simplifiedchinese.GBK.NewEncoder()
+	var b bytes.Buffer
+	zw := zip.NewWriter(&b)
+	for rel, data := range renamed {
+		name, err := gbk.String(strings.ReplaceAll("审图-7-外观检测/"+rel, "/", `\`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		w, err := zw.CreateHeader(&zip.FileHeader{Name: name, NonUTF8: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, zipName)
+	if err := os.WriteFile(zipPath, b.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := newTestServer(t)
+	s := ts.open(zipPath)
+	if s.Package == nil || s.Package.MissingImages != 0 || s.Package.Counts.Total != 5 {
+		t.Fatalf("package = %+v", s.Package)
+	}
+	for _, rel := range []string{"外观A/NG/a.png", "外观A/NG/a.xml", "外观B/e.tif"} {
+		if _, err := os.Stat(filepath.Join(s.Package.Path, filepath.FromSlash(rel))); err != nil {
+			t.Errorf("%s: %v", rel, err)
+		}
+	}
+}
+
+// TestResolveOpenPathQuotes opens a path pasted with the quotes of
+// Explorer's “复制为路径”.
+func TestResolveOpenPathQuotes(t *testing.T) {
+	zipPath := newTestPackage().writeZip(t, t.TempDir(), zipName)
+	for _, p := range []string{`"` + zipPath + `"`, " \"" + zipPath + "\"\r\n", " " + zipPath + " "} {
+		if got, err := resolveOpenPath(p); err != nil || got.zipPath != zipPath {
+			t.Errorf("resolveOpenPath(%q) = %+v, %v", p, got, err)
+		}
+	}
+	var e *Error
+	if _, err := resolveOpenPath(` "" `); !errors.As(err, &e) || !strings.Contains(e.Message, "请选择审图包") {
+		t.Errorf("empty quotes: %v", err)
+	}
+	if _, err := resolveOpenPath(`"relative.zip"`); !errors.As(err, &e) || !strings.Contains(e.Message, "请输入完整的路径（如 C:") ||
+		!strings.HasSuffix(e.Message, "：relative.zip") {
+		t.Errorf("relative path in quotes: %v", err)
 	}
 }

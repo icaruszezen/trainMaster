@@ -45,7 +45,9 @@ func TestExport(t *testing.T) {
 		names = append(names, name)
 	}
 	slices.Sort(names)
-	if !slices.Equal(names, []string{top + "README.txt", top + "line_a/c.xml", top + "review.json"}) {
+	// Every VOC file, the unchanged ones too (d has none).
+	if !slices.Equal(names, []string{top + "README.txt", top + "line_a/NG/a.xml", top + "line_a/b.xml", top + "line_a/c.xml",
+		top + "line_b/e.xml", top + "review.json"}) {
 		t.Fatalf("results hold %v", names)
 	}
 	if !bytes.HasPrefix(files[top+"README.txt"], []byte("\xef\xbb\xbf")) || !bytes.Contains(files[top+"README.txt"], []byte("\r\n")) ||
@@ -60,12 +62,16 @@ func TestExport(t *testing.T) {
 		!m.ExportedAt.Equal(ts.clock.Now()) {
 		t.Errorf("manifest = %+v", m)
 	}
-	a, b, cm := m.Images[0], m.Images[1], m.Images[2]
-	if a.Status != "approved" || a.BaseStatus != "pending" || a.ReviewedAt == nil || a.HasAnnotation || a.Edited {
+	a, b, cm, d := m.Images[0], m.Images[1], m.Images[2], m.Images[3]
+	if a.Status != "approved" || a.BaseStatus != "pending" || a.ReviewedAt == nil || !a.HasAnnotation || a.Edited ||
+		reviewfile.AnnotationVersion(files[top+"line_a/NG/a.xml"]) != a.BaseAnnotationVersion {
 		t.Errorf("a = %+v", a)
 	}
-	if b.Status != "approved" || b.BaseStatus != "approved" || b.BaseRevision != 2 || b.HasAnnotation {
+	if b.Status != "approved" || b.BaseStatus != "approved" || b.BaseRevision != 2 || !b.HasAnnotation {
 		t.Errorf("b = %+v", b)
+	}
+	if d.HasAnnotation || d.BaseAnnotationVersion != "" {
+		t.Errorf("d = %+v", d)
 	}
 	if cm.Status != "pending" || !cm.HasAnnotation || !cm.Edited || cm.BaseAnnotationVersion == "" ||
 		reviewfile.AnnotationVersion(files[top+"line_a/c.xml"]) == cm.BaseAnnotationVersion {
@@ -98,8 +104,11 @@ func TestExport(t *testing.T) {
 		t.Errorf("second export = %+v", res)
 	}
 	files = readZip(t, resultsPath)
-	if _, ok := files[top+"line_a/NG/a.xml"]; ok || len(files) != 3 {
+	if _, ok := files[top+"line_a/NG/a.xml"]; ok || len(files) != 5 {
 		t.Errorf("second results hold %d files", len(files))
+	}
+	if m, err := reviewfile.ReadManifest(bytes.NewReader(files[top+"review.json"]), 1<<20); err != nil || m.Images[0].HasAnnotation {
+		t.Errorf("a in the second results = %+v, %v", m.Images[0], err)
 	}
 	if names := dirNames(t, filepath.Dir(dir)); len(names) != 2 {
 		t.Errorf("next to the package: %v", names)

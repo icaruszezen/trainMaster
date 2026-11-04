@@ -101,6 +101,16 @@ export function hasReviewFilters(filters: ReviewImageFilters) {
   return Object.keys(reviewImageFilterParams(filters)).length > 0
 }
 
+/** 两组筛选条件是否相同（按写进地址栏的参数比较）。 */
+export function sameReviewFilters(
+  a: ReviewImageFilters,
+  b: ReviewImageFilters
+) {
+  const text = (filters: ReviewImageFilters) =>
+    new URLSearchParams(reviewImageFilterParams(filters)).toString()
+  return text(a) === text(b)
+}
+
 /** 审图任务的详情页。 */
 export function reviewDetailPath(reviewId: number) {
   return `/models/reviews/${reviewId}`

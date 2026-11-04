@@ -171,6 +171,7 @@ function Start({ session }: { session: Session }) {
       {session.package && (
         <CurrentPackage
           pkg={session.package}
+          opening={session.opening !== null}
           closing={close.isPending}
           onContinue={() => navigate("/review")}
           onClose={() => close.mutate()}
@@ -272,13 +273,20 @@ function OpeningCard({
   )
 }
 
-function CurrentPackage({
+/**
+ * 正在审的审图包。正在打开另一个审图包时不能继续审它：打开完成时程序关闭它、
+ * 换成新的审图包，这时还没有保存的修改会写进新的审图包。
+ */
+export function CurrentPackage({
   pkg,
+  opening,
   closing,
   onContinue,
   onClose,
 }: {
   pkg: PackageInfo
+  /** 正在打开另一个审图包。 */
+  opening: boolean
   closing: boolean
   onContinue: () => void
   onClose: () => void
@@ -321,9 +329,14 @@ function CurrentPackage({
             ? `上次导出：${formatDateTime(pkg.last_export.exported_at)}（${pkg.last_export.file_name}）`
             : "还没有导出过审图结果。"}
         </p>
+        {opening && (
+          <p className="text-amber-600 dark:text-amber-400">
+            正在打开另一个审图包，打开后这个审图包会被关闭；取消打开可以继续审它。
+          </p>
+        )}
       </CardContent>
       <CardFooter className="flex-wrap gap-2">
-        <Button onClick={onContinue}>
+        <Button onClick={onContinue} disabled={opening}>
           继续审图
           <ArrowRight />
         </Button>

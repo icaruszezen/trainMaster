@@ -40,6 +40,7 @@ type Package struct {
 
 	mu         sync.RWMutex
 	root       *os.Root // nil once closed
+	lock       *os.File // the locked lock file of the folder (nil without one), see lockPackage
 	images     []*image // in review order
 	byID       map[int64]*image
 	lastExport *ExportInfo
@@ -200,12 +201,60 @@ func loadPackage(ctx context.Context, dir string, o loadOptions) (*Package, erro
 	if err != nil {
 		return nil, openError(dir, err)
 	}
-	p, err := loadFromRoot(ctx, root, dir, o)
+	lock, err := lockPackage(root)
 	if err != nil {
 		root.Close()
 		return nil, err
 	}
+	p, err := loadFromRoot(ctx, root, dir, o)
+	if err != nil {
+		root.Close()
+		closeLock(lock)
+		return nil, err
+	}
+	p.lock = lock
 	return p, nil
+}
+
+// lockFileName is the file locked in a package folder while a program has
+// the package open, so that a second program (the package opened again,
+// say by dropping its zip on the program's icon once more) cannot open it
+// too: each program keeps the statuses in memory and rewrites
+// review-progress.json from them, so the two would undo each other's
+// work. The system releases the lock when the program ends, crashed or
+// not; the (empty) file stays. It is not part of the results.
+const lockFileName = ".tm-reviewer.lock"
+
+// errLocked is returned by lockFile when another program holds the lock.
+var errLocked = errors.New("locked by another program")
+
+var errPackageLocked = &Error{Kind: ErrConflict, Message: "这个审图包已在另一个本地审图程序窗口中打开"}
+
+// lockPackage locks the package folder of root; nil (and no error) when
+// the folder cannot have the lock: a folder files cannot be created in
+// (nothing in it can be changed then), or a file system that cannot lock
+// files (some network drives), which open as before.
+func lockPackage(root *os.Root) (*os.File, error) {
+	f, err := root.OpenFile(lockFileName, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return nil, nil
+	}
+	if err := lockFile(f); err != nil {
+		f.Close()
+		if errors.Is(err, errLocked) {
+			return nil, errPackageLocked
+		}
+		return nil, nil
+	}
+	return f, nil
+}
+
+// closeLock releases the lock of a package folder (closing the file
+// releases it).
+func closeLock(f *os.File) {
+	if f != nil {
+		_ = f.Close()
+	}
 }
 
 func loadFromRoot(ctx context.Context, root *os.Root, dir string, o loadOptions) (*Package, error) {
@@ -354,6 +403,8 @@ func (p *Package) Close() error {
 	}
 	err := p.root.Close()
 	p.root = nil
+	closeLock(p.lock)
+	p.lock = nil
 	return err
 }
 

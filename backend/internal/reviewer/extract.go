@@ -125,7 +125,9 @@ func planExtraction(zr *zip.Reader) (*extraction, error) {
 	byName := make(map[string]*zip.File, 2*len(zr.File))
 	names := make([]string, 0, len(zr.File))
 	for _, f := range zr.File {
-		name := strings.ReplaceAll(f.Name, `\`, "/") // some Windows tools write "\"
+		// Zip tools of Chinese Windows write GBK names; some Windows tools
+		// write "\" between folders.
+		name := strings.ReplaceAll(dataset.DecodeEntryName(f.Name), `\`, "/")
 		if !safeEntryName(name) {
 			return nil, newError(ErrInvalid, "压缩包中有不安全的路径（%s），为了安全没有解压。请重新从平台下载审图包", f.Name)
 		}
@@ -395,9 +397,14 @@ type openTarget struct {
 // resolveOpenPath tells what to open for a path: a .zip file, a package
 // folder (holding review.json), its review.json, or a folder with exactly
 // one package folder in it (such as the folder Windows' “全部解压缩”
-// makes).
+// makes). Quotes around the path (Explorer's “复制为路径” adds them; no
+// Windows path holds one) are left out.
 func resolveOpenPath(p string) (openTarget, error) {
-	if strings.TrimSpace(p) == "" {
+	p = strings.TrimSpace(p)
+	if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+		p = strings.TrimSpace(p[1 : len(p)-1])
+	}
+	if p == "" {
 		return openTarget{}, &Error{Kind: ErrInvalid, Message: "请选择审图包（.zip 文件）或解压后的文件夹"}
 	}
 	if !filepath.IsAbs(p) {

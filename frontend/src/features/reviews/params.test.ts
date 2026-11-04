@@ -6,6 +6,7 @@ import {
   parseReviewFilters,
   reviewDetailPath,
   reviewWorkspacePath,
+  sameReviewFilters,
   updateReviewParams,
 } from "@/features/reviews/params"
 
@@ -105,6 +106,32 @@ describe("hasReviewFilters", () => {
       { inference: "failed" },
     ] as const) {
       expect(hasReviewFilters({ ...ALL_REVIEW_IMAGES, ...change })).toBe(true)
+    }
+  })
+})
+
+describe("sameReviewFilters", () => {
+  it("compares the filters the address bar would carry", () => {
+    expect(sameReviewFilters(ALL_REVIEW_IMAGES, { ...ALL_REVIEW_IMAGES })).toBe(
+      true
+    )
+    expect(
+      sameReviewFilters(
+        parse("status=pending&q=NG&image=3"),
+        parse("q=NG&status=pending&image=9")
+      )
+    ).toBe(true)
+  })
+
+  it("notices a filter changed while an image was being marked", () => {
+    const pending = parse("status=pending&dataset_id=2")
+    for (const search of [
+      "status=needs_sample&dataset_id=2",
+      "status=pending",
+      "status=pending&dataset_id=2&q=NG",
+      "status=pending&dataset_id=2&label=dent",
+    ]) {
+      expect(sameReviewFilters(pending, parse(search)), search).toBe(false)
     }
   })
 })

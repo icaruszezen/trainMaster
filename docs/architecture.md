@@ -266,12 +266,12 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `GET /api/v1/reviews/{reviewID}/images/{imageID}/thumbnail` | 缩略图 `size=sm` / `lg`（数据集的缩略图） |
 | `GET /api/v1/reviews/{reviewID}/labels` | 审图标注中的类别：`{items: [{name, object_count, image_count}], total}`，按目标数从多到少 |
 | `GET /api/v1/reviews/{reviewID}/classes` | 候选类别 `{items: [{name, color}], total, version}`：模型所属项目的类别列表不为空时用它（带它的 `version`），否则为模型的类别名称（`version` 为 `""`） |
-| `POST /api/v1/reviews/{reviewID}/packages` | 准备下载审图包：`{statuses?, dataset_ids?}`（省略时为全部），返回 201 `{url, file_name, expires_at, image_count}`；没有识别过的图片、或没有符合条件的图片时 409 |
+| `POST /api/v1/reviews/{reviewID}/packages` | 准备下载审图包：`{statuses?, dataset_ids?}`（省略时为全部），返回 201 `{url, file_name, expires_at, image_count}`；没有识别过的图片、或没有符合条件的图片时 409；选中的图片太多、清单 `review.json` 会超过 256 MiB 时 409（见第 11 节“审图包”） |
 | `GET /api/v1/reviews/{reviewID}/packages/{token}` | 下载审图包 zip（`Content-Disposition: attachment`，流式输出，无 Content-Length，每次下载都按当时的状态打包）；链接 1 小时内可重复使用，失效后 404 |
 | `POST /api/v1/reviews/{reviewID}/results?overwrite=&file_name=` | 上传本地审图程序导出的审图结果：请求体是 zip 本身（multipart 400），必须带 `Content-Length`（≤ 4 GiB，否则 413），剩余空间不足时 507；不是这个任务的结果或文件无效时 422。返回 `{id, review_id, file_name, overwrite, summary, problems, created_at}`，规则见第 11 节“上传审图结果” |
-| `GET /api/v1/reviews/{reviewID}/uploads` | 最近 50 次上传，新的在前 |
+| `GET /api/v1/reviews/{reviewID}/uploads` | 最近 50 次上传，新的在前（`total` 为全部的次数） |
 | `POST /api/v1/reviews/{reviewID}/merges` | 开始合并到数据集：`{dataset_ids?, statuses, on_existing: "skip" \| "overwrite"}`，返回 202 与合并记录（`status: running`）。已有合并在进行、没有识别过的图片、没有符合条件的图片时 409 |
-| `GET /api/v1/reviews/{reviewID}/merges` | 最近 50 次合并，新的在前 |
+| `GET /api/v1/reviews/{reviewID}/merges` | 最近 50 次合并，新的在前（`total` 为全部的次数） |
 | `GET /api/v1/reviews/{reviewID}/merges/{mergeID}` | 合并的状态与进度（前端轮询）：`status`、`total`、`done`、`summary`、`problems`、`error` |
 | `GET /api/v1/reviews/tool` | 本地审图程序：`{available, file_name: "trainmaster-reviewer.exe", size_bytes, version}`（`version` 为平台的版本，两者一起构建；没有时为 `""`） |
 | `GET /api/v1/reviews/tool/download` | 下载本地审图程序（`application/octet-stream`、`attachment`，支持 Range）；平台没有附带（`TM_REVIEWER_TOOL` 未设置或文件不存在）时 404 |
@@ -298,7 +298,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `POST /api/v1/compute/agent/model-exports/{exportID}/fail` | `{error, detail?, retryable?}` 报告失败：`retryable` 为 true 且领取次数少于 3 次时重新排队，否则转换失败（`error` 截断到 500 个字符、`detail` 截断到 8 KiB），返回转换记录 |
 | `GET /api/v1/compute/agent/review-inferences/{reviewID}/model` | 下载审图任务所用的 `model.pt`（支持 Range）；读取期间每 15 秒续租一次。模型已被删除或文件已不在磁盘上时审图任务失败，返回 404 |
 | `GET /api/v1/compute/agent/review-inferences/{reviewID}/images?after=&limit=` | 还没有识别的图片：ID 大于 `after` 的，按 ID 排列，`limit` 默认 200、最多 500；返回 `{items: [{id, file_name, width, height, size_bytes, url}], remaining}`，并续租 |
-| `GET /api/v1/compute/agent/review-inferences/{reviewID}/images/{imageID}/file` | 下载一张图片（数据集中的原图，支持 Range）并续租；文件已不存在时 404，节点把这张图片报为识别失败 |
+| `GET /api/v1/compute/agent/review-inferences/{reviewID}/images/{imageID}/file` | 下载一张图片（数据集中的原图，支持 Range）并续租；文件或数据集文件夹已不存在时 404 `not_found`（带数据集的说明；不用 409，它表示任务已不属于这个节点），节点把这张图片报为识别失败 |
 | `POST /api/v1/compute/agent/review-inferences/{reviewID}/progress` | `{stage: "downloading" \| "inferring", message?}` 上报进度并续租，返回 `{"lease_seconds": 60}` |
 | `POST /api/v1/compute/agent/review-inferences/{reviewID}/results` | 上报一批识别结果：`{results: [{id, ok, width, height, boxes: [{name, class_id, confidence, xmin, ymin, xmax, ymax}], error}]}`（每批最多 500 张），在一个事务中写入并续租，返回 `{lease_seconds, accepted, remaining}`；已经识别过的、不属于任务的图片忽略（可以安全重发） |
 | `POST /api/v1/compute/agent/review-inferences/{reviewID}/complete` | `{result: {...}}` 结束识别，任务为 `ready`，返回审图任务；还有没识别的图片时 409（“还有 N 张图片没有识别”） |
@@ -668,7 +668,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 |---|---|
 | `reviews` | 审图任务：名称、说明、`model_id` 与 `project_id`（模型或项目删除后为 NULL）、创建时的模型快照 `model_ref`（`{id, project_id, project_name, version, yolo_version, task, file_name, class_names}`，模型删除后仍能显示）、识别参数 `options`（`{conf, iou, imgsz: [高, 宽], max_det}`）、识别状态（`status`、`stage`、`node_id`、`attempts`、`lease_expires_at`、`error`、`error_detail`、`result`、开始与结束时间） |
 | `review_datasets` | 任务的数据集，按选择的顺序（`position`）；`folder` 是数据集在任务文件夹与审图包中的文件夹名，`dataset_name` 是创建时的名称 |
-| `review_images` | 任务的图片：创建时数据集图片的**快照**（`rel_path`、尺寸、`image_version`），`position` 为任务中的顺序；`package_path` / `annotation_path` 是图片与审图标注在任务文件夹（审图包）中的路径。识别结果 `inferred`、`inference_error`、`predictions`（模型的框，之后不再改变）；当前审图标注的 `object_count`、`labels`、`annotation_version`（文件内容的版本，没有文件时为 `""`）与 `edited`；审核状态 `status`、`reviewed_at`；`revision`（标注与状态各自每变一次加 1）；`merged_at` / `merged_revision`（最近一次合并） |
+| `review_images` | 任务的图片：创建时数据集图片的**快照**（`rel_path`、尺寸、`image_version`），`position` 为任务中的顺序；`package_path` / `annotation_path` 是图片与审图标注在任务文件夹（审图包）中的路径。识别结果 `inferred`、`inference_error`、`predictions`（模型的框，之后不再改变）；当前审图标注的 `object_count`、`labels`、`annotation_version`（文件内容的版本，没有文件时为 `""`）与 `edited`；审核状态 `status`、`reviewed_at`；`revision`（标注与状态各自每变一次加 1）；`merged_at` / `merged_revision`（最近一次合并）；`upload_package_id` / `upload_revision`（最近一次改了它的上传来自哪个审图包、改成的 `revision`，见“上传审图结果”） |
 | `review_uploads` | 上传的审图结果与应用结果：`file_name`、`overwrite`、`summary`、最多 100 条 `problems` |
 | `review_merges` | 合并到数据集的后台任务：`dataset_ids`、`statuses`、`on_existing`（`skip` / `overwrite`）、`status`（`running` → `succeeded` / `failed`）、进度 `total` / `done`、`summary`、`problems`、`error`；部分唯一索引保证一个任务同时只有一个合并在进行 |
 
@@ -710,7 +710,7 @@ reviews/
 1. **领取**：节点在 `kinds` 中带上 `review_inference`。平台先找转换任务（`model_export`），没有时再按注册顺序问各个任务来源；审图任务按 `SELECT … FROM reviews WHERE status = 'queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1` 取最早排队的，置为 `running`、记下节点、`attempts + 1`、租约 60 秒。模型已被删除或模型文件不在时，这个任务直接失败（“模型已被删除，无法识别” / “模型文件不存在，无法识别”），领取继续看下一个（一次最多跳过 20 个）。
 2. **任务**（`review.Task`）：`{kind, id, lease_seconds, model: {id, project_id, version, yolo_version, task, file_name, size_bytes, sha256, class_names}, options, image_count, remaining, model_url, images_url, progress_url, results_url, complete_url, fail_url}`，URL 都在 `/api/v1/compute/agent/review-inferences/<任务ID>/` 下。
 3. **执行**：节点下载模型（`GET model`，支持 Range，读取期间每 15 秒续租；这时才发现模型已删除或文件已不在时任务失败，返回 404），上报进度（`downloading` / `inferring`）；按页取还没有识别的图片（`GET images?after=<上一页最后的 ID>&limit=`，按 ID 排列，带 `remaining`），逐张下载（`GET images/{imageID}/file`）并识别，结果攒批上报（`POST results`，每批最多 500 张、请求体 1 MiB）。
-4. **写入结果**：每个请求在一个事务中处理：识别成功的图片写入 VOC 文件（模型的框，不带置信度与 `difficult` / `truncated` 标记）并记下 `predictions`、`object_count`、`labels`、`annotation_version`；识别失败的图片只记 `inference_error`（中文原因，没有文件）。已经识别过的、不属于这个任务的图片 ID 忽略，因此重发同一批结果是安全的；返回 `{lease_seconds, accepted, remaining}`。框按上报的值清洗：类别名称去掉控制字符与首尾空白、最长 255 个字符，名称为空或坐标不是有限值的框丢弃；坐标裁剪到图片范围并取整，面积为 0 的框丢弃；置信度限制在 0–1 并保留 4 位小数；每张图片最多保留置信度最高的 1000 个框。
+4. **写入结果**：每个请求在一个事务中处理：识别成功的图片写入 VOC 文件（模型的框，不带置信度与 `difficult` / `truncated` 标记）并记下 `predictions`、`object_count`、`labels`、`annotation_version`；识别失败的图片只记 `inference_error`（中文原因，没有文件）。图片的尺寸（裁剪框、VOC 的 `<size>`）取数据集索引中现在的尺寸（文件被替换后重新扫描时随之更新，图片列表交给节点的也是它），没有时用创建时复制的尺寸，都没有时才用节点上报的，并记到行中。已经识别过的、不属于这个任务的图片 ID 忽略，因此重发同一批结果是安全的；返回 `{lease_seconds, accepted, remaining}`。框按上报的值清洗：类别名称去掉控制字符与首尾空白、最长 255 个字符，名称为空或坐标不是有限值的框丢弃；坐标裁剪到图片范围并取整，面积为 0 的框丢弃；置信度限制在 0–1 并保留 4 位小数；每张图片最多保留置信度最高的 1000 个框。
 5. **完成**：`POST complete`（`{result}`）在还有没识别的图片时返回 409（“还有 N 张图片没有识别”），否则任务为 `ready`。`result` 只保留 `device`、`torch_version`、`ultralytics_version`、`node_name`、`elapsed_seconds`、`images_per_second`。
 6. **租约与失败**：同模型转换：每个调用都续租，平台每 15 秒检查一次，租约过期的任务在领取次数少于 3 次时重新排队，否则失败（“训练节点在识别过程中失去联系（已尝试 3 次）”）；`POST fail`（`{error, detail?, retryable?}`）可重试且领取次数少于 3 次时重新排队，否则失败。重新排队与重试都从还没有识别的图片继续，已经上报的结果保留。任务被删除时节点的调用得到 404，已不属于该节点或已结束时得到 409，节点随之放弃。
 7. **排队与在线节点**：排队中的任务带 `queue_position`（在排队的审图任务中的位置，从 1 起）；`workers_online` 是最近 60 秒内在领取中提供过 `review_inference`、或上报过任务的节点数（`model.Service.WorkersOnline(kind)`，按类型统计，正在执行转换的节点仍算作提供了审图识别）。为 0 时页面提示没有可以识别的训练节点。
@@ -722,9 +722,9 @@ reviews/
 1. 工作目录为状态目录中的 `work/review-inference-<任务ID>/`（开始前清理残留，结束后删除，节点启动时也清理）；检查剩余空间（模型大小 + 256 MiB，不足时为可重试的失败）；下载 `model.pt` 并核对大小与 SHA256。
 2. 启动**子进程** `python -m trainmaster_trainer.review_inference --spec <JSON>`：环境变量的处理与模型转换相同（只继承运行 Python 需要的变量，没有节点令牌；`YOLO_OFFLINE=1`、`YOLO_AUTOINSTALL=False`、`ULTRALYTICS_SAFE_LOAD=1`，并确认安全加载已生效），只是**显卡可见**（节点自己设置了 `CUDA_VISIBLE_DEVICES` 时沿用）：有 CUDA 时在 `cuda:0` 上识别，否则在 CPU 上。子进程加载模型并预热一次后输出一行 `{"ready": true, "device", "names", "versions", …}`；之后父进程每张图片写一行 `{"id", "path"}`，子进程回答一行 `{"id", "ok": true, "width", "height", "boxes": [[x1, y1, x2, y2, 置信度, 类别], …]}`，或这张图片的 `{"id", "ok": false, "error"}`；显存不足、显卡出错等继续下去没有意义的错误输出不带 `id` 的失败后退出。
 3. 图片按存储的像素方向读取（OpenCV 的 `IMREAD_IGNORE_ORIENTATION`；TIFF 先把 Orientation 标签改为 1，因为 OpenCV 与 Pillow 读 TIFF 时都会按它旋转；OpenCV 读不了的格式（GIF、部分 AVIF 等）用 Pillow 读取第一帧，同样不旋转），坐标与平台显示、标注的图片一致；旋转框模型取旋转框的外接矩形（`obb.xyxy`）。torch、ultralytics 与 OpenCV 只在子进程中导入。
-4. 父进程按页（200 张）取图片，用 4 个线程预先下载（最多领先 8 张，工作目录中同时只有这么多张图片），依次交给子进程（最多 2 张在途），结果攒满 32 张、512 KB 或 5 秒时上报一批，期间定期上报进度（续租）。超过 1 GiB 的图片不下载，上报这张图片识别失败；单张图片下载时得到 404 时同样只是这张失败。平台不再列出图片时完成；一轮之后平台仍列出未识别的图片时再来一轮，连续 3 轮都有时放弃。
-5. **超时**：单张图片的识别（从子进程开始处理它算起）与启动子进程、加载模型都受 `TM_INFERENCE_IMAGE_TIMEOUT` 限制（默认 300 秒；启动至少 120 秒），超时后结束整个进程组，任务失败（不可重试，“识别超时（单张图片 N 秒内没有识别完成）…”）。
-6. **失败**：平台返回 404 / 409 时放弃任务；5xx（507 除外）、401、网络错误、磁盘不足等为可重试的失败；节点停止时结束子进程并上报可重试的失败（“训练节点正在停止，识别已中断”）；模型无法加载等识别本身的失败不可重试，`error` 为中文说明（翻译规则同模型转换），`detail` 为子进程 stderr 的最后部分。
+4. 父进程按页（200 张）取图片，用 4 个线程预先下载（最多领先 8 张，工作目录中同时只有这么多张图片），依次交给子进程（最多 2 张在途），结果攒满 32 张、512 KB 或 5 秒时上报一批，期间定期上报进度（续租）。超过 1 GiB 的图片不下载，上报这张图片识别失败；单张图片下载时得到 404 或 409 时同样只是这张失败（任务已不属于本节点时，下一次上报结果或进度同样得到 409，随即放弃）。平台不再列出图片时完成；一轮之后平台仍列出未识别的图片时再来一轮，连续 3 轮都有时放弃。
+5. **超时**：单张图片的识别（从子进程开始处理它算起）与启动子进程、加载模型都受 `TM_INFERENCE_IMAGE_TIMEOUT` 限制（默认 300 秒；启动至少 120 秒），超时后结束整个进程组，任务失败（不可重试，“识别超时（单张图片 N 秒内没有识别完成）…”）；超时的图片先记为识别失败（随失败一起上报），所以“重新识别”时跳过它、继续识别其余的图片。
+6. **失败**：平台返回 404 / 409 时放弃任务；5xx（507 除外）、401、网络错误、磁盘不足等为可重试的失败；节点停止时结束子进程并上报可重试的失败（“训练节点正在停止，识别已中断”）；模型无法加载等识别本身的失败不可重试，`error` 为中文说明（翻译规则同模型转换），`detail` 为子进程 stderr 的最后部分。子进程在识别某张图片时意外退出（“识别进程崩溃（信号 SIGSEGV）”等；只有 SIGKILL 说明“可能是内存不足”）时同样先把这张图片记为识别失败、再让任务失败，`detail` 的最后注明出错的图片，一张有问题的图片不会让任务永远完成不了。
 
 `python -m trainmaster_trainer infer --weights x.pt [--conf 0.25] [--iou 0.7] [--imgsz 640|高x宽] [--max-det 300] [--device cpu|cuda:0] [--task …] [--json] 图片…` 用同一个子进程在本机识别图片（离线，不连接平台），打印每张图片的尺寸、检测框与耗时，便于排查识别失败或结果不对的原因；任何一张失败时退出码为 1。
 
@@ -732,13 +732,13 @@ reviews/
 
 - **读取**：图片列表与上一张 / 下一张按任务中的顺序（`position`），筛选：`status`（`all` / `pending` / `approved` / `needs_sample` / `reviewed` 即已审核与需加样）、`dataset_id`、`label`（审图标注中的类别）、`q`（数据集中的路径包含，不区分大小写）、`edited`（`all` / `edited` / `unedited`）、`boxes`（`all` / `with` / `without`）、`inference`（`all` / `failed`）；`limit` 默认 60、最多 200。图片详情的 `objects` 实时从任务文件夹中的 VOC 文件读取（文件无法使用时 `annotation_error` 说明原因，编辑器只读），并带 `predictions`。原图与缩略图来自数据集。
 - **候选类别**（`GET …/classes`）：模型所属项目的类别列表（带 `version`）不为空时用它，否则用模型的类别名称（`version` 为 `""`）。`GET …/labels` 是审图标注中各类别的目标数与图片数，按目标数从多到少。
-- **保存审图标注**（`PUT …/annotation`，请求体最多 8 MiB）：`{objects, base_version, force?}`，校验与裁剪同数据集的标注；`base_version` 与当前文件版本不同时返回 409 `annotation_conflict`（带 `force: true` 覆盖），还没有识别的图片返回 409 `conflict`。重新生成整个 VOC 文件，更新 `object_count`、`labels`、`edited` 与 `annotation_version`，`revision` 加 1；框与当前文件相同时不算修改。`objects` 为 `[]` 时写入没有目标的文件。
+- **保存审图标注**（`PUT …/annotation`，请求体最多 8 MiB）：`{objects, base_version, force?}`，校验与裁剪同数据集的标注；`base_version` 与当前文件版本不同时返回 409 `annotation_conflict`（带 `force: true` 覆盖），还没有识别的图片返回 409 `conflict`。框按数据集索引中这张图片现在的尺寸裁剪（与记下的不同时一并更正，上传结果时同样）。重新生成整个 VOC 文件，更新 `object_count`、`labels`、`edited` 与 `annotation_version`，`revision` 加 1；框与当前文件相同时不算修改。`objects` 为 `[]` 时写入没有目标的文件。
 - **审核状态**（`PUT …/status`，`{status}`）：改为 `approved` / `needs_sample` 时记下 `reviewed_at`，改回 `pending` 时清空；状态变化时 `revision` 加 1。还没有识别的图片返回 409。
 - **编辑器**（`src/features/reviews/review-editor.tsx`）与标注工作台共用画布、框编辑、工具栏部件、保存队列与离开前的保存（`features/annotation/` 中的 `box-editing.tsx`、`toolbar-parts.tsx`、`save-guard.tsx`、`use-editor-keys.ts`、`editor-common.ts`），只通过 `ReviewSource`（接口前缀与查询键）读写，平台（`/api/v1/reviews/<ID>`）与本地审图程序（`/api/review`）共用。审图时快捷键多了 <kbd>S</kbd> / <kbd>X</kbd> / <kbd>U</kbd>（已审核 / 需加样 / 待审核，`shortcuts.ts` 的 `review` 模式），<kbd>N</kbd>（空标注）不可用，<kbd>Shift</kbd>+<kbd>D</kbd> / <kbd>Shift</kbd>+<kbd>A</kbd>（没有选中框时还有 <kbd>Shift</kbd>+<kbd>→</kbd> / <kbd>←</kbd>）跳到当前数据集筛选下的下一张 / 上一张待审核图片。标记前先等这张图片的保存完成；“标记后自动跳到下一张”（默认开，记在浏览器中）开启时，标为已审核或需加样后跳到下一张符合筛选条件的图片，改回待审核不跳。
 
 ### 审图包
 
-`POST …/packages`（`{statuses?, dataset_ids?}`，默认全部状态与数据集）检查后返回 201 `{url, file_name, expires_at, image_count}`；只打包识别过的图片，没有时 409。链接的令牌（`crypto/rand` 的 `rand.Text()`）保存在进程内存中，1 小时内可以重复下载，**每次下载都按当时的状态现场打包**：边打包边输出，没有 Content-Length，不占用磁盘空间；中途出错时中断连接（同数据集下载），链接过期后 404（“下载链接已失效，请重新下载”）。
+`POST …/packages`（`{statuses?, dataset_ids?}`，默认全部状态与数据集）检查后返回 201 `{url, file_name, expires_at, image_count}`；只打包识别过的图片，没有时 409。平台与本地审图程序都只读取 256 MiB 以内的清单，所以先按选中的图片估算 `review.json` 的大小（每张约 400 字节加路径，每个框约 100 字节），超过 240 MiB 时 409（“选中的图片太多：审图包中的 review.json 会超过 256 MiB…，请按数据集或审核状态分批下载”）。链接的令牌（`crypto/rand` 的 `rand.Text()`）保存在进程内存中，1 小时内可以重复下载，**每次下载都按当时的状态现场打包**：边打包边输出，没有 Content-Length，不占用磁盘空间；中途出错时中断连接（同数据集下载），链接过期后 404（“下载链接已失效，请重新下载”）。
 
 zip 中只有一个顶层文件夹 `审图-<任务ID>-<任务名>/`（`SafeSegment`，也是 zip 的文件名）：先是 `README.txt`（UTF-8 带 BOM、CRLF 换行的中文说明），然后按任务中的顺序依次是每张图片（`package_path`）与紧随其后的审图标注（`annotation_path`，有文件时），最后是清单 `review.json`。图片按数据集下载的规则选择存储或 Deflate（`dataset.ZipMethod`）；数据集中已不存在的图片文件同时从 zip 与清单中略去。
 
@@ -747,23 +747,24 @@ zip 中只有一个顶层文件夹 `审图-<任务ID>-<任务名>/`（`SafeSegme
 - `format: "trainmaster-review"`、`version: 1`、`kind`（`package` 审图包 / `results` 审图结果）、`package_id`（每次下载随机生成的 128 位十六进制，审图结果沿用）、`platform`（如 `trainMaster 0.1.0-dev (d62132f)`）、`exported_at`。
 - `review`（`{id, name, description, created_at}`）、`model`（模型快照）、`options`、`classes`（`[{name, color}]`，候选类别）、`datasets`（`[{id, name, folder}]`）。
 - `images`：按任务中的顺序，每张 `{id（审图图片）, dataset_id, image_id（数据集图片）, path（包中的图片）, source_path（数据集中的路径）, annotation（包中的标注文件）, has_annotation, width, height, predictions, inference_error, base_status, base_revision, base_annotation_version, status, reviewed_at, edited}`。`base_*` 是打包时平台上的状态、`revision` 与标注文件的版本，是之后上传结果时判断“谁改过”的依据。写入时每张图片一行，便于查看与比对。
-- 读取时校验：格式与版本（更新的版本提示升级程序）、`kind`、ID 为正数且不重复、数据集文件夹合法且不是保留的名称、每个路径都合法并位于自己的数据集文件夹中、路径不区分大小写不重复。zip 中的清单是最浅的 `review.json`（最多 3 层文件夹，忽略 `__MACOSX`），同一层有多个时报错。
+- 读取时校验：格式与版本（更新的版本提示升级程序）、`kind`、`package_id` 为 32 位小写十六进制（本地审图程序用它命名文件夹）、ID 为正数且不重复、数据集文件夹合法且不是保留的名称、每个路径都合法并位于自己的数据集文件夹中、路径不区分大小写不重复。zip 中的清单是最浅的 `review.json`（最多 3 层文件夹，忽略 `__MACOSX`），同一层有多个时报错。解码之前先检查各列表的长度（`MaxManifestImages` 等：`images` 最多 200 000 张，每张最多 1000 个框、合计最多 3 000 000 个框，其它列表最多 65 536 项），很小的文件不会解码成几 GB 的内存。
 
 ### 上传审图结果
 
-`POST …/results?overwrite=&file_name=`，请求体就是 zip 本身（`Content-Type: application/zip`，multipart 返回 400），必须带 `Content-Length`，最大 4 GiB（413）。剩余空间至少为大小 + 512 MiB（否则 507）；请求体先暂存到 `tmp/review-uploads/<随机名>.zip`，接收完之后的处理不再因浏览器断开而中断。清单最大 256 MiB；不是这个任务的结果时返回 422（“这是审图任务 #N 的审图结果，不是这个任务的”）。重新压缩的审图包也可以上传（其中的图片忽略，标注只在内容变化时才算修改）。
+`POST …/results?overwrite=&file_name=`，请求体就是 zip 本身（`Content-Type: application/zip`，multipart 返回 400），必须带 `Content-Length`，最大 4 GiB（413）。剩余空间至少为大小 + 512 MiB（否则 507）；请求体先暂存到 `tmp/review-uploads/<随机名>.zip`，接收完之后的处理不再因浏览器断开而中断。清单最大 256 MiB；不是这个任务的结果时返回 422（“这是审图任务 #N 的审图结果，不是这个任务的”）。重新压缩的审图包也可以上传（其中的图片忽略，标注只在内容变化时才算修改），但在本地审图程序中打开过的审图包文件夹（有 `review-progress.json`）不行（422）：其中标记的审核状态只保存在进度文件中，要在程序中“导出审图结果”再上传。zip 中未标记 UTF-8 的文件名按 GB18030 解码（中文 Windows 的压缩工具写的是 GBK），`\` 当作文件夹分隔符；文件夹条目（包括名称不以 `/` 结尾、只带文件夹属性的）忽略，没有 `review.json` 时 422。
 
 逐张比较清单与打包时的状态：
 
 1. 清单中的图片不在任务中 → `unknown`；`image_id` 或标注路径与平台不符 → `invalid`。
 2. **本地的修改**：`status` 与 `base_status` 不同为状态修改；zip 中有这张图片的标注文件、且版本与 `base_annotation_version` 不同为标注修改（解析并按平台的规则规范化，文件无效时整张图片作为 `invalid` 跳过，大小上限同数据集的标注文件）。都没有 → `unchanged`。
 3. 在这张图片的锁内，只有与平台**当前内容**不同的部分才算数：都相同时为 `unchanged`（所以重复上传同一份结果不会重复应用）。平台上的 `revision` 与 `base_revision` 不同（下载之后平台上也改过）且没有 `overwrite=true` 时为冲突（“平台上的这张图片在下载审图包之后被修改过”），否则应用（写入标注文件、更新状态，规则同保存与审核，`reviewed_at` 为应用的时间）。
+4. **接着上传**：本地审图程序再次导出时 `base_*` 仍是包中的，同一个审图包的结果可以随着审核多次上传。应用时平台在同一个事务中记下改了这张图片的审图包（`package_id`）与改成的 `revision`（`upload_package_id` / `upload_revision`）；之后没有别人再改过（`revision` 仍是那次的）的图片，同一个包的上传从平台现在的状态接着比较：本地的状态与标注和平台现在的不同就算修改（改回包中的状态或标注也算），也不算冲突。重新压缩的审图包没有自己的状态，这时只比较标注。同一个包解压到两个文件夹分别审、先后上传时，后上传的会把先上传改过的图片改回去。
 
-每张图片单独处理，一张的问题不影响其它。返回并记录到 `review_uploads` 的结果为 `summary`（`images`、`applied`、`status_changes`、`annotation_changes`、`unchanged`、`conflicts`、`invalid`、`unknown`）与最多 100 条 `problems: [{path, kind, message}]`；`GET …/uploads` 列出最近 50 次上传。页面在有冲突时可以带 `overwrite=true` 再上传一次。
+每张图片单独处理，一张的问题不影响其它。返回并记录到 `review_uploads` 的结果为 `summary`（`images`、`applied`、`status_changes`、`annotation_changes`、`unchanged`、`conflicts`、`invalid`、`unknown`）与最多 100 条 `problems: [{path, kind, message}]`；`GET …/uploads` 列出最近 50 次上传（`total` 为全部的次数）。页面在有冲突时可以带 `overwrite=true` 再上传一次。
 
 ### 合并到数据集
 
-`POST …/merges`（`{dataset_ids?, statuses, on_existing}`，`statuses` 至少一种，`on_existing` 为 `skip` / `overwrite`）返回 202 与合并记录，在后台按任务中的顺序处理所选数据集中这些状态的识别过的图片（页面提供需加样（默认）与已审核，接口也接受 `pending`）。已有合并在进行时 409，没有符合条件的图片时 409。进度至少每 50 张或每秒保存一次，`GET …/merges/{mergeID}` 查看，`GET …/merges` 列出最近 50 次。
+`POST …/merges`（`{dataset_ids?, statuses, on_existing}`，`statuses` 至少一种，`on_existing` 为 `skip` / `overwrite`）返回 202 与合并记录，在后台按任务中的顺序处理所选数据集中这些状态的识别过的图片（页面提供需加样（默认）与已审核，接口也接受 `pending`）。已有合并在进行时 409，没有符合条件的图片时 409。进度至少每 50 张或每秒保存一次，`GET …/merges/{mergeID}` 查看，`GET …/merges` 列出最近 50 次（`total` 为全部的次数）。
 
 每张图片：
 
@@ -772,17 +773,17 @@ zip 中只有一个顶层文件夹 `审图-<任务ID>-<任务名>/`（`SafeSegme
 - 数据集中这张图片已有标注文件（含空标注与无效标注）且 `on_existing` 为 `skip` → `skipped_existing`；
 - 否则通过 `dataset.Service.SaveAnnotation` 写入（与标注工作台的保存相同：数据集索引与计数随之更新，`base_version` 为刚读到的版本，`overwrite` 时允许重新生成无法保留其它内容的文件）；框为空时写入空标注（负样本）。期间数据集中的标注被别人修改了 → `conflicts`（“数据集中这张图片的标注在合并时被其他人修改了，没有合并”）；成功 → `merged`，记下 `merged_at` 与 `merged_revision`。
 
-个别图片的失败不影响合并的结果（`succeeded`，`summary`：`merged`、`skipped_existing`、`skipped_empty`、`conflicts`、`failed`，以及最多 100 条 `problems`）；只有合并本身出错时为 `failed`。服务停止或重启时进行中的合并为失败，已合并的图片保留，可以再次合并。任务自己的审图标注不受影响；进行中的合并会阻止删除任务。
+个别图片的失败不影响合并的结果（`succeeded`，`summary`：`merged`、`skipped_existing`、`skipped_empty`、`conflicts`、`failed`，以及最多 100 条 `problems`）；只有合并本身出错时为 `failed`。记下合并结束的更新失败时（如数据库正在重启）从 1 秒起加倍、最长每 30 秒重试一次，直到成功或服务停止，合并不会一直显示为进行中。服务停止或重启时进行中的合并为失败，已合并的图片保留，可以再次合并。任务自己的审图标注不受影响；进行中的合并会阻止删除任务。
 
 ### 本地审图程序
 
 `trainmaster-reviewer.exe`（`backend/cmd/trainmaster-reviewer`，Go，`GOOS=windows`、`-H windowsgui`）是在 Windows 电脑上离线审图的单个可执行文件：
 
 - **分发**：平台镜像中带着它（`/app/tools/trainmaster-reviewer.exe`，`TM_REVIEWER_TOOL`），`GET /api/v1/reviews/tool` 说明是否可以下载与版本（与平台同时构建，版本即平台的版本），`GET …/tool/download` 下载。页面（`frontend/reviewer.html`，`vite.reviewer.config.ts`）构建到 `cmd/trainmaster-reviewer/web/dist`，编译时用 `go:embed` 嵌入；没有构建时嵌入的是占位页。
-- **启动**：只监听本机地址（`-addr`，默认 `127.0.0.1:0`，端口为 0 时先试 47821，这样每次的地址相同，WebView2 保留页面的设置；被占用时随机选择）。Windows 上用 WebView2（`github.com/jchv/go-webview2`，数据目录为程序缓存目录 `%LOCALAPPDATA%\trainmaster-reviewer` 中的 `webview2\`）打开标题为“trainMaster 本地审图”的窗口；系统没有 WebView2 运行时、窗口打不开或带 `-browser` 时改用默认浏览器打开，并用一个消息框让程序保持运行，点“确定”退出。关闭窗口时先通知页面（`window.__tmReviewerRequestClose`），页面保存最后的修改后调用 `POST /api/quit`；3 秒内没有回应（页面没有加载）时直接关闭。命令行的参数（或拖到程序图标上的文件）是启动时要打开的审图包。`TM_REVIEWER_DEBUG` 不为空时启用开发者工具；其它系统上的构建用于开发，在浏览器中打开。
-- **访问控制**（`internal/reviewer/security.go`）：本机的任何程序与网页都能访问 127.0.0.1，所以只回应程序打开的页面：程序打开 `/?token=<随机令牌>`，服务器把令牌设为 Cookie（`HttpOnly`、`SameSite=Strict`，名称带端口）后重定向到不带令牌的地址，之后每个请求都必须带它（否则 401）；`Host` 必须是服务器自己的地址（`127.0.0.1:<端口>` 或 `localhost:<端口>`，防 DNS 重绑定，否则 403）；浏览器标为来自其它来源的请求（`Origin` 与本机地址不符，`Sec-Fetch-Site` 不是 `same-origin` / `none`）返回 403（127.0.0.1 的其它端口对 Cookie 来说是同一个站点）。
+- **启动**：只监听本机地址（`-addr`，默认 `127.0.0.1:0`，端口为 0 时先试 47821，这样每次的地址相同，WebView2 保留页面的设置；被占用时随机选择）。Windows 上用 WebView2（`github.com/jchv/go-webview2`，数据目录为程序缓存目录 `%LOCALAPPDATA%\trainmaster-reviewer` 中的 `webview2\`）打开标题为“trainMaster 本地审图”的窗口；系统没有 WebView2 运行时、窗口打不开或带 `-browser` 时改用默认浏览器打开，并用一个消息框让程序保持运行，点“确定”退出。窗口出现之后 WebView2 才失败时（创建环境或控制器失败，如数据目录不能写；go-webview2 这时用 `log.Fatal` 结束程序）程序拦下它，关掉留下的窗口后同样改用浏览器；标准库 `log` 的输出（go-webview2 的报错）写进 `reviewer.log`。关闭窗口时先通知页面（`window.__tmReviewerRequestClose`），页面保存最后的修改后调用 `POST /api/quit`；3 秒内没有回应（页面没有加载）时直接关闭。命令行的参数（或拖到程序图标上的文件）是启动时要打开的审图包。`TM_REVIEWER_DEBUG` 不为空时启用开发者工具；其它系统上的构建用于开发，在浏览器中打开。
+- **访问控制**（`internal/reviewer/security.go`）：本机的任何程序与网页都能访问 127.0.0.1，所以只回应程序打开的页面：程序打开 `/?token=<随机令牌>`，服务器把令牌设为 Cookie（`HttpOnly`、`SameSite=Strict`，名称带端口）后重定向到不带令牌的地址，之后每个请求都必须带它（否则 401）；`Host` 必须是服务器自己的地址（监听的地址与端口，监听 `127.0.0.1` 或 `::1` 时还有 `localhost:<端口>`，防 DNS 重绑定，否则 403；程序打开的也是监听的地址）；浏览器标为来自其它来源的请求（`Origin` 与本机地址不符，`Sec-Fetch-Site` 不是 `same-origin` / `none`）返回 403（127.0.0.1 的其它端口对 Cookie 来说是同一个站点）。
 - **接口**：`/api/review/*` 与平台的审图接口形状相同（审图编辑器直接复用），另有程序自己的 `/api/session`、`/api/browse`（打开对话框中浏览文件夹：下载、桌面、文档与各个盘符）、`/api/open`、`/api/open/cancel`、`/api/close`、`/api/export`、`/api/reveal`（在资源管理器中显示）、`/api/recent/remove`、`/api/closing`、`/api/quit`。
-- **打开审图包**（`extract.go`）：zip 解压到它旁边与 zip 同名的文件夹（`审图-12-外观.zip` → `审图-12-外观\`），只解压清单中列出的文件（以及 `README.txt` 与进度文件）；有任何不安全的条目（绝对路径、盘符、`..`、NUL、符号链接）时拒绝整个 zip。单个图片文件不超过 4 GiB、清单不超过 256 MiB，剩余空间至少为要解压的总大小 + 64 MiB。先解压到临时文件夹 `.tm-extracting-*`，全部完成后改名，因此最终名称的文件夹总是完整的（24 小时前的临时文件夹作为崩溃残留删除）。同名文件夹已存在且是同一个包（`package_id` 相同）时直接打开、接着审；否则改用 `<名称> (2)`、`<名称> (3)`…（最多到 100）。也可以直接打开解压好的文件夹、其中的 `review.json`，或只含一个审图包的文件夹；打开审图结果的 zip 时提示到平台上传。
+- **打开审图包**（`extract.go`）：zip 解压到它旁边与 zip 同名的文件夹（`审图-12-外观.zip` → `审图-12-外观\`），只解压清单中列出的文件（以及 `README.txt` 与进度文件）；有任何不安全的条目（绝对路径、盘符、`..`、NUL、符号链接）时拒绝整个 zip。单个图片文件不超过 4 GiB、清单不超过 256 MiB，剩余空间至少为要解压的总大小 + 64 MiB。先解压到临时文件夹 `.tm-extracting-*`，全部完成后改名，因此最终名称的文件夹总是完整的（24 小时前的临时文件夹作为崩溃残留删除）。同名文件夹已存在且是同一个包（`package_id` 相同）时直接打开、接着审；否则改用 `<名称> (2)`、`<名称> (3)`…（最多到 100）。也可以直接打开解压好的文件夹、其中的 `review.json`，或只含一个审图包的文件夹；打开审图结果的 zip 时提示到平台上传。zip 中未标记 UTF-8 的文件名按 GB18030 解码；输入的路径两端的引号（资源管理器“复制为路径”加的）去掉。打开期间锁住文件夹中的 `.tm-reviewer.lock`（Windows 上为 `LockFileEx`，Linux / macOS 为 `flock`；程序退出或崩溃时由系统释放，文件留着），另一个程序（如再次把 zip 拖到程序图标上）打开同一个包时提示“这个审图包已在另一个本地审图程序窗口中打开”，免得两边的审核状态互相覆盖；文件夹不能写或文件系统不支持锁时照常打开（不加锁）。
 - **审核进度**：审图标注就是文件夹中的 VOC 文件（保存方式同平台）；审核状态保存在 `review-progress.json`（`format: "trainmaster-review-progress"`、`version: 1`、`package_id`、`review_id`、`updated_at`，只记状态与包中不同的图片 `[{id, status, reviewed_at}]`，以及最近一次导出 `last_export`），都是原子替换。进度文件损坏时不打开这个包。
-- **导出审图结果**（`export.go`）：在审图包文件夹旁边原子写入 `<文件夹名>-审图结果.zip`（再次导出时替换），其中顶层文件夹 `<审图包文件夹名>-审图结果/` 有 `README.txt`、`kind` 为 `results` 的 `review.json`（包中每张图片及其当前状态，`base_*` 与包中相同）与内容和包中不同的 VOC 文件；读不出的改动过的标注文件跳过并计数。
-- **其它**：缩略图 `sm`（320px）用平台的代码生成，缓存在程序缓存目录的 `thumbs\<package_id>\` 中（30 天没有再打开的包的缩略图删除）；`lg` 对浏览器能显示的格式直接返回原图，其它格式（如 TIFF）生成 1600px 的 JPEG。最近打开的包（最多 12 个）记在用户配置目录（`%APPDATA%\trainmaster-reviewer`）的 `recent.json` 中；日志写到程序缓存目录的 `reviewer.log`（超过 4 MiB 时另起，旧的保留为 `reviewer.log.1`）。开发时用 `TM_REVIEWER_WEB_DIR` 从磁盘读取页面（见开发指南）。
+- **导出审图结果**（`export.go`）：在审图包文件夹旁边原子写入 `<文件夹名>-审图结果.zip`（再次导出时替换），其中顶层文件夹 `<审图包文件夹名>-审图结果/` 有 `README.txt`、`kind` 为 `results` 的 `review.json`（包中每张图片及其当前状态，`base_*` 与包中相同）与每张图片现在的 VOC 文件（能读取的都在，`has_annotation`；与包中相同的，平台只在“接着上传”时才算修改）；读不出的改动过的标注文件跳过并计数。
+- **其它**：缩略图 `sm`（320px）用平台的代码生成，缓存在程序缓存目录的 `thumbs\<package_id>\` 中（不是 32 位十六进制的 ID 用它的 SHA-256 命名，不会指到缓存目录之外）（30 天没有再打开的包的缩略图删除）；`lg` 对浏览器能显示的格式直接返回原图，其它格式（如 TIFF）生成 1600px 的 JPEG。最近打开的包（最多 12 个）记在用户配置目录（`%APPDATA%\trainmaster-reviewer`）的 `recent.json` 中；日志写到程序缓存目录的 `reviewer.log`（超过 4 MiB 时另起，旧的保留为 `reviewer.log.1`）。开发时用 `TM_REVIEWER_WEB_DIR` 从磁盘读取页面（见开发指南）。

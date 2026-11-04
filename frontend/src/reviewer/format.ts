@@ -55,6 +55,19 @@ export function dirName(path: string): string {
   return parent
 }
 
+/**
+ * 输入框中粘贴的路径：去掉首尾的空白和一对包住整个路径的双引号（Windows 资源
+ * 管理器的“复制为路径”总是带着它们；Windows 的路径中不能有双引号）。
+ */
+export function typedPath(text: string): string {
+  const trimmed = text.trim()
+  const unquoted =
+    trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')
+      ? trimmed.slice(1, -1)
+      : trimmed
+  return unquoted.trim()
+}
+
 /** 能打开的项目：审图包文件夹与 zip 文件。 */
 export function isOpenable(entry: Pick<BrowseEntry, "kind">) {
   return entry.kind === "package" || entry.kind === "zip"
@@ -104,6 +117,11 @@ export function openOutcome(
     return { done: false, failure: session.open_error }
   }
   return { done: session.package !== null, failure: null }
+}
+
+/** 打开的是哪个审图包（审图页面据此判断审着的审图包是否被换掉了）。 */
+export function packageKey(pkg: Pick<PackageInfo, "package_id" | "path">) {
+  return `${pkg.package_id}\n${pkg.path}`
 }
 
 /** 窗口 / 标签页的标题。 */

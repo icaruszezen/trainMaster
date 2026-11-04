@@ -348,6 +348,9 @@ type imageChange struct {
 	objects    []dataset.AnnotationObject // the new annotation, if setObjects
 	setObjects bool
 	status     string // the new status; "" keeps it
+	// The package whose uploaded results make the change ("" none): noted
+	// with the revision it makes (see imageRow.continues).
+	uploadPackageID string
 }
 
 // changed tells which kinds of change applyChange made.
@@ -374,8 +377,8 @@ func (s *Service) changeImage(ctx context.Context, reviewID, imageID int64,
 // and renamed into place before the commit (and put back if the commit
 // fails), so the file and the row agree. Each kind of change raises the
 // revision by one; a change to what the image has already is no change.
-// The image must be inferred. It returns the row as changed and what
-// changed.
+// The image must be inferred; its size is taken from its dataset first
+// (refreshSize). It returns the row as changed and what changed.
 func (s *Service) changeImageRow(ctx context.Context, reviewID, imageID int64,
 	decide func(r imageRow, a annotationFile) (imageChange, error)) (imageRow, changed, error) {
 	unlock, err := s.lockImage(ctx, imageID)
@@ -400,6 +403,9 @@ func (s *Service) changeImageRow(ctx context.Context, reviewID, imageID int64,
 		if !row.Inferred {
 			return errNotInferred
 		}
+		if err := refreshSize(ctx, tx, &row); err != nil {
+			return err
+		}
 		root, err := s.openReviewRoot(reviewID, true)
 		if err != nil {
 			return err
@@ -423,6 +429,28 @@ func (s *Service) changeImageRow(ctx context.Context, reviewID, imageID int64,
 		return imageRow{}, changed{}, err
 	}
 	return row, what, nil
+}
+
+// refreshSize gives a locked review image the size its dataset's index has
+// now, when it has one and it differs (a rescan updates it when the file is
+// replaced by another one), so that boxes are checked against, and the VOC
+// file describes, the image people see. The row is corrected in tx.
+func refreshSize(ctx context.Context, tx pgx.Tx, row *imageRow) error {
+	var width, height *int
+	err := tx.QueryRow(ctx, "SELECT width, height FROM dataset_images WHERE id = $1", row.ImageID).Scan(&width, &height)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if width == nil || height == nil ||
+		(row.Width != nil && row.Height != nil && *row.Width == *width && *row.Height == *height) {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, "UPDATE review_images SET width = $2, height = $3 WHERE id = $1",
+		row.ID, *width, *height); err != nil {
+		return err
+	}
+	row.Width, row.Height = width, height
+	return nil
 }
 
 // applyChange makes a change of a locked review image in tx: it writes the
@@ -465,7 +493,11 @@ func (s *Service) applyChange(ctx context.Context, tx pgx.Tx, root *os.Root, row
 			changes++
 		}
 	}
-	q := "UPDATE review_images SET " + strings.Join(sets, ", ") + ", revision = revision + " + args.add(changes) +
+	changesArg := args.add(changes)
+	if ch.uploadPackageID != "" {
+		sets = append(sets, "upload_package_id = "+args.add(ch.uploadPackageID), "upload_revision = revision + "+changesArg)
+	}
+	q := "UPDATE review_images SET " + strings.Join(sets, ", ") + ", revision = revision + " + changesArg +
 		", updated_at = now() WHERE id = " + args.add(row.ID) + " RETURNING revision, status, reviewed_at"
 	if err := tx.QueryRow(ctx, q, args...).Scan(&row.Revision, &row.Status, &row.ReviewedAt); err != nil {
 		if restore != nil {

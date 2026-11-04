@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -255,4 +256,119 @@ func TestIntegrationPlatformRoundTrip(t *testing.T) {
 	if err != nil || again.Summary != (review.UploadSummary{Images: 5, Unchanged: 5}) {
 		t.Errorf("repeated upload = %+v, %v", again, err)
 	}
+	results2.Close() // the next export replaces the file
+
+	// The review goes on in the same folder, and the results are exported
+	// and uploaded again: a needs samples after all, b is back to pending
+	// with the boxes of the package. The platform takes the local state,
+	// changes back to the package's included, and sees no conflict: the
+	// earlier upload of this package is not somebody else's change.
+	setStatus := func(img Image, status string) {
+		t.Helper()
+		if code := ts.do(http.MethodPut, fmt.Sprintf("/api/review/images/%d/status", img.ID), map[string]string{"status": status},
+			nil); code != http.StatusOK {
+			t.Fatalf("status of %s: %d", img.Path, code)
+		}
+	}
+	saveBoxes := func(img Image, objects ...dataset.AnnotationObject) {
+		t.Helper()
+		var cur ImageDetail
+		ts.do(http.MethodGet, fmt.Sprintf("/api/review/images/%d", img.ID), nil, &cur)
+		if code := ts.do(http.MethodPut, fmt.Sprintf("/api/review/images/%d/annotation", img.ID), map[string]any{
+			"objects": objects, "base_version": cur.AnnotationVersion}, nil); code != http.StatusOK {
+			t.Fatalf("save %s: %d", img.Path, code)
+		}
+	}
+	upload := func(overwrite bool) review.Upload {
+		t.Helper()
+		var exported ExportResult
+		if code := ts.do(http.MethodPost, "/api/export", nil, &exported); code != http.StatusOK {
+			t.Fatalf("export: %d", code)
+		}
+		f, err := os.Open(exported.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		up, err := svc.UploadResults(ctx, r.ID, review.ResultsInput{FileName: exported.FileName, Overwrite: overwrite,
+			Size: exported.SizeBytes, Body: f})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return up
+	}
+	// matches checks that the platform has what the local reviewer shows,
+	// except for the images given.
+	matches := func(round string, except ...string) {
+		t.Helper()
+		for _, li := range local.Items {
+			if slices.Contains(except, li.PackagePath) {
+				continue
+			}
+			var mine ImageDetail
+			ts.do(http.MethodGet, fmt.Sprintf("/api/review/images/%d", li.ID), nil, &mine)
+			got, err := svc.GetImage(ctx, r.ID, li.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != mine.Status || !reviewfile.SameObjects(got.Objects, mine.Objects) ||
+				(got.ReviewedAt == nil) != (mine.ReviewedAt == nil) {
+				t.Errorf("%s: %s on the platform = %s %v, locally %s %v", round, li.PackagePath, got.Status, got.Objects,
+					mine.Status, mine.Objects)
+			}
+		}
+	}
+	setStatus(a, reviewfile.StatusNeedsSample)
+	setStatus(b, reviewfile.StatusPending)
+	saveBoxes(b, obj("scratch", 1, 1, 11, 11))
+	up = upload(false)
+	if up.Summary != (review.UploadSummary{Images: 5, Applied: 2, StatusChanges: 2, AnnotationChanges: 1, Unchanged: 3}) ||
+		len(up.Problems) != 0 {
+		t.Errorf("second upload = %+v", up)
+	}
+	matches("second upload")
+	if got, _ := svc.GetImage(ctx, r.ID, b.ID); got.Edited || got.ReviewedAt != nil {
+		t.Errorf("b after the second upload = %+v", got)
+	}
+	if again := upload(false); again.Summary != (review.UploadSummary{Images: 5, Unchanged: 5}) {
+		t.Errorf("second upload repeated = %+v", again)
+	}
+
+	// Changes on the platform meanwhile still conflict: a's status and d's
+	// boxes changed on the web, then a (still needs_sample locally) and d
+	// (new boxes) are uploaded again; b goes on.
+	if _, err := svc.SetStatus(ctx, r.ID, a.ID, reviewfile.StatusApproved); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SaveAnnotation(ctx, r.ID, d.ID, review.SaveInput{Objects: []dataset.AnnotationObject{
+		obj("scratch", 3, 3, 9, 9)}, Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	setStatus(b, reviewfile.StatusApproved)
+	saveBoxes(d, obj("dent", 2, 2, 30, 25))
+	up = upload(false)
+	if up.Summary != (review.UploadSummary{Images: 5, Applied: 1, StatusChanges: 1, Unchanged: 2, Conflicts: 2}) ||
+		len(up.Problems) != 2 {
+		t.Fatalf("upload after changes on the platform = %+v", up)
+	}
+	for i, path := range []string{a.PackagePath, d.PackagePath} {
+		if p := up.Problems[i]; p.Path != path || p.Kind != review.ProblemConflict || !strings.Contains(p.Message, "修改过") {
+			t.Errorf("problem %d = %+v", i, p)
+		}
+	}
+	matches("upload after changes on the platform", a.PackagePath, d.PackagePath)
+	if got, _ := svc.GetImage(ctx, r.ID, a.ID); got.Status != reviewfile.StatusApproved {
+		t.Errorf("a after the conflict = %+v", got)
+	}
+	// Overwriting applies them; from then on the package continues again.
+	if up := upload(true); up.Summary != (review.UploadSummary{Images: 5, Applied: 2, StatusChanges: 1, AnnotationChanges: 1,
+		Unchanged: 3}) {
+		t.Errorf("overwriting upload = %+v", up)
+	}
+	matches("overwriting upload")
+	setStatus(a, reviewfile.StatusPending)
+	if up := upload(false); up.Summary != (review.UploadSummary{Images: 5, Applied: 1, StatusChanges: 1, Unchanged: 4}) {
+		t.Errorf("upload after overwriting = %+v", up)
+	}
+	matches("upload after overwriting")
 }

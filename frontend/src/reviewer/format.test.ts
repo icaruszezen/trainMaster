@@ -10,7 +10,9 @@ import {
   openingProgress,
   openOutcome,
   pageTitle,
+  packageKey,
   progressSummary,
+  typedPath,
 } from "@/reviewer/format"
 
 const counts = (patch: Partial<ReviewCounts> = {}): ReviewCounts => ({
@@ -130,5 +132,44 @@ describe("openOutcome", () => {
     expect(
       openOutcome({ opening: null, open_error: failure, package: pkg }, "b")
     ).toEqual({ done: true, failure: null })
+  })
+})
+
+describe("typedPath", () => {
+  it("accepts a path copied with Explorer's “复制为路径”", () => {
+    expect(typedPath('"C:\\Users\\张三\\Downloads\\审图-12-外观.zip"')).toBe(
+      "C:\\Users\\张三\\Downloads\\审图-12-外观.zip"
+    )
+    expect(typedPath('  "D:\\审图包\\审图-12"\n')).toBe("D:\\审图包\\审图-12")
+    expect(typedPath('" /home/a/审图-12.zip "')).toBe("/home/a/审图-12.zip")
+  })
+
+  it("keeps an unquoted path and drops surrounding blanks", () => {
+    expect(typedPath("  C:\\a\\b.zip\t")).toBe("C:\\a\\b.zip")
+    expect(typedPath("/home/a/b.zip")).toBe("/home/a/b.zip")
+  })
+
+  it("handles blanks and quotes without a path", () => {
+    expect(typedPath("   ")).toBe("")
+    expect(typedPath('""')).toBe("")
+    expect(typedPath('"')).toBe('"')
+  })
+
+  it("only strips a pair that wraps the whole path", () => {
+    expect(typedPath('"C:\\a.zip')).toBe('"C:\\a.zip')
+    expect(typedPath('C:\\a.zip"')).toBe('C:\\a.zip"')
+  })
+})
+
+describe("packageKey", () => {
+  it("tells a re-downloaded package or another folder apart", () => {
+    const a = { package_id: "p1", path: "C:\\审图-12" }
+    expect(packageKey(a)).toBe(packageKey({ ...a }))
+    expect(packageKey(a)).not.toBe(packageKey({ ...a, package_id: "p2" }))
+    expect(packageKey(a)).not.toBe(packageKey({ ...a, path: "D:\\审图-12" }))
+    // 字段之间有分隔，拼接后不会相同。
+    expect(packageKey({ package_id: "p1C", path: ":\\x" })).not.toBe(
+      packageKey({ package_id: "p1", path: "C:\\x" })
+    )
   })
 })

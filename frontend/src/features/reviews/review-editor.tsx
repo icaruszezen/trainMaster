@@ -110,10 +110,12 @@ import {
   savedReviewDetail,
   type ReviewSaveContext,
 } from "@/features/reviews/editor-api"
+import { flushWithNotice } from "@/features/reviews/editor-flush"
 import {
   hasReviewFilters,
   parseId,
   parseReviewFilters,
+  sameReviewFilters,
   updateReviewParams,
 } from "@/features/reviews/params"
 import { ReviewImageList } from "@/features/reviews/review-image-list"
@@ -157,6 +159,11 @@ const docKey = (loaded: Loaded) => `${loaded.detail.id}:${loaded.token}`
 export type ReviewEditorControls = {
   /** 立即保存这张图片的修改；保存失败、有冲突时返回 false（并已提示）。 */
   flush: () => Promise<boolean>
+  /**
+   * 放弃这张图片上还没有保存的修改，之后不再保存它们（如审图包已被换掉，
+   * 保存会写错地方）；返回是否有被放弃的修改。
+   */
+  discard: () => boolean
 }
 
 export type ReviewEditorProps = {
@@ -285,35 +292,13 @@ export function ReviewEditorSkeleton() {
   )
 }
 
-/**
- * 保存这张图片的修改；失败或有冲突时提示原因（`action` 是因此没有进行的操作，
- * 如“标记”）。保存期间切换了图片时不提示。
- */
-async function flushWithNotice(
-  saver: AnnotationSaver<ReviewSaveContext>,
-  action: string | null
-) {
-  const context = saver.getContext()
-  if (await saver.flush()) {
-    return true
+/** 只看待审核的图片（Shift+A / Shift+D），数据集的范围不变。 */
+function pendingFiltersOf(filters: ReviewImageFilters): ReviewImageFilters {
+  return {
+    ...ALL_REVIEW_IMAGES,
+    datasetId: filters.datasetId,
+    status: "pending",
   }
-  if (saver.getContext() !== context || !saver.isDirty()) {
-    return false
-  }
-  const state = saver.getState()
-  if (state.status === "conflict") {
-    toast.error(
-      action
-        ? `请先处理这张图片的保存冲突，再${action}`
-        : "请先处理这张图片的保存冲突"
-    )
-  } else {
-    toast.error(
-      action ? `保存失败，没有${action}` : "这张图片的修改没有保存成功",
-      { description: state.error ?? undefined }
-    )
-  }
-  return false
 }
 
 function Editor({
@@ -409,6 +394,11 @@ function Editor({
   )
   const [controls] = useState<ReviewEditorControls>(() => ({
     flush: () => flushWithNotice(saver, null),
+    discard: () => {
+      const pending = saver.hasPendingWork()
+      saver.discard()
+      return pending
+    },
   }))
 
   // 换了图片：载入它的框（在渲染中调整状态，避免先渲染一次旧图片的框）。
@@ -426,9 +416,16 @@ function Editor({
   // 异步操作完成时判断是否还在同一次编辑中（没有切换图片、没有重新读取）。
   const loadedRef = useRef<Loaded | null>(null)
   const imageIdRef = useRef(imageId)
+  // 地址栏中最新的筛选条件与修改参数的函数：标记后自动跳转等异步操作完成时
+  // 据此选图、改地址。某次渲染的 setParams 在那次渲染的参数上修改，期间改过的
+  // 筛选条件会被它改回去。
+  const filtersRef = useRef(filters)
+  const setParamsRef = useRef(setParams)
   useLayoutEffect(() => {
     loadedRef.current = loaded
     imageIdRef.current = imageId
+    filtersRef.current = filters
+    setParamsRef.current = setParams
   })
   const isCurrent = (start: Loaded | null): start is Loaded =>
     start !== null &&
@@ -795,7 +792,9 @@ function Editor({
   // ---- 切换图片 ----
   const openImage = (id: number) => {
     setCarry(view.keepViewport ? lastViewport.current : null)
-    setParams((previous) => updateReviewParams(previous, { image: id }))
+    setParamsRef.current((previous) =>
+      updateReviewParams(previous, { image: id })
+    )
     setImagesOpen(false)
   }
 
@@ -862,26 +861,24 @@ function Editor({
     }
   }
 
-  /** 只看待审核的图片（Shift+A / Shift+D），数据集的范围不变。 */
-  const pendingFilters: ReviewImageFilters = {
-    ...ALL_REVIEW_IMAGES,
-    datasetId: filters.datasetId,
-    status: "pending",
-  }
-
-  /** 上一张 / 下一张（`pending` 时是待审核的）；没有时返回 false 并提示。 */
+  /**
+   * 上一张 / 下一张（`pending` 时是待审核的）；没有时返回 false 并提示。按地址栏
+   * 中最新的筛选条件选图（标记后自动跳转时，标记期间可能改了筛选条件）。
+   */
   const step = async (direction: 1 | -1, pending: boolean, from = imageId) => {
+    const scope = (active: ReviewImageFilters) =>
+      pending ? pendingFiltersOf(active) : active
+    const used = scope(filtersRef.current)
     try {
       const neighbors = await queryClient.fetchQuery({
-        ...reviewNeighborsQuery(
-          source,
-          from,
-          pending ? pendingFilters : filters
-        ),
+        ...reviewNeighborsQuery(source, from, used),
         staleTime: 0,
       })
       if (imageIdRef.current !== from) {
         return false // 已切换到别的图片
+      }
+      if (!sameReviewFilters(scope(filtersRef.current), used)) {
+        return false // 期间改了筛选条件：不按原来的条件跳转
       }
       const target = direction === 1 ? neighbors.next : neighbors.prev
       if (!target) {
@@ -892,7 +889,7 @@ function Editor({
               : "前面没有待审核的图片了"
             : direction === -1
               ? "已经是第一张"
-              : hasReviewFilters(filters)
+              : hasReviewFilters(used)
                 ? "筛选结果中没有更多图片"
                 : "已经是最后一张"
         )

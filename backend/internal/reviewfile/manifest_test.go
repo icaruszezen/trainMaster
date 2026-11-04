@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -72,7 +74,8 @@ func TestManifestRoundTrip(t *testing.T) {
 
 	// Empty lists.
 	b.Reset()
-	if err := WriteManifest(&b, &Manifest{Format: ManifestFormat, Version: 1, Kind: KindResults, Review: ManifestReview{ID: 1}}); err != nil {
+	if err := WriteManifest(&b, &Manifest{Format: ManifestFormat, Version: 1, Kind: KindResults,
+		PackageID: strings.Repeat("0f", 16), Review: ManifestReview{ID: 1}}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasSuffix(b.String(), "\"images\": []\n}\n") || !strings.Contains(b.String(), `"datasets": []`) {
@@ -100,6 +103,13 @@ func TestReadManifestRejects(t *testing.T) {
 		{"newer version", func(m *Manifest) { m.Version = 2 }, "比这个程序支持的版本（1）新"},
 		{"version 0", func(m *Manifest) { m.Version = 0 }, "格式版本 0 无效"},
 		{"kind", func(m *Manifest) { m.Kind = "backup" }, "kind 必须是"},
+		{"no package id", func(m *Manifest) { m.PackageID = "" }, "package_id 无效"},
+		{"package id path", func(m *Manifest) { m.PackageID = "../x" }, "package_id 无效"},
+		{"package id escaping", func(m *Manifest) { m.PackageID = "../../0123456789abcdef0123456789" }, "package_id 无效"},
+		{"package id windows", func(m *Manifest) { m.PackageID = `..\..\0123456789abcdef0123456789` }, "package_id 无效"},
+		{"package id upper case", func(m *Manifest) { m.PackageID = strings.ToUpper(m.PackageID) }, "package_id 无效"},
+		{"package id short", func(m *Manifest) { m.PackageID = m.PackageID[1:] }, "package_id 无效"},
+		{"package id long", func(m *Manifest) { m.PackageID += "0" }, "package_id 无效"},
 		{"review id", func(m *Manifest) { m.Review.ID = 0 }, "缺少审图任务 ID"},
 		{"dataset id", func(m *Manifest) { m.Datasets[0].ID = -1 }, "第 1 个数据集的 ID 无效"},
 		{"dataset twice", func(m *Manifest) { m.Datasets[1].ID = 4 }, "数据集 4 出现了多次"},
@@ -146,6 +156,73 @@ func TestReadManifestRejects(t *testing.T) {
 	extra := bytes.Replace(data, []byte(`"kind"`), []byte(`"future": {"x": 1}, "kind"`), 1)
 	if _, err := ReadManifest(bytes.NewReader(extra), 1<<20); err != nil {
 		t.Errorf("unknown field: %v", err)
+	}
+}
+
+// TestReadManifestListLimits: lists that would decode into far more
+// memory than review.json takes are refused before they are decoded.
+func TestReadManifestListLimits(t *testing.T) {
+	const head = `{"format":"trainmaster-review","version":1,"kind":"results","package_id":"0123456789abcdef0123456789abcdef","review":{"id":1}`
+	list := func(n int, item string) string {
+		return "[" + strings.TrimSuffix(strings.Repeat(item+",", n), ",") + "]"
+	}
+	image := func(predictions int) string {
+		return `{"predictions":` + list(predictions, "{}") + `}`
+	}
+	for _, tt := range []struct {
+		name, data, msg string
+	}{
+		{"images", head + `,"images":` + list(MaxManifestImages+1, "{}") + `}`, "图片超过 200000 张"},
+		// Names match ignoring case and may be escaped: the place counts.
+		{"images in upper case", head + `,"IMAGES":` + list(maxManifestList+1, "{}") + `}`, `"IMAGES" 超过 65536 项`},
+		{"escaped name", head + `,"\u0069mages":` + list(maxManifestList+1, "{}") + `}`, "超过 65536 项"},
+		{"classes", head + `,"classes":` + list(maxManifestList+1, "{}") + `}`, "classes 超过 65536 项"},
+		{"class names", head + `,"model":{"class_names":` + list(maxManifestList+1, `""`) + `}}`,
+			"model.class_names 超过 65536 项"},
+		{"predictions", head + `,"images":[{}, ` + image(MaxImagePredictions+1) + `]}`, "第 2 张图片的预测框超过 1000 个"},
+		{"predictions of other lists", head + `,"datasets":[{"x":` + list(MaxImagePredictions+1, "1") + `}]}`,
+			"datasets[0].x 超过 1000 项"},
+		{"all predictions", head + `,"images":` + list(MaxManifestPredictions/MaxImagePredictions+1, image(MaxImagePredictions)) + `}`,
+			"预测框总数超过 3000000 个"},
+	} {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		_, err := ReadManifest(strings.NewReader(tt.data), 256<<20)
+		runtime.ReadMemStats(&after)
+		var me *ManifestError
+		if !errors.As(err, &me) || !strings.Contains(me.Message, tt.msg) {
+			t.Errorf("%s: err = %v, want %q", tt.name, err, tt.msg)
+		}
+		// Reading the file takes a few times its size, decoding it would take
+		// 20–80 times.
+		if alloc := after.TotalAlloc - before.TotalAlloc; alloc > uint64(8*len(tt.data))+1<<20 {
+			t.Errorf("%s: %d MB allocated for %d MB of JSON", tt.name, alloc>>20, len(tt.data)>>20)
+		}
+	}
+
+	// At the limits, and with brackets, commas and quotes in strings.
+	m := testManifest()
+	m.Review.Description = `[[[{"a": [1, 2, 3]}, \" ]]],,,`
+	m.Classes = make([]Class, maxManifestList)
+	for i := range m.Classes {
+		m.Classes[i] = Class{Name: fmt.Sprintf("c%d,[\"]", i)}
+	}
+	m.Images[0].Predictions = make([]Prediction, MaxImagePredictions)
+	for i := range m.Images[0].Predictions {
+		m.Images[0].Predictions[i] = Prediction{Name: `"],[{`, Confidence: 0.5, Xmin: 1, Ymin: 1, Xmax: 2, Ymax: 2}
+	}
+	var b bytes.Buffer
+	if err := WriteManifest(&b, m); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadManifest(&b, 256<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Classes) != maxManifestList || len(got.Images[0].Predictions) != MaxImagePredictions ||
+		got.Review.Description != m.Review.Description {
+		t.Errorf("ReadManifest = %d classes, %d predictions, description %q", len(got.Classes),
+			len(got.Images[0].Predictions), got.Review.Description)
 	}
 }
 

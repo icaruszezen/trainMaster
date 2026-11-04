@@ -35,7 +35,11 @@ import {
   type ReviewMerge,
 } from "@/features/reviews/api"
 import { CreateReviewDialog } from "@/features/reviews/create-review-dialog"
-import { MergeDialog, useFinishedMerges } from "@/features/reviews/merge-dialog"
+import {
+  MergeDialog,
+  useFinishedMerges,
+  useMergesEnded,
+} from "@/features/reviews/merge-dialog"
 import { reviewDetailPath } from "@/features/reviews/params"
 import {
   inferredImageCount,
@@ -54,9 +58,16 @@ import { useMediaQuery } from "@/hooks/use-media-query"
 import { formatDateTime, formatNumber, formatRelativeTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
-/** 标签页上的审图任务数（加载完成后显示）。 */
+const NO_REVIEWS: DatasetReview[] = []
+
+/**
+ * 标签页上的审图任务数（加载完成后显示）。它在标签上，总是挂载：这个数据集的
+ * 审图任务中有合并结束时在这里刷新数据集（标注状态、计数），“审核记录”标签页
+ * 没有显示时也是。
+ */
 export function DatasetReviewsCount({ datasetId }: { datasetId: number }) {
   const { data } = useQuery(datasetReviewsQuery(datasetId))
+  useFinishedMerges(data?.items ?? NO_REVIEWS)
   if (!data || data.total === 0) {
     return null
   }
@@ -76,8 +87,8 @@ export function DatasetReviews({ dataset }: { dataset: Dataset }) {
   const [merging, setMerging] = useState<DatasetReview | null>(null)
 
   const items = useMemo(() => query.data?.items ?? [], [query.data])
-  // 合并在对话框之外结束时刷新数据集（标注状态、计数），并提示结果。
-  useFinishedMerges(items, (reviewId, merge) => {
+  // 合并在对话框之外结束时提示结果（数据集由 DatasetReviewsCount 刷新）。
+  useMergesEnded(items, ({ reviewId, merge }) => {
     if (merging?.id === reviewId || !merge) {
       return
     }

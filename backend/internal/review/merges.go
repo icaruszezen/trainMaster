@@ -113,18 +113,27 @@ func (s *Service) StartMerge(ctx context.Context, reviewID int64, in MergeInput)
 	return m, nil
 }
 
-// ListMerges returns the newest merges of a review (at most 50), newest
-// first.
-func (s *Service) ListMerges(ctx context.Context, reviewID int64) ([]Merge, error) {
+// ListMerges returns the newest merges of a review (at most
+// maxListedRecords), newest first, and how many the review has.
+func (s *Service) ListMerges(ctx context.Context, reviewID int64) ([]Merge, int, error) {
 	if err := s.reviewExists(ctx, s.db, reviewID); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	merges, err := collectMerges(s.db.Query(ctx, "SELECT "+mergeColumns+
-		" FROM review_merges WHERE review_id = $1 ORDER BY id DESC LIMIT 50", reviewID))
+		" FROM review_merges WHERE review_id = $1 ORDER BY id DESC LIMIT $2", reviewID, maxListedRecords))
+	if err != nil {
+		return nil, 0, err
+	}
 	if merges == nil {
 		merges = []Merge{}
 	}
-	return merges, err
+	total := len(merges)
+	if total == maxListedRecords {
+		if err := s.db.QueryRow(ctx, "SELECT count(*) FROM review_merges WHERE review_id = $1", reviewID).Scan(&total); err != nil {
+			return nil, 0, err
+		}
+	}
+	return merges, total, nil
 }
 
 // GetMerge returns one merge of a review.
@@ -170,19 +179,55 @@ func (s *Service) runMerge(ctx context.Context, m Merge) {
 			s.log.Error("review merge failed", "review_id", m.ReviewID, "merge_id", m.ID, "err", err)
 		}
 	}
-	// The outcome is recorded also when the service is stopping.
-	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	if _, err := s.db.Exec(fctx, `UPDATE review_merges SET status = $2, error = $3, done = $4, summary = $5, problems = $6,
-			finished_at = now()
-		WHERE id = $1 AND status = 'running'`, m.ID, status, msg, j.Done, j.Summary, j.Problems); err != nil {
-		s.log.Error("record the end of a review merge", "review_id", m.ReviewID, "merge_id", m.ID, "err", err)
-		return
+	if err := s.recordMergeEnd(ctx, j, status, msg); err != nil {
+		return // the service is stopping; Start fails the merge on the next start
 	}
 	sum := j.Summary
 	s.log.Info("review merge finished", "review_id", m.ReviewID, "merge_id", m.ID, "status", status, "images", j.Done,
 		"merged", sum.Merged, "skipped_existing", sum.SkippedExisting, "skipped_empty", sum.SkippedEmpty,
 		"conflicts", sum.Conflicts, "failed", sum.Failed, "duration_ms", time.Since(start).Milliseconds())
+}
+
+// mergeEndRetry are the first and the longest wait between attempts to
+// record the end of a merge; tests shorten them.
+var mergeEndRetry = [2]time.Duration{time.Second, 30 * time.Second}
+
+// mergeEndFault, if set, is called before each attempt to record the end
+// of a merge (from 1); an error fails that attempt. Tests simulate a
+// database outage with it.
+var mergeEndFault func(attempt int) error
+
+// recordMergeEnd records the outcome of a merge, also when the service is
+// stopping. The merge must not stay running, which would refuse new merges
+// and deleting the review until a restart: a failure (the database
+// restarting, ...) is retried, waiting longer each time, until it works or
+// the service stops (Start then fails the merge on the next start).
+func (s *Service) recordMergeEnd(ctx context.Context, j *mergeJob, status, msg string) error {
+	wait := mergeEndRetry[0]
+	for attempt := 1; ; attempt++ {
+		var err error
+		if mergeEndFault != nil {
+			err = mergeEndFault(attempt)
+		}
+		if err == nil {
+			fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			_, err = s.db.Exec(fctx, `UPDATE review_merges SET status = $2, error = $3, done = $4, summary = $5, problems = $6,
+					finished_at = now()
+				WHERE id = $1 AND status = 'running'`, j.ID, status, msg, j.Done, j.Summary, j.Problems)
+			cancel()
+		}
+		if err == nil {
+			return nil
+		}
+		s.log.Error("record the end of a review merge", "review_id", j.ReviewID, "merge_id", j.ID, "attempt", attempt,
+			"err", err)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(wait):
+		}
+		wait = min(2*wait, mergeEndRetry[1])
+	}
 }
 
 // mergeImages works through the images of a merge.

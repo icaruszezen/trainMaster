@@ -296,3 +296,63 @@ func TestReviewAPITool(t *testing.T) {
 	// The tool download is read-only.
 	wantError(t, e.do("POST", "/api/v1/reviews/tool/download", nil), 405, codeMethodNotAllowed, "")
 }
+
+// TestReviewAPIHistoryTotals checks that the upload and merge lists give
+// the number of all records, not only of the newest 50 they hold.
+func TestReviewAPIHistoryTotals(t *testing.T) {
+	e := newReviewEnv(t, "")
+	ctx := t.Context()
+	p := e.project(t, "外观检测")
+	m, _ := e.uploadModel(t, p.ID, "detect")
+	ds := e.dataset(t, "line-a", "a.png")
+	rv := want[review.Review](t, e.do("POST", "/api/v1/reviews", map[string]any{"model_id": m.ID,
+		"dataset_ids": []int64{ds.ID}}), 201)
+	base := fmt.Sprintf("/api/v1/reviews/%d", rv.ID)
+	e.inferReview(t, rv.ID)
+	pkg := want[map[string]any](t, e.do("POST", base+"/packages", nil), 201)
+	entries := readZip(t, e.do("GET", pkg["url"].(string), nil).Body.Bytes())
+	top := fmt.Sprintf("审图-%d-外观检测 v1 审图", rv.ID)
+	manifest, err := reviewfile.ReadManifest(bytes.NewReader(entries[top+"/review.json"]), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Kind = reviewfile.KindResults
+	manifest.Images[0].Status = reviewfile.StatusApproved
+	var mb bytes.Buffer
+	if err := reviewfile.WriteManifest(&mb, manifest); err != nil {
+		t.Fatal(err)
+	}
+	var zb bytes.Buffer
+	zw := zip.NewWriter(&zb)
+	w, _ := zw.Create(top + "-审图结果/review.json")
+	_, _ = w.Write(mb.Bytes())
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 51 {
+		if _, err := e.reviews.UploadResults(ctx, rv.ID, review.ResultsInput{FileName: "结果.zip", Size: int64(zb.Len()),
+			Body: bytes.NewReader(zb.Bytes())}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 51 {
+		started, err := e.reviews.StartMerge(ctx, rv.ID, review.MergeInput{Statuses: []string{"approved"}, OnExisting: "skip"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+			if m, err := e.reviews.GetMerge(ctx, rv.ID, started.ID); err != nil || m.Status != review.MergeRunning {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the merge did not finish")
+			}
+		}
+	}
+	for _, path := range []string{"/uploads", "/merges"} {
+		list := want[map[string]any](t, e.do("GET", base+path, nil), 200)
+		if list["total"] != 51.0 || len(list["items"].([]any)) != 50 {
+			t.Errorf("%s: total %v, %d items", path, list["total"], len(list["items"].([]any)))
+		}
+	}
+}

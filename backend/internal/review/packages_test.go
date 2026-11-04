@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,4 +294,145 @@ func TestIntegrationPackageMissingFolders(t *testing.T) {
 		}
 	}
 	_ = ctx
+}
+
+// TestIntegrationPackageTooLarge: a selection whose review.json would be
+// too large for the readers is refused, a smaller one is not.
+func TestIntegrationPackageTooLarge(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	r, _, ds, _ := e.exchangeReview(t)
+	estimate := func(datasetIDs ...int64) int64 {
+		t.Helper()
+		var n int64
+		if err := e.db.QueryRow(ctx, "SELECT coalesce(sum("+manifestImageBytes+"), 0) FROM review_images ri"+
+			" WHERE ri.review_id = $1 AND ri.inferred AND ri.dataset_id = ANY($2)", r.ID, datasetIDs).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// The estimate is close to what the images take in review.json.
+	data, _ := e.downloadPackage(t, r.ID, PackageInput{})
+	files, content := zipEntries(t, data)
+	top := strings.TrimSuffix(files[0].Name, "/"+reviewfile.ReadmeFile)
+	m := packageManifest(t, content, top)
+	m.Images = nil
+	var head bytes.Buffer
+	if err := reviewfile.WriteManifest(&head, m); err != nil {
+		t.Fatal(err)
+	}
+	size := int64(len(content[top+"/"+reviewfile.ManifestFile]) - head.Len())
+	if all := estimate(ds[0], ds[1]); all < size || all > 2*size {
+		t.Errorf("estimate %d bytes, the images take %d bytes", all, size)
+	}
+
+	defer func(n int64) { maxPackageManifest = n }(maxPackageManifest)
+	maxPackageManifest = max(estimate(ds[0]), estimate(ds[1]))
+	_, err := e.svc.CreatePackage(ctx, r.ID, PackageInput{})
+	wantKind(t, err, ErrConflict, "review.json 会超过 256 MiB")
+	for _, id := range ds {
+		if _, err := e.svc.CreatePackage(ctx, r.ID, PackageInput{DatasetIDs: []int64{id}}); err != nil {
+			t.Errorf("package of dataset %d: %v", id, err)
+		}
+	}
+	// The limits of the platform and of review.json agree.
+	if MaxImages > reviewfile.MaxManifestImages || maxBoxes > reviewfile.MaxImagePredictions ||
+		maxManifestBytes/100 > reviewfile.MaxManifestPredictions {
+		t.Error("packages the platform writes can break the limits of review.json")
+	}
+}
+
+// stallingWriter takes everything until it has seen marker, then blocks
+// the next write until release is closed (a client that stops reading).
+type stallingWriter struct {
+	marker   []byte
+	buf      bytes.Buffer
+	seen     bool
+	stalled  chan struct{} // closed when a write blocks
+	release  chan struct{}
+	stallOne sync.Once
+}
+
+func (w *stallingWriter) Write(p []byte) (int, error) {
+	if w.seen {
+		w.stallOne.Do(func() { close(w.stalled) })
+		<-w.release
+	}
+	from := max(0, w.buf.Len()-len(w.marker))
+	w.buf.Write(p)
+	w.seen = w.seen || bytes.Contains(w.buf.Bytes()[from:], w.marker)
+	return len(p), nil
+}
+
+// TestIntegrationPackageStalledClient: a client that stops reading while
+// review.json is sent does not hold a database connection.
+func TestIntegrationPackageStalledClient(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	m := e.addModel(t, e.project(t, "p"), testModel{})
+	ds := e.addDataset(t, "ds", "ds")
+	dir := filepath.Join(e.st.Dir(storage.Datasets), "ds")
+	const n = packageBatch + 100 // two batches of review.json, the first far above the buffers
+	for i := range n {
+		e.addDatasetImage(t, ds, dir, testImage{rel: fmt.Sprintf("NG/%04d.png", i), w: 4, h: 3})
+	}
+	r := e.create(t, CreateInput{ModelID: m.ID, DatasetIDs: []int64{ds}})
+	node := e.node(t, "a")
+	e.claim(t, node)
+	for {
+		page, err := e.svc.ListTaskImages(ctx, r.ID, node, 0, MaxTaskImageLimit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Items) == 0 {
+			break
+		}
+		var results []ImageResult
+		for i, img := range page.Items {
+			results = append(results, ImageResult{ID: img.ID, OK: true, Boxes: []ResultBox{
+				box("scratch", 0.9, 0, 0, float64(1+i%3), 1), box("dent", 0.5+float64(i%40)/100, 1, 1, 4, 3)}})
+		}
+		if _, err := e.svc.SubmitResults(ctx, r.ID, node, results); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ticket, err := e.svc.CreatePackage(ctx, r.ID, PackageInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := e.svc.OpenPackage(ctx, r.ID, ticket.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	w := &stallingWriter{marker: []byte("/" + reviewfile.ManifestFile), stalled: make(chan struct{}),
+		release: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() { done <- p.Write(ctx, w) }()
+	released := false
+	defer func() {
+		if !released {
+			close(w.release)
+			<-done
+		}
+	}()
+	select {
+	case <-w.stalled:
+	case err := <-done:
+		t.Fatalf("Write ended before review.json was sent: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("Write did not reach review.json")
+	}
+	if n := e.db.Stat().AcquiredConns(); n != 0 {
+		t.Errorf("%d database connections held while the client does not read", n)
+	}
+	close(w.release)
+	released = true
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	files, content := zipEntries(t, w.buf.Bytes())
+	if got := packageManifest(t, content, strings.TrimSuffix(files[0].Name, "/"+reviewfile.ReadmeFile)); len(got.Images) != n {
+		t.Errorf("review.json lists %d images", len(got.Images))
+	}
 }

@@ -203,7 +203,7 @@ docker compose logs -f app       # 确认迁移执行成功、服务正常
 - **从没有训练节点的版本升级**：`make up` 现在会运行 `make setup`，在 `.env` 中启用训练节点（有可用的显卡时为 GPU 版 `trainer`，否则为 `trainer-cpu`）并构建它的镜像，第一次需要下载 PyTorch（GPU 版数 GB）。国内网络先按第 7 节配置镜像源；不需要训练节点时把第 3 步的 `make up` 换成 `make up SETUP_ARGS="--mode off"`。
 - 新旧版本的平台与训练节点可以混用一段时间（上报的数据允许未知字段），其它机器上的训练节点按第 10.6 节分别升级。
 - **升级到带模型仓库的版本**：迁移 `0008_create_models` 自动执行。ONNX 转换需要 0.2.0 或更新的训练节点（新增依赖 onnx、onnxslim、onnxruntime）：本机的训练节点由 `make up` 重新构建（PyTorch 变体不变时 PyTorch 层使用构建缓存）；其它机器上的训练节点、裸机节点按第 10.10 节升级。旧版训练节点照常注册与上报心跳，只是不领取转换任务；新版训练节点连接旧版平台时同样只是不领取任务（每 5 分钟检查一次平台是否已支持）。
-- **升级到带模型审图的版本**：迁移 `0010_create_reviews` 自动执行，存储目录中的 `reviews/` 在启动时自动创建。审图的识别由训练节点执行：本机的训练节点由 `make up` 重新构建；其它机器上的训练节点、裸机节点按 10.10 的方法升级。旧版训练节点照常工作，只是不领取审图任务（任务一直排队，页面提示没有可以识别的训练节点）；新版训练节点连接旧版平台时不受影响。本地审图程序随平台镜像一起构建，不需要另外部署（见 10.11）。
+- **升级到带模型审图的版本**：迁移 `0010_create_reviews` 自动执行，存储目录中的 `reviews/` 在启动时自动创建。审图的识别由训练节点执行（0.3.0 或更新）：本机的训练节点由 `make up` 重新构建；其它机器上的训练节点、裸机节点按 10.10 的方法升级。旧版训练节点照常工作，只是不领取审图任务（任务一直排队，页面提示没有可以识别的训练节点）；新版训练节点连接旧版平台时不受影响。本地审图程序随平台镜像一起构建，不需要另外部署（见 10.11）。
 - 迁移只向前，不提供自动回滚。需要回退版本时，先恢复升级前的数据库备份（第 6 节），再用保留的旧镜像启动 postgres 与 app（`--no-build`：不构建任何镜像）：
 
   ```bash
@@ -371,7 +371,7 @@ docker compose up -d          # 不加 --build，直接使用导入的镜像
 
 ## 9. 反向代理（nginx 示例）
 
-需要通过域名、HTTPS 或统一入口访问时，在 trainMaster 前面加一层 nginx。数据集导入会上传大量数据：压缩包与模型文件按 8 MiB 分块上传（服务端单块上限 64 MiB），文件夹按批上传（服务端单批上限 256 MiB），因此 `client_max_body_size` 不能小于 `300m`。其它机器上的训练节点经这个代理连接平台时（`TM_SERVER_URL` 为代理的地址），ONNX 转换的结果在一个请求中整个上传（平台上限 4 GiB），`client_max_body_size` 还要大于要转换的模型的 ONNX 文件（下例的 2g 足够常见的 YOLO 模型）；上传本地审图程序导出的审图结果也是一个请求（平台上限 4 GiB，只有审核状态与改过的标注，通常不大）；下载数据集与审图包是边打包边输出的流式响应（下例的 `proxy_buffering off` 让 nginx 不在磁盘上缓存它们）；领取任务的长轮询最长 30 秒，`proxy_read_timeout` 不能比它短。同时注意超时设置：
+需要通过域名、HTTPS 或统一入口访问时，在 trainMaster 前面加一层 nginx。数据集导入会上传大量数据：压缩包与模型文件按 8 MiB 分块上传（服务端单块上限 64 MiB），文件夹按批上传（服务端单批上限 256 MiB），因此 `client_max_body_size` 不能小于 `300m`。其它机器上的训练节点经这个代理连接平台时（`TM_SERVER_URL` 为代理的地址），ONNX 转换的结果在一个请求中整个上传（平台上限 4 GiB），`client_max_body_size` 还要大于要转换的模型的 ONNX 文件（下例的 2g 足够常见的 YOLO 模型）；上传本地审图程序导出的审图结果也是一个请求（平台上限 4 GiB，只有审核状态与标注文件、不含图片，通常不大）；下载数据集与审图包是边打包边输出的流式响应（下例的 `proxy_buffering off` 让 nginx 不在磁盘上缓存它们）；领取任务的长轮询最长 30 秒，`proxy_read_timeout` 不能比它短。同时注意超时设置：
 
 ```nginx
 server {
@@ -632,7 +632,7 @@ services:
 - **分发**：平台镜像中附带它（`/app/tools/trainmaster-reviewer.exe`，`TM_REVIEWER_TOOL` 已指向它），审图任务详情页的“本地审图”中“下载本地审图程序（Windows）”直接下载，不需要另外部署。程序与平台一起构建，页面显示的版本就是平台的版本；平台升级后请从页面重新下载程序（新版平台的审图包可能需要新版程序才能打开，旧程序会提示升级）。不用 Docker 镜像部署时用 `make reviewer` 构建（见开发指南），把 `TM_REVIEWER_TOOL` 设为生成的 `backend/bin/trainmaster-reviewer.exe`；没有设置或文件不存在时页面提示“平台没有附带本地审图程序”，其它功能不受影响。平台每次请求时查找这个文件，之后放上的文件不需要重启；启动日志说明是否找到（`local reviewer bundled`；没有设置时为 `no local reviewer bundled`，文件不存在时为 `local reviewer not found`）。
 - **运行要求**：64 位 Windows 10 / 11，单个文件，不需要安装，也不需要管理员权限与网络。界面用系统的 Microsoft Edge WebView2 运行时显示（Windows 11 与更新过的 Windows 10 已自带）；没有时程序改用默认浏览器打开同样的页面，并显示“已在浏览器中打开本地审图程序。点“确定”退出。”——需要窗口时安装 Microsoft 提供的 WebView2 运行时即可。程序只监听本机地址 `127.0.0.1`（优先使用端口 47821，被占用时随机选择），只回应自己打开的页面。程序没有数字签名，从浏览器下载后 Windows SmartScreen 可能提示，确认来源后选择仍要运行。
 - **磁盘**：打开审图包时解压到 zip 旁边与 zip 同名的文件夹，需要对 zip 所在的文件夹有写权限，剩余空间约为审图包大小 + 64 MiB；审核进度、审图标注与导出的审图结果（`<文件夹名>-审图结果.zip`）都在旁边，删除这些文件夹即可清理。缩略图缓存与日志在 `%LOCALAPPDATA%\trainmaster-reviewer\`（日志为其中的 `reviewer.log`，排障时提供它），最近打开的列表在 `%APPDATA%\trainmaster-reviewer\`。
-- **上传结果**：导出的审图结果只包含审核状态与改过的标注，通常不大；经反向代理时它在一个请求中上传（平台上限 4 GiB），见第 9 节。
+- **上传结果**：导出的审图结果包含审核状态与各图片的标注文件（不含图片），通常不大；同一个审图包可以边审边多次导出、上传，后一次接着前一次（改回去的也算修改）；经反向代理时它在一个请求中上传（平台上限 4 GiB），见第 9 节。
 - **命令行参数**（排障）：`trainmaster-reviewer.exe [-browser] [-no-open] [-addr 127.0.0.1:端口] [审图包.zip | 文件夹]`：`-browser` 在默认浏览器中打开而不用程序窗口，`-no-open` 不自动打开、只显示访问地址，`-addr` 指定监听的本机地址与端口，`-version` 显示版本；设置环境变量 `TM_REVIEWER_DEBUG=1` 后运行，程序窗口中可以打开开发者工具。
 
 ### 10.12 常见问题
@@ -645,10 +645,11 @@ services:
 | 转换失败：“训练节点的 PyTorch … 不支持 Ultralytics 的安全加载（需要 2.6 及以上）”或“训练节点的 Ultralytics … 不支持 / 没有启用安全加载” | 节点上的 torch 或 ultralytics 太旧（多见于自己安装了依赖的裸机节点），节点为了安全不加载上传的文件：按 10.10 升级训练节点 |
 | 转换失败：“模型文件中引用了不允许加载的对象（…）” | 文件中有 Ultralytics 安全加载不允许的对象（上传时的检查只按名称判断，个别文件到加载时才被拒绝），可能是构造的恶意文件，或被其它工具改过：上传 Ultralytics 训练直接保存的 `best.pt` / `last.pt` |
 | 审图任务一直“排队中”，页面提示“没有可以识别的训练节点” | 没有在线的、能执行审图识别的训练节点（见 10.11）：在“计算资源”页面确认至少有一个在线的节点。旧版训练节点照常显示在线，但不领取审图任务，按 10.10 升级。查看节点日志（同上一行）：有 `not claiming review_inference tasks: cannot find …` → 节点缺少 torch / ultralytics，重新构建镜像或重新运行 `install.sh`；有 `the platform does not support task claims` → 平台是旧版本。没有这条提示、只是排队位置不变时，节点正在执行排在前面的任务（转换或其它审图任务） |
-| 审图任务失败：“识别超时（单张图片 … 秒内没有识别完成）”或“加载模型超时…” | CPU 较慢、输入尺寸很大或图片很大：用较小的输入尺寸新建任务，或按 10.11 调大训练节点的 `TM_INFERENCE_IMAGE_TIMEOUT`，再在审图任务页面“重新识别” |
+| 审图任务失败：“识别超时（单张图片 … 秒内没有识别完成）”或“加载模型超时…” | CPU 较慢、输入尺寸很大或图片很大：用较小的输入尺寸新建任务，或按 10.11 调大训练节点的 `TM_INFERENCE_IMAGE_TIMEOUT`，再在审图任务页面“重新识别”（超时的那张图片已记为识别失败，重新识别时跳过它） |
 | 审图任务失败：“训练节点在识别过程中失去联系（已尝试 3 次）” | 执行识别的节点反复崩溃、断网或被强制停止：查看节点日志（显存或内存不足时日志中有说明），处理后在审图任务页面“重新识别”（已识别的图片保留） |
 | 审图任务页面提示“平台没有附带本地审图程序” | `TM_REVIEWER_TOOL` 没有设置或指向的文件不存在（Docker 镜像中已设置，多见于不用镜像的部署）：按 10.11 构建程序并设置 `TM_REVIEWER_TOOL` |
 | 本地审图程序打开的是浏览器而不是程序窗口 | 电脑上没有 WebView2 运行时（或窗口创建失败）：可以照常在浏览器中审图，审完在开始页点“退出”或在消息框中点“确定”结束程序（只关闭浏览器标签页时程序仍在运行）；需要程序窗口时安装 Microsoft Edge WebView2 运行时。日志在 `%LOCALAPPDATA%\trainmaster-reviewer\reviewer.log` |
+| 本地审图程序提示“这个审图包已在另一个本地审图程序窗口中打开” | 同一个审图包已在另一个程序窗口（或浏览器模式下的另一个程序）中打开：两个程序同时审同一个包会互相覆盖审核状态，所以不允许。切换到那个窗口继续审，或先在那里退出再打开；找不到窗口时在任务管理器中结束多余的 `trainmaster-reviewer.exe` |
 | 转换失败：“上传转换结果失败：磁盘剩余空间不足…” | 平台的存储目录（`TM_HOST_STORAGE_DIR`）空间不足，放不下转换结果：清理磁盘后在下载对话框或模型详情页重试 |
 | 启动 `trainer` 时报 `could not select device driver "nvidia" with capabilities: [[gpu]]`（较新的 Docker 为 `failed to discover GPU vendor from CDI: no known GPU vendor found`） | Docker 没有安装或没有配置 NVIDIA Container Toolkit：`make up SETUP_ARGS="--install-toolkit"`（其它机器上的训练节点：`make setup SETUP_ARGS="--install-toolkit"`，再 `docker compose up -d --build trainer`）。暂时不用 GPU：`make up SETUP_ARGS="--mode cpu"` |
 | `docker run --gpus all …` 或启动 `trainer` 时报 `AMD CDI spec not found` | Docker 29.5 起，dockerd 启动时还没有安装 NVIDIA Container Toolkit（装好 Toolkit 后没有重启 Docker）就会这样报错，与 AMD 显卡无关：`make up SETUP_ARGS="--install-toolkit"`（已安装时只配置并重启 Docker；其它机器上的训练节点：`make setup SETUP_ARGS="--install-toolkit"`，再 `docker compose up -d --build trainer`），或手动 `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` |

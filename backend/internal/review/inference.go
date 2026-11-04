@@ -282,7 +282,9 @@ func (s *Service) ListTaskImages(ctx context.Context, reviewID, nodeID, after in
 	if err := s.renewLease(ctx, s.db, reviewID, nodeID, ""); err != nil {
 		return TaskImages{}, err
 	}
-	rows, err := s.db.Query(ctx, `SELECT ri.id, ri.file_name, coalesce(ri.width, di.width), coalesce(ri.height, di.height),
+	// The size as the dataset's index has it now: a rescan updates it when
+	// a file is replaced by another one.
+	rows, err := s.db.Query(ctx, `SELECT ri.id, ri.file_name, coalesce(di.width, ri.width), coalesce(di.height, ri.height),
 			di.size_bytes
 		FROM review_images ri JOIN dataset_images di ON di.id = ri.image_id
 		WHERE ri.review_id = $1 AND NOT ri.inferred AND ri.id > $2
@@ -310,8 +312,10 @@ func (s *Service) ListTaskImages(ctx context.Context, reviewID, nodeID, after in
 }
 
 // OpenTaskImage opens the file of an image of a review the node holds,
-// and renews the lease. A missing file is a *dataset.Error of kind
-// ErrNotFound (the node reports that image as failed).
+// and renews the lease. An image that cannot be read from its dataset (the
+// file or the dataset folder is missing) is ErrNotFound with the dataset's
+// message: the node reports that image as failed and goes on (a conflict
+// would tell it that it no longer holds the review).
 func (s *Service) OpenTaskImage(ctx context.Context, reviewID, nodeID, imageID int64) (*dataset.ImageFile, error) {
 	if err := s.renewLease(ctx, s.db, reviewID, nodeID, ""); err != nil {
 		return nil, err
@@ -320,7 +324,12 @@ func (s *Service) OpenTaskImage(ctx context.Context, reviewID, nodeID, imageID i
 	if err != nil {
 		return nil, err
 	}
-	return s.datasets.OpenImage(ctx, datasetID, datasetImageID)
+	f, err := s.datasets.OpenImage(ctx, datasetID, datasetImageID)
+	var de *dataset.Error
+	if errors.As(err, &de) && (errors.Is(err, dataset.ErrNotFound) || errors.Is(err, dataset.ErrConflict)) {
+		return nil, &Error{Kind: ErrNotFound, Message: de.Message}
+	}
+	return f, err
 }
 
 // ProgressInput is a node's report on a review it holds.
@@ -355,9 +364,12 @@ type ResultsReceipt struct {
 // SubmitResults records the node's results for images of a review it
 // holds, in one transaction: the boxes of each image are cleaned (see
 // sanitizeBoxes) and written as its VOC file, a failed image keeps its
-// error and gets no file. Results for images already inferred or not in
-// the review are ignored, so a report can be sent again. It renews the
-// lease.
+// error and gets no file. The size of an image is the one the dataset's
+// index has now (a rescan updates it when the file is replaced), else the
+// one copied when the review was created, and only when neither is known
+// the one the node reports; the row keeps it. Results for images already
+// inferred or not in the review are ignored, so a report can be sent
+// again. It renews the lease.
 func (s *Service) SubmitResults(ctx context.Context, reviewID, nodeID int64, results []ImageResult) (ResultsReceipt, error) {
 	if len(results) > MaxResults {
 		return ResultsReceipt{}, newError(ErrInvalid, "一次最多提交 %d 张图片的结果", MaxResults)
@@ -374,7 +386,8 @@ func (s *Service) SubmitResults(ctx context.Context, reviewID, nodeID int64, res
 
 	type target struct {
 		relPath, annotationPath string
-		width, height           *int
+		width, height           *int // the review image's
+		indexW, indexH          *int // the dataset image's now
 	}
 	type file struct{ tmp, rel string }
 	var staged []file   // VOC files written to temporary files
@@ -384,15 +397,17 @@ func (s *Service) SubmitResults(ctx context.Context, reviewID, nodeID int64, res
 		if err := s.renewLease(ctx, tx, reviewID, nodeID, StageInferring); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT id, rel_path, annotation_path, width, height FROM review_images
-			WHERE review_id = $1 AND id = ANY($2) AND NOT inferred ORDER BY id FOR UPDATE`, reviewID, ids)
+		rows, err := tx.Query(ctx, `SELECT ri.id, ri.rel_path, ri.annotation_path, ri.width, ri.height, di.width, di.height
+			FROM review_images ri JOIN dataset_images di ON di.id = ri.image_id
+			WHERE ri.review_id = $1 AND ri.id = ANY($2) AND NOT ri.inferred ORDER BY ri.id FOR UPDATE OF ri`, reviewID, ids)
 		if err != nil {
 			return err
 		}
 		targets := map[int64]*target{}
 		var id int64
 		var t target
-		if _, err := pgx.ForEachRow(rows, []any{&id, &t.relPath, &t.annotationPath, &t.width, &t.height}, func() error {
+		if _, err := pgx.ForEachRow(rows, []any{&id, &t.relPath, &t.annotationPath, &t.width, &t.height,
+			&t.indexW, &t.indexH}, func() error {
 			c := t
 			targets[id] = &c
 			return nil
@@ -424,7 +439,10 @@ func (s *Service) SubmitResults(ctx context.Context, reviewID, nodeID int64, res
 					continue
 				}
 				width, height := t.width, t.height
-				if (width == nil || height == nil) && res.Width > 0 && res.Height > 0 {
+				switch {
+				case t.indexW != nil && t.indexH != nil:
+					width, height = t.indexW, t.indexH
+				case (width == nil || height == nil) && res.Width > 0 && res.Height > 0:
 					width, height = &res.Width, &res.Height
 				}
 				w, h := 0, 0
@@ -441,7 +459,7 @@ func (s *Service) SubmitResults(ctx context.Context, reviewID, nodeID int64, res
 				staged = append(staged, file{tmp, t.annotationPath})
 				batch.Queue(`UPDATE review_images SET inferred = true, inference_error = '', predictions = $2,
 						object_count = $3, labels = $4, edited = false, annotation_version = $5,
-						width = coalesce(width, $6), height = coalesce(height, $7), updated_at = now()
+						width = $6, height = $7, updated_at = now()
 					WHERE id = $1`, res.ID, predictions, len(objects), reviewfile.LabelCounts(objects),
 					reviewfile.AnnotationVersion(data), width, height)
 				receipt.Accepted++

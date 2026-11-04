@@ -15,7 +15,9 @@
   ReviewInferenceTask 在任务线程中执行平台下发的识别任务：工作目录 → 检查磁盘 → 下载并校验 pt → 启动子进程
   → 按页取还没有识别的图片，预先下载几张（小线程池），依次交给子进程，结果攒批上报 → 平台不再列出图片时
   完成；期间定期上报进度（续租）。平台上的任务被删除或已不属于本节点（404 / 409）时结束子进程并放弃，
-  不再上报。单张图片下载不到（404）时上报这张图片识别失败，其余照常。
+  不再上报。单张图片下载不到（404 / 409，如文件或数据集文件夹已不存在）时上报这张图片识别失败，其余照常
+  （任务已不属于本节点时下一次上报结果或进度同样得到 409，随即放弃）。子进程在识别某张图片时崩溃或超时，
+  先上报这张图片识别失败再让任务失败：重新识别时跳过它，继续识别其余的图片。
 """
 
 from __future__ import annotations
@@ -102,11 +104,18 @@ CLOSE_TIMEOUT = 10.0  # 识别完成后等待子进程退出的时间
 # 启动子进程（导入 PyTorch、初始化显卡、加载模型、预热）至少可以用这么久：通常比识别一张图片慢得多
 MIN_STARTUP_TIMEOUT = 120.0
 MAX_STDERR = 64 * 1024  # 保留子进程 stderr 的最后这么多字节（失败时作为详情）
+# 子进程自己崩溃时的信号（与被 OOM killer 等结束的 SIGKILL 区分）
+_CRASH_SIGNALS = frozenset(
+    getattr(signal, name)
+    for name in ("SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE", "SIGABRT")
+    if hasattr(signal, name)
+)
 _T = TypeVar("_T")
 
 
 class InferenceError(Exception):
-    """识别失败，message 为直接展示给用户的中文说明。父进程中 timeout / cancelled 表示子进程超时、被取消。"""
+    """识别失败，message 为直接展示给用户的中文说明。父进程中 timeout / cancelled 表示子进程超时、被取消；
+    image_id 为子进程崩溃（意外退出）或超时的时候正在识别的图片（问题多半出在这张图片上）。"""
 
     def __init__(
         self,
@@ -115,12 +124,14 @@ class InferenceError(Exception):
         *,
         timeout: bool = False,
         cancelled: bool = False,
+        image_id: int | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.detail = detail
         self.timeout = timeout
         self.cancelled = cancelled
+        self.image_id = image_id
 
 
 def _number(value: Any) -> float | None:
@@ -780,9 +791,10 @@ class InferenceProcess:
                 return None
             raise self._timed_out(
                 f"识别超时（单张图片 {self.image_timeout:g} 秒内没有识别完成）。"
-                "可以减小输入尺寸，或在训练节点上用 TM_INFERENCE_IMAGE_TIMEOUT 延长时间"
+                "可以减小输入尺寸，或在训练节点上用 TM_INFERENCE_IMAGE_TIMEOUT 延长时间",
+                image_id,
             )
-        message, at = self._message(item)
+        message, at = self._message(item, image_id)
         if "id" not in message:
             raise self._fatal(message)
         if message.get("id") != image_id:
@@ -848,10 +860,13 @@ class InferenceProcess:
         except queue.Empty:
             return None
 
-    def _message(self, item: tuple[str, Any, float]) -> tuple[dict[str, Any], float]:
+    def _message(
+        self, item: tuple[str, Any, float], image_id: int | None = None
+    ) -> tuple[dict[str, Any], float]:
+        """队列中的一项 → (消息, 收到的时间)。image_id：正在识别的图片（启动时为 None）。"""
         kind, payload, at = item
         if kind == "eof":
-            raise self._exited()
+            raise self._exited(image_id)
         if kind == "invalid":
             self._stop_now()
             raise InferenceError(
@@ -888,8 +903,9 @@ class InferenceProcess:
             _join_detail(detail if isinstance(detail, str) else None, self.stderr_tail()),
         )
 
-    def _exited(self) -> InferenceError:
-        """stdout 已关闭：子进程退出了（被取消、崩溃，或没有说明就退出）。"""
+    def _exited(self, image_id: int | None = None) -> InferenceError:
+        """stdout 已关闭：子进程退出了（被取消、崩溃，或没有说明就退出）。只有 SIGKILL 可能是内存不足
+        （系统的 OOM killer）；SIGSEGV 等是子进程自己崩溃了（如解码器出错）。"""
         code = self._wait_exit()
         stderr = self.stderr_tail()
         if self._cancelled:
@@ -899,16 +915,22 @@ class InferenceProcess:
                 name = signal.Signals(-code).name
             except ValueError:
                 name = str(-code)
-            return InferenceError(f"识别进程被信号 {name} 终止（可能是内存不足）", stderr)
-        return InferenceError(f"识别进程意外退出（退出码 {code}）", stderr)
+            if -code == signal.SIGKILL:
+                message = f"识别进程被信号 {name} 终止（可能是内存不足）"
+            elif -code in _CRASH_SIGNALS:
+                message = f"识别进程崩溃（信号 {name}）"
+            else:
+                message = f"识别进程被信号 {name} 终止"
+            return InferenceError(message, stderr, image_id=image_id)
+        return InferenceError(f"识别进程意外退出（退出码 {code}）", stderr, image_id=image_id)
 
-    def _timed_out(self, message: str) -> InferenceError:
+    def _timed_out(self, message: str, image_id: int | None = None) -> InferenceError:
         if self._proc is not None:
             _kill(self._proc)
         self._wait_exit()
         if self._cancelled:
             return InferenceError("识别已取消", self.stderr_tail(), cancelled=True)
-        return InferenceError(message, self.stderr_tail(), timeout=True)
+        return InferenceError(message, self.stderr_tail(), timeout=True, image_id=image_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1182,7 +1204,8 @@ class _Fetched:
 
 
 class _ImageGone(Exception):
-    """下载图片时平台返回 404（图片文件已不存在、图片已被删除）：只是这张图片失败。"""
+    """下载图片时平台返回 404（图片文件已不存在、图片已被删除）或 409（如数据集文件夹已不存在）：只是这张
+    图片失败。任务已不属于本节点时下载也得到 409，但下一次上报结果或进度同样得到 409，任务随即放弃。"""
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
@@ -1337,7 +1360,7 @@ class ReviewInferenceTask:
     ) -> _T:
         """调用平台的幂等接口（图片列表、下载图片、上报结果、完成）：网络错误与可重试的 HTTP 错误先在
         这里重试几次（长时间的识别不因为一次网络抖动而重新开始），仍失败时按 _api_error 分类。
-        image=True 时 404（不是 unknown_node）表示这张图片已不存在，抛出 _ImageGone。"""
+        image=True 时 404（不是 unknown_node）与 409 表示这张图片无法下载（见 _ImageGone），抛出 _ImageGone。"""
         delays = (*FAIL_RETRY_DELAYS, None)
         for delay in delays:
             self._check_interrupted()
@@ -1346,7 +1369,9 @@ class ReviewInferenceTask:
             try:
                 return fn()
             except ApiError as exc:
-                if image and exc.status == 404 and exc.code != "unknown_node":
+                if image and (
+                    exc.status == 409 or (exc.status == 404 and exc.code != "unknown_node")
+                ):
                     raise _ImageGone(exc.message) from None
                 failure = self._api_error(exc, what)
                 if not isinstance(failure, TaskFailed) or not failure.retryable or delay is None:
@@ -1625,15 +1650,17 @@ class ReviewInferenceTask:
                     in_flight.append(fetched)
                 if not in_flight:
                     return count
-                reply = self._next_reply()
+                reply = self._next_reply(in_flight[0].item)
                 fetched = in_flight.popleft()
                 if fetched.path is not None:
                     with contextlib.suppress(OSError):
                         fetched.path.unlink()
                 self._add_result(translate_reply(reply, self._names))
 
-    def _next_reply(self) -> dict[str, Any]:
-        """等子进程回答最早交给它的图片；等待期间到了上报时间就上报攒下的结果。"""
+    def _next_reply(self, current: ImageItem) -> dict[str, Any]:
+        """等子进程回答最早交给它的图片 current；等待期间到了上报时间就上报攒下的结果。子进程识别它时崩溃
+        或超时：先记下这张图片识别失败（随失败一起上报），任务仍失败，但重新识别时跳过它、继续识别其余的
+        图片，一张有问题的图片不会让任务永远完成不了。"""
         while True:
             self._check_interrupted()
             wait = min(self._batch.seconds_until_due(), 1.0)
@@ -1641,7 +1668,23 @@ class ReviewInferenceTask:
                 reply = self.process.next_reply(wait)
             except InferenceError as exc:
                 self._check_interrupted()
-                raise TaskFailed(exc.message, exc.detail) from None
+                detail = exc.detail
+                if exc.image_id is not None:
+                    label = current.label if current.id == exc.image_id else f"#{exc.image_id}"
+                    log.warning(
+                        "review inference: image %s (%s) failed the inference process: %s",
+                        exc.image_id,
+                        label,
+                        exc.message,
+                    )
+                    error = exc.message if exc.timeout else f"识别这张图片时{exc.message}"
+                    self._add_result(
+                        {"id": exc.image_id, "ok": False, "error": _error_text(error, "识别失败")}
+                    )
+                    # 放在最后：上报时详情过长会去掉开头
+                    note = f"出错的图片：{label}（已记为识别失败，重新识别时继续识别其余的图片）"
+                    detail = f"{detail}\n\n{note}" if detail else note
+                raise TaskFailed(exc.message, detail) from None
             if reply is not None:
                 return reply
             if self._batch.items and self._batch.seconds_until_due() <= 0:
@@ -1691,7 +1734,7 @@ class ReviewInferenceTask:
         return items
 
     def _fetch_image(self, item: ImageItem, folder: Path, abort: Callable[[], bool]) -> _Fetched:
-        """（下载线程中）下载一张图片。图片不存在（404）或太大时返回这张图片的失败原因；其它失败抛出。
+        """（下载线程中）下载一张图片。图片无法下载（404 / 409）或太大时返回这张图片的失败原因；其它失败抛出。
         abort()：任务中断或这一轮已经结束（出错）时为 True，下载随即停止。"""
         if item.size_bytes is not None and item.size_bytes > MAX_IMAGE_BYTES:
             return _Fetched(

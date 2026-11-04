@@ -719,6 +719,7 @@ def test_process_startup_problems(tmp_path, body, expected):
     with pytest.raises(InferenceError) as info:
         process(tmp_path, script(tmp_path, body)).start(InferenceSpec(weights="/w.pt"))
     assert info.value.message == expected
+    assert info.value.image_id is None  # 不是哪一张图片的问题
     if "Segmentation" in body:
         assert "Segmentation fault" in info.value.detail
 
@@ -760,6 +761,7 @@ def test_process_image_timeout_kills_process_group(tmp_path):
         reply(proc)
     assert time.monotonic() - started < 10
     assert info.value.timeout is True
+    assert info.value.image_id == 1  # 超时的图片
     assert info.value.message.startswith("识别超时（单张图片 1 秒内没有识别完成）")
     assert (
         "TM_INFERENCE_IMAGE_TIMEOUT" in info.value.message and "减小输入尺寸" in info.value.message
@@ -782,25 +784,32 @@ def test_process_timeout_counts_from_the_previous_reply(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("body", "expected"),
+    ("body", "expected", "crashed"),
     [
         ('    print(json.dumps({"id": 99, "ok": True}), flush=True)\n',
-         "识别进程的回答与请求不对应（收到 99 的结果，应为 1）"),
-        ("    os.kill(os.getpid(), 9)\n", "识别进程被信号 SIGKILL 终止（可能是内存不足）"),
+         "识别进程的回答与请求不对应（收到 99 的结果，应为 1）", False),
+        ("    os.kill(os.getpid(), 9)\n", "识别进程被信号 SIGKILL 终止（可能是内存不足）", True),
+        # 只有 SIGKILL（系统的 OOM killer）可能是内存不足
+        ("    os.kill(os.getpid(), 11)\n", "识别进程崩溃（信号 SIGSEGV）", True),
+        ("    os.kill(os.getpid(), 15)\n", "识别进程被信号 SIGTERM 终止", True),
+        # 子进程报告的无法继续的错误（显存不足、显卡出错）对每张图片都一样：不算这张图片的问题
         ('    print(json.dumps({"ok": False, "error": "显卡出错", "detail": "CUDA"}), flush=True)\n    sys.exit(1)\n',
-         "显卡出错"),
-        ("    sys.exit(0)\n", "识别进程意外退出（退出码 0）"),
-        ("    print('garbage', flush=True)\n", "识别进程的输出无法解析"),
+         "显卡出错", False),
+        ("    sys.exit(0)\n", "识别进程意外退出（退出码 0）", True),
+        ("    print('garbage', flush=True)\n", "识别进程的输出无法解析", False),
     ],
 )  # fmt: skip
-def test_process_reply_problems(tmp_path, body, expected):
+def test_process_reply_problems(tmp_path, body, expected, crashed):
     proc = process(tmp_path, script(tmp_path, ready_child(body)))
     proc.start(InferenceSpec(weights="/w.pt"))
     proc.send(1, "/a.jpg")
+    proc.send(2, "/b.jpg")
     with pytest.raises(InferenceError) as info:
         reply(proc)
     assert info.value.message == expected
     assert info.value.timeout is False and info.value.cancelled is False
+    # 崩溃时正在识别的是最早交给它的那一张（第二张还在排队）
+    assert info.value.image_id == (1 if crashed else None)
 
 
 def test_process_send_after_the_child_died(tmp_path):
@@ -828,6 +837,7 @@ def test_process_cancel(tmp_path):
     with pytest.raises(InferenceError) as info:
         reply(proc)
     assert info.value.cancelled is True and info.value.message == "识别已取消"
+    assert info.value.image_id is None
     assert gone(int(pid_file.read_text()))
     # 取消后不再启动新的子进程
     with pytest.raises(InferenceError) as info:

@@ -195,10 +195,10 @@ func mapArchiveError(err error) error {
 
 func readErr(err error) error { return &archiveReadError{err} }
 
-// decodeEntryName converts a legacy-encoded entry name to UTF-8. Archives
+// DecodeEntryName converts a legacy-encoded entry name to UTF-8. Archives
 // created on Chinese Windows store names in the GBK code page without
 // flagging the encoding; GB18030 is a superset of GBK.
-func decodeEntryName(name string) string {
+func DecodeEntryName(name string) string {
 	if utf8.ValidString(name) {
 		return name
 	}
@@ -238,7 +238,7 @@ func walkZip(ctx context.Context, f *os.File, size int64, fn func(*archiveEntry)
 		}
 		// Names flagged as UTF-8 (bit 11) are decoded too: the flag is
 		// sometimes set on names that are not UTF-8 at all.
-		e := &archiveEntry{Name: decodeEntryName(zf.Name), Type: modeType(zf.Mode())}
+		e := &archiveEntry{Name: DecodeEntryName(zf.Name), Type: modeType(zf.Mode())}
 		if zf.Mode().IsDir() || (len(zf.Name) > 0 && zf.Name[len(zf.Name)-1] == '/') {
 			e.Type = entryDir
 		}
@@ -385,7 +385,7 @@ func walkTar(ctx context.Context, f *os.File, size int64, format archiveFormat, 
 			}
 			return readErr(err)
 		}
-		e := &archiveEntry{Name: decodeEntryName(hdr.Name)}
+		e := &archiveEntry{Name: DecodeEntryName(hdr.Name)}
 		switch hdr.Typeflag {
 		case tar.TypeReg, tar.TypeGNUSparse:
 			e.Type, e.Data = entryFile, entryReader{tr}
@@ -418,7 +418,7 @@ func walk7z(ctx context.Context, f *os.File, size int64, fn func(*archiveEntry) 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		e := &archiveEntry{Name: decodeEntryName(zf.Name), Type: modeType(zf.Mode())}
+		e := &archiveEntry{Name: DecodeEntryName(zf.Name), Type: modeType(zf.Mode())}
 		if err := callWithReader(e, zf.Open, fn); err != nil {
 			return err
 		}
@@ -559,7 +559,7 @@ func walkRar(ctx context.Context, f *os.File, size int64, head []byte, fn func(*
 		if hdr.Encrypted {
 			return errArchiveEncrypted
 		}
-		e := &archiveEntry{Name: decodeEntryName(hdr.Name), Type: modeType(hdr.Mode())}
+		e := &archiveEntry{Name: DecodeEntryName(hdr.Name), Type: modeType(hdr.Mode())}
 		switch {
 		case hdr.IsDir:
 			e.Type = entryDir

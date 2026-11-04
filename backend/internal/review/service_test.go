@@ -329,3 +329,61 @@ func exists(p string) bool {
 	_, err := os.Lstat(p)
 	return err == nil
 }
+
+// TestIntegrationCleanupDuringCreation: the janitor does not remove the
+// folder of a review that commits while it cleans up (it read the reviews
+// before), whether the folder was still marked busy when it listed it or
+// not marked at all.
+func TestIntegrationCleanupDuringCreation(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	root := e.st.Dir(storage.Reviews)
+	trash := filepath.Join(root, ".deleting-1")
+	if err := os.MkdirAll(trash, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := e.db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // committed below
+	var dirs []string
+	for range 2 {
+		var id int64
+		if err := tx.QueryRow(ctx, `INSERT INTO reviews (name, model_ref, options, status)
+			VALUES ('r', '{}', '{}', 'queued') RETURNING id`).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		dir := e.svc.reviewDir(id)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "review.json"), []byte("{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		dirs = append(dirs, dir)
+	}
+	e.svc.busy.add(dirs[0]) // being created; the second one is not marked
+	// The creation commits while the janitor removes the trash, after it
+	// read the reviews.
+	e.svc.removeAll = func(p string) error {
+		if p == trash {
+			if err := tx.Commit(ctx); err != nil {
+				t.Error(err)
+			}
+			e.svc.busy.remove(dirs[0])
+		}
+		return os.RemoveAll(p)
+	}
+	if err := e.svc.cleanReviewFolders(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if exists(trash) {
+		t.Error("the trash was not removed")
+	}
+	for _, dir := range dirs {
+		if !exists(filepath.Join(dir, "review.json")) {
+			t.Errorf("%s was removed", dir)
+		}
+	}
+}

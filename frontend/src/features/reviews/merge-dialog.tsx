@@ -30,6 +30,7 @@ import { TaskProgress } from "@/features/datasets/task-progress"
 import {
   createReviewMerge,
   refreshMergedDatasets,
+  refreshReviewMerges,
   reviewKeys,
   reviewMergeQuery,
   type CreateReviewMergeInput,
@@ -112,10 +113,15 @@ function MergeContent({
   initialDatasetId: number | null
   onDone: () => void
 }) {
-  // 打开时已有合并在进行：直接显示它的进度（一个审图任务同时只能有一个合并）。
+  // 已有合并在进行：直接显示它的进度（一个审图任务同时只能有一个合并）。打开
+  // 时还不知道的（如开始合并时 409、列表刷新后才看到）出现后也切换过去；显示
+  // 之后一直显示它，合并结束后 `active_merge` 变回 null 时仍显示结果。
   const [mergeId, setMergeId] = useState<number | null>(
     review.active_merge?.id ?? null
   )
+  if (mergeId === null && review.active_merge) {
+    setMergeId(review.active_merge.id)
+  }
   if (mergeId !== null) {
     return <MergeProgress review={review} mergeId={mergeId} onDone={onDone} />
   }
@@ -172,23 +178,15 @@ function MergeForm({
       createReviewMerge(review.id, mergeInput(statuses, datasetId, onExisting)),
     onSuccess: (merge) => {
       queryClient.setQueryData(reviewKeys.merge(review.id, merge.id), merge)
-      // 任务上的 active_merge 与合并记录。
-      void queryClient.invalidateQueries({
-        queryKey: reviewKeys.detail(review.id),
-        exact: true,
-      })
-      void queryClient.invalidateQueries({
-        queryKey: reviewKeys.merges(review.id),
-      })
+      // 任务上的 active_merge（详情、列表、数据集的审核记录）与合并记录：关闭
+      // 对话框后页面照样显示进度，合并结束时刷新数据集。
+      refreshReviewMerges(review.id)
       onStarted(merge.id)
     },
     onError: (error) => {
       if (error instanceof ApiError && error.status === 409) {
-        // 多半是别人刚开始了合并：显示最新的状态（有合并时可以查看它的进度）。
-        void queryClient.invalidateQueries({
-          queryKey: reviewKeys.detail(review.id),
-          exact: true,
-        })
+        // 多半是已有合并在进行：显示最新的状态（刷新后对话框显示它的进度）。
+        refreshReviewMerges(review.id)
       }
     },
   })
@@ -320,39 +318,78 @@ function MergeForm({
   )
 }
 
+type MergeWatched = Pick<Review, "id" | "active_merge" | "last_merge">
+
+/**
+ * 一次结束的合并：`running` 是之前看到的进行中的合并，`merge` 见
+ * {@link endedMerges}。
+ */
+export type EndedMerge = {
+  reviewId: number
+  running: ReviewMerge
+  merge: ReviewMerge | null
+}
+
+/**
+ * 比较前后两次看到的审图任务：`active` 是现在进行中的合并（按任务），`ended`
+ * 是之前进行中、现在没有了的合并；`merge` 是结束的合并（任务的 `last_merge`，
+ * 与之前进行中的是同一个时，否则为 null）。
+ */
+export function endedMerges(
+  previous: ReadonlyMap<number, ReviewMerge>,
+  reviews: readonly MergeWatched[]
+): { active: Map<number, ReviewMerge>; ended: EndedMerge[] } {
+  const active = new Map<number, ReviewMerge>()
+  const ended: EndedMerge[] = []
+  for (const review of reviews) {
+    if (review.active_merge) {
+      active.set(review.id, review.active_merge)
+      continue
+    }
+    const running = previous.get(review.id)
+    if (running) {
+      ended.push({
+        reviewId: review.id,
+        running,
+        merge: review.last_merge?.id === running.id ? review.last_merge : null,
+      })
+    }
+  }
+  return { active, ended }
+}
+
+/** 页面上的审图任务中有合并结束（`active_merge` 从有到无）时调用 `onEnded`。 */
+export function useMergesEnded(
+  reviews: readonly MergeWatched[],
+  onEnded: (ended: EndedMerge) => void
+) {
+  const active = useRef(new Map<number, ReviewMerge>())
+  const callback = useRef(onEnded)
+  useEffect(() => {
+    callback.current = onEnded
+  })
+  useEffect(() => {
+    const result = endedMerges(active.current, reviews)
+    active.current = result.active
+    for (const ended of result.ended) {
+      callback.current(ended)
+    }
+  }, [reviews])
+}
+
 /**
  * 页面上的审图任务中有合并结束（`active_merge` 从有到无）时，刷新被合并的
  * 数据集与审图任务；`onFinished` 收到结束的合并（任务的 `last_merge`，与刚才
  * 进行中的是同一个时）。合并对话框自己也会刷新，两边重复刷新没有关系。
  */
 export function useFinishedMerges(
-  reviews: readonly Pick<Review, "id" | "active_merge" | "last_merge">[],
+  reviews: readonly MergeWatched[],
   onFinished?: (reviewId: number, merge: ReviewMerge | null) => void
 ) {
-  const active = useRef(new Map<number, ReviewMerge>())
-  const callback = useRef(onFinished)
-  useEffect(() => {
-    callback.current = onFinished
+  useMergesEnded(reviews, ({ reviewId, running, merge }) => {
+    refreshMergedDatasets(reviewId, running.dataset_ids)
+    onFinished?.(reviewId, merge)
   })
-  useEffect(() => {
-    const previous = active.current
-    const next = new Map<number, ReviewMerge>()
-    for (const review of reviews) {
-      if (review.active_merge) {
-        next.set(review.id, review.active_merge)
-        continue
-      }
-      const running = previous.get(review.id)
-      if (running) {
-        refreshMergedDatasets(review.id, running.dataset_ids)
-        callback.current?.(
-          review.id,
-          review.last_merge?.id === running.id ? review.last_merge : null
-        )
-      }
-    }
-    active.current = next
-  }, [reviews])
 }
 
 /** 合并的进度与结果（每秒刷新，结束后刷新被合并的数据集）。 */

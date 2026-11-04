@@ -3,11 +3,13 @@ package review
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -145,11 +147,11 @@ func TestIntegrationMerge(t *testing.T) {
 	}
 
 	// Lists.
-	merges, err := e.svc.ListMerges(ctx, r.ID)
-	if err != nil || len(merges) != 2 || merges[0].ID != m2.ID {
-		t.Errorf("ListMerges = %+v, %v", merges, err)
+	merges, total, err := e.svc.ListMerges(ctx, r.ID)
+	if err != nil || len(merges) != 2 || merges[0].ID != m2.ID || total != 2 {
+		t.Errorf("ListMerges = %+v, %d, %v", merges, total, err)
 	}
-	_, err = e.svc.ListMerges(ctx, 999)
+	_, _, err = e.svc.ListMerges(ctx, 999)
 	wantKind(t, err, ErrNotFound, "审图任务不存在")
 	_, err = e.svc.GetMerge(ctx, r.ID, 999)
 	wantKind(t, err, ErrNotFound, "合并记录不存在")
@@ -311,5 +313,75 @@ func TestIntegrationMergeInterrupted(t *testing.T) {
 	defer e.svc.Stop()
 	if m := e.mergeAndWait(t, r.ID, MergeInput{Statuses: []string{"needs_sample"}, OnExisting: MergeSkip}); m.Status != MergeSucceeded {
 		t.Errorf("merge after the restart = %+v", m)
+	}
+}
+
+// TestIntegrationMergeEndRetried makes recording the end of a merge fail
+// (the database away for a moment): it is tried again, so the merge does
+// not stay running; when the service stops meanwhile, the next start fails
+// the merge.
+func TestIntegrationMergeEndRetried(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	r, images, _, _ := e.exchangeReview(t)
+	e.mark(t, r.ID, reviewfile.StatusNeedsSample, images[0], images[1])
+	retry := mergeEndRetry
+	t.Cleanup(func() { mergeEndRetry, mergeEndFault = retry, nil })
+	mergeEndRetry = [2]time.Duration{time.Millisecond, 4 * time.Millisecond}
+	var attempts atomic.Int32
+	mergeEndFault = func(attempt int) error {
+		attempts.Store(int32(attempt))
+		if attempt <= 3 {
+			return errors.New("database unavailable")
+		}
+		return nil
+	}
+	in := MergeInput{Statuses: []string{"needs_sample"}, OnExisting: MergeSkip}
+	if m := e.mergeAndWait(t, r.ID, in); m.Status != MergeSucceeded || m.FinishedAt == nil || m.Summary.Merged != 2 ||
+		attempts.Load() != 4 {
+		t.Errorf("merge = %+v after %d attempts", m, attempts.Load())
+	}
+	if m := e.mergeAndWait(t, r.ID, in); m.Status != MergeSucceeded {
+		t.Errorf("next merge = %+v", m)
+	}
+
+	// It never works: the service stopping ends the attempts.
+	attempts.Store(0)
+	mergeEndFault = func(attempt int) error {
+		attempts.Store(int32(attempt))
+		return errors.New("database unavailable")
+	}
+	svcCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := e.svc.Start(svcCtx); err != nil {
+		t.Fatal(err)
+	}
+	m, err := e.svc.StartMerge(ctx, r.ID, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(10 * time.Second); attempts.Load() < 3; {
+		if time.Now().After(deadline) {
+			t.Fatal("recording the end of the merge was not retried")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	stopped := make(chan struct{})
+	go func() { e.svc.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not return")
+	}
+	if got, err := e.svc.GetMerge(ctx, r.ID, m.ID); err != nil || got.Status != MergeRunning {
+		t.Errorf("merge after stopping = %+v, %v", got, err)
+	}
+	mergeEndFault = nil
+	if err := e.svc.Start(svcCtx); err != nil {
+		t.Fatal(err)
+	}
+	defer e.svc.Stop()
+	if got, err := e.svc.GetMerge(ctx, r.ID, m.ID); err != nil || got.Status != MergeFailed || got.Error != msgMergeInterrupted {
+		t.Errorf("merge after the restart = %+v, %v", got, err)
 	}
 }

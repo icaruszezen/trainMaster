@@ -127,10 +127,21 @@ func manifestError(format string, args ...any) error {
 // errNotReview is returned for JSON that is not a review manifest at all.
 var errNotReview = &ManifestError{Message: "这不是 trainMaster 的审图包或审图结果（review.json 的 format 不是 " + ManifestFormat + "）"}
 
+// Bounds of the lists in review.json, checked before it is decoded: a
+// list of empty objects ({}) decodes into many times its size, so a small
+// crafted file could otherwise take gigabytes of memory.
+const (
+	MaxManifestImages      = 200_000   // images: as many as a review has at most (review.MaxImages)
+	MaxImagePredictions    = 1000      // predictions of an image: max_det is at most 1000
+	MaxManifestPredictions = 3_000_000 // predictions of all images: packages stay below (review.CreatePackage)
+	maxManifestList        = 1 << 16   // any other list: classes, datasets, class names
+)
+
 // ReadManifest reads and validates review.json from r, which may hold at
 // most limit bytes. Unknown fields are ignored (newer writers may add
 // some). The checks: the format and a version this code understands, the
-// kind, positive and unique IDs, every image in one of the datasets, valid
+// kind, the package ID, the sizes of the lists (see MaxManifestImages),
+// positive and unique IDs, every image in one of the datasets, valid
 // statuses, and image and VOC paths that are valid (ValidRelPath), inside
 // the folder of their dataset and unique ignoring case. A problem is a
 // *ManifestError.
@@ -158,6 +169,10 @@ func ReadManifest(r io.Reader, limit int64) (*Manifest, error) {
 	case head.Version < 1:
 		return nil, manifestError("格式版本 %d 无效", head.Version)
 	}
+	// data is valid JSON now (Unmarshal checks all of it first).
+	if err := checkLists(data); err != nil {
+		return nil, err
+	}
 	var m Manifest
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, &ManifestError{Message: "review.json 的内容无效：" + err.Error()}
@@ -172,6 +187,11 @@ func ReadManifest(r io.Reader, limit int64) (*Manifest, error) {
 func (m *Manifest) validate() error {
 	if m.Kind != KindPackage && m.Kind != KindResults {
 		return manifestError("kind 必须是 %s 或 %s", KindPackage, KindResults)
+	}
+	// The local reviewer names folders after it: 128 bits in lowercase hex,
+	// as the platform writes it.
+	if len(m.PackageID) != 32 || strings.Trim(m.PackageID, "0123456789abcdef") != "" {
+		return manifestError("package_id 无效")
 	}
 	if m.Review.ID <= 0 {
 		return manifestError("缺少审图任务 ID")
@@ -226,6 +246,125 @@ func (m *Manifest) validate() error {
 		ids[img.ID] = true
 	}
 	return nil
+}
+
+// checkLists checks the sizes of the lists of review.json (valid JSON)
+// before it is decoded (see MaxManifestImages). It goes by where a list is
+// rather than by its name, since Unmarshal matches names ignoring case and
+// they may be escaped: the lists that decode into slices are the members
+// of the top-level object (images, classes, datasets), the members of its
+// objects (model.class_names) and the members of the elements of its lists
+// (images[].predictions); Unmarshal skips lists anywhere else.
+func checkLists(data []byte) error {
+	var stack []listFrame // the open objects and arrays, outermost first
+	var boxes int         // elements of the lists in elements of top-level lists
+	// count adds an element to the innermost container, an array.
+	count := func() error {
+		top := &stack[len(stack)-1]
+		top.n++
+		if top.boxes {
+			if boxes++; boxes > MaxManifestPredictions {
+				return manifestError("预测框总数超过 %d 个", MaxManifestPredictions)
+			}
+		}
+		if top.limit == 0 || top.n <= top.limit {
+			return nil
+		}
+		switch {
+		case len(stack) == 2 && string(stack[0].key) == "images":
+			return manifestError("图片超过 %d 张", MaxManifestImages)
+		case top.boxes && string(stack[0].key) == "images" && string(stack[2].key) == "predictions":
+			return manifestError("第 %d 张图片的预测框超过 %d 个", stack[1].n, MaxImagePredictions)
+		}
+		return manifestError("%s 超过 %d 项", listName(stack), top.limit)
+	}
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			continue
+		}
+		if n := len(stack); n > 0 && stack[n-1].array && stack[n-1].empty && c != ']' {
+			stack[n-1].empty = false
+			if err := count(); err != nil {
+				return err
+			}
+		}
+		switch c {
+		case '"':
+			start := i + 1
+			for i++; i < len(data) && data[i] != '"'; i++ {
+				if data[i] == '\\' {
+					i++
+				}
+			}
+			if n := len(stack); n > 0 && !stack[n-1].array && stack[n-1].wantKey {
+				stack[n-1].key, stack[n-1].wantKey = data[start:min(i, len(data))], false
+			}
+		case '{':
+			stack = append(stack, listFrame{wantKey: true})
+		case '[':
+			a := listFrame{array: true, empty: true}
+			switch {
+			case len(stack) == 1 && !stack[0].array: // images, classes, datasets
+				a.limit = maxManifestList
+				if string(stack[0].key) == "images" {
+					a.limit = MaxManifestImages
+				}
+			case len(stack) == 2 && !stack[0].array && !stack[1].array: // model.class_names
+				a.limit = maxManifestList
+			case len(stack) == 3 && !stack[0].array && stack[1].array && !stack[2].array: // images[].predictions
+				a.limit, a.boxes = MaxImagePredictions, true
+			}
+			stack = append(stack, a)
+		case '}', ']':
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+		case ',':
+			switch n := len(stack); {
+			case n == 0:
+			case stack[n-1].array:
+				if err := count(); err != nil {
+					return err
+				}
+			default:
+				stack[n-1].wantKey = true
+			}
+		}
+	}
+	return nil
+}
+
+// listFrame is an object or array checkLists is in.
+type listFrame struct {
+	array   bool
+	key     []byte // object: the last member name, as written
+	wantKey bool   // object: a member name comes next
+	n       int    // array: the elements so far
+	empty   bool   // array: no element yet
+	limit   int    // array: at most this many elements (0: any number)
+	boxes   bool   // array: in an element of a top-level list (predictions)
+}
+
+// listName names the innermost list of stack in messages, e.g.
+// model.class_names or images[3].predictions.
+func listName(stack []listFrame) string {
+	var b strings.Builder
+	for i, f := range stack[:len(stack)-1] {
+		if f.array {
+			fmt.Fprintf(&b, "[%d]", f.n-1)
+			continue
+		}
+		if i > 0 {
+			b.WriteByte('.')
+		}
+		if key := string(f.key); len(key) <= 64 && strings.Trim(key, "abcdefghijklmnopqrstuvwxyz_0123456789") == "" {
+			b.WriteString(key)
+		} else {
+			fmt.Fprintf(&b, "%.32q", key)
+		}
+	}
+	return b.String()
 }
 
 // WriteManifest writes m as review.json: indented, except that every image

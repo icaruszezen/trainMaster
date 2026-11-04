@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 	"github.com/icaruszezen/trainmaster/backend/internal/model"
 	"github.com/icaruszezen/trainmaster/backend/internal/reviewfile"
+	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 )
 
 // expireLease makes the lease of a running review run out.
@@ -113,9 +115,19 @@ func TestIntegrationInference(t *testing.T) {
 	if err := os.Remove(e.datasetPath("ds", "d.png")); err != nil {
 		t.Fatal(err)
 	}
-	var de *dataset.Error
-	if _, err := e.svc.OpenTaskImage(ctx, r.ID, node, ids[3]); !errors.As(err, &de) || !errors.Is(err, dataset.ErrNotFound) {
-		t.Errorf("missing file: %v", err)
+	// A file that cannot be read is not found, with the dataset's message
+	// (the node fails that image and goes on), also when the dataset folder
+	// is missing (a conflict would tell the node it lost the review).
+	_, err = e.svc.OpenTaskImage(ctx, r.ID, node, ids[3])
+	wantKind(t, err, ErrNotFound, "图片文件不存在")
+	dsDir := filepath.Join(e.st.Dir(storage.Datasets), "ds")
+	if err := os.Rename(dsDir, dsDir+"-moved"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.svc.OpenTaskImage(ctx, r.ID, node, ids[0])
+	wantKind(t, err, ErrNotFound, "数据集文件夹不存在")
+	if err := os.Rename(dsDir+"-moved", dsDir); err != nil {
+		t.Fatal(err)
 	}
 
 	// Progress.
@@ -238,6 +250,94 @@ func formatID(id int64) string {
 
 func (e *testEnv) datasetPath(dirName, rel string) string {
 	return strings.Join([]string{e.st.Dir("datasets"), dirName, rel}, string(os.PathSeparator))
+}
+
+// replaceDatasetImage replaces a dataset image file by a w×h one and
+// updates its index as a rescan does (the row and its ID stay).
+func (e *testEnv) replaceDatasetImage(t *testing.T, datasetID int64, dirName, rel string, w, h int) {
+	t.Helper()
+	p := e.datasetPath(dirName, rel)
+	if err := os.WriteFile(p, pngImage(t, w, h), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Exec(context.Background(), `UPDATE dataset_images SET width = $3, height = $4, size_bytes = $5,
+			mod_time = $6
+		WHERE dataset_id = $1 AND rel_path = $2`, datasetID, rel, w, h, fi.Size(), time.UnixMicro(fi.ModTime().UnixMicro())); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestIntegrationInferenceAfterRescan: an image replaced by a larger one
+// (and rescanned) after the review was created takes the size of the new
+// file, which is the one the node infers and people see.
+func TestIntegrationInferenceAfterRescan(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	m := e.addModel(t, e.project(t, "p"), testModel{})
+	ds := e.addDataset(t, "ds", "ds", testImage{rel: "a.png", w: 100, h: 80}, testImage{rel: "b.png", w: 100, h: 80})
+	r := e.create(t, CreateInput{ModelID: m.ID, DatasetIDs: []int64{ds}})
+	node := e.node(t, "a")
+	if e.claim(t, node) == nil {
+		t.Fatal("no task")
+	}
+	page, err := e.svc.ListTaskImages(ctx, r.ID, node, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := page.Items[0], page.Items[1]
+	// b is inferred at the old size, then both files are replaced.
+	if _, err := e.svc.SubmitResults(ctx, r.ID, node, []ImageResult{{ID: b.ID, OK: true, Width: 100, Height: 80,
+		Boxes: []ResultBox{box("scratch", 0.9, 10, 10, 50, 50)}}}); err != nil {
+		t.Fatal(err)
+	}
+	e.replaceDatasetImage(t, ds, "ds", "a.png", 200, 160)
+	e.replaceDatasetImage(t, ds, "ds", "b.png", 200, 160)
+
+	page, err = e.svc.ListTaskImages(ctx, r.ID, node, 0, 0)
+	if err != nil || len(page.Items) != 1 || page.Items[0].ID != a.ID || *page.Items[0].Width != 200 || *page.Items[0].Height != 160 {
+		t.Fatalf("images to infer = %+v, %v", page, err)
+	}
+	// The node infers the new file; what it reports is not what counts (the
+	// index is).
+	if _, err := e.svc.SubmitResults(ctx, r.ID, node, []ImageResult{{ID: a.ID, OK: true, Width: 999, Height: 999,
+		Boxes: []ResultBox{box("scratch", 0.9, 10, 10, 50, 50), box("dent", 0.8, 120, 100, 190, 150), box("dent", 0.7, 120, 100, 300, 300)}}}); err != nil {
+		t.Fatal(err)
+	}
+	got := e.detail(t, r.ID, a.ID)
+	want := []Prediction{
+		{Name: "scratch", Confidence: 0.9, Xmin: 10, Ymin: 10, Xmax: 50, Ymax: 50},
+		{Name: "dent", Confidence: 0.8, Xmin: 120, Ymin: 100, Xmax: 190, Ymax: 150},
+		{Name: "dent", Confidence: 0.7, Xmin: 120, Ymin: 100, Xmax: 200, Ymax: 160},
+	}
+	if !slices.Equal(got.Predictions, want) || got.Width == nil || *got.Width != 200 || *got.Height != 160 {
+		t.Errorf("image inferred after a rescan = %+v", got)
+	}
+	file := string(readFile(t, e.reviewFile(r.ID, got.AnnotationPath)))
+	if !strings.Contains(file, "<width>200</width>") || !strings.Contains(file, "<height>160</height>") {
+		t.Errorf("VOC file:\n%s", file)
+	}
+
+	// b was inferred at the old size: a box drawn on the new image is kept,
+	// and the image takes the new size.
+	saved, err := e.svc.SaveAnnotation(ctx, r.ID, b.ID, SaveInput{Force: true, Objects: []dataset.AnnotationObject{
+		{Name: "dent", Xmin: 120, Ymin: 100, Xmax: 190, Ymax: 150}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.Objects) != 1 || saved.Objects[0].Xmax != 190 || saved.Width == nil || *saved.Width != 200 || *saved.Height != 160 {
+		t.Errorf("saved after a rescan = %+v", saved)
+	}
+	file = string(readFile(t, e.reviewFile(r.ID, saved.AnnotationPath)))
+	if !strings.Contains(file, "<width>200</width>") || !strings.Contains(file, "<xmax>190</xmax>") {
+		t.Errorf("VOC file:\n%s", file)
+	}
+	if again := e.detail(t, r.ID, b.ID); again.Width == nil || *again.Width != 200 || again.AnnotationVersion != saved.AnnotationVersion {
+		t.Errorf("image after the save = %+v", again)
+	}
 }
 
 func TestIntegrationLeasesAndRetries(t *testing.T) {

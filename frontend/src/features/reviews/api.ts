@@ -8,7 +8,8 @@
  *
  * 审图编辑器只通过 {@link ReviewSource}（接口前缀与查询键）读写一个审图任务的
  * 图片：平台上是 `/api/v1/reviews/<id>`（{@link reviewSource}），本地审图程序是
- * `/api/review`，两边的接口形状相同（见 spec 的“本地审图”）。
+ * `/api/review`，两边的接口形状相同（见 docs/architecture.md 第 11 节“本地审图
+ * 程序”）。
  */
 import { keepPreviousData, queryOptions } from "@tanstack/react-query"
 
@@ -870,6 +871,22 @@ export function refreshReviewContent(reviewId: number) {
     queryKey: reviewSourceKeys.imageDetails(reviewSource(reviewId)),
     refetchType: "none",
   })
+  void queryClient.invalidateQueries({ queryKey: reviewKeys.lists() })
+  void queryClient.invalidateQueries({ queryKey: reviewKeys.datasets() })
+}
+
+/**
+ * 开始合并后（或开始时 409：多半已有合并在进行）刷新任务上的 `active_merge`：
+ * 详情、合并记录、列表与数据集的审核记录。它们看到进行中的合并后开始轮询，
+ * 合并结束时刷新被合并的数据集（见 merge-dialog 的 useFinishedMerges），关闭了
+ * 合并对话框也是。
+ */
+export function refreshReviewMerges(reviewId: number) {
+  void queryClient.invalidateQueries({
+    queryKey: reviewKeys.detail(reviewId),
+    exact: true,
+  })
+  void queryClient.invalidateQueries({ queryKey: reviewKeys.merges(reviewId) })
   void queryClient.invalidateQueries({ queryKey: reviewKeys.lists() })
   void queryClient.invalidateQueries({ queryKey: reviewKeys.datasets() })
 }
