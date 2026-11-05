@@ -51,11 +51,11 @@ flowchart LR
 | `internal/config` | 读取并校验 `TM_*` 环境变量；非法值一次性全部报出并退出 |
 | `internal/database` | pgxpool 连接池、启动时连接重试、内置迁移执行器 |
 | `internal/storage` | 数据目录布局、启动时创建与可写检查、磁盘用量、安全路径解析 |
-| `internal/dataset` | 数据集：命名规则、图片与 VOC 标注识别、压缩包解压、目录扫描、缩略图、导入任务执行器 |
+| `internal/dataset` | 数据集：命名规则、图片与 VOC 标注识别、压缩包解压、目录扫描、缩略图、导入任务执行器、下载打包；审图版本（`versions.go`：版本的生成、编号、修改与删除，下载时按所选版本组合标注，见第 11 节“审图版本”） |
 | `internal/project` | 项目：项目的增删改、项目与数据集的多对多关系、按数据集合计的统计与标签分布、项目的类别列表（训练时的类别顺序，标注时的候选类别）、项目的模型数与最新版本 |
 | `internal/model` | 模型仓库：分块上传与提交、项目内的版本分配、模型文件夹与 `model.json`、下载、删除；ONNX 转换的选项、缓存、任务队列（领取、租约、重试）与训练节点的任务接口；为平台训练预留的 `RegisterTrainedModel`（见第 10 节） |
 | `internal/model/checkpoint` | 读取 Ultralytics `.pt` 的元数据：zip 中的 `data.pkl` 由只读的 pickle 解释器解析（不执行任何代码），得到任务、类别、输入尺寸、YOLO 版本、训练信息；纯函数，无数据库依赖 |
-| `internal/review` | 模型审图：审图任务的创建、修改与删除；识别任务（实现 `model.TaskSource`，通过训练节点的领取接口下发）、租约与识别结果的写入；审核状态与审图标注；审图包；上传审图结果；合并到数据集的后台任务（见第 11 节） |
+| `internal/review` | 模型审图：审图任务的创建、修改与删除；识别任务（实现 `model.TaskSource`，通过训练节点的领取接口下发）、租约与识别结果的写入；审核状态与审图标注；审图包；上传审图结果；合并为数据集审图版本的后台任务（见第 11 节） |
 | `internal/reviewfile` | 审图包的文件格式，平台与本地审图程序共用：清单 `review.json` 的读写与校验、Windows 安全的路径（`SafeSegment`、`Layout`）、审图标注（VOC）的读写与原子替换 |
 | `internal/reviewer` | 本地审图程序的本机服务：打开与解压审图包、与平台形状相同的审图接口、审核进度 `review-progress.json`、缩略图、导出审图结果、访问控制 |
 | `internal/compute` | 计算资源：训练节点的注册与心跳、上报数据的规范化与校验、在线状态判定、删除与重新检测、内存中的指标历史 |
@@ -69,7 +69,7 @@ flowchart LR
 2. 初始化存储目录：创建根目录和 7 个子目录（见第 5 节）并做可写探测，失败则退出并提示检查挂载目录权限 / PUID、PGID。
 3. 连接数据库：指数退避重试，最长约 60 秒（数据库容器还在启动时会等待），仍失败则以非 0 退出。
 4. `TM_DB_AUTO_MIGRATE=true`（默认）时执行待执行的迁移。
-5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），然后启动任务执行器（见第 6 节）；启动模型仓库的后台任务（见第 10 节“存储与版本号”）与模型审图的后台任务（先把上次运行中断的合并记为失败，见第 11 节“存储”）。
+5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），然后启动任务执行器（见第 6 节）；启动模型仓库的后台任务（见第 10 节“存储与版本号”）与模型审图的后台任务（先把上次运行中断的合并记为失败、删除它们没有生成完的审图版本，见第 11 节“存储”）。
 6. 启动 HTTP 服务；收到 SIGINT / SIGTERM 后停止接收新请求，等待进行中的请求完成（最长 15 秒）；超时后强制关闭剩余连接（取消其请求的 context），最后关闭数据库连接池。还在等待数据库或迁移锁时收到信号，则直接正常退出。收到信号时会立即取消正在执行的导入 / 扫描任务并记为失败（“服务重启，导入被中断”），排队中的任务保留到下次启动执行；HTTP 服务关闭后再等待任务执行器的 worker 退出。进程在写入结果前异常退出时，下次启动由恢复逻辑把任务标记为中断，并重新计算受影响数据集的统计数据。长连接 handler 应通过 `http.Server.RegisterOnShutdown` 在关闭开始时主动结束：训练节点领取任务的长轮询（最长 30 秒）就是这样立即返回 `{"task": null}` 的，以后的 SSE 推送（如训练日志）也应如此。
 
 ## 3. API 约定
@@ -103,7 +103,7 @@ flowchart LR
 | 404 | `not_found` | 接口或资源不存在（未设置 `TM_WEB_DIR` 时，非 `/api` 路径也返回它） |
 | 404 | `unknown_node` | 心跳或任务调用中的 `node_key`（`X-Node-Key`）尚未注册（或节点已被删除），训练节点收到后重新注册 |
 | 405 | `method_not_allowed` | 路径存在但不支持该方法（响应头 `Allow` 列出支持的方法） |
-| 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、下载 YOLO 时所选项目还没有类别列表、标注文件不能在平台中修改、删除在线的训练节点、重新检测离线的训练节点、删除有模型的项目、模型文件未上传完就提交、模型上传的临时文件已丢失、转换任务已不属于该训练节点、审图图片还没有识别完成、审图任务正在合并时删除或再次合并等） |
+| 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、下载 YOLO 时所选项目还没有类别列表、标注文件不能在平台中修改、删除在线的训练节点、重新检测离线的训练节点、删除有模型的项目、模型文件未上传完就提交、模型上传的临时文件已丢失、转换任务已不属于该训练节点、审图图片还没有识别完成、审图任务正在合并时删除或再次合并、修改或删除正在生成的审图版本、所选版本中没有可以导出的图片等） |
 | 409 | `annotation_conflict` | 保存 / 删除标注时，标注文件在 `base_version` 之后已被修改（他人在另一个窗口保存，或用其它工具改了文件）。客户端应重新读取图片详情，或带 `force: true` 覆盖 |
 | 409 | `annotation_unpatchable` | 保存标注时，已有的标注文件无法在保留其中平台不编辑的内容的情况下修改（极少见）；带 `regenerate: true` 时按平台的格式重新生成整个文件（`force: true` 只跳过版本检查，不会重新生成） |
 | 409 | `upload_offset_mismatch` | 分块上传（数据集压缩包、模型文件）的 `offset` 与服务端已接收的字节数不一致，客户端应重新获取任务或上传后从 `received_bytes` 续传 |
@@ -172,7 +172,7 @@ flowchart LR
 
 | 方法与路径 | 说明 |
 |---|---|
-| `GET /api/v1/datasets` | 数据集列表（`q` 按名称 / 描述筛选；`project_id=<项目ID>` 只列出该项目中的数据集，`project_id=none` 只列出未纳入任何项目的数据集，其它值返回 400），按更新时间倒序；每项带统计数据、封面图片（最多 4 张）、所属项目 `projects: [{id, name}]`（按名称排序）和进行中的导入任务 |
+| `GET /api/v1/datasets` | 数据集列表（`q` 按名称 / 描述筛选；`project_id=<项目ID>` 只列出该项目中的数据集，`project_id=none` 只列出未纳入任何项目的数据集，其它值返回 400），按更新时间倒序；每项带统计数据、封面图片（最多 4 张）、所属项目 `projects: [{id, name}]`（按名称排序）、审图版本数 `version_count`（不含正在生成的）和进行中的导入任务 |
 | `POST /api/v1/datasets` | `{name, description?}` 新建数据集并创建同名文件夹；带 `directory` 时把 `datasets/` 下已有的文件夹添加为数据集，并立即开始扫描 |
 | `GET /api/v1/datasets/directories` | `datasets/` 下的全部一级文件夹（跳过隐藏目录和符号链接），标明是否已添加，附图片 / 标注文件数量（超过 5 万个条目或 2 秒时为估算值，`approximate: true`） |
 | `GET /api/v1/datasets/{id}` | 数据集详情；`directory_missing` 表示文件夹已不在磁盘上 |
@@ -196,7 +196,12 @@ flowchart LR
 | `POST /api/v1/datasets/{id}/imports/{importId}/files` | 上传文件夹中的一批文件（multipart，每个文件前带一个 `path` 字段给出相对路径，单次 ≤ 256 MiB） |
 | `POST /api/v1/datasets/{id}/imports/{importId}/commit` | 上传完成，进入后台处理队列 |
 | `POST /api/v1/datasets/{id}/imports/{importId}/cancel` | 取消上传或处理 |
-| `POST /api/v1/datasets/{id}/exports` | 准备下载：`{format: "voc" \| "xanylabeling" \| "yolo", project_id?, classes?: [...]}`，返回 201 `{url, file_name, expires_at}`；数据集没有图片或文件夹不存在时 409。`yolo` 需要类别顺序，二者选一：`project_id` 使用该项目的类别列表的顺序，项目必须包含这个数据集且类别列表不为空（项目不存在或不包含该数据集时 422，类别列表为空时 409 `conflict`）；或用 `classes` 手动指定（见“标注格式”，页面上用于不属于任何项目的数据集），两者都没有时 422。两者都带时以 `project_id` 为准，其它格式忽略它们 |
+| `POST /api/v1/datasets/{id}/exports` | 准备下载：`{format: "voc" \| "xanylabeling" \| "yolo", project_id?, classes?: [...], include_base?, version_ids?: [...]}`，返回 201 `{url, file_name, expires_at}`；数据集没有图片或文件夹不存在时 409。`yolo` 需要类别顺序，二者选一：`project_id` 使用该项目的类别列表的顺序，项目必须包含这个数据集且类别列表不为空（项目不存在或不包含该数据集时 422，类别列表为空时 409 `conflict`）；或用 `classes` 手动指定（见“标注格式”，页面上用于不属于任何项目的数据集），两者都没有时 422。两者都带时以 `project_id` 为准，其它格式忽略它们。`include_base`（默认 `true`）与 `version_ids`（审图版本的 ID，默认没有）选择组合的版本（见第 11 节“审图版本”）：两者都省略时只有基础版本，与没有版本时相同；什么都不选或超过 100 个版本时 422；版本不存在或不属于这个数据集时 404，正在生成时 409；所选版本中没有可以导出的图片（如不选基础版本，版本中又没有需加样的图片）时 409。选了审图版本时文件名带上版本，如 `line_a-基础+审图1.1+审图1.3-yolo.zip` |
+| `GET /api/v1/datasets/{id}/exports/preview` | 下载的内容（按索引统计，与数据集的计数相同）：`include_base`（`true` / `false`，默认 `true`）、`version_ids`（以逗号分隔的版本 ID）选择版本，规则同上（参数格式不对时 400）。返回 `{image_count, from_versions, annotated_count, empty_count, invalid_count, unannotated_count, object_count, labels, version_image_count, missing_count, changed_count}`：导出的图片数、其中用审图版本标注的、有目标 / 空标注 / 标注无效 / 没有标注的图片数、目标数与各标签的目标数（按目标数降序），以及所选版本中被选中的图片数、其中已不在数据集中与合并后文件被替换（不再用版本的标注）的图片数。下载对话框用它显示将导出的内容、YOLO 的类别对照与默认的类别顺序 |
+| `GET /api/v1/datasets/{id}/versions` | 审图版本 `{items, total}`，新的在前，包括正在生成的（`status: building`，还没有名称与编号）。每项：`id`、`name`（如 `审图1.3`）、`major` / `minor`、`note`、`status`（`building` / `ready`）、图片数 `image_count`、`needs_sample_count`、`approved_count` 与目标数 `object_count`（编号时统计）、来自的审图任务 `review: {id, name}`（任务删除后为 null）、`merge_id`、合并时的快照 `source: {review_id, review_name, merge_id, statuses, model}`、`created_at`、`updated_at`、`finished_at` |
+| `GET /api/v1/datasets/{id}/versions/{versionID}` | 单个版本（字段同列表项）；不存在或不属于这个数据集时 404 |
+| `PATCH /api/v1/datasets/{id}/versions/{versionID}` | `{note}` 修改备注（必填，最多 500 个字符，规则同合并时），返回版本；正在生成时 409 |
+| `DELETE /api/v1/datasets/{id}/versions/{versionID}` | 删除版本与它的标注快照，返回 204，编号不再使用；正在生成时 409。数据集的标注文件与审图任务不受影响 |
 | `GET /api/v1/datasets/{id}/exports/{token}` | 下载 zip（`Content-Disposition: attachment`，流式输出，无 Content-Length）；链接 1 小时内可重复使用，失效后 404 |
 
 ### 项目接口
@@ -251,11 +256,11 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 | 方法与路径 | 说明 |
 |---|---|
-| `GET /api/v1/reviews` | 审图任务列表 `{items, total}`，新的在前（`id DESC`）。筛选：`q`（名称、说明或项目名，不区分大小写）、`project_id`、`dataset_id`（包含该数据集的任务）、`model_id`、`status`（`queued` / `running` / `ready` / `failed`，其它值 400）。每项带创建时的模型快照 `model` 与 `model_exists`、模型所属项目 `project`、识别参数 `options`、识别状态（`status`、`stage`、`attempts`、`node`、`error`、`error_detail`、`result`，排队中的 `queue_position`，`workers_online`）、图片数 `counts`、各数据集 `datasets: [{id, name, folder, counts}]`（按选择的顺序）、最近一次上传 `last_upload`、进行中的合并 `active_merge` 与最近完成的合并 `last_merge` |
+| `GET /api/v1/reviews` | 审图任务列表 `{items, total}`，新的在前（`id DESC`）。筛选：`q`（名称、说明或项目名，不区分大小写）、`project_id`、`dataset_id`（包含该数据集的任务）、`model_id`、`status`（`queued` / `running` / `ready` / `failed`，其它值 400）。每项带创建时的模型快照 `model` 与 `model_exists`、模型所属项目 `project`、识别参数 `options`、识别状态（`status`、`stage`、`attempts`、`node`、`error`、`error_detail`、`result`，排队中的 `queue_position`，`workers_online`）、图片数 `counts`、各数据集 `datasets: [{id, name, folder, counts, next_version}]`（按选择的顺序；`next_version` 是这个数据集下一个审图版本的名称，如 `审图1.3`，合并对话框中显示，实际编号在合并完成时确定）、最近一次上传 `last_upload`、进行中的合并 `active_merge` 与最近完成的合并 `last_merge` |
 | `POST /api/v1/reviews` | `{name?, description?, model_id, dataset_ids, options?: {conf?, iou?, imgsz?, max_det?}}` 新建审图任务并排队识别，返回 201。规则见第 11 节“新建”：模型不存在、没有检测框、数据集不存在或超出数量、没有图片、参数超出范围时 422；模型文件不在磁盘上时 409 |
 | `GET /api/v1/reviews/{reviewID}` | 审图任务详情（字段同列表项） |
 | `PATCH /api/v1/reviews/{reviewID}` | `{name?, description?}` 修改名称和说明（规则同项目） |
-| `DELETE /api/v1/reviews/{reviewID}` | 删除审图任务与它的文件夹（审图标注），返回 204；数据集与已经合并到数据集的标注不受影响。正在合并时 409；正在识别时也可以删除，节点之后的调用得到 404 而停止。记录已删除但文件夹没能完全删除时返回 200 `{"files_removed": false, "message": "…"}`（同模型） |
+| `DELETE /api/v1/reviews/{reviewID}` | 删除审图任务与它的文件夹（审图标注），返回 204；数据集与已经生成的审图版本不受影响（版本的 `review` 变为 null，`source` 中仍有任务名称）。正在合并时 409；正在识别时也可以删除，节点之后的调用得到 404 而停止。记录已删除但文件夹没能完全删除时返回 200 `{"files_removed": false, "message": "…"}`（同模型） |
 | `POST /api/v1/reviews/{reviewID}/retry` | 重新识别失败的任务：清零尝试次数与错误后重新排队，返回 202 与任务，从还没有识别的图片继续。不是 `failed` 时 409（“只有识别失败的审图任务可以重试”），模型已被删除或模型文件不在时 409 |
 | `GET /api/v1/reviews/{reviewID}/images` | 图片列表，按任务中的顺序：`offset`、`limit`（默认 60，≤ 200）、`status`（`all` / `pending` / `approved` / `needs_sample` / `reviewed`）、`dataset_id`、`label`、`q`（数据集中的路径包含，不区分大小写）、`edited`（`all` / `edited` / `unedited`）、`boxes`（`all` / `with` / `without`）、`inference`（`all` / `failed`），参数值非法时 400。每项带数据集与数据集图片的 ID、路径、尺寸、`inferred`、`inference_error`、目标数与类别、`prediction_count`、`edited`、`status`、`revision`、`reviewed_at`、`merged_at`、`annotation_version` |
 | `GET /api/v1/reviews/{reviewID}/images/{imageID}` | 单张图片详情：另带 `objects`（审图标注，实时从 VOC 文件读取，没有文件时为 `[]`）、`predictions`（模型的框与置信度）、`dataset_name`，以及文件无法使用时的 `annotation_error` |
@@ -270,9 +275,9 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `GET /api/v1/reviews/{reviewID}/packages/{token}` | 下载审图包 zip（`Content-Disposition: attachment`，流式输出，无 Content-Length，每次下载都按当时的状态打包）；链接 1 小时内可重复使用，失效后 404 |
 | `POST /api/v1/reviews/{reviewID}/results?overwrite=&file_name=` | 上传本地审图程序导出的审图结果：请求体是 zip 本身（multipart 400），必须带 `Content-Length`（≤ 4 GiB，否则 413），剩余空间不足时 507；不是这个任务的结果或文件无效时 422。返回 `{id, review_id, file_name, overwrite, summary, problems, created_at}`，规则见第 11 节“上传审图结果” |
 | `GET /api/v1/reviews/{reviewID}/uploads` | 最近 50 次上传，新的在前（`total` 为全部的次数） |
-| `POST /api/v1/reviews/{reviewID}/merges` | 开始合并到数据集：`{dataset_ids?, statuses, on_existing: "skip" \| "overwrite"}`，返回 202 与合并记录（`status: running`）。已有合并在进行、没有识别过的图片、没有符合条件的图片时 409 |
+| `POST /api/v1/reviews/{reviewID}/merges` | 开始合并，生成数据集的审图版本：`{dataset_ids?, statuses, note}`（`note` 为版本备注，必填，最多 500 个字符，可以换行；空白、过长或含其它控制字符时 422），返回 202 与合并记录（`status: running`）。已有合并在进行、没有识别过的图片、没有符合条件的图片时 409 |
 | `GET /api/v1/reviews/{reviewID}/merges` | 最近 50 次合并，新的在前（`total` 为全部的次数） |
-| `GET /api/v1/reviews/{reviewID}/merges/{mergeID}` | 合并的状态与进度（前端轮询）：`status`、`total`、`done`、`summary`、`problems`、`error` |
+| `GET /api/v1/reviews/{reviewID}/merges/{mergeID}` | 合并的状态与进度（前端轮询）：`status`、`total`、`done`、`summary`、`problems`、`error`、`note`、生成的版本 `versions: [{id, dataset_id, name, status, image_count}]`（合并成功后才有；删除的版本不再列出）、`on_existing`（审图版本之前的合并为 `skip` / `overwrite`，之后为 null） |
 | `GET /api/v1/reviews/tool` | 本地审图程序：`{available, file_name: "trainmaster-reviewer.exe", size_bytes, version}`（`version` 为平台的版本，两者一起构建；没有时为 `""`） |
 | `GET /api/v1/reviews/tool/download` | 下载本地审图程序（`application/octet-stream`、`attachment`，支持 Range）；平台没有附带（`TM_REVIEWER_TOOL` 未设置或文件不存在）时 404 |
 | `GET /api/v1/datasets/{id}/reviews` | 数据集的审核记录：包含该数据集的审图任务，新的在前；每项为审图任务加上这个数据集的部分 `dataset`（带这个数据集中的图片数 `counts`）与包含它的最近 5 次合并 `dataset_merges`。数据集不存在时 404 |
@@ -342,7 +347,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 服务端状态用 TanStack Query 管理，界面组件来自 `src/components/ui/`（shadcn/ui）。
 - 项目模块位于 `src/features/projects/`：项目列表页（卡片 / 列表视图）、项目详情页（数据集 / 类别 / 模型，当前标签页记在 URL 的 `?tab=`，以前“标签分布”的链接 `?tab=labels` 打开“类别”）、类别列表的编辑对话框（列表的增删、改名、颜色、顺序与按 `classes.txt` 排列是 `class-edit.ts` 中与界面无关的纯函数，有单元测试）、新建 / 编辑 / 删除对话框（项目中有模型时需要勾选同时删除模型）、添加数据集对话框，以及数据集页使用的“纳入项目”对话框和项目标记。数据集页的项目筛选记在 URL 的 `?project=<项目ID|none>`。
 - 标注模块位于 `src/features/annotation/`：工作台首页（选择数据集）与标注编辑器（`/annotation/workspace/:datasetId`，路由带 `handle.fullBleed`，占满内容区且默认收起侧边栏）。几何计算（`geometry.ts`）、框列表与撤销历史（`document.ts`）、自动保存（`autosave.ts`）、快捷键映射（`shortcuts.ts`）、候选类别与类别配色（`classes.ts`）都是与界面无关的纯函数 / 类，有单元测试；画布（`annotation-canvas.tsx`）用一张 `<img>` 加屏幕坐标的 SVG 叠加层绘制，指针事件统一处理鼠标、触控笔与触屏（双指缩放；触屏与触控笔的按下取消默认行为，不再产生松开之后才派发的兼容鼠标事件，否则短拖动画好框后弹出的类别选择框会被随后的 mousedown 关掉），macOS Safari 的触控板捏合通过 `gesture*` 事件处理；画布容器为 `overflow: clip`（不可滚动），类别选择框等浮层放在画布内，其中的滚轮不缩放图片；类别选择框的高度不超过画布，画布较矮时其中的列表变短（可以滚动）。打开图片时如果焦点不在任何元素上（刚进入编辑器、用快捷键切换图片后），画布获得焦点，Tab 随即可以依次选中框；焦点在输入框、对话框、图片列表等处时不移动焦点。类别选择框关闭（选好类别、Esc）时焦点还在其中、快捷键说明 / 离开与删除的确认对话框关闭、点击提示中的按钮（载入最新版本、仍然保存、重试等）或提示条中的操作（放弃修改并切换）后，焦点也回到画布，不会落到页面上；用户已点到别的控件上、按钮在窄屏时弹出的面板中时不移动，对话框关闭时面板还开着则焦点回到面板中。未保存的修改由 react-router 的 `useBlocker` 守护：切换图片（包括浏览器后退 / 前进）或离开工作台前先保存。
-- 数据集模块位于 `src/features/datasets/`：列表页、详情页（图片 / 标签分布 / 导入记录）、新建与导入对话框、图片查看器（叠加 VOC 标注框）。上传由全局的上传管理器（`upload-manager.ts`，`useSyncExternalStore`）执行，切换页面不会中断；右下角的上传面板显示进度，上传中关闭页面会弹出提醒。
+- 数据集模块位于 `src/features/datasets/`：列表页、详情页（图片 / 标签分布 / 导入记录 / 审核记录 / 审图版本，记在 URL 的 `?tab=`）、新建与导入对话框、图片查看器（叠加 VOC 标注框）、下载对话框（选择版本与格式）。“审图版本”标签页（`dataset-review-versions.tsx`）列出基础版本与各审图版本，可以修改备注、删除，或打开选好版本的下载对话框；版本的组合方式与说明文字在 `versions.ts`（纯函数，有单元测试）。上传由全局的上传管理器（`upload-manager.ts`，`useSyncExternalStore`）执行，切换页面不会中断；右下角的上传面板显示进度，上传中关闭页面会弹出提醒。
 - 模型审图位于 `src/features/reviews/`：列表页（`/datasets/reviews`，项目与模型的筛选记在 URL 的 `?project=`、`?model=`）、详情页（`/datasets/reviews/:reviewId`：进度、各数据集、本地审图的步骤、上传与合并记录）、审图编辑器（`/datasets/reviews/:reviewId/workspace?image=`，`handle.fullBleed`，筛选记在 URL 中），以及新建、下载审图包、上传审图结果、合并到数据集的对话框；模型详情页的“用这个模型审图”与数据集详情页的“审核记录”（`?tab=reviews`）也在这里。审图编辑器与标注工作台共用画布、框编辑（`features/annotation/box-editing.tsx`）、工具栏部件（`toolbar-parts.tsx`）、保存守护（`save-guard.tsx`）、快捷键（`use-editor-keys.ts`、`shortcuts.ts` 的 `review` 模式）与跨图片的视图设置（`editor-common.ts`），只通过 `ReviewSource`（接口前缀与查询键）读写，所以本地审图程序直接复用它。`review-status.ts`、`review-format.ts`、`params.ts` 是与界面无关的纯函数，有单元测试。
 - 本地审图程序的页面位于 `src/reviewer/`（入口 `frontend/reviewer.html`，用 `vite.reviewer.config.ts` 单独构建到 `backend/cmd/trainmaster-reviewer/web/dist`）：开始页（打开审图包、最近打开的包、打开进度）、审图页（复用 `ReviewEditor`，接口为本机的 `/api/review`）与导出对话框。
 - 模型仓库位于 `src/features/models/`：列表页（`/models`，桌面为表格、窄屏为卡片）、模型详情页（`/models/:modelId`）、上传对话框与下载对话框（PT / ONNX，ONNX 转换的进度与失败原因）。`yolo-versions.ts`（版本表、各模型允许的与默认的后处理方式、转换选项的范围、输出形状说明、下载文件名）与 `naming.ts`（上传文件名与说明的规则）是与后端 `internal/model` 规则一致的纯函数，有单元测试。模型上传由 `features/models/upload-manager.ts` 执行（做法同数据集，复用 `upload-plan.ts` 的分块与重试，进度显示在同一个上传面板中）。
@@ -431,6 +436,8 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 下载为 YOLO 时，类别顺序来自数据集所属项目的类别列表（请求带 `project_id`），类别编号与用这个项目训练时一致：只属于一个项目时直接使用它；属于多个项目时由用户选择使用哪个项目的顺序（各项目的类别顺序都相同、或只有一个项目有类别列表时已默认选好，否则必须选择）；所选项目还没有类别列表时不能下载，页面提示先在项目的“类别”中添加类别。数据集没有纳入任何项目时手动指定类别顺序（请求带 `classes`），页面上的默认值为：数据集有成功的 YOLO 导入时，先沿用最近一次导入所用的顺序（类别编号与导入时一致），数据集中其余的标签按名称排在后面；没有 YOLO 导入时按标签名称排序。
 
+选了审图版本时（见第 11 节“审图版本”），用版本标注的图片按版本中的框生成标注（VOC 也重新生成 `.xml`，而不是复制数据集中的文件），其余图片同上。顶层文件夹与文件名带上所选的版本，如 `line_a-基础+审图1.1+审图1.3/`（超过 4 个版本时为 `审图1.0…审图1.5（6个版本）`；文件夹名超过 200 字节时改为 `基础+6个审图版本`，仍然过长时截短数据集文件夹名）。不选基础版本时 YOLO 的 `data.yaml` 中注明只含数据集的部分图片。打包开始时在一个只读的可重复读事务中确认版本还在并读出要导出的图片与版本标注：准备下载之后版本被删除时返回 404（“所选的版本已被删除，请重新下载”），已没有可以导出的图片时返回 409。
+
 压缩包中的文件按图片顺序排列。未标注或标注无法解析的图片只包含图片本身；扫描之后已被删除的图片会被跳过。两个文件在压缩包中的名称相同时（如 `a.jpg` 与 `a.png` 的 `a.json`），只保留按图片顺序在前的那个。打包中途出错时连接被中断，浏览器会显示下载失败，而不会留下不完整的压缩包。
 
 ### 图片顺序
@@ -488,7 +495,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 因此迁移文件中**不要写 `BEGIN` / `COMMIT`**，也不能包含无法在事务中执行的语句（如 `CREATE INDEX CONCURRENTLY`）。
 - 迁移只向前：**已发布的迁移文件不要修改，也不要改名**，需要变更就新增一个文件。
 - 同一个版本号只能对应一个文件。执行器会比对 `schema_migrations` 中记录的文件名：数据库里已执行过的版本号在当前代码中对应另一个文件名时（典型情况是两个分支各自新增了 `0002_*.sql`，又共用一个开发数据库），启动直接失败并给出两个文件名，而不是悄悄跳过。此时给后合入的那个文件换一个新编号；开发数据库可以删掉 `data/postgres` 重建。
-- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）；`0008_create_models.sql` 建立模型仓库的 `models`、`model_uploads`、`model_exports`（转换任务，同时是转换结果的缓存），并为 `projects` 增加 `model_version_seq`（见第 10 节）；`0009_project_classes.sql` 把类别列表从数据集移到项目（`projects.classes`），带上每个项目中数据集原有的列表，然后删除 `datasets.classes`（见第 6 节“类别列表”）；`0010_create_reviews.sql` 建立模型审图的 `reviews`、`review_datasets`、`review_images`、`review_uploads`、`review_merges`（见第 11 节）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
+- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）；`0008_create_models.sql` 建立模型仓库的 `models`、`model_uploads`、`model_exports`（转换任务，同时是转换结果的缓存），并为 `projects` 增加 `model_version_seq`（见第 10 节）；`0009_project_classes.sql` 把类别列表从数据集移到项目（`projects.classes`），带上每个项目中数据集原有的列表，然后删除 `datasets.classes`（见第 6 节“类别列表”）；`0010_create_reviews.sql` 建立模型审图的 `reviews`、`review_datasets`、`review_images`、`review_uploads`、`review_merges`（见第 11 节）；`0011_dataset_versions.sql` 建立数据集的审图版本 `dataset_versions`、`dataset_version_images`，为 `datasets` 增加 `review_version_seq`，为 `review_merges` 增加 `note` 并允许 `on_existing` 为空（见第 11 节“审图版本”）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
 
 ## 8. 日志
 
@@ -658,7 +665,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 ## 11. 模型审图
 
-模型审图用模型仓库中的一个模型识别一个或多个数据集的图片，再由人逐张审核：识别正确的标为“已审核”（`approved`），需要参与后续训练的修正识别框后标为“需加样”（`needs_sample`），最后把审图标注合并进数据集。实现分几部分：`internal/review`（审图任务、识别任务、审核、审图包、上传结果、合并），`internal/reviewfile`（审图包的文件格式，平台与本地审图程序共用），本地审图程序 `cmd/trainmaster-reviewer` 与 `internal/reviewer`，前端 `src/features/reviews/` 与 `src/reviewer/`，训练节点 `trainmaster_trainer/review_inference.py`。接口见第 3 节“模型审图接口”与“计算资源接口”。
+模型审图用模型仓库中的一个模型识别一个或多个数据集的图片，再由人逐张审核：识别正确的标为“已审核”（`approved`），需要参与后续训练的修正识别框后标为“需加样”（`needs_sample`），最后把审图标注合并为数据集的审图版本（下载时选择版本）。实现分几部分：`internal/review`（审图任务、识别任务、审核、审图包、上传结果、合并），`internal/reviewfile`（审图包的文件格式，平台与本地审图程序共用），本地审图程序 `cmd/trainmaster-reviewer` 与 `internal/reviewer`，前端 `src/features/reviews/` 与 `src/reviewer/`，训练节点 `trainmaster_trainer/review_inference.py`。接口见第 3 节“模型审图接口”与“计算资源接口”。
 
 ### 数据模型
 
@@ -670,7 +677,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `review_datasets` | 任务的数据集，按选择的顺序（`position`）；`folder` 是数据集在任务文件夹与审图包中的文件夹名，`dataset_name` 是创建时的名称 |
 | `review_images` | 任务的图片：创建时数据集图片的**快照**（`rel_path`、尺寸、`image_version`），`position` 为任务中的顺序；`package_path` / `annotation_path` 是图片与审图标注在任务文件夹（审图包）中的路径。识别结果 `inferred`、`inference_error`、`predictions`（模型的框，之后不再改变）；当前审图标注的 `object_count`、`labels`、`annotation_version`（文件内容的版本，没有文件时为 `""`）与 `edited`；审核状态 `status`、`reviewed_at`；`revision`（标注与状态各自每变一次加 1）；`merged_at` / `merged_revision`（最近一次合并）；`upload_package_id` / `upload_revision`（最近一次改了它的上传来自哪个审图包、改成的 `revision`，见“上传审图结果”） |
 | `review_uploads` | 上传的审图结果与应用结果：`file_name`、`overwrite`、`summary`、最多 100 条 `problems` |
-| `review_merges` | 合并到数据集的后台任务：`dataset_ids`、`statuses`、`on_existing`（`skip` / `overwrite`）、`status`（`running` → `succeeded` / `failed`）、进度 `total` / `done`、`summary`、`problems`、`error`；部分唯一索引保证一个任务同时只有一个合并在进行 |
+| `review_merges` | 合并到数据集的后台任务：`dataset_ids`、`statuses`、版本备注 `note`（`0011`）、`on_existing`（审图版本之前的合并：`skip` / `overwrite`；之后为 NULL）、`status`（`running` → `succeeded` / `failed`）、进度 `total` / `done`、`summary`、`problems`、`error`；部分唯一索引保证一个任务同时只有一个合并在进行。生成的版本见“审图版本” |
 
 - **图片是快照**：创建时按所选数据集的顺序、数据集内按“图片顺序”（第 6 节）写入 `review_images`；之后数据集中新增的图片不会加入。数据集中的图片被删除（重新扫描、覆盖导入）或数据集被删除时，对应的审图图片级联删除。
 - **计数不存储**：各状态的图片数（`counts`：`total`、`inferred`、`inference_failed`、`pending`、`approved`、`needs_sample`、`edited`、`merged`）总是用 `GROUP BY` 现算，级联删除不会让计数过期。
@@ -691,7 +698,7 @@ reviews/
 - **审图标注属于平台**：每次保存都用导入时的 VOC 写入器重新生成整个文件（不保留其它内容），同样的框总是得到同样的文件，`annotation_version` 随内容变化。文件通过 `os.Root` 访问（任务文件夹中的符号链接不能指向外面），先写同目录的隐藏临时文件再改名替换；同一张图片的修改串行执行（按图片加锁），先写文件、再在同一事务中更新这张图片的行，失败时恢复原来的文件。
 - **Windows 安全的路径**（`reviewfile/paths.go`，审图包要在 Windows 上解压）：数据集文件夹名为 `SafeSegment(数据集文件夹名)`，与已用的名称不区分大小写地重复时加 `~<数据集ID>`；图片的路径逐段 `SafeSegment`，同一文件夹中重复（不区分大小写，`FoldKey`）时在扩展名前加 `~2`、`~3`…；标注为 `<图片名去掉扩展名>.xml`，被占用时为 `<图片文件名>.xml`，仍被占用时为 `<图片名>~N.xml`。`SafeSegment` 把 `< > : " | ? * \ /`、控制字符与无效的 UTF-8 换成 `_`，末尾的点与空格换成 `_`，Windows 设备名（`CON`、`PRN`、`AUX`、`NUL`、`CONIN$`、`CONOUT$`、`COM0`–`COM9`、`LPT0`–`LPT9`，含上标数字的写法）前加 `_`，每段不超过 255 个 UTF-16 单元。顶层的 `review.json`、`review-progress.json`、`README.txt` 是保留的名称，数据集文件夹不会用它们。
 - **删除**：在事务中锁定任务、确认没有进行中的合并后删除记录，并把文件夹改名为 `reviews/.deleting-<任务ID>`，提交后再删除；没能完全删除时剩余的文件恢复为原来的名称（任务 ID 不复用），接口返回 200 与说明。数据集不受影响。
-- **后台任务**（`review.Service.Start` / `Stop`）：启动时把上次运行中断的合并记为失败（“服务重启，合并被中断（已合并的图片保留，可以再次合并）”）；每 15 秒处理租约过期的识别任务；启动时与每小时删除 `.deleting-*`、没有对应任务的文件夹与 1 小时前暂存、已不再使用的上传（`tmp/review-uploads/`）。审图包的下载链接、按图片的锁与合并任务都在进程内存中，**目前只支持单实例部署**。
+- **后台任务**（`review.Service.Start` / `Stop`）：启动时把上次运行中断的合并记为失败（“服务重启，合并被中断，没有生成新的版本，可以重新合并”），在同一事务中删除所有正在生成的审图版本（只有合并生成版本，`Start` 返回前没有合并在进行）；每 15 秒处理租约过期的识别任务；启动时与每小时删除 `.deleting-*`、没有对应任务的文件夹与 1 小时前暂存、已不再使用的上传（`tmp/review-uploads/`）。审图包的下载链接、按图片的锁与合并任务都在进程内存中，**目前只支持单实例部署**。
 
 ### 新建
 
@@ -764,16 +771,45 @@ zip 中只有一个顶层文件夹 `审图-<任务ID>-<任务名>/`（`SafeSegme
 
 ### 合并到数据集
 
-`POST …/merges`（`{dataset_ids?, statuses, on_existing}`，`statuses` 至少一种，`on_existing` 为 `skip` / `overwrite`）返回 202 与合并记录，在后台按任务中的顺序处理所选数据集中这些状态的识别过的图片（页面提供需加样（默认）与已审核，接口也接受 `pending`）。已有合并在进行时 409，没有符合条件的图片时 409。进度至少每 50 张或每秒保存一次，`GET …/merges/{mergeID}` 查看，`GET …/merges` 列出最近 50 次（`total` 为全部的次数）。
+`POST …/merges`（`{dataset_ids?, statuses, note}`，`statuses` 至少一种，`note` 为版本备注）返回 202 与合并记录，在后台按任务中的顺序处理所选数据集中这些状态的识别过的图片（页面提供需加样（默认）与已审核，接口也接受 `pending`）。合并**不修改数据集的文件**：每个有要合并的图片的数据集生成一个新的审图版本（见下一节），图片的审图标注与审核状态保存在版本中。已有合并在进行时 409，没有符合条件的图片时 409。进度至少每 50 张或每秒保存一次，`GET …/merges/{mergeID}` 查看，`GET …/merges` 列出最近 50 次（`total` 为全部的次数）。
 
-每张图片：
+开始时在事务中锁定任务（`KEY SHARE`，之后删除任务时会看到合并在进行），并记下版本的来源快照（任务名称、合并的状态、模型）。每张图片在它的锁下读出审核状态与审图标注：
 
-- 审图图片已被删除、审图标注无法读取、数据集中这张图片不能在平台中保存标注（`annotation_blocked`）→ `failed`；
+- 审图图片已被删除（与数据集图片一起）、审图标注无法读取 → `failed`；
+- 审核状态在合并开始之后改为了不合并的状态 → `skipped_changed`（“审核状态在合并时被改为其它状态，没有合并”）；
 - 没有审图标注文件（识别失败、之后也没有编辑过）→ `skipped_empty`；
-- 数据集中这张图片已有标注文件（含空标注与无效标注）且 `on_existing` 为 `skip` → `skipped_existing`；
-- 否则通过 `dataset.Service.SaveAnnotation` 写入（与标注工作台的保存相同：数据集索引与计数随之更新，`base_version` 为刚读到的版本，`overwrite` 时允许重新生成无法保留其它内容的文件）；框为空时写入空标注（负样本）。期间数据集中的标注被别人修改了 → `conflicts`（“数据集中这张图片的标注在合并时被其他人修改了，没有合并”）；成功 → `merged`，记下 `merged_at` 与 `merged_revision`。
+- 否则加入这个数据集的版本（第一次遇到这个数据集时由 `dataset.Service.CreateReviewVersion` 新建，`status: building`）：`AddVersionImage` 按图片在数据集文件夹中的路径写入框、尺寸、审核状态，以及数据集中这张图片**此时**的大小与修改时间（版本只用于仍是这个文件的图片）。框为空时作为空标注（负样本）。数据集中已没有这张图片、或数据集已被删除 → `failed`（“图片已不在数据集中（可能已被删除）”）；成功 → `merged`。
 
-个别图片的失败不影响合并的结果（`succeeded`，`summary`：`merged`、`skipped_existing`、`skipped_empty`、`conflicts`、`failed`，以及最多 100 条 `problems`）；只有合并本身出错时为 `failed`。记下合并结束的更新失败时（如数据库正在重启）从 1 秒起加倍、最长每 30 秒重试一次，直到成功或服务停止，合并不会一直显示为进行中。服务停止或重启时进行中的合并为失败，已合并的图片保留，可以再次合并。任务自己的审图标注不受影响；进行中的合并会阻止删除任务。
+个别图片的失败不影响合并的结果（`succeeded`，`summary`：`merged`、`skipped_empty`、`skipped_changed`、`failed`，以及最多 100 条 `problems`；`skipped_existing` 与 `conflicts` 只出现在审图版本之前的合并中）；只有合并本身出错时为 `failed`。合并的结束在一个事务中记下：先更新合并记录（只更新仍为 `running` 的），再按 ID 顺序锁定涉及的数据集（`FOR NO KEY UPDATE`）、为版本编号并统计图片数（`FinishReviewVersions`，见下一节），最后记下合并了的图片的 `merged_at` 与 `merged_revision`；合并失败、或已在别处被记为结束时删除它生成的版本。这个事务因暂时性的错误失败时（连接中断、数据库正在重启、资源不足、序列化失败与死锁：不是来自服务器的错误与 SQLSTATE 类 08、53、57、58、40）从 1 秒起加倍、最长每 30 秒重试一次，直到成功或服务停止，合并不会一直显示为进行中；其它错误（如违反约束）重试也不会成功，合并改为失败（“合并失败：服务器内部错误（详见服务器日志），没有生成新的版本，可以重新合并”）并删除版本。服务停止或重启时进行中的合并为失败，不生成版本，可以再次合并。任务自己的审图标注不受影响；进行中的合并会阻止删除任务。
+
+审图版本之前的合并直接写进了数据集的 VOC 文件（`on_existing` 为 `skip` / `overwrite`），它们的记录保留，页面显示为“直接写入数据集”；那些标注就是现在基础版本的一部分。
+
+### 审图版本
+
+数据集文件夹中的图片与 VOC 文件是数据集的**基础版本**：导入、扫描、标注工作台修改的都是它，标签分布与数据集的计数也只统计它。合并审图任务生成**审图版本**（`internal/dataset/versions.go`），是合并时审图标注的快照，不修改基础版本。
+
+`0011_dataset_versions.sql`：
+
+| 表 | 内容 |
+|---|---|
+| `dataset_versions` | 版本：`dataset_id`、`kind`（目前只有 `review`）、编号 `major` / `minor`（名称为 `审图<major>.<minor>`，生成中为 NULL）、`note`、`status`（`building` → `ready`）、来自的 `review_id` 与 `merge_id`（删除后为 NULL）与快照 `source`（`{review_id, review_name, merge_id, statuses, model}`）、编号时统计的 `image_count`、`needs_sample_count`、`approved_count`、`object_count`，`finished_at`（编号的时间）。约束保证编号、`ready` 与 `finished_at` 同时出现，`(dataset_id, kind, major, minor)` 唯一 |
+| `dataset_version_images` | 版本中的图片，按图片在数据集文件夹中的路径 `rel_path`（主键 `(version_id, rel_path)`）：合并时数据集图片的 `image_size` 与 `image_mod_time`、审核状态 `review_status`、尺寸、框 `objects`（`[]` 为负样本）、`object_count`、`labels`（`{类别: 目标数}`） |
+| `datasets.review_version_seq` | 这个数据集编号过的审图版本数，即下一个版本的 `minor` |
+
+- **编号**：版本在合并结束的事务中编号（`FinishReviewVersions`）：按 ID 顺序锁定这次合并涉及的数据集，`review_version_seq` 加 1，加之前的值作为 `minor`（`major` 目前总是 1），版本变为 `ready`。所以同一个数据集的版本按合并**完成**的先后编号，删除的版本号不会再分配，失败的合并不占用编号。审图任务的 `datasets[].next_version` 是按 `review_version_seq` 预计的下一个名称。
+- **版本不变**：`ready` 的版本除了备注不再改变；之后修改审图任务、再次合并都不影响它（再次合并生成下一个版本，包含当时所选状态的全部图片，不只是改过的）。
+- **对应图片**：版本按路径对应数据集的图片，只要数据集中这个路径上的图片的大小与修改时间（索引中的值）与合并时相同，版本就用于这张图片，重新扫描删除后又导入回来的同一个文件也是。路径上换成了别的文件（重新扫描或覆盖导入后大小或修改时间变了）时，版本的标注不再适用。
+- **删除**：删除版本级联删除它的图片，删除数据集级联删除它的版本；删除审图任务或合并记录时版本保留（`review_id`、`merge_id` 为 NULL）。正在生成的版本不能修改或删除（409）。
+
+**下载时组合版本**（`VersionSelection{IncludeBase, VersionIDs}`）：所选的审图版本从新到旧排列；对数据集中的每张图片，取所选版本中最新的、包含这张图片并且仍然适用的版本的标注（`layerSQL`：`DISTINCT ON (rel_path)`，按版本在从新到旧的列表中的位置排序）。
+
+| 选择 | 导出的图片 |
+|---|---|
+| 只有基础版本（省略版本字段） | 与没有版本时相同：全部图片与数据集自己的标注 |
+| 基础版本 + 审图版本 | 全部图片；取到版本标注的图片用版本的标注（任何审核状态），其余用基础版本的标注 |
+| 只有审图版本 | 只导出取到的版本标注为**需加样**的图片（同一张图片在新版本中是已审核时不导出：以新版本为准），不含基础版本的标注 |
+
+例如选择审图1.3、1.2、1.1 与基础版本：1.3 中的图片用 1.3 的标注，其余在 1.2 中的用 1.2 的，再其余在 1.1 中的用 1.1 的，剩下的用基础版本的标注。版本中已不在数据集中的图片不导出；文件已被替换的图片不用版本的标注（有基础版本时用基础版本的，否则不导出）。`GET …/exports/preview` 用同样的查询统计导出的内容，另外按所选版本中每个路径最新的那条记录统计被选中的图片数（`version_image_count`）、其中已不在数据集中的（`missing_count`）与文件已被替换的（`changed_count`），下载对话框中提示这些图片不按版本导出。
 
 ### 本地审图程序
 
