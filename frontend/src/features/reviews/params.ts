@@ -147,35 +147,43 @@ export type StartImage = {
 
 /**
  * 地址栏中没有指定图片时打开哪张，筛选条件不变：
- * 1. 符合筛选条件的第一张待审核的图片（审核状态筛选“全部”或“待审核”时）。
- *    “网页审图”与数据集的“审图”进来时列表显示全部图片，从第一张待审核的开始。
- * 2. 没有待审核的：第一张符合筛选条件的图片（如复查已审核的图片）。
+ * 1. 审核状态筛选“全部”时：符合其它筛选条件的第一张可以审核的待审核图片。“网页
+ *    审图”与数据集的“审图”进来时列表显示全部图片，从这一张开始。还没有识别的
+ *    图片也是待审核，但识别完成后才能标记，不算（识别按图片的顺序进行，第一张
+ *    待审核的还没有识别时，前面已识别的都审完了）。
+ * 2. 第一张符合筛选条件的图片（待审核的都审完了时复查已审核的，或者地址栏中
+ *    指定了审核状态）。
  * 3. 没有符合筛选条件的图片：审图任务的第一张。
  *
  * `first(filters)` 返回符合 `filters` 的第一张图片（没有时为 null）。
  */
 export async function pickStartImage(
   filters: ReviewImageFilters,
-  first: (filters: ReviewImageFilters) => Promise<{ id: number } | null>
+  first: (
+    filters: ReviewImageFilters
+  ) => Promise<{ id: number; inferred: boolean } | null>
 ): Promise<StartImage> {
-  const wantsPending = filters.status === "all" || filters.status === "pending"
-  if (wantsPending) {
+  const all = filters.status === "all"
+  // 有待审核的图片，但都还没有识别。
+  let uninferred = false
+  if (all) {
     const pending = await first({ ...filters, status: "pending" })
-    if (pending) {
+    if (pending?.inferred) {
       return { id: pending.id, notice: null }
     }
+    uninferred = pending !== null
   }
-  if (filters.status !== "pending") {
-    const match = await first(filters)
-    if (match) {
-      return {
-        id: match.id,
-        notice: !wantsPending
-          ? null
+  const match = await first(filters)
+  if (match) {
+    return {
+      id: match.id,
+      notice: !all
+        ? null
+        : uninferred
+          ? "已识别的图片都审完了，已打开第一张"
           : hasReviewFilters(filters)
             ? "筛选出的图片中没有待审核的，已打开第一张"
             : "没有待审核的图片了，已打开第一张",
-      }
     }
   }
   if (!hasReviewFilters(filters)) {
