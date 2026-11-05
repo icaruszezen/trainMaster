@@ -279,7 +279,9 @@ function MergeEntry({ merge, review }: { merge: ReviewMerge; review: Review }) {
       summary={
         merge.status === "running"
           ? `已处理 ${formatNumber(merge.done)} / ${formatNumber(merge.total)} 张${note}`
-          : `${mergeSummaryText(merge.summary)} · ${mergeOutcomeText(merge, review.datasets)}${note}`
+          : merge.status === "failed" && merge.on_existing === null
+            ? `已处理 ${formatNumber(merge.done)} / ${formatNumber(merge.total)} 张后中断 · 没有生成版本${note}`
+            : `${mergeSummaryText(merge.summary)} · ${mergeOutcomeText(merge, review.datasets)}${note}`
       }
       time={merge.finished_at ?? merge.created_at}
     >

@@ -53,11 +53,12 @@ CREATE INDEX dataset_versions_review_idx ON dataset_versions (review_id);
 CREATE INDEX dataset_versions_building_idx ON dataset_versions (id) WHERE status = 'building';
 
 -- The images of a version with their annotation, keyed by the image's path
--- in the dataset folder: a version outlives the image rows (a rescan that
--- removes an image, an import that brings it back) and applies again to an
--- image at the same path, as long as it is the same file: the size and
--- modification time of the dataset image when merged must match (a
--- different picture at the path keeps its base annotation).
+-- in the dataset folder: a version outlives the image rows (a rescan while
+-- the file was moved away) and applies again to an image at the same path,
+-- as long as it is the same file: the size and modification time of the
+-- dataset image when merged must match. A different picture at the path,
+-- or the same one imported again (written with a new modification time),
+-- keeps its base annotation.
 CREATE TABLE dataset_version_images (
     version_id     bigint NOT NULL REFERENCES dataset_versions (id) ON DELETE CASCADE,
     rel_path       text NOT NULL,

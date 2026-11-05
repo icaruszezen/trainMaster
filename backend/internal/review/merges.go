@@ -294,7 +294,8 @@ func (s *Service) recordMergeEnd(ctx context.Context, j *mergeJob, status, msg s
 			err = pgx.BeginFunc(fctx, s.db, func(tx pgx.Tx) error {
 				// The merge row first (nothing else locks it), then the
 				// datasets and their versions (FinishReviewVersions), then
-				// the review images.
+				// the review images, in image order (as a rescan deleting
+				// images locks them, see dataset.deleteImages).
 				tag, err := tx.Exec(fctx, `UPDATE review_merges SET status = $2, error = $3, done = $4, summary = $5,
 						problems = $6, finished_at = now()
 					WHERE id = $1 AND status = 'running'`, j.ID, status, msg, j.Done, j.Summary, j.Problems)
@@ -305,6 +306,10 @@ func (s *Service) recordMergeEnd(ctx context.Context, j *mergeJob, status, msg s
 					return s.datasets.DiscardReviewVersions(fctx, tx, j.ID)
 				}
 				if versions, err = s.datasets.FinishReviewVersions(fctx, tx, j.ID); err != nil {
+					return err
+				}
+				if _, err = tx.Exec(fctx, `SELECT 1 FROM review_images WHERE id = ANY($1)
+					ORDER BY image_id, id FOR NO KEY UPDATE`, ids); err != nil {
 					return err
 				}
 				_, err = tx.Exec(fctx, `UPDATE review_images ri SET merged_at = now(), merged_revision = m.revision

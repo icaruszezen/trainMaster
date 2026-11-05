@@ -116,12 +116,14 @@ const byCodePoint = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 /**
  * 不属于任何项目的数据集下载为 YOLO 时的默认类别顺序：先沿用 `imported`（最近
  * 一次 YOLO 导入的类别顺序，类别编号与导入时一致；重复的只取第一次出现的
- * 位置），数据集中其余的标签按名称（码点）排在后面。属于项目的数据集使用
- * 项目的类别列表，不用它。
+ * 位置），数据集中其余的标签按名称（码点）排在后面。`extra` 是只在所选审图
+ * 版本中出现的标签，按名称排在最后：选不选版本，数据集已有标签的类别编号
+ * 都不变。属于项目的数据集使用项目的类别列表，不用它。
  */
 export function defaultClassOrder(
   labels: readonly Pick<DatasetLabel, "name">[],
-  imported?: readonly string[]
+  imported?: readonly string[],
+  extra: readonly Pick<DatasetLabel, "name">[] = []
 ) {
   const order: string[] = []
   const known = new Set<string>()
@@ -131,12 +133,15 @@ export function defaultClassOrder(
       order.push(name)
     }
   }
+  const addSorted = (items: readonly Pick<DatasetLabel, "name">[]) =>
+    items
+      .map((label) => label.name)
+      .filter((name) => !known.has(name))
+      .sort(byCodePoint)
+      .forEach(add)
   imported?.forEach(add)
-  labels
-    .map((label) => label.name)
-    .filter((name) => !known.has(name))
-    .sort(byCodePoint)
-    .forEach(add)
+  addSorted(labels)
+  addSorted(extra)
   return order
 }
 

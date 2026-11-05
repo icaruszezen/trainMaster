@@ -9,6 +9,7 @@
  * 哪个项目的。不属于任何项目时手动指定（文本框或 classes.txt）。
  */
 import {
+  useEffect,
   useId,
   useMemo,
   useRef,
@@ -209,13 +210,26 @@ function ExportForm({
     mode === "none" ||
     (withVersions && !previewLoading && previewData?.image_count === 0)
 
-  // 下载的图片的标签：只有基础版本时是数据集的标签，选了审图版本时按所选版本统计。
+  // 统计失败多半是所选的版本已被删除：刷新版本列表，不再选中它（refetch 不变）。
+  const previewFailed =
+    withVersions && preview.isError && isPermanentError(preview.error)
+  const refetchVersions = versions.refetch
+  useEffect(() => {
+    if (previewFailed) {
+      void refetchVersions()
+    }
+  }, [previewFailed, refetchVersions])
+
+  // 下载的图片的标签：只有基础版本时是数据集的标签，选了审图版本时按所选版本
+  // 统计（与类别顺序对照）。默认的类别顺序总是由数据集的标签生成，只在所选
+  // 版本中出现的标签排在最后，选不选版本类别编号都不变。
   const labels = useQuery(labelsQuery(dataset.id))
-  const labelItems = withVersions ? previewData?.labels : labels.data?.items
-  const labelsPending = withVersions
-    ? previewData === undefined && preview.isPending
-    : labels.isPending
-  const labelsError = withVersions ? preview.error : labels.error
+  const datasetLabels = labels.data?.items
+  const labelItems = withVersions ? previewData?.labels : datasetLabels
+  const versionLabels = withVersions ? previewData?.labels : undefined
+  const labelsPending =
+    labels.isPending ||
+    (withVersions && previewData === undefined && preview.isPending)
 
   // ---- 属于项目：使用（所选）项目的类别列表 ----
   const projectGroupRef = useRef<HTMLDivElement>(null)
@@ -259,8 +273,14 @@ function ExportForm({
     () =>
       defaultsPending
         ? ""
-        : toClassListText(defaultClassOrder(labelItems ?? [], importedClasses)),
-    [defaultsPending, labelItems, importedClasses]
+        : toClassListText(
+            defaultClassOrder(
+              datasetLabels ?? [],
+              importedClasses,
+              versionLabels
+            )
+          ),
+    [defaultsPending, datasetLabels, importedClasses, versionLabels]
   )
   const classesText = classesDraft ?? defaultText
   const classList = useMemo(() => parseClassList(classesText), [classesText])
@@ -367,8 +387,10 @@ function ExportForm({
   const invalidCount = withVersions
     ? (previewData?.invalid_count ?? 0)
     : dataset.invalid_count
-  // 有审图版本（或正在生成、正在读取）时显示版本的选择。
+  // 有审图版本（或正在生成、正在读取）时显示版本的选择；版本都被删除时，
+  // 不是只选了基础版本也仍然显示，以便改回基础版本。
   const showVersions =
+    mode !== "base" ||
     (versionItems?.length ?? 0) > 0 ||
     (versionItems === undefined &&
       (dataset.version_count > 0 || initialSelection.version_ids.length > 0))
@@ -403,7 +425,10 @@ function ExportForm({
           preview={previewData}
           previewLoading={previewLoading}
           previewError={withVersions ? preview.error : null}
-          onRetryPreview={() => void preview.refetch()}
+          onRetryPreview={() => {
+            void preview.refetch()
+            void versions.refetch()
+          }}
           disabled={mutation.isPending}
         />
       )}
@@ -441,13 +466,17 @@ function ExportForm({
                   数据集还没有纳入项目，需要手动指定类别顺序（纳入项目后可使用项目的类别顺序）。
                   {defaultsPending
                     ? "正在读取数据集中的标签…"
-                    : labelsError
-                      ? `无法读取数据集中的标签（${labelsError.message}），请手动填写。`
+                    : labels.error
+                      ? `无法读取数据集中的标签（${labels.error.message}），请手动填写。`
                       : lastYolo.error
                         ? `无法读取导入记录（${lastYolo.error.message}），默认按标签名称排序；请确认与训练时使用的 classes.txt 一致。`
                         : yoloImport
                           ? `默认沿用导入“${yoloImport.file_name}”时的类别顺序（类别编号不变），其余标签按名称排在后面；可直接编辑，或读取训练时使用的 classes.txt。`
                           : "默认按数据集中的标签名称排序；可直接编辑，或读取训练时使用的 classes.txt 以保持类别编号一致。"}
+                  {!defaultsPending &&
+                    !labels.error &&
+                    withVersions &&
+                    "只在所选审图版本中出现的标签排在最后，选不选版本，数据集已有标签的类别编号都不变。"}
                 </>
               }
               onReset={
@@ -460,7 +489,9 @@ function ExportForm({
             />
           )}
 
-          {coverage && <CoverageNotes {...coverage} />}
+          {coverage && (
+            <CoverageNotes {...coverage} withVersions={withVersions} />
+          )}
         </div>
       )}
 
@@ -961,15 +992,17 @@ function ProjectClassState({
 }
 
 /**
- * 类别顺序与数据集标签的对照：不在列表中的标签（它们的目标不会导出），以及
- * 数据集中没有目标、但仍会写入 classes.txt 的类别。
+ * 类别顺序与下载的图片的标签的对照：不在列表中的标签（它们的目标不会导出），
+ * 以及下载的图片中没有目标、但仍会写入 classes.txt 的类别。
  */
 function CoverageNotes({
   missing,
   unused,
+  withVersions,
 }: {
   missing: readonly DatasetLabel[]
   unused: readonly string[]
+  withVersions: boolean
 }) {
   const missingObjects = missing.reduce(
     (sum, label) => sum + label.object_count,
@@ -1019,7 +1052,7 @@ function CoverageNotes({
         <p className="flex items-start gap-1.5 text-xs text-pretty text-muted-foreground">
           <Info className="mt-px size-3.5 shrink-0" />
           <span>
-            数据集中没有这些类别的目标：
+            {withVersions ? "导出的图片中" : "数据集中"}没有这些类别的目标：
             {unused.slice(0, LIST_LIMIT).join("、")}
             {unused.length > LIST_LIMIT &&
               ` 等 ${formatNumber(unused.length)} 个`}

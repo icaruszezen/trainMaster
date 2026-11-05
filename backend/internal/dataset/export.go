@@ -491,19 +491,24 @@ func sidecarPath(rel, ext string) string {
 }
 
 // reserve records the annotation entry names (by name) of the images that
-// keep their base annotation. A review version annotation does not take
-// one of them: when a.jpg (from a version) and a.png (a.xml paired with
-// it) share a name, a.png keeps its annotation whatever their order, as in
-// a download of the base alone, where a.jpg has none.
-func (e *Export) reserve(name func(exportImage) string) {
+// own them (by owns). A review version annotation does not take one of
+// them: when a.jpg (from a version) and a.png (a.xml paired with it) share
+// a name, a.png keeps its annotation whatever their order, as in a download
+// of the base alone, where a.jpg has none.
+func (e *Export) reserve(name func(exportImage) string, owns func(exportImage) bool) {
 	if e.reserved == nil {
 		e.reserved = map[string]bool{}
 	}
 	for _, img := range e.images {
-		if img.VersionID == nil && img.AnnPath != nil {
+		if owns(img) {
 			e.reserved[name(img)] = true
 		}
 	}
+}
+
+// keepsBaseAnnotation reports whether img is written with its own VOC file.
+func keepsBaseAnnotation(img exportImage) bool {
+	return img.VersionID == nil && img.AnnPath != nil
 }
 
 // nameReserved reports whether the annotation entry name of a review
@@ -526,7 +531,11 @@ func (e *Export) nameReserved(img exportImage, name string) bool {
 // go in the dataset folder (next to the image, or in a sibling
 // Annotations/ folder, see defaultAnnotationPath).
 func (e *Export) writeVOC(ctx context.Context, zw *zip.Writer) error {
-	e.reserve(func(img exportImage) string { return *img.AnnPath })
+	// A VOC file belongs to the image it is paired with, also when the
+	// annotation comes from a version (and is written in its place): a.jpg
+	// from a version without a VOC file does not take a.xml from a.png.
+	e.reserve(func(img exportImage) string { return *img.AnnPath },
+		func(img exportImage) bool { return img.AnnPath != nil })
 	for i, img := range e.images {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -610,7 +619,7 @@ type xalExportShape struct {
 // writeXAnyLabeling copies the images and writes <stem>.json next to each
 // image with a usable VOC file.
 func (e *Export) writeXAnyLabeling(ctx context.Context, zw *zip.Writer) error {
-	e.reserve(func(img exportImage) string { return sidecarPath(img.Path, ".json") })
+	e.reserve(func(img exportImage) string { return sidecarPath(img.Path, ".json") }, keepsBaseAnnotation)
 	for i, img := range e.images {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -696,7 +705,7 @@ func (e *Export) writeYOLO(ctx context.Context, zw *zip.Writer) error {
 	if _, err := e.addFile(zw, "data.yaml", yoloDataYAML(e.top, e.classes, e.images, prefix, e.subset), now); err != nil {
 		return err
 	}
-	e.reserve(func(img exportImage) string { return ultralyticsLabelPath(prefix + img.Path) })
+	e.reserve(func(img exportImage) string { return ultralyticsLabelPath(prefix + img.Path) }, keepsBaseAnnotation)
 
 	ids := make(map[string]int, len(e.classes))
 	for i, name := range e.classes {
@@ -819,6 +828,9 @@ func yoloDataYAML(name string, classes []string, images []exportImage, prefix st
 	var b strings.Builder
 	fmt.Fprintf(&b, "# trainMaster 导出的 YOLO 数据集“%s”。\n# 路径相对于本文件所在的文件夹；类别编号与 classes.txt 一致。\n", name)
 	if split {
+		if subset {
+			b.WriteString("# 本次导出只含数据集的部分图片。\n")
+		}
 		fmt.Fprintf(&b, "train: images/train\nval: images/%s\n", val)
 		if dirs["test"] {
 			b.WriteString("test: images/test\n")

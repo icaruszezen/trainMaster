@@ -514,6 +514,8 @@ export function MergeStatus({
     )
   }
   const versions = mergeVersionsText(merge, datasets, datasetId)
+  // 生成版本的合并中断时什么都没有保留：计数与没有合并的图片已没有意义。
+  const discarded = merge.status === "failed" && !legacy
   return (
     <div className="grid min-w-0 gap-4">
       {merge.status === "failed" ? (
@@ -521,12 +523,21 @@ export function MergeStatus({
           <CircleAlert />
           <AlertTitle>合并中断</AlertTitle>
           <AlertDescription>
-            <p className="break-words">
-              {merge.error ||
-                (legacy
-                  ? "合并没有完成，已合并的图片保留，可以再次合并。"
-                  : "合并没有完成，没有生成新的版本，可以重新合并。")}
-            </p>
+            {legacy ? (
+              <p className="break-words">
+                {merge.error ||
+                  "合并没有完成，已合并的图片保留，可以再次合并。"}
+              </p>
+            ) : (
+              <>
+                {merge.error && <p className="break-words">{merge.error}</p>}
+                <p className="tabular-nums">
+                  中断前已处理 {formatNumber(merge.done)} /{" "}
+                  {formatNumber(merge.total)}{" "}
+                  张图片，没有生成新的版本，可以重新合并。
+                </p>
+              </>
+            )}
           </AlertDescription>
         </Alert>
       ) : (
@@ -560,11 +571,15 @@ export function MergeStatus({
           </div>
         </div>
       )}
-      <MergeSummaryGrid merge={merge} />
-      <ProblemList
-        problems={merge.problems}
-        total={problemTotal + summary.skipped_changed}
-      />
+      {!discarded && (
+        <>
+          <MergeSummaryGrid merge={merge} />
+          <ProblemList
+            problems={merge.problems}
+            total={problemTotal + summary.skipped_changed}
+          />
+        </>
+      )}
     </div>
   )
 }

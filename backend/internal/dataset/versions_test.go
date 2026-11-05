@@ -422,6 +422,38 @@ func TestIntegrationVersionExport(t *testing.T) {
 	}
 }
 
+// TestIntegrationVersionExportSharedVOCName: e.jpg and e.png both come from
+// a version, e.xml is paired with e.png. e.png keeps e.xml (with its version
+// annotation), although e.jpg comes first and a new VOC file for it would
+// also be e.xml.
+func TestIntegrationVersionExportSharedVOCName(t *testing.T) {
+	e := newTestEnv(t, true)
+	ctx := context.Background()
+	d, _ := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "ds"})
+	writeFiles(t, d.Path, map[string][]byte{
+		"e.jpg": encodeImage(t, "jpeg", gradient(64, 48)), "e.png": pngFile(t, 64, 48), "e.xml": vocFile("e.png", "base_e"),
+	})
+	scan, _ := e.svc.StartScan(ctx, d.ID)
+	e.waitJob(t, d.ID, scan.ID)
+	v := e.addVersion(t, d.ID, "1.0",
+		testVersionImage{"e.jpg", "needs_sample", []string{"v_jpg"}},
+		testVersionImage{"e.png", "needs_sample", []string{"v_png"}})
+	for _, base := range []bool{true, false} {
+		_, files := e.export(t, d.ID, ExportInput{Format: FormatVOC, Versions: selection(base, v)})
+		top := "ds-审图1.0"
+		if base {
+			top = "ds-基础+审图1.0"
+		}
+		xml := files[top+"/e.xml"]
+		if got := vocLabels(t, xml); !slices.Equal(got, []string{"v_png"}) || !strings.Contains(xml, "<filename>e.png</filename>") {
+			t.Errorf("base %v: e.xml = %v\n%s", base, got, xml)
+		}
+		if len(files) != 3 {
+			t.Errorf("base %v: files %v", base, slices.Sorted(maps.Keys(files)))
+		}
+	}
+}
+
 func TestExportTop(t *testing.T) {
 	versions := func(n int) []Version {
 		var out []Version

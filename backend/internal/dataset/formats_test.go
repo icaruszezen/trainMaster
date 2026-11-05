@@ -363,6 +363,13 @@ func TestYOLODataYAML(t *testing.T) {
 		!strings.Contains(y, "train: images\nval: images\n") {
 		t.Errorf("subset:\n%s", y)
 	}
+	y = string(yoloDataYAML("ds", classes, imgs("train/a.jpg", "val/b.jpg"), "images/", true))
+	if !strings.Contains(y, "# 本次导出只含数据集的部分图片。\ntrain: images/train\nval: images/val\n") {
+		t.Errorf("split subset:\n%s", y)
+	}
+	if y = string(yoloDataYAML("ds", classes, imgs("train/a.jpg", "val/b.jpg"), "images/", false)); strings.Contains(y, "部分图片") {
+		t.Errorf("split, all images:\n%s", y)
+	}
 }
 
 func TestYOLODataYAMLFolderNameNewline(t *testing.T) {
