@@ -32,7 +32,6 @@ import { reviewWorkspacePath } from "@/features/reviews/params"
 import {
   REVIEW_IMAGE_STATUSES,
   reviewImageStatusLabels,
-  scopedCounts,
 } from "@/features/reviews/review-status"
 import { formatDuration, formatNumber } from "@/lib/format"
 
@@ -415,20 +414,15 @@ export function statusesText(statuses: Iterable<ReviewImageStatus>) {
 }
 
 /**
- * “审图”入口的地址：还有待审核的图片时打开第一张待审核的，否则不筛选审核状态
- * （复查已审核的图片）。`datasetId` 时只看这个数据集。
+ * “网页审图”“审图”入口的地址：不筛选审核状态（列表显示全部图片），编辑器打开
+ * 第一张待审核的图片，没有时打开第一张（见 params 的 `pickStartImage`）。
+ * `datasetId` 时只看这个数据集。
  */
 export function reviewEntryPath(
-  review: Pick<Review, "id" | "counts" | "datasets">,
+  review: Pick<Review, "id">,
   datasetId: number | null = null
 ) {
-  const pending = inferredImageCount(scopedCounts(review, datasetId), [
-    "pending",
-  ])
-  return reviewWorkspacePath(review.id, {
-    ...(pending > 0 ? { status: "pending" as const } : {}),
-    ...(datasetId !== null ? { datasetId } : {}),
-  })
+  return reviewWorkspacePath(review.id, datasetId !== null ? { datasetId } : {})
 }
 
 // ---- 审图包 ----

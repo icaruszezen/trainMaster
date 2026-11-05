@@ -117,8 +117,8 @@ export function reviewDetailPath(reviewId: number) {
 }
 
 /**
- * 审图编辑器的地址：可选某张图片与筛选条件，如“网页审图”打开第一张待审核的
- * 图片（`{ status: "pending" }`），数据集页面的“审图”只看这个数据集。
+ * 审图编辑器的地址：可选某张图片与筛选条件，如数据集页面的“审图”只看这个数据集
+ * （`{ datasetId }`）。不指定图片时编辑器打开第一张待审核的（见 {@link pickStartImage}）。
  */
 export function reviewWorkspacePath(
   reviewId: number,
@@ -135,4 +135,69 @@ export function reviewWorkspacePath(
   }
   const search = params.toString()
   return `${reviewDetailPath(reviewId)}/workspace${search ? `?${search}` : ""}`
+}
+
+/** 地址栏中没有指定图片时打开哪张（{@link pickStartImage}）。 */
+export type StartImage = {
+  /** 图片 ID；审图任务中没有图片时为 null。 */
+  id: number | null
+  /** 没有找到待审核 / 符合筛选条件的图片、改为打开第一张时的提示。 */
+  notice: string | null
+}
+
+/**
+ * 地址栏中没有指定图片时打开哪张，筛选条件不变：
+ * 1. 审核状态筛选“全部”时：符合其它筛选条件的第一张可以审核的待审核图片。“网页
+ *    审图”与数据集的“审图”进来时列表显示全部图片，从这一张开始。还没有识别的
+ *    图片也是待审核，但识别完成后才能标记，不算（识别按图片的顺序进行，第一张
+ *    待审核的还没有识别时，前面已识别的都审完了）。
+ * 2. 第一张符合筛选条件的图片（待审核的都审完了时复查已审核的，或者地址栏中
+ *    指定了审核状态）。
+ * 3. 没有符合筛选条件的图片：审图任务的第一张。
+ *
+ * `first(filters)` 返回符合 `filters` 的第一张图片（没有时为 null）。
+ */
+export async function pickStartImage(
+  filters: ReviewImageFilters,
+  first: (
+    filters: ReviewImageFilters
+  ) => Promise<{ id: number; inferred: boolean } | null>
+): Promise<StartImage> {
+  const all = filters.status === "all"
+  // 有待审核的图片，但都还没有识别。
+  let uninferred = false
+  if (all) {
+    const pending = await first({ ...filters, status: "pending" })
+    if (pending?.inferred) {
+      return { id: pending.id, notice: null }
+    }
+    uninferred = pending !== null
+  }
+  const match = await first(filters)
+  if (match) {
+    return {
+      id: match.id,
+      notice: !all
+        ? null
+        : uninferred
+          ? "已识别的图片都审完了，已打开第一张"
+          : hasReviewFilters(filters)
+            ? "筛选出的图片中没有待审核的，已打开第一张"
+            : "没有待审核的图片了，已打开第一张",
+    }
+  }
+  if (!hasReviewFilters(filters)) {
+    return { id: null, notice: null } // 审图任务中没有图片
+  }
+  const any = await first(ALL_REVIEW_IMAGES)
+  if (!any) {
+    return { id: null, notice: null }
+  }
+  return {
+    id: any.id,
+    notice:
+      filters.status === "pending"
+        ? "没有待审核的图片了，已打开第一张"
+        : "没有符合筛选条件的图片，已打开第一张",
+  }
 }

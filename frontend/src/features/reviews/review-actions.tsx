@@ -59,11 +59,9 @@ import {
   updateReview,
   type Review,
 } from "@/features/reviews/api"
+import { reviewDetailPath } from "@/features/reviews/params"
 import {
-  reviewDetailPath,
-  reviewWorkspacePath,
-} from "@/features/reviews/params"
-import {
+  reviewEntryPath,
   validateReviewDescription,
   validateReviewName,
 } from "@/features/reviews/review-format"
@@ -122,7 +120,7 @@ export function ReviewActionsMenu({
         {showLinks && (
           <>
             <DropdownMenuItem asChild disabled={review.counts.inferred === 0}>
-              <Link to={reviewWorkspacePath(review.id, { status: "pending" })}>
+              <Link to={reviewEntryPath(review)}>
                 <ScanEye />
                 网页审图
               </Link>

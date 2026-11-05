@@ -115,6 +115,7 @@ import {
   hasReviewFilters,
   parseId,
   parseReviewFilters,
+  pickStartImage,
   sameReviewFilters,
   updateReviewParams,
 } from "@/features/reviews/params"
@@ -183,8 +184,8 @@ export type ReviewEditorProps = {
 /**
  * 审图编辑器：逐张查看模型的识别结果，修改审图标注（只写在审图任务中），把图片
  * 标为已审核 / 需加样 / 待审核。当前图片与筛选条件在地址栏（`?image=12&status=pending`），
- * 没有指定图片时打开第一张符合筛选条件的图片。只通过 `source` 读写，平台与本地
- * 审图程序共用。
+ * 没有指定图片时打开第一张符合筛选条件的待审核图片（没有时第一张符合筛选条件的）。
+ * 只通过 `source` 读写，平台与本地审图程序共用。
  */
 export function ReviewEditor(props: ReviewEditorProps) {
   const [params] = useSearchParams()
@@ -197,8 +198,8 @@ export function ReviewEditor(props: ReviewEditorProps) {
 }
 
 /**
- * 没有指定图片时打开第一张符合筛选条件的图片（“网页审图”带着 `status=pending`
- * 进来时是第一张待审核的）；没有符合条件的图片时打开第一张，筛选条件不变。
+ * 没有指定图片时打开第一张待审核的图片（“网页审图”进来时），筛选条件不变（列表
+ * 显示全部图片）；没有待审核的时打开第一张，见 {@link pickStartImage}。
  */
 function StartImage({ source, review, backTo, backLabel }: ReviewEditorProps) {
   const [params] = useSearchParams()
@@ -206,19 +207,13 @@ function StartImage({ source, review, backTo, backLabel }: ReviewEditorProps) {
   const start = useQuery({
     queryKey: ["review-start", ...source.key, filters],
     queryFn: async () => {
-      const first = await fetchReviewImageAt(source, filters, 0)
-      if (first || !hasReviewFilters(filters)) {
-        return first?.id ?? null
+      const picked = await pickStartImage(filters, (scope) =>
+        fetchReviewImageAt(source, scope, 0)
+      )
+      if (picked.notice) {
+        toast.info(picked.notice)
       }
-      const any = await fetchReviewImageAt(source, ALL_REVIEW_IMAGES, 0)
-      if (any) {
-        toast.info(
-          filters.status === "pending"
-            ? "没有待审核的图片了，已打开第一张"
-            : "没有符合筛选条件的图片，已打开第一张"
-        )
-      }
-      return any?.id ?? null
+      return picked.id
     },
     staleTime: 0,
     gcTime: 0,

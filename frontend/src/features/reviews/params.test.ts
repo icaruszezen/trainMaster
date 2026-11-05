@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest"
 
-import { ALL_REVIEW_IMAGES } from "@/features/reviews/api"
+import {
+  ALL_REVIEW_IMAGES,
+  type ReviewImageFilters,
+  type ReviewImageStatus,
+} from "@/features/reviews/api"
 import {
   hasReviewFilters,
   parseReviewFilters,
+  pickStartImage,
   reviewDetailPath,
   reviewWorkspacePath,
   sameReviewFilters,
@@ -160,5 +165,119 @@ describe("paths", () => {
     } as const
     const search = reviewWorkspacePath(1, filters).split("?")[1]
     expect(parse(search)).toEqual(filters)
+  })
+})
+
+describe("pickStartImage", () => {
+  type Row = {
+    id: number
+    status: ReviewImageStatus
+    datasetId: number
+    inferred?: boolean
+  }
+  /** 审图任务中的图片（按审图任务中的顺序），只按审核状态与数据集筛选。 */
+  const images = (rows: Row[]) => {
+    const asked: ReviewImageFilters[] = []
+    const first = async (filters: ReviewImageFilters) => {
+      asked.push(filters)
+      const row = rows.find(
+        (r) =>
+          (filters.status === "all" ||
+            (filters.status === "reviewed"
+              ? r.status !== "pending"
+              : r.status === filters.status)) &&
+          (filters.datasetId === null || r.datasetId === filters.datasetId)
+      )
+      return row ? { id: row.id, inferred: row.inferred ?? true } : null
+    }
+    return { first, asked }
+  }
+  const rows: Row[] = [
+    { id: 1, status: "approved", datasetId: 1 },
+    { id: 2, status: "needs_sample", datasetId: 1 },
+    { id: 3, status: "pending", datasetId: 1 },
+    { id: 4, status: "approved", datasetId: 2 },
+    { id: 5, status: "pending", datasetId: 2 },
+  ]
+  const reviewed = rows.map((r) => ({ ...r, status: "approved" as const }))
+  /** 前 4 张识别完成、都审完了，后面的还没有识别（识别失败的任务、识别中）。 */
+  const waiting: Row[] = [
+    ...reviewed.slice(0, 4),
+    { id: 5, status: "pending", datasetId: 2, inferred: false },
+    { id: 6, status: "pending", datasetId: 2, inferred: false },
+  ]
+  const all = ALL_REVIEW_IMAGES
+
+  it("opens the first pending image when every status is shown", async () => {
+    const { first, asked } = images(rows)
+    expect(await pickStartImage(all, first)).toEqual({ id: 3, notice: null })
+    expect(asked).toEqual([{ ...all, status: "pending" }])
+    expect(
+      await pickStartImage({ ...all, datasetId: 2 }, images(rows).first)
+    ).toEqual({ id: 5, notice: null })
+  })
+
+  it("opens the first image when nothing is pending", async () => {
+    expect(await pickStartImage(all, images(reviewed).first)).toEqual({
+      id: 1,
+      notice: "没有待审核的图片了，已打开第一张",
+    })
+    // 只看一个数据集：这个数据集中没有待审核的
+    expect(
+      await pickStartImage(
+        { ...all, datasetId: 2 },
+        images(rows.slice(0, 4)).first
+      )
+    ).toEqual({ id: 4, notice: "筛选出的图片中没有待审核的，已打开第一张" })
+  })
+
+  it("skips pending images that are not inferred yet", async () => {
+    // 还没有识别的不能标记：已识别的都审完了，从第一张开始复查
+    expect(await pickStartImage(all, images(waiting).first)).toEqual({
+      id: 1,
+      notice: "已识别的图片都审完了，已打开第一张",
+    })
+    expect(
+      await pickStartImage({ ...all, datasetId: 2 }, images(waiting).first)
+    ).toEqual({ id: 4, notice: "已识别的图片都审完了，已打开第一张" })
+  })
+
+  it("keeps the status filter the address asks for", async () => {
+    expect(
+      await pickStartImage({ ...all, status: "reviewed" }, images(rows).first)
+    ).toEqual({ id: 1, notice: null })
+    const pending = images(rows)
+    expect(
+      await pickStartImage({ ...all, status: "pending" }, pending.first)
+    ).toEqual({ id: 3, notice: null })
+    expect(pending.asked).toEqual([{ ...all, status: "pending" }])
+    // 只看待审核的：列表中的第一张，识别中的也是
+    expect(
+      await pickStartImage({ ...all, status: "pending" }, images(waiting).first)
+    ).toEqual({ id: 5, notice: null })
+  })
+
+  it("falls back to the first image when nothing matches", async () => {
+    expect(
+      await pickStartImage(
+        { ...all, status: "pending" },
+        images(reviewed).first
+      )
+    ).toEqual({ id: 1, notice: "没有待审核的图片了，已打开第一张" })
+    expect(
+      await pickStartImage({ ...all, datasetId: 9 }, images(rows).first)
+    ).toEqual({ id: 1, notice: "没有符合筛选条件的图片，已打开第一张" })
+  })
+
+  it("finds nothing in an empty review", async () => {
+    const empty = images([])
+    expect(await pickStartImage(all, empty.first)).toEqual({
+      id: null,
+      notice: null,
+    })
+    expect(empty.asked).toEqual([{ ...all, status: "pending" }, all])
+    expect(
+      await pickStartImage({ ...all, status: "pending" }, images([]).first)
+    ).toEqual({ id: null, notice: null })
   })
 })
