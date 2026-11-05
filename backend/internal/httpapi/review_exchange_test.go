@@ -24,9 +24,12 @@ var (
 	reviewUploadKeys        = []string{"id", "review_id", "file_name", "overwrite", "summary", "problems", "created_at"}
 	reviewUploadSummaryKeys = []string{"images", "applied", "status_changes", "annotation_changes", "unchanged", "conflicts",
 		"invalid", "unknown"}
-	reviewMergeKeys = []string{"id", "review_id", "dataset_ids", "statuses", "on_existing", "status", "total", "done",
-		"summary", "problems", "error", "created_at", "finished_at"}
-	reviewMergeSummaryKeys = []string{"merged", "skipped_existing", "skipped_empty", "conflicts", "failed"}
+	reviewMergeKeys = []string{"id", "review_id", "dataset_ids", "statuses", "on_existing", "note", "versions", "status",
+		"total", "done", "summary", "problems", "error", "created_at", "finished_at"}
+	reviewMergeSummaryKeys = []string{"merged", "skipped_existing", "skipped_empty", "skipped_changed", "conflicts", "failed"}
+	datasetVersionKeys     = []string{"id", "dataset_id", "kind", "name", "major", "minor", "note", "status", "image_count",
+		"needs_sample_count", "approved_count", "object_count", "review", "merge_id", "source", "created_at", "updated_at",
+		"finished_at"}
 )
 
 // inferReview runs the inference of a review as a node would: one box on
@@ -183,22 +186,31 @@ func TestReviewAPIExchange(t *testing.T) {
 	wantError(t, e.do("GET", "/api/v1/reviews/999/uploads", nil), 404, codeNotFound, "审图任务不存在")
 
 	// Merges.
-	wantError(t, e.do("POST", base+"/merges", map[string]any{"statuses": []string{}, "on_existing": "skip"}), 422,
+	xmlPath := filepath.Join(e.st.Dir(storage.Datasets), "line-a", strings.TrimSuffix(manifest.Images[0].SourcePath, ".png")+".xml")
+	wantError(t, e.do("POST", base+"/merges", map[string]any{"statuses": []string{}, "note": "x"}), 422,
 		codeValidationFailed, "至少选择")
-	wantError(t, e.do("POST", base+"/merges", map[string]any{"statuses": []string{"approved"}, "on_existing": "replace"}), 422,
-		codeValidationFailed, "on_existing")
-	wantError(t, e.do("POST", base+"/merges", map[string]any{"statuses": []string{"needs_sample"}, "on_existing": "skip"}), 409,
+	wantError(t, e.do("POST", base+"/merges", map[string]any{"statuses": []string{"approved"}}), 422,
+		codeValidationFailed, "请填写版本备注")
+	wantError(t, e.do("POST", base+"/merges", map[string]any{"statuses": []string{"approved"}, "note": " \n "}), 422,
+		codeValidationFailed, "请填写版本备注")
+	wantError(t, e.do("POST", base+"/merges", map[string]any{"statuses": []string{"approved"}, "note": strings.Repeat("备", 501)}),
+		422, codeValidationFailed, "500")
+	wantError(t, e.do("POST", base+"/merges", map[string]any{"statuses": []string{"needs_sample"}, "note": "x"}), 409,
 		codeConflict, "没有符合条件")
 	wantError(t, e.do("POST", fmt.Sprintf("/api/v1/reviews/%d/merges", other.ID),
-		map[string]any{"statuses": []string{"pending"}, "on_existing": "skip"}), 409, codeConflict, "还没有识别完成")
+		map[string]any{"statuses": []string{"pending"}, "note": "x"}), 409, codeConflict, "还没有识别完成")
 	wantError(t, e.do("POST", "/api/v1/reviews/999/merges", map[string]any{"statuses": []string{"approved"},
-		"on_existing": "skip"}), 404, codeNotFound, "审图任务不存在")
+		"note": "x"}), 404, codeNotFound, "审图任务不存在")
+	if rv := want[map[string]any](t, e.do("GET", base, nil), 200); object(t, rv["datasets"].([]any)[0], "dataset")["next_version"] != "审图1.0" {
+		t.Errorf("review before merging = %v", rv)
+	}
 	started := want[map[string]any](t, e.do("POST", base+"/merges", map[string]any{"statuses": []string{"approved"},
-		"on_existing": "skip", "dataset_ids": []int64{ds.ID}}), 202)
+		"note": " 第一轮复核 ", "dataset_ids": []int64{ds.ID}}), 202)
 	wantKeys(t, "merge", started, reviewMergeKeys...)
 	wantKeys(t, "merge summary", object(t, started["summary"], "summary"), reviewMergeSummaryKeys...)
 	if started["status"] != "running" || started["total"] != 1.0 || fmt.Sprint(started["dataset_ids"]) != fmt.Sprintf("[%d]", ds.ID) ||
-		fmt.Sprint(started["statuses"]) != "[approved]" || started["finished_at"] != nil {
+		fmt.Sprint(started["statuses"]) != "[approved]" || started["finished_at"] != nil || started["on_existing"] != nil ||
+		started["note"] != "第一轮复核" {
 		t.Errorf("started merge = %v", started)
 	}
 	mergeURL := fmt.Sprintf("%s/merges/%d", base, int64(started["id"].(float64)))
@@ -211,13 +223,100 @@ func TestReviewAPIExchange(t *testing.T) {
 			t.Fatal("the merge did not finish")
 		}
 	}
-	if done.Status != review.MergeSucceeded || done.Summary.Merged != 1 || done.Done != 1 {
+	if done.Status != review.MergeSucceeded || done.Summary.Merged != 1 || done.Done != 1 || len(done.Versions) != 1 ||
+		done.Versions[0].Name != "审图1.0" || done.Versions[0].DatasetID != ds.ID || done.Versions[0].ImageCount != 1 {
 		t.Errorf("merge = %+v", done)
 	}
-	if xml, err := os.ReadFile(filepath.Join(e.st.Dir(storage.Datasets), "line-a", strings.TrimSuffix(manifest.Images[0].SourcePath, ".png")+".xml")); err != nil ||
-		!strings.Contains(string(xml), "<name>scratch</name>") {
-		t.Errorf("merged dataset annotation: %s, %v", xml, err)
+	merged := want[map[string]any](t, e.do("GET", mergeURL, nil), 200)
+	wantKeys(t, "merge version", object(t, merged["versions"].([]any)[0], "version"), "id", "dataset_id", "name", "status",
+		"image_count")
+	// The dataset's files are not touched: the merge made a version.
+	if _, err := os.Stat(xmlPath); !os.IsNotExist(err) {
+		t.Errorf("merge wrote the dataset annotation: %v", err)
 	}
+	if rv := want[map[string]any](t, e.do("GET", base, nil), 200); object(t, rv["datasets"].([]any)[0], "dataset")["next_version"] != "审图1.1" {
+		t.Errorf("review after merging = %v", rv)
+	}
+
+	// The version on the dataset API.
+	dsBase := fmt.Sprintf("/api/v1/datasets/%d", ds.ID)
+	versions := want[map[string]any](t, e.do("GET", dsBase+"/versions", nil), 200)
+	if versions["total"] != 1.0 || len(versions["items"].([]any)) != 1 {
+		t.Fatalf("versions = %v", versions)
+	}
+	ver := object(t, versions["items"].([]any)[0], "version")
+	wantKeys(t, "version", ver, datasetVersionKeys...)
+	wantKeys(t, "version source", object(t, ver["source"], "source"), "review_id", "review_name", "merge_id", "statuses", "model")
+	if ver["name"] != "审图1.0" || ver["note"] != "第一轮复核" || ver["status"] != "ready" || ver["approved_count"] != 1.0 ||
+		ver["image_count"] != 1.0 || object(t, ver["review"], "review")["id"] != float64(rv.ID) || ver["merge_id"] != started["id"] {
+		t.Errorf("version = %v", ver)
+	}
+	versionID := fmt.Sprint(int64(ver["id"].(float64)))
+	verURL := dsBase + "/versions/" + versionID
+	if got := want[map[string]any](t, e.do("GET", verURL, nil), 200); got["id"] != ver["id"] {
+		t.Errorf("GET version = %v", got)
+	}
+	if got := want[map[string]any](t, e.do("PATCH", verURL, map[string]any{"note": " 复核后 "}), 200); got["note"] != "复核后" {
+		t.Errorf("PATCH version = %v", got)
+	}
+	wantError(t, e.do("PATCH", verURL, map[string]any{"note": ""}), 422, codeValidationFailed, "请填写版本备注")
+	wantError(t, e.do("PATCH", verURL, `{"note": 1}`), 400, codeBadRequest, "")
+	wantError(t, e.do("GET", dsBase+"/versions/999", nil), 404, codeNotFound, "版本不存在")
+	wantError(t, e.do("GET", dsBase+"/versions/x", nil), 404, codeNotFound, "版本不存在")
+	wantError(t, e.do("GET", "/api/v1/datasets/999/versions", nil), 404, codeNotFound, "数据集不存在")
+	if d := want[map[string]any](t, e.do("GET", dsBase, nil), 200); d["version_count"] != 1.0 {
+		t.Errorf("dataset = %v", d)
+	}
+
+	// What a download of it contains, and the download.
+	preview := want[map[string]any](t, e.do("GET", dsBase+"/exports/preview?version_ids="+versionID, nil), 200)
+	wantKeys(t, "export preview", preview, "image_count", "from_versions", "annotated_count", "empty_count", "invalid_count",
+		"unannotated_count", "object_count", "labels", "version_image_count", "missing_count", "changed_count")
+	if preview["image_count"] != 2.0 || preview["from_versions"] != 1.0 || preview["object_count"] != 1.0 ||
+		fmt.Sprint(preview["labels"]) != "[map[image_count:1 name:scratch object_count:1]]" {
+		t.Errorf("preview = %v", preview)
+	}
+	// Without the base only needs_sample images: the image was approved.
+	if p := want[map[string]any](t, e.do("GET", dsBase+"/exports/preview?include_base=false&version_ids="+versionID, nil), 200); p["image_count"] != 0.0 || p["version_image_count"] != 0.0 {
+		t.Errorf("preview without the base = %v", p)
+	}
+	if p := want[map[string]any](t, e.do("GET", dsBase+"/exports/preview", nil), 200); p["image_count"] != 2.0 || p["from_versions"] != 0.0 {
+		t.Errorf("preview of the base = %v", p)
+	}
+	wantError(t, e.do("GET", dsBase+"/exports/preview?include_base=maybe", nil), 400, codeBadRequest, "include_base")
+	wantError(t, e.do("GET", dsBase+"/exports/preview?version_ids=1,x", nil), 400, codeBadRequest, "version_ids")
+	wantError(t, e.do("GET", dsBase+"/exports/preview?include_base=false", nil), 422, codeValidationFailed, "请至少选择")
+	wantError(t, e.do("GET", dsBase+"/exports/preview?version_ids=999", nil), 404, codeNotFound, "所选的版本不存在")
+	wantError(t, e.do("GET", "/api/v1/datasets/999/exports/preview", nil), 404, codeNotFound, "数据集不存在")
+	wantError(t, e.do("POST", dsBase+"/exports", map[string]any{"format": "voc", "include_base": false,
+		"version_ids": []string{versionID}}), 400, codeBadRequest, "")
+	wantError(t, e.do("POST", dsBase+"/exports", map[string]any{"format": "voc", "include_base": false,
+		"version_ids": []any{ver["id"]}}), 409, codeConflict, "所选版本中没有可以导出的图片")
+	wantError(t, e.do("POST", dsBase+"/exports", map[string]any{"format": "voc", "include_base": false}), 422,
+		codeValidationFailed, "请至少选择")
+	ticket := want[map[string]any](t, e.do("POST", dsBase+"/exports", map[string]any{"format": "voc",
+		"version_ids": []any{ver["id"]}}), 201)
+	if ticket["file_name"] != "line-a-基础+审图1.0-voc.zip" {
+		t.Errorf("export = %v", ticket)
+	}
+	rec = e.do("GET", ticket["url"].(string), nil)
+	if rec.Code != 200 {
+		t.Fatalf("download = %d %s", rec.Code, rec.Body)
+	}
+	files := readZip(t, rec.Body.Bytes())
+	mergedXML := "line-a-基础+审图1.0/" + strings.TrimSuffix(manifest.Images[0].SourcePath, ".png") + ".xml"
+	if !strings.Contains(string(files[mergedXML]), "<name>scratch</name>") || len(files) != 3 {
+		t.Errorf("download: %d files, %s = %s", len(files), mergedXML, files[mergedXML])
+	}
+	if plain := want[map[string]any](t, e.do("POST", dsBase+"/exports", map[string]any{"format": "voc", "include_base": true,
+		"version_ids": []any{}}), 201); plain["file_name"] != "line-a-voc.zip" {
+		t.Errorf("export of the base = %v", plain)
+	}
+	if rec := e.do("DELETE", verURL, nil); rec.Code != 204 {
+		t.Errorf("DELETE version = %d %s", rec.Code, rec.Body)
+	}
+	wantError(t, e.do("DELETE", verURL, nil), 404, codeNotFound, "版本不存在")
+	wantError(t, e.do("GET", ticket["url"].(string), nil), 404, codeNotFound, "所选的版本已被删除")
 	merges := want[map[string]any](t, e.do("GET", base+"/merges", nil), 200)
 	if merges["total"] != 1.0 {
 		t.Errorf("merges = %v", merges)
@@ -336,7 +435,7 @@ func TestReviewAPIHistoryTotals(t *testing.T) {
 		}
 	}
 	for range 51 {
-		started, err := e.reviews.StartMerge(ctx, rv.ID, review.MergeInput{Statuses: []string{"approved"}, OnExisting: "skip"})
+		started, err := e.reviews.StartMerge(ctx, rv.ID, review.MergeInput{Statuses: []string{"approved"}, Note: "复核"})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -47,6 +47,8 @@ type Dataset struct {
 	Name   string `json:"name"`
 	Folder string `json:"folder"`
 	Counts Counts `json:"counts"`
+	// NextVersion is "" here: the editor does not merge into datasets.
+	NextVersion string `json:"next_version"`
 }
 
 // Summary is what the review editor needs to know about the review

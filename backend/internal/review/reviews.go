@@ -280,6 +280,9 @@ func (s *Service) ListDatasetReviews(ctx context.Context, datasetID int64) ([]Da
 	if err != nil {
 		return nil, err
 	}
+	if err := s.attachVersions(ctx, merges); err != nil {
+		return nil, err
+	}
 	for _, m := range merges {
 		r := index[m.ReviewID]
 		r.DatasetMerges = append(r.DatasetMerges, m)

@@ -121,7 +121,7 @@ func wantKeys(t *testing.T, what string, obj map[string]any, keys ...string) {
 var (
 	datasetKeys = []string{"id", "name", "description", "dir_name", "path", "origin", "directory_missing",
 		"image_count", "annotated_count", "empty_count", "invalid_count", "object_count", "label_count", "total_bytes",
-		"covers", "projects", "active_import", "scanned_at", "created_at", "updated_at"}
+		"covers", "projects", "version_count", "active_import", "scanned_at", "created_at", "updated_at"}
 	importKeys = []string{"id", "dataset_id", "source", "status", "on_conflict", "annotation_format", "classes", "file_name", "file_size",
 		"file_count", "received_bytes", "received_files", "stage", "progress", "summary", "error",
 		"created_at", "updated_at", "started_at", "finished_at"}

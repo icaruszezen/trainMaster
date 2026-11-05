@@ -59,7 +59,8 @@ const (
 	ProblemConflict = "conflict"
 	ProblemInvalid  = "invalid"
 	ProblemUnknown  = "unknown"
-	ProblemFailed   = "failed" // merges
+	ProblemFailed   = "failed"  // merges
+	ProblemSkipped  = "skipped" // merges: the review status changed meanwhile
 )
 
 const (

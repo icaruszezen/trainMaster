@@ -176,7 +176,7 @@ func (s *server) listReviewUploads(w http.ResponseWriter, r *http.Request) {
 type startMergeRequest struct {
 	DatasetIDs []int64  `json:"dataset_ids"`
 	Statuses   []string `json:"statuses"`
-	OnExisting string   `json:"on_existing"`
+	Note       string   `json:"note"`
 }
 
 func (s *server) startReviewMerge(w http.ResponseWriter, r *http.Request) {
@@ -189,7 +189,7 @@ func (s *server) startReviewMerge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m, err := s.reviews.StartMerge(r.Context(), id, review.MergeInput{DatasetIDs: req.DatasetIDs, Statuses: req.Statuses,
-		OnExisting: req.OnExisting})
+		Note: req.Note})
 	if err != nil {
 		s.reviewError(w, r, err)
 		return

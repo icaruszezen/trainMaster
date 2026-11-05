@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/klauspost/compress/flate"
@@ -46,6 +48,9 @@ type ExportInput struct {
 	// dataset is exported for (see project.Service.ExportClasses) or, for
 	// a dataset in no project, an order given by hand.
 	Classes []string
+	// Versions selects the versions the download combines (see
+	// VersionSelection); nil is the base version alone.
+	Versions *VersionSelection
 }
 
 // ExportTicket is a prepared download.
@@ -59,8 +64,12 @@ type exportRequest struct {
 	datasetID int64
 	format    string
 	classes   []string
-	fileName  string
-	expires   time.Time
+	// The selection: the base, and the review versions newest first.
+	includeBase bool
+	versionIDs  []int64
+	top         string // the folder in the archive
+	fileName    string
+	expires     time.Time
 }
 
 // exportTickets holds the prepared downloads in memory (the service runs as
@@ -91,7 +100,8 @@ func (t *exportTickets) get(token string, now time.Time) (exportRequest, bool) {
 	return r, ok && !now.After(r.expires)
 }
 
-// CreateExport prepares the download of a dataset in the given format.
+// CreateExport prepares the download of a dataset in the given format, of
+// the versions in.Versions.
 func (s *Service) CreateExport(ctx context.Context, datasetID int64, in ExportInput) (ExportTicket, error) {
 	format, classes, err := normalizeFormat(in.Format, in.Classes, "导出")
 	if err != nil {
@@ -101,18 +111,59 @@ func (s *Service) CreateExport(ctx context.Context, datasetID int64, in ExportIn
 	if err != nil {
 		return ExportTicket{}, err
 	}
+	sv := selectedVersions{includeBase: true}
+	if in.Versions != nil {
+		if sv, err = resolveSelection(ctx, s.db, d.ID, *in.Versions); err != nil {
+			return ExportTicket{}, err
+		}
+	}
 	if !s.dirExists(d.DirName) {
 		return ExportTicket{}, errDatasetDirMissing(s.datasetDir(d.DirName))
 	}
 	if d.ImageCount == 0 {
 		return ExportTicket{}, &Error{Kind: ErrConflict, Message: "数据集中没有图片，无法下载"}
 	}
+	top := d.DirName
+	if !sv.baseOnly() {
+		var n int
+		if err := s.db.QueryRow(ctx, "WITH "+layerSQL+", "+composedSQL+" SELECT count(*) FROM composed",
+			d.ID, sv.ids(), sv.includeBase).Scan(&n); err != nil {
+			return ExportTicket{}, err
+		}
+		if n == 0 {
+			return ExportTicket{}, &Error{Kind: ErrConflict, Message: "所选版本中没有可以导出的图片：不选基础版本时只导出审图中标为需加样的图片，" +
+				"这些版本中没有这样的图片，或它们已不在数据集中"}
+		}
+		top = exportTop(d.DirName, sv)
+	}
 	now := time.Now()
-	r := exportRequest{datasetID: d.ID, format: format, classes: classes,
-		fileName: d.DirName + "-" + format + ".zip", expires: now.Add(exportTTL)}
+	r := exportRequest{datasetID: d.ID, format: format, classes: classes, includeBase: sv.includeBase,
+		versionIDs: sv.ids(), top: top, fileName: top + "-" + format + ".zip", expires: now.Add(exportTTL)}
 	token := rand.Text()
 	s.exports.put(token, r, now)
 	return ExportTicket{Token: token, FileName: r.fileName, ExpiresAt: r.expires.UTC()}, nil
+}
+
+// maxExportTopBytes bounds the folder name in the archive of a download
+// of versions (and so its file name) well below the usual 255-byte limit.
+const maxExportTopBytes = 200
+
+// exportTop is the folder name in the archive of a download of versions:
+// the dataset's folder name and the versions, shortened to
+// maxExportTopBytes (the versions first, then the folder name).
+func exportTop(dirName string, sv selectedVersions) string {
+	label := sv.label()
+	if len(dirName)+1+len(label) > maxExportTopBytes {
+		label = sv.shortLabel()
+	}
+	if over := len(dirName) + 1 + len(label) - maxExportTopBytes; over > 0 {
+		n := len(dirName) - over
+		for n > 0 && !utf8.RuneStart(dirName[n]) {
+			n--
+		}
+		dirName = dirName[:n]
+	}
+	return dirName + "-" + label
 }
 
 // Export is an opened download. The caller writes it with Write and then
@@ -120,17 +171,29 @@ func (s *Service) CreateExport(ctx context.Context, datasetID int64, in ExportIn
 type Export struct {
 	FileName string
 
+	db      querier
 	root    *os.Root
-	top     string // the folder everything is in: the dataset's folder name
+	top     string // the folder everything is in: the dataset's folder name (and the versions)
 	format  string
 	classes []string
 	images  []exportImage
 	log     *slog.Logger
 
+	// subset: the download has only some of the dataset's images (versions
+	// without the base); allInImages: all the dataset's images are in
+	// images/ (YOLO).
+	subset, allInImages bool
+
 	entries map[string]bool // archive entry names written so far
+	// reserved are the annotation entry names of the images that keep
+	// their base annotation (see reserve).
+	reserved map[string]bool
+	// loaded holds the annotations of the review version images of the
+	// current chunk, by index in images (see versionAnnotation).
+	loaded map[int]*vocAnnotation
 
 	// Counts for the log.
-	written, missing, annotations int
+	written, missing, annotations, fromVersions, nameTaken int
 }
 
 type exportImage struct {
@@ -138,10 +201,17 @@ type exportImage struct {
 	ModTime time.Time
 	Width   *int
 	Height  *int
-	AnnPath *string
+	AnnPath *string // the base VOC file
+	// VersionID is the review version whose annotation replaces the base
+	// one (nil: the base).
+	VersionID *int64
 }
 
+// versionChunk is how many version annotations an export loads at a time.
+const versionChunk = 500
+
 // OpenExport opens a download prepared by CreateExport for the dataset.
+// The selected versions must still exist.
 func (s *Service) OpenExport(ctx context.Context, datasetID int64, token string) (*Export, error) {
 	r, ok := s.exports.get(token, time.Now())
 	if !ok || r.datasetID != datasetID {
@@ -151,23 +221,52 @@ func (s *Service) OpenExport(ctx context.Context, datasetID int64, token string)
 	if err != nil {
 		return nil, err
 	}
-	// The archive lists the images in image order, which also decides which
-	// of two files with the same entry name is kept.
-	rows, err := s.db.Query(ctx, `SELECT rel_path, mod_time, width, height, annotation_path
-		FROM dataset_images WHERE dataset_id = $1 ORDER BY `+ImageOrder, d.ID)
+	// The selection and the images in one snapshot: a version deleted
+	// after it fails the download while it is written (versionAnnotation).
+	var images []exportImage
+	var allInImages bool
+	err = pgx.BeginTxFunc(ctx, s.db, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly},
+		func(tx pgx.Tx) error {
+			if len(r.versionIDs) > 0 {
+				_, err := resolveSelection(ctx, tx, d.ID, VersionSelection{IncludeBase: r.includeBase, VersionIDs: r.versionIDs})
+				if errors.Is(err, ErrNotFound) {
+					return &Error{Kind: ErrNotFound, Message: "所选的版本已被删除，请重新下载"}
+				}
+				if err != nil {
+					return err
+				}
+			}
+			// The archive lists the images in image order, which also decides
+			// which of two files with the same entry name is kept.
+			rows, err := tx.Query(ctx, "WITH "+layerSQL+", "+composedSQL+`
+				SELECT rel_path, mod_time, width, height, annotation_path, version_id
+				FROM composed ORDER BY sort_key, id`, d.ID, r.versionIDs, r.includeBase)
+			if err != nil {
+				return err
+			}
+			if images, err = pgx.CollectRows(rows, pgx.RowToStructByPos[exportImage]); err != nil {
+				return fmt.Errorf("load images: %w", err)
+			}
+			return tx.QueryRow(ctx, `SELECT NOT EXISTS (SELECT 1 FROM dataset_images
+				WHERE dataset_id = $1 AND NOT starts_with(rel_path, 'images/'))`, d.ID).Scan(&allInImages)
+		})
 	if err != nil {
 		return nil, err
 	}
-	images, err := pgx.CollectRows(rows, pgx.RowToStructByPos[exportImage])
-	if err != nil {
-		return nil, fmt.Errorf("load images: %w", err)
+	if len(images) == 0 && !r.includeBase {
+		return nil, &Error{Kind: ErrConflict, Message: "所选版本中已没有可以导出的图片，请重新下载"}
 	}
 	root, err := s.openDatasetRoot(d)
 	if err != nil {
 		return nil, err
 	}
-	return &Export{FileName: r.fileName, root: root, top: d.DirName, format: r.format, classes: r.classes,
-		images: images, log: s.log.With("dataset_id", d.ID, "format", r.format), entries: map[string]bool{}}, nil
+	log := s.log.With("dataset_id", d.ID, "format", r.format)
+	if len(r.versionIDs) > 0 {
+		log = log.With("versions", r.versionIDs, "base", r.includeBase)
+	}
+	return &Export{FileName: r.fileName, db: s.db, root: root, top: r.top, format: r.format, classes: r.classes,
+		images: images, log: log, subset: !r.includeBase, allInImages: allInImages,
+		entries: map[string]bool{}, loaded: map[int]*vocAnnotation{}}, nil
 }
 
 // Close releases the dataset folder.
@@ -195,7 +294,8 @@ func (e *Export) Write(ctx context.Context, w io.Writer) error {
 		return err
 	}
 	e.log.Info("dataset exported", "images", e.written, "images_missing", e.missing,
-		"annotations", e.annotations, "duration_ms", time.Since(start).Milliseconds())
+		"annotations", e.annotations, "from_versions", e.fromVersions, "annotation_names_taken", e.nameTaken,
+		"duration_ms", time.Since(start).Milliseconds())
 	return nil
 }
 
@@ -310,18 +410,69 @@ func (e *Export) copyImage(zw *zip.Writer, img exportImage, name string) (bool, 
 	return ok, err
 }
 
-// readAnnotation parses the VOC file of an image as it is on disk now; nil
-// when the image has none or it cannot be used.
-func (e *Export) readAnnotation(img exportImage) *vocAnnotation {
+// annotation returns the annotation of the image at index i: its review
+// version's, else its VOC file as it is on disk now; nil when it has none
+// or the file cannot be used.
+func (e *Export) annotation(ctx context.Context, i int) (*vocAnnotation, error) {
+	img := e.images[i]
+	if img.VersionID != nil {
+		return e.versionAnnotation(ctx, i)
+	}
 	if img.AnnPath == nil {
-		return nil
+		return nil, nil
 	}
 	a, err := newAnnotationCache(e.root).get(*img.AnnPath)
 	if err != nil {
 		e.log.Info("export: annotation not usable", "path", *img.AnnPath, "err", err)
-		return nil
+		return nil, nil
 	}
-	return a
+	return a, nil
+}
+
+// versionAnnotation returns the review version annotation of the image at
+// index i. They are loaded a chunk at a time, so that a large download
+// does not hold them all in memory. A version deleted during the download
+// fails it: leaving the image with the wrong annotation would go unnoticed.
+func (e *Export) versionAnnotation(ctx context.Context, i int) (*vocAnnotation, error) {
+	if a, ok := e.loaded[i]; ok {
+		return a, nil
+	}
+	clear(e.loaded)
+	var indexes []int32
+	var versionIDs []int64
+	var paths []string
+	for j := i; j < len(e.images) && len(indexes) < versionChunk; j++ {
+		if v := e.images[j].VersionID; v != nil {
+			indexes = append(indexes, int32(j))
+			versionIDs = append(versionIDs, *v)
+			paths = append(paths, e.images[j].Path)
+		}
+	}
+	rows, err := e.db.Query(ctx, `SELECT k.i, vi.objects, vi.width, vi.height
+		FROM unnest($1::int[], $2::bigint[], $3::text[]) AS k (i, v, p)
+		JOIN dataset_version_images vi ON vi.version_id = k.v AND vi.rel_path = k.p`, indexes, versionIDs, paths)
+	if err != nil {
+		return nil, fmt.Errorf("load version annotations: %w", err)
+	}
+	var j int32
+	var objects []AnnotationObject
+	var w, h *int
+	if _, err := pgx.ForEachRow(rows, []any{&j, &objects, &w, &h}, func() error {
+		a := &vocAnnotation{Filename: path.Base(e.images[j].Path), Objects: objects}
+		if w != nil && h != nil {
+			a.Width, a.Height = *w, *h
+		}
+		e.loaded[int(j)] = a
+		objects = nil
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("load version annotations: %w", err)
+	}
+	if a, ok := e.loaded[i]; ok {
+		return a, nil
+	}
+	return nil, fmt.Errorf("the annotation of %s in version %d is gone (the version was deleted during the download)",
+		e.images[i].Path, *e.images[i].VersionID)
 }
 
 // imageSize is the size of an image from the index, else from its VOC file
@@ -339,11 +490,44 @@ func sidecarPath(rel, ext string) string {
 	return dir + strings.TrimSuffix(base, path.Ext(base)) + ext
 }
 
+// reserve records the annotation entry names (by name) of the images that
+// keep their base annotation. A review version annotation does not take
+// one of them: when a.jpg (from a version) and a.png (a.xml paired with
+// it) share a name, a.png keeps its annotation whatever their order, as in
+// a download of the base alone, where a.jpg has none.
+func (e *Export) reserve(name func(exportImage) string) {
+	if e.reserved == nil {
+		e.reserved = map[string]bool{}
+	}
+	for _, img := range e.images {
+		if img.VersionID == nil && img.AnnPath != nil {
+			e.reserved[name(img)] = true
+		}
+	}
+}
+
+// nameReserved reports whether the annotation entry name of a review
+// version image is reserved by another image (and logs it).
+func (e *Export) nameReserved(img exportImage, name string) bool {
+	if img.VersionID == nil || !e.reserved[name] || (img.AnnPath != nil && *img.AnnPath == name) {
+		return false
+	}
+	e.nameTaken++
+	e.log.Warn("export: annotation name taken by another image's annotation; leaving the version annotation out",
+		"image", img.Path, "name", name)
+	return true
+}
+
 // ---- VOC ----
 
-// writeVOC copies the images and their VOC files as they are.
+// writeVOC copies the images and their VOC files as they are. The
+// annotation of a review version is written as a new VOC file in place of
+// the base one: where the image's VOC file is, else where a new one would
+// go in the dataset folder (next to the image, or in a sibling
+// Annotations/ folder, see defaultAnnotationPath).
 func (e *Export) writeVOC(ctx context.Context, zw *zip.Writer) error {
-	for _, img := range e.images {
+	e.reserve(func(img exportImage) string { return *img.AnnPath })
+	for i, img := range e.images {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -351,7 +535,36 @@ func (e *Export) writeVOC(ctx context.Context, zw *zip.Writer) error {
 		if err != nil {
 			return err
 		}
-		if !ok || img.AnnPath == nil {
+		if !ok {
+			continue
+		}
+		if img.VersionID != nil {
+			a, err := e.versionAnnotation(ctx, i)
+			if err != nil {
+				return err
+			}
+			name := defaultAnnotationPath(e.root, img.Path)
+			if img.AnnPath != nil {
+				name = *img.AnnPath
+			}
+			if e.nameReserved(img, name) {
+				continue
+			}
+			w, h := imageSize(img, a)
+			data, err := EncodeVOC(path.Base(path.Dir(img.Path)), path.Base(img.Path), w, h, a.Objects)
+			if err != nil {
+				return err
+			}
+			if ok, err = e.addFile(zw, name, data, img.ModTime); err != nil {
+				return err
+			}
+			if ok {
+				e.annotations++
+				e.fromVersions++
+			}
+			continue
+		}
+		if img.AnnPath == nil {
 			continue
 		}
 		ok, err = e.copyFile(zw, *img.AnnPath, *img.AnnPath)
@@ -397,7 +610,8 @@ type xalExportShape struct {
 // writeXAnyLabeling copies the images and writes <stem>.json next to each
 // image with a usable VOC file.
 func (e *Export) writeXAnyLabeling(ctx context.Context, zw *zip.Writer) error {
-	for _, img := range e.images {
+	e.reserve(func(img exportImage) string { return sidecarPath(img.Path, ".json") })
+	for i, img := range e.images {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -405,10 +619,14 @@ func (e *Export) writeXAnyLabeling(ctx context.Context, zw *zip.Writer) error {
 		if err != nil {
 			return err
 		}
-		if !ok {
+		name := sidecarPath(img.Path, ".json")
+		if !ok || e.nameReserved(img, name) {
 			continue
 		}
-		a := e.readAnnotation(img)
+		a, err := e.annotation(ctx, i)
+		if err != nil {
+			return err
+		}
 		if a == nil {
 			continue
 		}
@@ -417,12 +635,15 @@ func (e *Export) writeXAnyLabeling(ctx context.Context, zw *zip.Writer) error {
 			return err
 		}
 		// a.jpg and a.png share a.json: the second keeps none.
-		ok, err = e.addFile(zw, sidecarPath(img.Path, ".json"), data, img.ModTime)
+		ok, err = e.addFile(zw, name, data, img.ModTime)
 		if err != nil {
 			return err
 		}
 		if ok {
 			e.annotations++
+			if img.VersionID != nil {
+				e.fromVersions++
+			}
 		}
 	}
 	return nil
@@ -461,24 +682,27 @@ func xAnyLabelingJSON(imageName string, a *vocAnnotation, img exportImage) ([]by
 // and data.yaml.
 func (e *Export) writeYOLO(ctx context.Context, zw *zip.Writer) error {
 	// A dataset imported from a YOLO layout has all images in images/
-	// already; another level would give images/images/.
+	// already; another level would give images/images/. Decided by all the
+	// dataset's images, so that every download of a dataset has the same
+	// layout.
 	prefix := "images/"
-	if !slices.ContainsFunc(e.images, func(img exportImage) bool { return !strings.HasPrefix(img.Path, "images/") }) {
+	if e.allInImages {
 		prefix = ""
 	}
 	now := time.Now()
 	if _, err := e.addFile(zw, yoloClassesFile, []byte(strings.Join(e.classes, "\n")+"\n"), now); err != nil {
 		return err
 	}
-	if _, err := e.addFile(zw, "data.yaml", yoloDataYAML(e.top, e.classes, e.images, prefix), now); err != nil {
+	if _, err := e.addFile(zw, "data.yaml", yoloDataYAML(e.top, e.classes, e.images, prefix, e.subset), now); err != nil {
 		return err
 	}
+	e.reserve(func(img exportImage) string { return ultralyticsLabelPath(prefix + img.Path) })
 
 	ids := make(map[string]int, len(e.classes))
 	for i, name := range e.classes {
 		ids[name] = i
 	}
-	for _, img := range e.images {
+	for i, img := range e.images {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -487,10 +711,14 @@ func (e *Export) writeYOLO(ctx context.Context, zw *zip.Writer) error {
 		if err != nil {
 			return err
 		}
-		if !ok {
+		label := ultralyticsLabelPath(name)
+		if !ok || e.nameReserved(img, label) {
 			continue
 		}
-		a := e.readAnnotation(img)
+		a, err := e.annotation(ctx, i)
+		if err != nil {
+			return err
+		}
 		if a == nil {
 			continue
 		}
@@ -500,12 +728,15 @@ func (e *Export) writeYOLO(ctx context.Context, zw *zip.Writer) error {
 			continue
 		}
 		// a.jpg and a.png share a.txt: the second keeps none.
-		ok, err = e.addFile(zw, ultralyticsLabelPath(name), data, img.ModTime)
+		ok, err = e.addFile(zw, label, data, img.ModTime)
 		if err != nil {
 			return err
 		}
 		if ok {
 			e.annotations++
+			if img.VersionID != nil {
+				e.fromVersions++
+			}
 		}
 	}
 	return nil
@@ -557,8 +788,9 @@ var yoloSplits = []string{"train", "val", "valid", "test"}
 // yoloDataYAML renders data.yaml for Ultralytics. Without a "path" key the
 // paths are relative to the file. When the images are split into
 // images/train, images/val (or valid) and optionally images/test, those are
-// used; otherwise train and val both point to all images.
-func yoloDataYAML(name string, classes []string, images []exportImage, prefix string) []byte {
+// used; otherwise train and val both point to all images. subset says the
+// download has only some of the dataset's images.
+func yoloDataYAML(name string, classes []string, images []exportImage, prefix string, subset bool) []byte {
 	dirs := map[string]bool{}
 	split := true
 	for _, img := range images {
@@ -592,7 +824,12 @@ func yoloDataYAML(name string, classes []string, images []exportImage, prefix st
 			b.WriteString("test: images/test\n")
 		}
 	} else {
-		b.WriteString("# 图片没有按 train / val 子文件夹划分，train 与 val 都指向全部图片；正式训练前请先划分验证集。\n")
+		if subset {
+			b.WriteString("# 本次导出只含数据集的部分图片，")
+		} else {
+			b.WriteString("# ")
+		}
+		b.WriteString("图片没有按 train / val 子文件夹划分，train 与 val 都指向全部图片；正式训练前请先划分验证集。\n")
 		b.WriteString("train: images\nval: images\n")
 	}
 	fmt.Fprintf(&b, "nc: %d\nnames:\n", len(classes))

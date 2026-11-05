@@ -123,7 +123,8 @@ func (s *Service) fillReviews(ctx context.Context, q querier, reviews []Review) 
 	}
 
 	// Datasets in selection order, then the counts per dataset.
-	rows, err := q.Query(ctx, `SELECT rd.review_id, rd.dataset_id, coalesce(d.name, rd.dataset_name), rd.folder
+	rows, err := q.Query(ctx, `SELECT rd.review_id, rd.dataset_id, coalesce(d.name, rd.dataset_name), rd.folder,
+			d.review_version_seq
 		FROM review_datasets rd LEFT JOIN datasets d ON d.id = rd.dataset_id
 		WHERE rd.review_id = ANY($1) ORDER BY rd.review_id, rd.position`, ids)
 	if err != nil {
@@ -131,9 +132,14 @@ func (s *Service) fillReviews(ctx context.Context, q querier, reviews []Review) 
 	}
 	var reviewID int64
 	var d Dataset
-	if _, err := pgx.ForEachRow(rows, []any{&reviewID, &d.ID, &d.Name, &d.Folder}, func() error {
+	var seq *int
+	if _, err := pgx.ForEachRow(rows, []any{&reviewID, &d.ID, &d.Name, &d.Folder, &seq}, func() error {
 		r := index[reviewID]
-		r.Datasets = append(r.Datasets, d)
+		next := d
+		if seq != nil {
+			next.NextVersion = dataset.NextReviewVersionName(*seq)
+		}
+		r.Datasets = append(r.Datasets, next)
 		return nil
 	}); err != nil {
 		return err
@@ -167,6 +173,9 @@ func (s *Service) fillReviews(ctx context.Context, q querier, reviews []Review) 
 		(SELECT DISTINCT ON (review_id) `+mergeColumns+` FROM review_merges
 			WHERE review_id = ANY($1) AND status <> 'running' ORDER BY review_id, id DESC)`, ids))
 	if err != nil {
+		return err
+	}
+	if err := s.attachVersions(ctx, merges); err != nil {
 		return err
 	}
 	for _, m := range merges {
@@ -258,13 +267,15 @@ func collectUploads(rows pgx.Rows, err error) ([]Upload, error) {
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Upload, error) { return scanUpload(row) })
 }
 
-const mergeColumns = `id, review_id, dataset_ids, statuses, on_existing, status, total, done, summary, problems,
+const mergeColumns = `id, review_id, dataset_ids, statuses, note, on_existing, status, total, done, summary, problems,
 	error, created_at, finished_at`
 
+// scanMerge reads a merge; its Versions are filled in by attachVersions.
 func scanMerge(row pgx.Row) (Merge, error) {
 	var m Merge
-	err := row.Scan(&m.ID, &m.ReviewID, &m.DatasetIDs, &m.Statuses, &m.OnExisting, &m.Status, &m.Total, &m.Done,
-		&m.Summary, &m.Problems, &m.Error, &m.CreatedAt, &m.FinishedAt)
+	err := row.Scan(&m.ID, &m.ReviewID, &m.DatasetIDs, &m.Statuses, &m.Note, &m.OnExisting, &m.Status, &m.Total,
+		&m.Done, &m.Summary, &m.Problems, &m.Error, &m.CreatedAt, &m.FinishedAt)
+	m.Versions = []dataset.VersionRef{}
 	if m.DatasetIDs == nil {
 		m.DatasetIDs = []int64{}
 	}

@@ -217,6 +217,10 @@ func (s *Service) decorate(ctx context.Context, ds []Dataset) error {
 	if err != nil {
 		return fmt.Errorf("load dataset projects: %w", err)
 	}
+	versions, err := queryVersionCounts(ctx, s.db, ids)
+	if err != nil {
+		return fmt.Errorf("load dataset versions: %w", err)
+	}
 	for i := range ds {
 		d := &ds[i]
 		d.Path = s.datasetDir(d.DirName)
@@ -228,6 +232,7 @@ func (s *Service) decorate(ctx context.Context, ds []Dataset) error {
 			d.Projects = p
 		}
 		d.ActiveImport = active[d.ID]
+		d.VersionCount = versions[d.ID]
 	}
 	return nil
 }

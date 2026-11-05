@@ -27,7 +27,7 @@ var (
 		"last_upload", "active_merge", "last_merge", "created_at", "updated_at", "started_at", "finished_at"}
 	reviewCountKeys = []string{"total", "inferred", "inference_failed", "pending", "approved", "needs_sample", "edited",
 		"merged"}
-	reviewDatasetKeys  = []string{"id", "name", "folder", "counts"}
+	reviewDatasetKeys  = []string{"id", "name", "folder", "counts", "next_version"}
 	reviewModelKeys    = []string{"id", "project_id", "project_name", "version", "yolo_version", "task", "file_name", "class_names"}
 	reviewOptionKeys   = []string{"conf", "iou", "imgsz", "max_det"}
 	reviewImageKeyList = []string{"id", "review_id", "dataset_id", "image_id", "position", "path", "file_name",

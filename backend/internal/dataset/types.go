@@ -78,6 +78,7 @@ type Dataset struct {
 	TotalBytes       int64        `json:"total_bytes"`
 	Covers           []ImageRef   `json:"covers"`        // up to 4 images for the card mosaic
 	Projects         []ProjectRef `json:"projects"`      // the projects that include the dataset, by name
+	VersionCount     int          `json:"version_count"` // ready review versions (versions.go)
 	ActiveImport     *Import      `json:"active_import"` // latest uploading/queued/running job
 	ScannedAt        *time.Time   `json:"scanned_at"`
 	CreatedAt        time.Time    `json:"created_at"`
