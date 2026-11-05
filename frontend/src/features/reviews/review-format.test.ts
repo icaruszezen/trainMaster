@@ -352,28 +352,12 @@ describe("requests and links", () => {
     })
   })
 
-  it("opens the first pending image while there is one", () => {
-    const review = {
-      id: 4,
-      counts: counts(),
-      datasets: [
-        { id: 1, name: "A", folder: "A", counts: counts() },
-        {
-          id: 2,
-          name: "B",
-          folder: "B",
-          counts: counts({ total: 3, inferred: 3, pending: 0, approved: 3 }),
-        },
-      ],
-    }
-    expect(reviewEntryPath(review)).toBe(
-      "/datasets/reviews/4/workspace?status=pending"
-    )
+  it("enters the review without filtering the review status", () => {
+    // 列表显示全部图片，编辑器从第一张待审核的开始（params 的 pickStartImage）。
+    const review = { id: 4 }
+    expect(reviewEntryPath(review)).toBe("/datasets/reviews/4/workspace")
     expect(reviewEntryPath(review, 1)).toBe(
-      "/datasets/reviews/4/workspace?status=pending&dataset_id=1"
-    )
-    expect(reviewEntryPath(review, 2)).toBe(
-      "/datasets/reviews/4/workspace?dataset_id=2"
+      "/datasets/reviews/4/workspace?dataset_id=1"
     )
   })
 })
