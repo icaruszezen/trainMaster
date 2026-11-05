@@ -26,9 +26,10 @@ import {
   type ReviewMerge,
   type ReviewUpload,
 } from "@/features/reviews/api"
-import { MergeStatus, onExistingLabels } from "@/features/reviews/merge-dialog"
+import { MergeStatus } from "@/features/reviews/merge-dialog"
 import {
   mergeDatasetsText,
+  mergeOutcomeText,
   mergeSummaryText,
   statusesText,
   uploadSummaryText,
@@ -269,6 +270,7 @@ function UploadEntry({ upload }: { upload: ReviewUpload }) {
 }
 
 function MergeEntry({ merge, review }: { merge: ReviewMerge; review: Review }) {
+  const note = merge.note ? ` · 备注：${shortNote(merge.note)}` : ""
   return (
     <Entry
       icon={<GitMerge className="size-4" />}
@@ -276,14 +278,20 @@ function MergeEntry({ merge, review }: { merge: ReviewMerge; review: Review }) {
       badges={<MergeStatusBadge merge={merge} />}
       summary={
         merge.status === "running"
-          ? `已处理 ${formatNumber(merge.done)} / ${formatNumber(merge.total)} 张 · ${onExistingLabels[merge.on_existing]}`
-          : `${mergeSummaryText(merge.summary)} · ${onExistingLabels[merge.on_existing]}`
+          ? `已处理 ${formatNumber(merge.done)} / ${formatNumber(merge.total)} 张${note}`
+          : `${mergeSummaryText(merge.summary)} · ${mergeOutcomeText(merge, review.datasets)}${note}`
       }
       time={merge.finished_at ?? merge.created_at}
     >
-      <MergeStatus merge={merge} />
+      <MergeStatus merge={merge} datasets={review.datasets} />
     </Entry>
   )
+}
+
+/** 摘要中的备注：一行，最多 60 个字符（完整的备注在展开后的结果中）。 */
+function shortNote(note: string) {
+  const chars = [...note.replace(/\s+/g, " ")]
+  return chars.length > 60 ? `${chars.slice(0, 60).join("")}…` : chars.join("")
 }
 
 export function MergeStatusBadge({ merge }: { merge: ReviewMerge }) {

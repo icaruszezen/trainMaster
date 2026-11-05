@@ -40,6 +40,7 @@ const summary: Pick<ReviewSummary, "counts" | "datasets"> = {
       id: 1,
       name: "A",
       folder: "A",
+      next_version: "审图1.0",
       counts: counts({
         total: 4,
         pending: 4,
@@ -48,7 +49,13 @@ const summary: Pick<ReviewSummary, "counts" | "datasets"> = {
         edited: 0,
       }),
     },
-    { id: 2, name: "B", folder: "B", counts: counts({ total: 6, pending: 2 }) },
+    {
+      id: 2,
+      name: "B",
+      folder: "B",
+      next_version: "审图1.0",
+      counts: counts({ total: 6, pending: 2 }),
+    },
   ],
 }
 

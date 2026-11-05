@@ -45,6 +45,7 @@ import {
   type Dataset,
   type ImageFilters,
   type ImageStatusFilter,
+  type VersionSelection,
 } from "@/features/datasets/api"
 import {
   DatasetActionsMenu,
@@ -59,6 +60,7 @@ import {
 } from "@/features/datasets/dataset-images"
 import { DatasetImports } from "@/features/datasets/dataset-imports"
 import { DatasetLabels } from "@/features/datasets/dataset-labels"
+import { DatasetReviewVersions } from "@/features/datasets/dataset-review-versions"
 import {
   DatasetReviews,
   DatasetReviewsCount,
@@ -70,6 +72,7 @@ import {
 import { ImportDialog } from "@/features/datasets/import-dialog"
 import { ImportProgressCard } from "@/features/datasets/import-progress-card"
 import { LoadError } from "@/features/datasets/load-error"
+import { BASE_ONLY } from "@/features/datasets/versions"
 import { workspacePath } from "@/features/annotation/workspace-params"
 import { DatasetProjectBadges } from "@/features/projects/dataset-project-badges"
 import { DatasetProjectsDialog } from "@/features/projects/dataset-projects-dialog"
@@ -131,9 +134,15 @@ function DatasetNotFound() {
   )
 }
 
-type DetailTab = "images" | "labels" | "imports" | "reviews"
+type DetailTab = "images" | "labels" | "imports" | "reviews" | "versions"
 
-const TABS: readonly DetailTab[] = ["images", "labels", "imports", "reviews"]
+const TABS: readonly DetailTab[] = [
+  "images",
+  "labels",
+  "imports",
+  "reviews",
+  "versions",
+]
 
 const STATUS_VALUES: ImageStatusFilter[] = [
   "all",
@@ -202,7 +211,8 @@ function DatasetDetail({ id }: { id: number }) {
   const [editing, setEditing] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [assigning, setAssigning] = useState(false)
-  const [exporting, setExporting] = useState(false)
+  // 打开下载对话框时选中的版本；null 时对话框关闭。
+  const [exporting, setExporting] = useState<VersionSelection | null>(null)
 
   usePageTitle(query.data?.name)
 
@@ -250,7 +260,7 @@ function DatasetDetail({ id }: { id: number }) {
               </Button>
               <Button
                 variant="outline"
-                onClick={() => setExporting(true)}
+                onClick={() => setExporting(BASE_ONLY)}
                 disabled={!canExportDataset(dataset)}
                 aria-label="下载"
               >
@@ -333,6 +343,14 @@ function DatasetDetail({ id }: { id: number }) {
             审核记录
             <DatasetReviewsCount datasetId={dataset.id} />
           </TabsTrigger>
+          <TabsTrigger value="versions" className="px-3">
+            审图版本
+            {dataset.version_count > 0 && (
+              <span className="text-xs text-muted-foreground tabular-nums">
+                {formatNumber(dataset.version_count)}
+              </span>
+            )}
+          </TabsTrigger>
         </TabsList>
         <TabsContent value="images">
           <DatasetImages
@@ -349,7 +367,17 @@ function DatasetDetail({ id }: { id: number }) {
           <DatasetImports dataset={dataset} />
         </TabsContent>
         <TabsContent value="reviews">
-          <DatasetReviews dataset={dataset} />
+          <DatasetReviews
+            dataset={dataset}
+            onShowVersions={() => search.setTab("versions")}
+          />
+        </TabsContent>
+        <TabsContent value="versions">
+          <DatasetReviewVersions
+            dataset={dataset}
+            onExport={setExporting}
+            onShowReviews={() => search.setTab("reviews")}
+          />
         </TabsContent>
       </Tabs>
 
@@ -374,7 +402,8 @@ function DatasetDetail({ id }: { id: number }) {
       />
       <ExportDialog
         dataset={exporting ? dataset : null}
-        onOpenChange={setExporting}
+        selection={exporting ?? undefined}
+        onOpenChange={(open) => !open && setExporting(null)}
       />
     </>
   )

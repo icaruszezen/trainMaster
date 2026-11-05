@@ -19,7 +19,9 @@ function merge(changes: Partial<ReviewMerge> = {}): ReviewMerge {
     review_id: 1,
     dataset_ids: [5],
     statuses: ["needs_sample"],
-    on_existing: "skip",
+    on_existing: null,
+    note: "第一轮",
+    versions: [],
     status: "running",
     total: 2000,
     done: 10,
@@ -27,6 +29,7 @@ function merge(changes: Partial<ReviewMerge> = {}): ReviewMerge {
       merged: 0,
       skipped_existing: 0,
       skipped_empty: 0,
+      skipped_changed: 0,
       conflicts: 0,
       failed: 0,
     },
@@ -113,12 +116,20 @@ describe("endedMerges", () => {
 })
 
 describe("refreshMergedDatasets", () => {
-  it("refreshes the merged datasets and the review lists", () => {
+  it("refreshes the merged datasets, their versions and the review lists", () => {
     queryClient.setQueryData(datasetKeys.detail(5), {})
     queryClient.setQueryData(datasetKeys.detail(6), {})
+    queryClient.setQueryData(datasetKeys.versions(5), { items: [] })
+    const preview = datasetKeys.exportPreview(5, {
+      include_base: true,
+      version_ids: [],
+    })
+    queryClient.setQueryData(preview, {})
     queryClient.setQueryData(reviewKeys.dataset(5), { items: [] })
     refreshMergedDatasets(1, [5])
     expect(invalidated(datasetKeys.detail(5))).toBe(true)
+    expect(invalidated(datasetKeys.versions(5))).toBe(true)
+    expect(invalidated(preview)).toBe(true)
     expect(invalidated(datasetKeys.detail(6))).toBe(false)
     expect(invalidated(reviewKeys.dataset(5))).toBe(true)
   })

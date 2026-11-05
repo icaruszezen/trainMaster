@@ -1,13 +1,16 @@
 /**
- * 合并到数据集：把审图标注（默认只有需加样的图片）写进数据集的 VOC 标注文件。
- * 审图任务保留自己的标注与审核状态，之后还可以再次合并。合并是后台任务，
- * 对话框显示它的进度与结果，关闭后继续进行。
+ * 合并到数据集：把审图标注（默认只有需加样的图片）保存为数据集的一个新的审图
+ * 版本（审图1.0、1.1…，附用户填写的备注），不修改数据集的标注文件（基础版本）。
+ * 下载数据集时可以选择版本。审图任务保留自己的标注与审核状态，之后还可以再次
+ * 合并（生成下一个版本）。合并是后台任务，对话框显示它的进度与结果，关闭后继续
+ * 进行。
  */
 import { useEffect, useId, useRef, useState, type FormEvent } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import {
   CircleAlert,
   CircleCheck,
+  GitBranch,
   GitMerge,
   Info,
   TriangleAlert,
@@ -23,9 +26,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { Field, FieldLabel } from "@/components/ui/field"
-import { RadioGroup } from "@/components/ui/radio-group"
+import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Spinner } from "@/components/ui/spinner"
+import { Textarea } from "@/components/ui/textarea"
+import { DescriptionCounter } from "@/features/datasets/dataset-actions"
 import { TaskProgress } from "@/features/datasets/task-progress"
 import {
   createReviewMerge,
@@ -33,13 +37,11 @@ import {
   refreshReviewMerges,
   reviewKeys,
   reviewMergeQuery,
-  type CreateReviewMergeInput,
   type Review,
   type ReviewImageStatus,
   type ReviewMerge,
 } from "@/features/reviews/api"
 import {
-  ChoiceCard,
   DatasetScopeSelect,
   StatusCheckboxes,
 } from "@/features/reviews/review-fields"
@@ -47,7 +49,10 @@ import {
   inferredImageCount,
   mergeDatasetsText,
   mergeInput,
+  mergeVersionsText,
+  onExistingLabels,
   statusesText,
+  validateVersionNote,
 } from "@/features/reviews/review-format"
 import { ProblemList } from "@/features/reviews/review-parts"
 import { scopedCounts } from "@/features/reviews/review-status"
@@ -64,15 +69,7 @@ const MERGE_STATUSES: readonly ReviewImageStatus[] = [
 
 const STATUS_HINTS: Partial<Record<ReviewImageStatus, string>> = {
   needs_sample: "需要参与后续训练的图片",
-  approved: "识别正确的图片，合并后同样有标注",
-}
-
-export const onExistingLabels: Record<
-  CreateReviewMergeInput["on_existing"],
-  string
-> = {
-  skip: "跳过已有标注的图片",
-  overwrite: "覆盖已有标注",
+  approved: "识别正确的图片，版本中同样有标注",
 }
 
 type MergeDialogProps = {
@@ -147,7 +144,7 @@ function MergeForm({
   onDone: () => void
 }) {
   const datasetFieldId = useId()
-  const onExistingId = useId()
+  const noteId = useId()
   const [statuses, setStatuses] = useState<Set<ReviewImageStatus>>(
     () => new Set(["needs_sample"])
   )
@@ -156,26 +153,25 @@ function MergeForm({
       ? initialDatasetId
       : null
   )
-  const [onExisting, setOnExisting] =
-    useState<CreateReviewMergeInput["on_existing"]>("skip")
+  const [note, setNote] = useState("")
+  // 备注为空的提示在第一次提交后才显示。
+  const [submitted, setSubmitted] = useState(false)
 
   const counts = scopedCounts(review, datasetId)
   const imageCount = inferredImageCount(counts, statuses)
-  const scopeDataset =
-    datasetId === null
-      ? review.datasets.length === 1
-        ? review.datasets[0]
-        : undefined
-      : review.datasets.find((dataset) => dataset.id === datasetId)
-  const scopeName = scopeDataset
-    ? `数据集“${scopeDataset.name}”`
-    : datasetId === null
-      ? `这 ${formatNumber(review.datasets.length)} 个数据集`
-      : "数据集"
+  // 有要合并的图片的数据集各生成一个版本。
+  const targets = review.datasets.filter(
+    (dataset) =>
+      (datasetId === null || dataset.id === datasetId) &&
+      inferredImageCount(scopedCounts(review, dataset.id), statuses) > 0
+  )
+  const noteError = validateVersionNote(note)
+  const shownNoteError =
+    noteError && (submitted || note.trim() !== "") ? noteError : null
 
   const mutation = useMutation({
     mutationFn: () =>
-      createReviewMerge(review.id, mergeInput(statuses, datasetId, onExisting)),
+      createReviewMerge(review.id, mergeInput(statuses, datasetId, note)),
     onSuccess: (merge) => {
       queryClient.setQueryData(reviewKeys.merge(review.id, merge.id), merge)
       // 任务上的 active_merge（详情、列表、数据集的审核记录）与合并记录：关闭
@@ -193,7 +189,8 @@ function MergeForm({
 
   const submit = (event: FormEvent) => {
     event.preventDefault()
-    if (statuses.size > 0 && imageCount > 0) {
+    setSubmitted(true)
+    if (statuses.size > 0 && imageCount > 0 && noteError === null) {
       mutation.mutate()
     }
   }
@@ -209,7 +206,7 @@ function MergeForm({
       <DialogHeader>
         <DialogTitle>合并到数据集</DialogTitle>
         <DialogDescription>
-          把审图标注写进数据集，用于之后的训练。
+          把审图标注保存为数据集的一个新的审图版本，下载数据集时可以选择版本。
         </DialogDescription>
       </DialogHeader>
 
@@ -247,40 +244,34 @@ function MergeForm({
         </Field>
       )}
 
-      <div className="grid gap-3">
-        <FieldLabel id={onExistingId}>数据集中的图片已有标注时</FieldLabel>
-        <RadioGroup
-          value={onExisting}
-          onValueChange={(value) => {
-            setOnExisting(value as CreateReviewMergeInput["on_existing"])
+      <Field data-invalid={shownNoteError ? true : undefined}>
+        <FieldLabel htmlFor={noteId}>版本备注</FieldLabel>
+        <Textarea
+          id={noteId}
+          value={note}
+          onChange={(event) => {
+            setNote(event.target.value)
             change()
           }}
-          aria-labelledby={onExistingId}
-          className="grid gap-2 sm:grid-cols-2"
+          placeholder="这个版本的内容，如“第二批产线图片复核，补充划痕样本”"
+          aria-invalid={shownNoteError ? true : undefined}
+          aria-required
           disabled={pending}
-        >
-          <ChoiceCard
-            id={`${onExistingId}-skip`}
-            value="skip"
-            selected={onExisting === "skip"}
-            title={onExistingLabels.skip}
-            description="只给还没有标注文件的图片写入审图标注，已有的标注保持不变"
-          />
-          <ChoiceCard
-            id={`${onExistingId}-overwrite`}
-            value="overwrite"
-            selected={onExisting === "overwrite"}
-            title={onExistingLabels.overwrite}
-            description="用审图标注替换数据集中原有的标注文件"
-          />
-        </RadioGroup>
-      </div>
+          className="min-h-20"
+        />
+        {shownNoteError ? (
+          <FieldError>{shownNoteError}</FieldError>
+        ) : (
+          <DescriptionCounter value={note} />
+        )}
+      </Field>
+
+      {targets.length > 0 && <PlannedVersions datasets={targets} />}
 
       <Alert>
         <Info />
         <AlertDescription>
-          只改动{scopeName}中这些图片的 VOC
-          标注文件，图片本身不变。审图任务保留自己的标注与审核状态，之后还可以再次合并。
+          数据集的标注文件（基础版本）不会被修改，标注工作台、标签分布仍是基础版本。审图任务保留自己的标注与审核状态，之后还可以再次合并，生成下一个版本。
         </AlertDescription>
       </Alert>
 
@@ -315,6 +306,37 @@ function MergeForm({
         </Button>
       </DialogFooter>
     </form>
+  )
+}
+
+/** 合并将生成的版本：每个数据集的下一个版本名（预计）。 */
+function PlannedVersions({
+  datasets,
+}: {
+  datasets: readonly Review["datasets"][number][]
+}) {
+  return (
+    <div className="grid gap-2 rounded-lg border bg-muted/30 p-3">
+      <p className="text-sm font-medium">将生成审图版本</p>
+      <ul className="grid gap-1 text-sm">
+        {datasets.map((dataset) => (
+          <li key={dataset.id} className="flex min-w-0 items-center gap-2">
+            <GitBranch className="size-4 shrink-0 text-muted-foreground" />
+            <span className="min-w-0 truncate" title={dataset.name}>
+              {dataset.name}
+            </span>
+            {dataset.next_version && (
+              <span className="shrink-0 font-medium tabular-nums">
+                {dataset.next_version}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+      <p className="text-xs text-muted-foreground">
+        版本号在合并完成时确定；其他审图任务先合并完成时会顺延。
+      </p>
+    </div>
   )
 }
 
@@ -427,7 +449,7 @@ function MergeProgress({
         </DialogTitle>
         <DialogDescription>
           {merge
-            ? `${statusesText(merge.statuses)}的图片 → ${mergeDatasetsText(merge, review.datasets)}，${onExistingLabels[merge.on_existing]}。`
+            ? `${statusesText(merge.statuses)}的图片 → ${mergeDatasetsText(merge, review.datasets)}${merge.on_existing ? `，${onExistingLabels[merge.on_existing]}` : ""}。`
             : "正在读取合并的进度…"}
         </DialogDescription>
       </DialogHeader>
@@ -441,7 +463,7 @@ function MergeProgress({
           <TaskProgress value={null} label="合并进度" />
         )
       ) : (
-        <MergeStatus merge={merge} />
+        <MergeStatus merge={merge} datasets={review.datasets} />
       )}
 
       <DialogFooter>
@@ -461,10 +483,22 @@ function MergeProgress({
   )
 }
 
-/** 合并的进度（进行中）或结果（各项计数、没有合并的图片）。 */
-export function MergeStatus({ merge }: { merge: ReviewMerge }) {
+/**
+ * 合并的进度（进行中）或结果（生成的版本、各项计数、没有合并的图片）。
+ * `datasetId`：只说明这个数据集的版本（数据集页面的审核记录）。
+ */
+export function MergeStatus({
+  merge,
+  datasets,
+  datasetId = null,
+}: {
+  merge: ReviewMerge
+  datasets: readonly { id: number; name: string }[]
+  datasetId?: number | null
+}) {
   const { summary } = merge
   const problemTotal = summary.conflicts + summary.failed
+  const legacy = merge.on_existing !== null
   if (merge.status === "running") {
     return (
       <div className="grid gap-1.5">
@@ -479,6 +513,7 @@ export function MergeStatus({ merge }: { merge: ReviewMerge }) {
       </div>
     )
   }
+  const versions = mergeVersionsText(merge, datasets, datasetId)
   return (
     <div className="grid min-w-0 gap-4">
       {merge.status === "failed" ? (
@@ -487,7 +522,10 @@ export function MergeStatus({ merge }: { merge: ReviewMerge }) {
           <AlertTitle>合并中断</AlertTitle>
           <AlertDescription>
             <p className="break-words">
-              {merge.error || "合并没有完成，已合并的图片保留，可以再次合并。"}
+              {merge.error ||
+                (legacy
+                  ? "合并没有完成，已合并的图片保留，可以再次合并。"
+                  : "合并没有完成，没有生成新的版本，可以重新合并。")}
             </p>
           </AlertDescription>
         </Alert>
@@ -498,14 +536,35 @@ export function MergeStatus({ merge }: { merge: ReviewMerge }) {
           ) : (
             <CircleCheck className="mt-0.5 size-5 shrink-0 text-emerald-600 dark:text-emerald-500" />
           )}
-          <p className="text-sm font-medium">
-            已合并 {formatNumber(summary.merged)} 张图片的标注
-            {problemTotal > 0 && `，${formatNumber(problemTotal)} 张没有合并`}
-          </p>
+          <div className="grid min-w-0 gap-1">
+            <p className="text-sm font-medium">
+              {legacy
+                ? `已合并 ${formatNumber(summary.merged)} 张图片的标注`
+                : versions
+                  ? `已生成 ${versions}，共 ${formatNumber(summary.merged)} 张图片`
+                  : summary.merged > 0
+                    ? `已合并 ${formatNumber(summary.merged)} 张图片（版本已删除）`
+                    : "没有可以合并的图片，没有生成版本"}
+              {problemTotal > 0 && `，${formatNumber(problemTotal)} 张没有合并`}
+            </p>
+            {!legacy && merge.note && (
+              <p className="text-xs break-words whitespace-pre-line text-muted-foreground">
+                备注：{merge.note}
+              </p>
+            )}
+            {!legacy && versions && (
+              <p className="text-xs text-muted-foreground">
+                下载数据集时可以选择这个版本：只导出其中需加样的图片，或覆盖基础版本中对应图片的标注后一起导出。
+              </p>
+            )}
+          </div>
         </div>
       )}
       <MergeSummaryGrid merge={merge} />
-      <ProblemList problems={merge.problems} total={problemTotal} />
+      <ProblemList
+        problems={merge.problems}
+        total={problemTotal + summary.skipped_changed}
+      />
     </div>
   )
 }
@@ -513,11 +572,16 @@ export function MergeStatus({ merge }: { merge: ReviewMerge }) {
 /** 合并结果的各项计数。 */
 export function MergeSummaryGrid({ merge }: { merge: ReviewMerge }) {
   const { summary } = merge
+  const legacy = merge.on_existing !== null
   const items = [
     { label: "已合并", value: summary.merged },
-    { label: "已有标注，跳过", value: summary.skipped_existing },
+    ...(legacy
+      ? [{ label: "已有标注，跳过", value: summary.skipped_existing }]
+      : []),
     { label: "没有审图标注", value: summary.skipped_empty },
-    { label: "冲突", value: summary.conflicts, warn: true },
+    ...(legacy
+      ? [{ label: "冲突", value: summary.conflicts, warn: true }]
+      : [{ label: "状态已改变", value: summary.skipped_changed }]),
     { label: "失败", value: summary.failed, warn: true },
   ]
   return (

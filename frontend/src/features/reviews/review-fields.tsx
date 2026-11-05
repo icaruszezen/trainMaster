@@ -1,11 +1,9 @@
 /**
- * 下载审图包与合并对话框共用的表单部件：按审核状态选择图片、选择数据集范围、
- * 单选卡片。
+ * 下载审图包与合并对话框共用的表单部件：按审核状态选择图片、选择数据集范围。
  */
-import { useId, type ReactNode } from "react"
+import { useId } from "react"
 
 import { Checkbox } from "@/components/ui/checkbox"
-import { RadioGroupItem } from "@/components/ui/radio-group"
 import {
   Select,
   SelectContent,
@@ -138,47 +136,5 @@ export function DatasetScopeSelect({
         ))}
       </SelectContent>
     </Select>
-  )
-}
-
-/** 单选卡片：标题与说明，选中时高亮。 */
-export function ChoiceCard({
-  id,
-  value,
-  selected,
-  title,
-  description,
-  disabled = false,
-  children,
-}: {
-  id: string
-  value: string
-  selected: boolean
-  title: string
-  description: string
-  disabled?: boolean
-  children?: ReactNode
-}) {
-  return (
-    <label
-      htmlFor={id}
-      className={cn(
-        "flex min-w-0 cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors hover:bg-muted/40",
-        selected && "border-primary/60 bg-muted/40",
-        disabled && "cursor-not-allowed opacity-60 hover:bg-transparent"
-      )}
-    >
-      <RadioGroupItem
-        id={id}
-        value={value}
-        className="mt-0.5"
-        disabled={disabled}
-      />
-      <span className="grid min-w-0 flex-1 gap-1">
-        <span className="text-sm font-medium">{title}</span>
-        <span className="text-xs text-muted-foreground">{description}</span>
-        {children}
-      </span>
-    </label>
   )
 }

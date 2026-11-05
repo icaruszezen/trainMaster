@@ -18,7 +18,6 @@ import {
   datasetPath,
   type AnnotationObject,
 } from "@/features/datasets/api"
-import { projectKeys } from "@/features/projects/api"
 import {
   apiGet,
   apiSend,
@@ -71,7 +70,7 @@ export type ReviewCounts = {
   needs_sample: number
   /** 审图标注与模型的识别结果不同。 */
   edited: number
-  /** 合并过到数据集。 */
+  /** 合并过到数据集（进了某个审图版本）。 */
   merged: number
 }
 
@@ -82,6 +81,11 @@ export type ReviewDataset = {
   name: string
   folder: string
   counts: ReviewCounts
+  /**
+   * 下一次合并会给这个数据集生成的审图版本名，如“审图1.2”（预计：别的审图任务
+   * 先合并完成时会用掉这个编号；数据集已删除或在本地审图程序中为空）。
+   */
+  next_version: string
 }
 
 export type ReviewNode = { id: number; name: string }
@@ -119,24 +123,47 @@ export type ReviewMergeStatus = "running" | "succeeded" | "failed"
 
 export type ReviewMergeSummary = {
   merged: number
+  /** 旧的合并（直接写进数据集）：数据集中已有标注而跳过的图片。 */
   skipped_existing: number
+  /** 识别失败、也没有修改过，没有审图标注的图片。 */
   skipped_empty: number
+  /** 合并进行时审核状态被改为其它状态的图片。 */
+  skipped_changed: number
+  /** 旧的合并：数据集的标注同时被其他人修改的图片。 */
   conflicts: number
   failed: number
 }
 
-/** 把审图标注合并到数据集（后台任务）。 */
+/** 合并生成（或正在生成）的一个审图版本。 */
+export type ReviewMergeVersion = {
+  id: number
+  dataset_id: number
+  /** 如“审图1.0”；正在生成时为空。 */
+  name: string
+  status: "building" | "ready"
+  image_count: number
+}
+
+/**
+ * 把审图标注合并到数据集（后台任务）：给每个数据集生成一个审图版本，不修改
+ * 数据集的标注文件。
+ */
 export type ReviewMerge = {
   id: number
   review_id: number
   dataset_ids: number[]
   statuses: ReviewImageStatus[]
-  on_existing: "skip" | "overwrite"
+  /** 旧的合并（直接写进数据集的标注文件）对已有标注的处理；生成版本的合并为 null。 */
+  on_existing: "skip" | "overwrite" | null
+  /** 生成的版本的备注（旧的合并为空）。 */
+  note: string
+  /** 生成的版本，按数据集 ID；删除的版本不再列出。 */
+  versions: ReviewMergeVersion[]
   status: ReviewMergeStatus
   total: number
   done: number
   summary: ReviewMergeSummary
-  problems: ReviewProblem<"conflict" | "failed">[]
+  problems: ReviewProblem<"conflict" | "failed" | "skipped">[]
   error: string
   created_at: string
   finished_at: string | null
@@ -861,13 +888,13 @@ export type CreateReviewMergeInput = {
   dataset_ids?: number[]
   /** 合并这些审核状态的图片（至少一个，通常是需加样）。 */
   statuses: ReviewImageStatus[]
-  /** 数据集中的图片已有标注文件时：跳过，或用审图标注覆盖。 */
-  on_existing: "skip" | "overwrite"
+  /** 生成的审图版本的备注（必填，最多 500 个字符）。 */
+  note: string
 }
 
 /**
- * 开始把审图标注合并到数据集（后台任务，用 {@link reviewMergeQuery} 查看进度）。
- * 已有合并在进行、还没有识别完成的图片时 409。
+ * 开始把审图标注合并到数据集（后台任务，用 {@link reviewMergeQuery} 查看进度）：
+ * 每个数据集生成一个新的审图版本。已有合并在进行、还没有识别完成的图片时 409。
  */
 export function createReviewMerge(id: number, input: CreateReviewMergeInput) {
   return apiSend<ReviewMerge>("POST", `${reviewPath(id)}/merges`, input)
@@ -912,21 +939,15 @@ export function refreshReviewMerges(reviewId: number) {
 }
 
 /**
- * 合并完成后刷新被合并的数据集：标注状态、计数、标签分布都变了（项目的标签
- * 分布也是），以及审图任务本身（已合并的图片数）。
+ * 合并结束后刷新被合并的数据集：它们多了审图版本（版本列表、版本数、下载时
+ * 可选的版本都在数据集的详情查询下），以及审图任务本身（已合并的图片数、下一
+ * 个版本名）。数据集的标注文件没有变。
  */
 export function refreshMergedDatasets(reviewId: number, datasetIds: number[]) {
   for (const id of datasetIds) {
     void queryClient.invalidateQueries({ queryKey: datasetKeys.detail(id) })
-    // 标注工作台中图片的详情（annotation/api 的 annotationKeys.image）：只标记
-    // 为过期，下次打开图片时读取合并后的标注。
-    void queryClient.invalidateQueries({
-      queryKey: ["annotation", "image", id],
-      refetchType: "none",
-    })
   }
   void queryClient.invalidateQueries({ queryKey: datasetKeys.lists() })
-  void queryClient.invalidateQueries({ queryKey: projectKeys.all })
   void queryClient.invalidateQueries({ queryKey: reviewKeys.detail(reviewId) })
   void queryClient.invalidateQueries({ queryKey: reviewKeys.lists() })
   void queryClient.invalidateQueries({ queryKey: reviewKeys.datasets() })

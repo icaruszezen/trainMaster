@@ -15,7 +15,9 @@ import {
   inferredImageCount,
   mergeDatasetsText,
   mergeInput,
+  mergeOutcomeText,
   mergeSummaryText,
+  mergeVersionsText,
   optionsDraftErrors,
   optionsFromDraft,
   orderedStatuses,
@@ -36,6 +38,7 @@ import {
   validateResultsFile,
   validateReviewDescription,
   validateReviewName,
+  validateVersionNote,
 } from "@/features/reviews/review-format"
 
 const counts = (changes: Partial<ReviewCounts> = {}): ReviewCounts => ({
@@ -341,13 +344,13 @@ describe("requests and links", () => {
       statuses: ["pending", "needs_sample"],
       dataset_ids: [3],
     })
-    expect(mergeInput(["needs_sample"], null, "skip")).toEqual({
+    expect(mergeInput(["needs_sample"], null, "  第一轮\n")).toEqual({
       statuses: ["needs_sample"],
-      on_existing: "skip",
+      note: "第一轮",
     })
-    expect(mergeInput(["needs_sample", "approved"], 2, "overwrite")).toEqual({
+    expect(mergeInput(["needs_sample", "approved"], 2, "x")).toEqual({
       statuses: ["approved", "needs_sample"],
-      on_existing: "overwrite",
+      note: "x",
       dataset_ids: [2],
     })
   })
@@ -407,6 +410,7 @@ describe("uploads and merges", () => {
         merged: 16,
         skipped_existing: 0,
         skipped_empty: 0,
+        skipped_changed: 0,
         conflicts: 0,
         failed: 0,
       })
@@ -416,12 +420,68 @@ describe("uploads and merges", () => {
         merged: 1,
         skipped_existing: 2,
         skipped_empty: 3,
+        skipped_changed: 6,
         conflicts: 4,
         failed: 5,
       })
     ).toBe(
-      "合并 1 张，跳过已有标注 2 张，没有审图标注 3 张，冲突 4 张，失败 5 张"
+      "合并 1 张，跳过已有标注 2 张，没有审图标注 3 张，审核状态已改变 6 张，冲突 4 张，失败 5 张"
     )
+  })
+
+  it("validates the version note", () => {
+    expect(validateVersionNote(" 第一轮 ")).toBeNull()
+    expect(validateVersionNote(" \n ")).toBe("请填写版本备注")
+    expect(validateVersionNote("备".repeat(500))).toBeNull()
+    expect(validateVersionNote("备".repeat(501))).toBe(
+      "版本备注不能超过 500 个字符"
+    )
+    // 按字符（码点）计数，与后端一致。
+    expect(validateVersionNote("😀".repeat(500))).toBeNull()
+  })
+
+  it("names the versions a merge made", () => {
+    const datasets = [
+      { id: 1, name: "A" },
+      { id: 2, name: "B" },
+    ]
+    const version = (dataset_id: number, name: string) => ({
+      id: dataset_id * 10,
+      dataset_id,
+      name,
+      status: name ? ("ready" as const) : ("building" as const),
+      image_count: 1,
+    })
+    const merge = {
+      dataset_ids: [1, 2],
+      versions: [version(1, "审图1.0"), version(2, "审图1.3")],
+      on_existing: null,
+      status: "succeeded" as const,
+    }
+    expect(mergeVersionsText(merge, datasets)).toBe("A 审图1.0、B 审图1.3")
+    expect(mergeVersionsText(merge, datasets, 2)).toBe("审图1.3")
+    expect(mergeOutcomeText(merge, datasets)).toBe("生成 A 审图1.0、B 审图1.3")
+    expect(
+      mergeOutcomeText(
+        { ...merge, dataset_ids: [1], versions: [version(1, "审图1.0")] },
+        datasets
+      )
+    ).toBe("生成 审图1.0")
+    expect(
+      mergeVersionsText({ ...merge, versions: [version(1, "")] }, datasets)
+    ).toBe("")
+    expect(mergeOutcomeText({ ...merge, versions: [] }, datasets)).toBe(
+      "没有生成版本"
+    )
+    expect(mergeOutcomeText({ ...merge, status: "failed" }, datasets)).toBe(
+      "没有生成版本"
+    )
+    expect(
+      mergeOutcomeText(
+        { ...merge, versions: [], on_existing: "skip" },
+        datasets
+      )
+    ).toBe("直接写入数据集，跳过已有标注的图片")
   })
 
   it("names the merged datasets", () => {

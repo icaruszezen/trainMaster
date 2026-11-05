@@ -92,7 +92,15 @@ const summary: ReviewSummary = {
   options: { conf: 0.25, iou: 0.7, imgsz: [640, 640], max_det: 300 },
   status: "ready",
   counts: counts(),
-  datasets: [{ id: 3, name: "A", folder: "A", counts: counts() }],
+  datasets: [
+    {
+      id: 3,
+      name: "A",
+      folder: "A",
+      next_version: "审图1.0",
+      counts: counts(),
+    },
+  ],
 }
 
 let client: QueryClient

@@ -79,6 +79,7 @@ import {
   inferenceReport,
   inferenceSpeedText,
   inferredImageCount,
+  mergeOutcomeText,
   mergeSummaryText,
   reviewEntryPath,
   reviewModelText,
@@ -167,8 +168,8 @@ function ReviewDetail({ id }: { id: number }) {
       return
     }
     if (merge.status === "succeeded") {
-      toast.success("已合并到数据集", {
-        description: mergeSummaryText(merge.summary),
+      toast.success("合并完成", {
+        description: `${mergeSummaryText(merge.summary)}，${mergeOutcomeText(merge, query.data?.datasets ?? [])}`,
       })
     } else {
       toast.error("合并没有完成", { description: merge.error || undefined })
@@ -234,7 +235,7 @@ function ReviewDetail({ id }: { id: number }) {
                 title={
                   review.active_merge
                     ? "正在合并到数据集，查看进度"
-                    : "把审图标注合并到数据集的标注中"
+                    : "把审图标注合并为数据集的审图版本"
                 }
               >
                 {review.active_merge ? <Spinner aria-hidden /> : <GitMerge />}
