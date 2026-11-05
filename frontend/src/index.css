@@ -137,6 +137,22 @@
   --sidebar-ring: oklch(0.556 0 0);
 }
 
+/*
+ * 侧栏的滚动条（导航栏、编辑器左侧的图片列表）：鼠标移到上面、或用键盘把焦点
+ * 移进去时才显示，平时透明。透明时仍占着位置，显示时内容不会左右跳动。
+ * Chrome / Edge 121+ 与 Firefox；Safari 本来就是自动隐藏的系统滚动条。
+ */
+@utility scrollbar-auto-hide {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  transition: scrollbar-color 0.2s;
+  &:hover,
+  &:has(:focus-visible) {
+    scrollbar-color: color-mix(in oklab, var(--foreground) 25%, transparent)
+      transparent;
+  }
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

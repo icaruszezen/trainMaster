@@ -47,7 +47,7 @@ export function AppSidebar(props: React.ComponentProps<typeof Sidebar>) {
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarHeader>
-      <SidebarContent>
+      <SidebarContent className="scrollbar-auto-hide">
         <NavMain groups={navGroups} />
       </SidebarContent>
       <SidebarFooter>
