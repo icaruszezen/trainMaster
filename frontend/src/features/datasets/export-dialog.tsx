@@ -571,7 +571,7 @@ function VersionPicker({
       <div
         role="group"
         aria-labelledby={groupId}
-        className="-m-0.5 grid max-h-80 gap-2 overflow-y-auto p-0.5"
+        className="-m-0.5 grid gap-2 p-0.5 sm:max-h-80 sm:overflow-y-auto"
       >
         <VersionOption
           checked={includeBase}
