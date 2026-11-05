@@ -305,7 +305,10 @@ export function ReviewImageList({
         </div>
       </div>
 
-      <ol className="min-h-0 flex-1 overflow-y-auto px-1.5" aria-label="图片">
+      <ol
+        className="min-h-0 flex-1 scrollbar-auto-hide overflow-y-auto px-1.5"
+        aria-label="图片"
+      >
         {query.isPending &&
           Array.from({ length: 8 }, (_, index) => (
             <li key={index} className="flex items-center gap-2 px-1.5 py-1">
