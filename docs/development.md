@@ -127,7 +127,7 @@ for t in trainer/scripts/tests/test-*.sh deploy/scripts/tests/test-*.sh; do bash
 shellcheck -x $(git ls-files '*.sh')
 ```
 
-后端单元测试不依赖数据库（数据集模块的压缩包、VOC、缩略图等测试使用 `backend/internal/dataset/testdata/` 中的小样本，来源见其中的 README）。数据库集成测试（迁移、并发加锁、`app_settings` 读写、数据集导入 / 扫描 / 接口，模型仓库的上传、版本分配、转换队列与租约，模型审图的各个流程）通过 `TM_TEST_DATABASE_URL` 启用，未设置时自动跳过。数据集相关的测试会为每个测试新建并删除一个独立的数据库，所以该账号需要 `CREATEDB` 权限（postgres 超级用户即可）。请使用一次性的数据库：
+后端单元测试不依赖数据库（数据集模块的压缩包、VOC、缩略图等测试使用 `backend/internal/dataset/testdata/` 中的小样本，来源见其中的 README）。数据库集成测试（迁移、并发加锁、`app_settings` 读写、数据集导入 / 扫描 / 接口、审图版本与按版本组合的下载，模型仓库的上传、版本分配、转换队列与租约，模型审图的各个流程）通过 `TM_TEST_DATABASE_URL` 启用，未设置时自动跳过。数据集相关的测试会为每个测试新建并删除一个独立的数据库，所以该账号需要 `CREATEDB` 权限（postgres 超级用户即可）。请使用一次性的数据库：
 
 ```bash
 docker run -d --rm --name tm-test-pg -e POSTGRES_PASSWORD=x -p 55432:5432 postgres:17-alpine
@@ -151,7 +151,7 @@ docker rm -f tm-test-pg
 
 ### 模型审图的测试
 
-- **后端**：`internal/reviewfile`（清单的读写与校验、Windows 安全的路径、VOC）是纯函数的单元测试；`internal/review`（创建、识别任务的领取与租约、结果写入、审核与并发保存、审图包、上传结果的冲突规则、合并）与 `internal/httpapi` 的 `reviews_test.go`、`review_exchange_test.go`（接口的完整流程、失败与重试）是数据库集成测试，按上面的方法用 `TM_TEST_DATABASE_URL` 启用。`internal/reviewer` 覆盖打开与解压（不安全的条目、剩余空间、zip 与文件夹的各种打开方式）、导出、本机接口与访问控制；`contract_test.go` 检查本机接口的 JSON 字段与平台的类型一致（编辑器两边共用，改了平台的类型这里会失败）；`platform_test.go` 的 `TestIntegrationPlatformRoundTrip` 在测试数据库上运行平台的审图服务，走完下载审图包 → 在本地审图程序中打开、审核、导出 → 上传到平台（同样需要 `TM_TEST_DATABASE_URL`）。
+- **后端**：`internal/reviewfile`（清单的读写与校验、Windows 安全的路径、VOC）是纯函数的单元测试；`internal/review`（创建、识别任务的领取与租约、结果写入、审核与并发保存、审图包、上传结果的冲突规则、合并生成审图版本、合并结束时的重试）与 `internal/httpapi` 的 `reviews_test.go`、`review_exchange_test.go`（接口的完整流程、失败与重试）是数据库集成测试，按上面的方法用 `TM_TEST_DATABASE_URL` 启用。`internal/reviewer` 覆盖打开与解压（不安全的条目、剩余空间、zip 与文件夹的各种打开方式）、导出、本机接口与访问控制；`contract_test.go` 检查本机接口的 JSON 字段与平台的类型一致（编辑器两边共用，改了平台的类型这里会失败）；`platform_test.go` 的 `TestIntegrationPlatformRoundTrip` 在测试数据库上运行平台的审图服务，走完下载审图包 → 在本地审图程序中打开、审核、导出 → 上传到平台（同样需要 `TM_TEST_DATABASE_URL`）。
 - **训练节点**：`tests/test_review_inference.py` 覆盖识别子进程（图片读取与方向，包括 TIFF 的 Orientation 标签、框的提取、错误翻译、JSON lines 协议）、父进程对子进程的处理（超时、取消、崩溃）、结果的整理与攒批，以及 `infer` 子命令；`tests/test_review_tasks.py` 让任务线程对假平台（`tests/fake_platform.py`，含审图识别的接口）领取并执行审图任务（分页与攒批、从还没有识别的图片继续、续租、单张图片的错误、超时与显存不足、可重试的错误、停止与放弃、模型的校验与磁盘检查）。假的 `ultralytics`、`torch`、`numpy`、`cv2`、`PIL` 在 `tests/inference_fakes.py` 中：识别子进程只继承允许清单中的环境变量，所以它们以同名模块文件放在 `PYTHONPATH` 上，配置从同目录的 `fake_inference.json` 读取。`tests/task_harness.py` 是模型转换与审图识别共用的任务线程替身。只运行这部分：
 
   ```bash

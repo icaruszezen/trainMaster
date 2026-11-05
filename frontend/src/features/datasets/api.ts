@@ -10,6 +10,7 @@ import {
   queryOptions,
 } from "@tanstack/react-query"
 
+import type { ReviewImageStatus } from "@/features/reviews/api"
 import { apiGet, apiSend, type ListResponse } from "@/lib/api"
 
 export type DatasetOrigin = "upload" | "directory"
@@ -49,6 +50,8 @@ export type Dataset = {
   covers: DatasetImageRef[]
   /** 纳入了该数据集的项目，按名称排序。 */
   projects: DatasetProjectRef[]
+  /** 审图版本数（合并审图生成，见 {@link DatasetVersion}；不含正在生成的）。 */
+  version_count: number
   /** 最近一个上传中 / 排队中 / 执行中的导入任务。 */
   active_import: DatasetImport | null
   scanned_at: string | null
@@ -307,6 +310,9 @@ export const datasetKeys = {
   /** 数据集所属项目的类别（标注时的候选），见 projects/api 的 datasetClassesQuery。 */
   classes: (id: number) => [...datasetKeys.detail(id), "classes"] as const,
   imports: (id: number) => [...datasetKeys.detail(id), "imports"] as const,
+  versions: (id: number) => [...datasetKeys.detail(id), "versions"] as const,
+  exportPreview: (id: number, selection: VersionSelection) =>
+    [...datasetKeys.detail(id), "export-preview", selection] as const,
   lastYoloImport: (id: number) =>
     [...datasetKeys.imports(id), "last-yolo"] as const,
   import: (id: number, importId: number) =>
@@ -589,6 +595,135 @@ export type CreateExportInput = {
   project_id?: number
   /** `format` 为 `yolo` 且数据集不属于任何项目时：手动填写的类别顺序。 */
   classes?: string[]
+} & Partial<VersionSelection>
+
+// ---- 审图版本 ----
+
+/** 审图版本来自的模型（合并时的快照）。 */
+export type DatasetVersionModel = {
+  id: number
+  project_id: number
+  project_name: string
+  version: number
+  yolo_version: string
+  task: string
+  file_name: string
+}
+
+/**
+ * 数据集的审图版本：合并审图任务时生成的审图标注快照（按图片在数据集文件夹中的
+ * 路径），不修改数据集的标注文件（基础版本）。每个数据集依次为审图1.0、1.1…，
+ * 编号不重复使用。
+ */
+export type DatasetVersion = {
+  id: number
+  dataset_id: number
+  kind: "review"
+  /** 如“审图1.3”；正在生成时为空。 */
+  name: string
+  major: number | null
+  minor: number | null
+  note: string
+  /** `building`：合并还在进行，完成后编号并变为 `ready`，失败时删除。 */
+  status: "building" | "ready"
+  image_count: number
+  needs_sample_count: number
+  approved_count: number
+  object_count: number
+  /** 来自的审图任务（当前名称）；任务删除后为 null，见 `source`。 */
+  review: { id: number; name: string } | null
+  merge_id: number | null
+  /** 合并时的快照：审图任务删除后也保留。 */
+  source: {
+    review_id: number
+    review_name: string
+    merge_id: number
+    /** 合并的审核状态。 */
+    statuses: ReviewImageStatus[]
+    model: DatasetVersionModel
+  }
+  created_at: string
+  updated_at: string
+  finished_at: string | null
+}
+
+/**
+ * 下载时组合的版本：基础版本（数据集自己的标注）与审图版本。每张图片用所选
+ * 版本中最新的、包含这张图片的版本的标注，没有时用基础版本；不选基础版本时只
+ * 导出（最新的那个版本中）标为需加样的图片。
+ */
+export type VersionSelection = {
+  include_base: boolean
+  version_ids: number[]
+}
+
+/** 一次下载的内容（按索引统计，与数据集的计数一样）。 */
+export type ExportPreview = {
+  image_count: number
+  /** 其中用审图版本标注的图片数。 */
+  from_versions: number
+  annotated_count: number
+  empty_count: number
+  invalid_count: number
+  unannotated_count: number
+  object_count: number
+  /** 按目标数降序、名称升序。 */
+  labels: DatasetLabel[]
+  /** 所选版本中被选中的图片数（每个路径一张；不选基础版本时只算需加样的）。 */
+  version_image_count: number
+  /** 其中已不在数据集中的图片数（不导出）。 */
+  missing_count: number
+  /** 其中合并后文件被替换的图片数（用基础版本的标注）。 */
+  changed_count: number
+}
+
+export function datasetVersionsQuery(id: number) {
+  return queryOptions({
+    queryKey: datasetKeys.versions(id),
+    queryFn: ({ signal }) =>
+      apiGet<ListResponse<DatasetVersion>>(`${datasetPath(id)}/versions`, {
+        signal,
+      }),
+    // 有正在生成的版本时轮询，直到合并完成。
+    refetchInterval: (query) =>
+      query.state.data?.items.some((v) => v.status === "building")
+        ? 2_000
+        : false,
+  })
+}
+
+export function exportPreviewQuery(id: number, selection: VersionSelection) {
+  return queryOptions({
+    queryKey: datasetKeys.exportPreview(id, selection),
+    queryFn: ({ signal }) =>
+      apiGet<ExportPreview>(
+        withQuery(`${datasetPath(id)}/exports/preview`, {
+          include_base: String(selection.include_base),
+          version_ids: selection.version_ids.join(","),
+        }),
+        { signal }
+      ),
+    placeholderData: keepPreviousData,
+  })
+}
+
+export function updateDatasetVersion(
+  datasetId: number,
+  versionId: number,
+  input: { note: string }
+) {
+  return apiSend<DatasetVersion>(
+    "PATCH",
+    `${datasetPath(datasetId)}/versions/${versionId}`,
+    input
+  )
+}
+
+export function deleteDatasetVersion(datasetId: number, versionId: number) {
+  return apiSend<void>(
+    "DELETE",
+    `${datasetPath(datasetId)}/versions/${versionId}`
+  )
 }
 
 /**

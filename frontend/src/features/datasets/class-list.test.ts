@@ -133,6 +133,16 @@ describe("defaultClassOrder", () => {
     ).toEqual(["person", "car", "dog", "ant", "bird"])
   })
 
+  it("puts the labels only in review versions last", () => {
+    expect(
+      defaultClassOrder(
+        [{ name: "dog" }, { name: "car" }],
+        ["person"],
+        [{ name: "car" }, { name: "ant" }, { name: "zebra" }, { name: "bee" }]
+      )
+    ).toEqual(["person", "car", "dog", "ant", "bee", "zebra"])
+  })
+
   it("keeps the first position of a repeated name", () => {
     expect(defaultClassOrder([{ name: "b" }], ["b", "a", "b"])).toEqual([
       "b",

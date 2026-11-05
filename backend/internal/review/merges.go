@@ -3,6 +3,7 @@ package review
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -12,16 +13,22 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 )
 
-// Merges (合并到数据集): a background job copies the review annotations of
-// the chosen images into the VOC files of their datasets through
-// dataset.Service.SaveAnnotation, as an edit in the annotation workspace
-// would (the dataset index and counters follow; the version check guards
-// against a concurrent edit). The review keeps its own annotations. At
+// Merges (合并到数据集): a background job adds the review annotations of
+// the chosen images to a new review version (审图版本) of each of their
+// datasets (dataset.Service.CreateReviewVersion, AddVersionImage). The
+// datasets' own files, their base version, are not touched. The versions
+// are numbered (审图1.0, 1.1, ...) and become ready in the transaction that
+// records the end of the merge; a merge that fails or is interrupted
+// discards them, and marks its images merged only when it succeeds. At
 // most one merge runs per review (a unique index), and a review cannot be
-// deleted while one runs. A restart ends a running merge as failed (see
-// Start); what it merged so far stays merged.
+// deleted while one runs. A restart ends a running merge as failed and
+// discards its versions (see Start).
+//
+// Merges made before versions existed wrote into the datasets' VOC files;
+// their records keep on_existing (MergeSkip or MergeOverwrite).
 
-// What a merge does with images that have a dataset annotation already.
+// What a merge made before versions existed did with images that had a
+// dataset annotation already (Merge.OnExisting).
 const (
 	MergeSkip      = "skip"
 	MergeOverwrite = "overwrite"
@@ -38,7 +45,7 @@ const (
 type MergeInput struct {
 	DatasetIDs []int64  // datasets of the review; none: all
 	Statuses   []string // the image statuses to merge, at least one
-	OnExisting string   // MergeSkip or MergeOverwrite
+	Note       string   // the note of the versions made (required)
 }
 
 var (
@@ -46,9 +53,19 @@ var (
 	errMergeBusy     = &Error{Kind: ErrConflict, Message: "这个审图任务正在合并到数据集，请等这次合并完成后再开始新的合并"}
 )
 
+// Messages of merges that did not complete.
+const (
+	msgMergeFailed   = "合并失败：服务器内部错误（详见服务器日志），没有生成新的版本，可以重新合并"
+	msgMergeStopped  = "服务停止，合并被中断，没有生成新的版本，可以重新合并"
+	msgMergeRestart  = "服务重启，合并被中断，没有生成新的版本，可以重新合并"
+	msgDatasetGone   = "数据集已被删除"
+	msgStatusChanged = "审核状态在合并时被改为其它状态，没有合并"
+)
+
 // StartMerge starts merging the review annotations of the inferred images
-// selected by in into their datasets, in the background. It returns the
-// merge, running; GetMerge reports its progress.
+// selected by in into new review versions of their datasets, in the
+// background. It returns the merge, running; GetMerge reports its
+// progress.
 func (s *Service) StartMerge(ctx context.Context, reviewID int64, in MergeInput) (Merge, error) {
 	statuses, err := normalizeStatuses(in.Statuses, "statuses")
 	if err != nil {
@@ -57,10 +74,16 @@ func (s *Service) StartMerge(ctx context.Context, reviewID int64, in MergeInput)
 	if len(statuses) == 0 {
 		return Merge{}, &Error{Kind: ErrInvalid, Message: "请至少选择一种要合并的审核状态"}
 	}
-	if in.OnExisting != MergeSkip && in.OnExisting != MergeOverwrite {
-		return Merge{}, &Error{Kind: ErrInvalid, Message: "on_existing 必须是 skip（跳过已有标注的图片）或 overwrite（覆盖已有标注）"}
+	note, err := dataset.NormalizeVersionNote(in.Note)
+	if err != nil {
+		var de *dataset.Error
+		if errors.As(err, &de) {
+			return Merge{}, &Error{Kind: ErrInvalid, Message: de.Message}
+		}
+		return Merge{}, err
 	}
 	var m Merge
+	var source dataset.VersionSource
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		// The review cannot be deleted before the merge row commits; a
 		// delete then sees it running.
@@ -96,8 +119,16 @@ func (s *Service) StartMerge(ctx context.Context, reviewID int64, in MergeInput)
 		case total == 0:
 			return &Error{Kind: ErrConflict, Message: "没有符合条件的图片可以合并（所选数据集中没有这些审核状态的已识别图片）"}
 		}
-		m, err = scanMerge(tx.QueryRow(ctx, `INSERT INTO review_merges (review_id, dataset_ids, statuses, on_existing, status, total)
-			VALUES ($1, $2, $3, $4, 'running', $5) RETURNING `+mergeColumns, reviewID, datasetIDs, statuses, in.OnExisting, total))
+		var model ModelRef
+		if err := tx.QueryRow(ctx, "SELECT name, model_ref FROM reviews WHERE id = $1", reviewID).
+			Scan(&source.ReviewName, &model); err != nil {
+			return err
+		}
+		source.ReviewID, source.Statuses = reviewID, statuses
+		source.Model = dataset.VersionModel{ID: model.ID, ProjectID: model.ProjectID, ProjectName: model.ProjectName,
+			Version: model.Version, YOLOVersion: model.YOLOVersion, Task: model.Task, FileName: model.FileName}
+		m, err = scanMerge(tx.QueryRow(ctx, `INSERT INTO review_merges (review_id, dataset_ids, statuses, note, status, total)
+			VALUES ($1, $2, $3, $4, 'running', $5) RETURNING `+mergeColumns, reviewID, datasetIDs, statuses, note, total))
 		return err
 	})
 	var pe *pgconn.PgError
@@ -107,9 +138,10 @@ func (s *Service) StartMerge(ctx context.Context, reviewID int64, in MergeInput)
 	if err != nil {
 		return Merge{}, err
 	}
+	source.MergeID = m.ID
 	s.log.Info("review merge started", "review_id", reviewID, "merge_id", m.ID, "datasets", m.DatasetIDs,
-		"statuses", m.Statuses, "on_existing", m.OnExisting, "images", m.Total)
-	s.goJob(func(ctx context.Context) { s.runMerge(ctx, m) })
+		"statuses", m.Statuses, "images", m.Total)
+	s.goJob(func(ctx context.Context) { s.runMerge(ctx, m, source) })
 	return m, nil
 }
 
@@ -126,6 +158,9 @@ func (s *Service) ListMerges(ctx context.Context, reviewID int64) ([]Merge, int,
 	}
 	if merges == nil {
 		merges = []Merge{}
+	}
+	if err := s.attachVersions(ctx, merges); err != nil {
+		return nil, 0, err
 	}
 	total := len(merges)
 	if total == maxListedRecords {
@@ -146,13 +181,46 @@ func (s *Service) GetMerge(ctx context.Context, reviewID, mergeID int64) (Merge,
 		}
 		return Merge{}, errMergeNotFound
 	}
-	return m, err
+	if err != nil {
+		return Merge{}, err
+	}
+	merges := []Merge{m}
+	err = s.attachVersions(ctx, merges)
+	return merges[0], err
+}
+
+// attachVersions fills in the versions the merges made (or are making).
+func (s *Service) attachVersions(ctx context.Context, merges []Merge) error {
+	ids := make([]int64, len(merges))
+	for i, m := range merges {
+		ids[i] = m.ID
+	}
+	versions, err := s.datasets.MergeVersions(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("load the versions of merges: %w", err)
+	}
+	for i := range merges {
+		if v := versions[merges[i].ID]; v != nil {
+			merges[i].Versions = v
+		}
+	}
+	return nil
 }
 
 // mergeJob is the state of a running merge.
 type mergeJob struct {
 	Merge
-	saved time.Time // when the progress was last saved
+	source   dataset.VersionSource
+	versions map[int64]int64 // the version being built, by dataset
+	merged   []mergedImage   // the review images added to a version
+	saved    time.Time       // when the progress was last saved
+}
+
+// mergedImage is a review image a merge added to a version, with the
+// revision it took.
+type mergedImage struct {
+	id       int64
+	revision int
 }
 
 func (j *mergeJob) problem(path, kind, msg string) {
@@ -165,27 +233,28 @@ func (j *mergeJob) problem(path, kind, msg string) {
 // review order, and records the outcome. Only a problem of the job itself
 // (the database, the service stopping) makes it fail; images that cannot
 // be merged are counted and listed.
-func (s *Service) runMerge(ctx context.Context, m Merge) {
+func (s *Service) runMerge(ctx context.Context, m Merge, source dataset.VersionSource) {
 	start := time.Now()
-	j := &mergeJob{Merge: m, saved: start}
+	j := &mergeJob{Merge: m, source: source, versions: map[int64]int64{}, saved: start}
 	j.Problems = []Problem{}
 	err := s.mergeImages(ctx, j)
 	status, msg := MergeSucceeded, ""
 	if err != nil {
-		status, msg = MergeFailed, "合并失败：服务器内部错误（详见服务器日志），已合并的图片保留，可以再次合并"
+		status, msg = MergeFailed, msgMergeFailed
 		if ctx.Err() != nil {
-			msg = "服务停止，合并被中断（已合并的图片保留，可以再次合并）"
+			msg = msgMergeStopped
 		} else {
 			s.log.Error("review merge failed", "review_id", m.ReviewID, "merge_id", m.ID, "err", err)
 		}
 	}
-	if err := s.recordMergeEnd(ctx, j, status, msg); err != nil {
+	status, versions, err := s.recordMergeEnd(ctx, j, status, msg)
+	if err != nil {
 		return // the service is stopping; Start fails the merge on the next start
 	}
 	sum := j.Summary
 	s.log.Info("review merge finished", "review_id", m.ReviewID, "merge_id", m.ID, "status", status, "images", j.Done,
-		"merged", sum.Merged, "skipped_existing", sum.SkippedExisting, "skipped_empty", sum.SkippedEmpty,
-		"conflicts", sum.Conflicts, "failed", sum.Failed, "duration_ms", time.Since(start).Milliseconds())
+		"merged", sum.Merged, "skipped_empty", sum.SkippedEmpty, "skipped_changed", sum.SkippedChanged,
+		"failed", sum.Failed, "versions", versions, "duration_ms", time.Since(start).Milliseconds())
 }
 
 // mergeEndRetry are the first and the longest wait between attempts to
@@ -198,36 +267,95 @@ var mergeEndRetry = [2]time.Duration{time.Second, 30 * time.Second}
 var mergeEndFault func(attempt int) error
 
 // recordMergeEnd records the outcome of a merge, also when the service is
-// stopping. The merge must not stay running, which would refuse new merges
-// and deleting the review until a restart: a failure (the database
-// restarting, ...) is retried, waiting longer each time, until it works or
-// the service stops (Start then fails the merge on the next start).
-func (s *Service) recordMergeEnd(ctx context.Context, j *mergeJob, status, msg string) error {
+// stopping, in one transaction with its versions: a merge that succeeded
+// numbers them and marks its images merged, one that failed discards them.
+// The merge must not stay running, which would refuse new merges and
+// deleting the review until a restart. A transient failure (the database
+// restarting, a deadlock, ...) is retried, waiting longer each time, until
+// it works or the service stops (Start then fails the merge on the next
+// start). Any other failure to complete the versions fails the merge
+// instead (retried the same way). It returns the final status and the
+// versions made.
+func (s *Service) recordMergeEnd(ctx context.Context, j *mergeJob, status, msg string) (string, []dataset.VersionRef, error) {
+	ids := make([]int64, len(j.merged))
+	revisions := make([]int32, len(j.merged))
+	for i, img := range j.merged {
+		ids[i], revisions[i] = img.id, int32(img.revision)
+	}
 	wait := mergeEndRetry[0]
 	for attempt := 1; ; attempt++ {
 		var err error
 		if mergeEndFault != nil {
 			err = mergeEndFault(attempt)
 		}
+		var versions []dataset.VersionRef
 		if err == nil {
-			fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-			_, err = s.db.Exec(fctx, `UPDATE review_merges SET status = $2, error = $3, done = $4, summary = $5, problems = $6,
-					finished_at = now()
-				WHERE id = $1 AND status = 'running'`, j.ID, status, msg, j.Done, j.Summary, j.Problems)
+			fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			err = pgx.BeginFunc(fctx, s.db, func(tx pgx.Tx) error {
+				// The merge row first (nothing else locks it), then the
+				// datasets and their versions (FinishReviewVersions), then
+				// the review images, in image order (as a rescan deleting
+				// images locks them, see dataset.deleteImages).
+				tag, err := tx.Exec(fctx, `UPDATE review_merges SET status = $2, error = $3, done = $4, summary = $5,
+						problems = $6, finished_at = now()
+					WHERE id = $1 AND status = 'running'`, j.ID, status, msg, j.Done, j.Summary, j.Problems)
+				if err != nil {
+					return err
+				}
+				if status != MergeSucceeded || tag.RowsAffected() == 0 { // ended elsewhere: keep nothing
+					return s.datasets.DiscardReviewVersions(fctx, tx, j.ID)
+				}
+				if versions, err = s.datasets.FinishReviewVersions(fctx, tx, j.ID); err != nil {
+					return err
+				}
+				if _, err = tx.Exec(fctx, `SELECT 1 FROM review_images WHERE id = ANY($1)
+					ORDER BY image_id, id FOR NO KEY UPDATE`, ids); err != nil {
+					return err
+				}
+				_, err = tx.Exec(fctx, `UPDATE review_images ri SET merged_at = now(), merged_revision = m.revision
+					FROM unnest($1::bigint[], $2::int[]) AS m (id, revision) WHERE ri.id = m.id`, ids, revisions)
+				return err
+			})
 			cancel()
 		}
 		if err == nil {
-			return nil
+			return status, versions, nil
 		}
 		s.log.Error("record the end of a review merge", "review_id", j.ReviewID, "merge_id", j.ID, "attempt", attempt,
-			"err", err)
+			"status", status, "err", err)
+		if status == MergeSucceeded && !transientError(err) {
+			status, msg, versions = MergeFailed, msgMergeFailed, nil
+			continue // fail it now; a retry would fail the same way
+		}
 		select {
 		case <-ctx.Done():
-			return err
+			return status, nil, err
 		case <-time.After(wait):
 		}
 		wait = min(2*wait, mergeEndRetry[1])
 	}
+}
+
+// transientError reports whether a database operation that failed with
+// err may work when tried again: errors that are not from the server
+// (connection problems, timeouts), and server errors about the connection,
+// the server's resources or state, serialization failures and deadlocks.
+// Other server errors (a constraint violated, ...) would happen again.
+func transientError(err error) bool {
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) {
+		return true
+	}
+	if len(pe.Code) < 2 {
+		return false
+	}
+	switch pe.Code[:2] {
+	case "08", "53", "57", "58": // connection, resources, operator intervention, system
+		return true
+	case "40": // transaction rollback: serialization failure, deadlock
+		return true
+	}
+	return false
 }
 
 // mergeImages works through the images of a merge.
@@ -273,14 +401,17 @@ func (s *Service) mergeImages(ctx context.Context, j *mergeJob) error {
 
 // mergeSource is a review image as a merge reads it.
 type mergeSource struct {
-	datasetID, imageID int64
-	path               string // in the package, for problems
-	revision           int
-	annotation         annotationFile
+	datasetID     int64
+	path          string // in the package, for problems
+	relPath       string // in the dataset
+	status        string
+	revision      int
+	width, height *int
+	annotation    annotationFile
 }
 
-// mergeImage merges one review image into its dataset. Only errors that
-// stop the job are returned.
+// mergeImage adds one review image to the version of its dataset. Only
+// errors that stop the job are returned.
 func (s *Service) mergeImage(ctx context.Context, j *mergeJob, id int64, path string) error {
 	src, err := s.readMergeSource(ctx, j.ReviewID, id)
 	switch {
@@ -290,6 +421,10 @@ func (s *Service) mergeImage(ctx context.Context, j *mergeJob, id int64, path st
 		return nil
 	case err != nil:
 		return err
+	case !slices.Contains(j.Statuses, src.status): // changed since the merge started
+		j.Summary.SkippedChanged++
+		j.problem(src.path, ProblemSkipped, msgStatusChanged)
+		return nil
 	case src.annotation.err != "":
 		j.Summary.Failed++
 		j.problem(src.path, ProblemFailed, "审图标注无法读取："+src.annotation.err)
@@ -305,52 +440,31 @@ func (s *Service) mergeImage(ctx context.Context, j *mergeJob, id int64, path st
 			j.problem(src.path, ProblemFailed, de.Message)
 			return nil
 		}
-		if ctx.Err() != nil {
-			return err
+		return err
+	}
+	versionID, ok := j.versions[src.datasetID]
+	if !ok {
+		versionID, err = s.datasets.CreateReviewVersion(ctx, dataset.ReviewVersionDraft{DatasetID: src.datasetID,
+			ReviewID: j.ReviewID, MergeID: j.ID, Note: j.Note, Source: j.source})
+		if err != nil {
+			return failed(err)
 		}
-		// A problem with one image's files (a folder without write
-		// permission, ...): logged, and the merge goes on.
-		s.log.Error("merge review image into its dataset", "review_id", j.ReviewID, "merge_id", j.ID,
-			"review_image_id", id, "err", err)
-		j.Summary.Failed++
-		j.problem(src.path, ProblemFailed, "写入数据集标注时出错（详见服务器日志）")
-		return nil
-	}
-	current, err := s.datasets.GetImage(ctx, src.datasetID, src.imageID)
-	if err != nil {
-		return failed(err)
-	}
-	switch {
-	case current.AnnotationBlocked != "":
-		j.Summary.Failed++
-		j.problem(src.path, ProblemFailed, current.AnnotationBlocked)
-		return nil
-	case current.AnnotationState != "none" && j.OnExisting == MergeSkip:
-		j.Summary.SkippedExisting++
-		return nil
-	}
-	objects := slices.Clone(src.annotation.file.Objects)
-	if objects == nil {
-		objects = []dataset.AnnotationObject{} // an empty annotation: a negative sample
+		j.versions[src.datasetID] = versionID
 	}
 	if s.beforeMergeSave != nil {
 		s.beforeMergeSave(j.ID, id)
 	}
-	_, err = s.datasets.SaveAnnotation(ctx, src.datasetID, src.imageID, dataset.SaveAnnotationInput{
-		Objects: objects, BaseVersion: current.AnnotationVersion, Regenerate: j.OnExisting == MergeOverwrite,
-	})
-	if errors.Is(err, dataset.ErrAnnotationChanged) {
-		j.Summary.Conflicts++
-		j.problem(src.path, ProblemConflict, "数据集中这张图片的标注在合并时被其他人修改了，没有合并")
-		return nil
+	// The size the review file records (the node's decoded size), else the
+	// dataset's at creation.
+	width, height := src.width, src.height
+	if f := src.annotation.file; f.Width > 0 && f.Height > 0 {
+		width, height = &f.Width, &f.Height
 	}
-	if err != nil {
+	if err := s.datasets.AddVersionImage(ctx, versionID, dataset.VersionImage{Path: src.relPath,
+		ReviewStatus: src.status, Width: width, Height: height, Objects: src.annotation.file.Objects}); err != nil {
 		return failed(err)
 	}
-	if _, err := s.db.Exec(ctx, "UPDATE review_images SET merged_at = now(), merged_revision = $2 WHERE id = $1",
-		id, src.revision); err != nil {
-		return err
-	}
+	j.merged = append(j.merged, mergedImage{id: id, revision: src.revision})
 	j.Summary.Merged++
 	return nil
 }
@@ -365,9 +479,9 @@ func (s *Service) readMergeSource(ctx context.Context, reviewID, id int64) (merg
 	defer unlock()
 	var src mergeSource
 	var annotationPath string
-	err = s.db.QueryRow(ctx, `SELECT dataset_id, image_id, package_path, annotation_path, revision
+	err = s.db.QueryRow(ctx, `SELECT dataset_id, package_path, rel_path, annotation_path, status, revision, width, height
 		FROM review_images WHERE id = $1 AND review_id = $2`, id, reviewID).
-		Scan(&src.datasetID, &src.imageID, &src.path, &annotationPath, &src.revision)
+		Scan(&src.datasetID, &src.path, &src.relPath, &annotationPath, &src.status, &src.revision, &src.width, &src.height)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return src, errImageNotFound
 	}

@@ -88,9 +88,8 @@ type Service struct {
 	jobs  sync.WaitGroup // background jobs (merges); Stop waits for them
 
 	removeAll func(path string) error // os.RemoveAll; tests make it fail
-	// beforeMergeSave, if set, runs before a merge writes an image's
-	// annotation into its dataset; tests hold a merge running or change
-	// the dataset file meanwhile with it.
+	// beforeMergeSave, if set, runs before a merge adds an image to the
+	// version of its dataset; tests hold a merge running with it.
 	beforeMergeSave func(mergeID, reviewImageID int64)
 }
 
@@ -131,21 +130,33 @@ const (
 	staleUploadAge = time.Hour
 )
 
-const msgMergeInterrupted = "服务重启，合并被中断（已合并的图片保留，可以再次合并）"
+const msgMergeInterrupted = msgMergeRestart
 
-// Start marks the merges a previous run left running as failed, then runs
-// the background work until ctx ends or Stop is called: every 15 seconds,
+// Start marks the merges a previous run left running as failed and
+// discards the dataset versions they were building, then runs the
+// background work until ctx ends or Stop is called: every 15 seconds,
 // reviews whose node stopped reporting are queued again (or fail); at
 // start and every hour, leftovers of deletes and stale temporary files are
 // removed.
 func (s *Service) Start(ctx context.Context) error {
-	tag, err := s.db.Exec(ctx, `UPDATE review_merges SET status = 'failed', error = $1, finished_at = now()
-		WHERE status = 'running'`, msgMergeInterrupted)
+	var merges, versions int64
+	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `UPDATE review_merges SET status = 'failed', error = $1, finished_at = now()
+			WHERE status = 'running'`, msgMergeInterrupted)
+		if err != nil {
+			return err
+		}
+		merges = tag.RowsAffected()
+		// Only merges build versions, and none runs before Start returns.
+		versions, err = s.datasets.DiscardBuildingVersions(ctx, tx)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("fail interrupted review merges: %w", err)
 	}
-	if n := tag.RowsAffected(); n > 0 {
-		s.log.Warn("review merges interrupted by a restart marked failed", "count", n)
+	if merges > 0 || versions > 0 {
+		s.log.Warn("review merges interrupted by a restart marked failed", "count", merges,
+			"versions_discarded", versions)
 	}
 	s.base, s.stop = context.WithCancel(ctx)
 	s.loops.Add(1)

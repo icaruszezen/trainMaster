@@ -103,6 +103,10 @@ type Dataset struct {
 	Name   string `json:"name"` // the current name (the name at creation once deleted)
 	Folder string `json:"folder"`
 	Counts Counts `json:"counts"`
+	// NextVersion is the name the next review version of the dataset gets
+	// if no other merge completes first, e.g. 审图1.3 ("" once the dataset
+	// is deleted).
+	NextVersion string `json:"next_version"`
 }
 
 // Image is an image of a review.
@@ -174,7 +178,7 @@ type ClassList struct {
 // Problem is an image an upload or a merge could not handle.
 type Problem struct {
 	Path    string `json:"path"`
-	Kind    string `json:"kind"` // uploads: conflict, invalid, unknown; merges: conflict, failed
+	Kind    string `json:"kind"` // uploads: conflict, invalid, unknown; merges: skipped, failed (conflict before versions)
 	Message string `json:"message"`
 }
 
@@ -211,31 +215,40 @@ const (
 	MergeFailed    = "failed"
 )
 
-// MergeSummary counts what a merge did.
+// MergeSummary counts what a merge did. SkippedExisting and Conflicts
+// only occur in merges made before versions existed, which wrote into the
+// datasets' files.
 type MergeSummary struct {
 	Merged          int `json:"merged"`
 	SkippedExisting int `json:"skipped_existing"`
 	SkippedEmpty    int `json:"skipped_empty"`
+	SkippedChanged  int `json:"skipped_changed"` // the review status changed to one not merged meanwhile
 	Conflicts       int `json:"conflicts"`
 	Failed          int `json:"failed"`
 }
 
-// Merge is a merge of review annotations into the datasets
-// (review_merges).
+// Merge is a merge of review annotations into review versions of the
+// datasets (review_merges).
 type Merge struct {
-	ID         int64        `json:"id"`
-	ReviewID   int64        `json:"review_id"`
-	DatasetIDs []int64      `json:"dataset_ids"`
-	Statuses   []string     `json:"statuses"`
-	OnExisting string       `json:"on_existing"` // skip or overwrite
+	ID         int64    `json:"id"`
+	ReviewID   int64    `json:"review_id"`
+	DatasetIDs []int64  `json:"dataset_ids"`
+	Statuses   []string `json:"statuses"`
+	Note       string   `json:"note"` // of the versions made ("" before versions existed)
+	// OnExisting is set (skip or overwrite) on merges made before versions
+	// existed, which wrote into the datasets' VOC files; nil otherwise.
+	OnExisting *string      `json:"on_existing"`
 	Status     string       `json:"status"`
 	Total      int          `json:"total"`
 	Done       int          `json:"done"`
 	Summary    MergeSummary `json:"summary"`
 	Problems   []Problem    `json:"problems"`
 	Error      string       `json:"error"`
-	CreatedAt  time.Time    `json:"created_at"`
-	FinishedAt *time.Time   `json:"finished_at"`
+	// Versions are the review versions the merge made (ready) or is making
+	// (building), by dataset ID; versions deleted since are not listed.
+	Versions   []dataset.VersionRef `json:"versions"`
+	CreatedAt  time.Time            `json:"created_at"`
+	FinishedAt *time.Time           `json:"finished_at"`
 }
 
 // DeleteResult describes a delete that removed the review but could not

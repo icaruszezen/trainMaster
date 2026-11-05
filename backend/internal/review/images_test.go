@@ -423,7 +423,8 @@ func TestIntegrationListUpdateDelete(t *testing.T) {
 	got := e.review(t, r1.ID)
 	if got.LastUpload == nil || got.LastUpload.FileName != "new.zip" || !got.LastUpload.Overwrite ||
 		got.LastUpload.Summary != (UploadSummary{Images: 2, Applied: 1}) || len(got.LastUpload.Problems) != 1 ||
-		got.ActiveMerge == nil || got.ActiveMerge.OnExisting != "overwrite" ||
+		got.ActiveMerge == nil || got.ActiveMerge.OnExisting == nil || *got.ActiveMerge.OnExisting != "overwrite" ||
+		got.ActiveMerge.Versions == nil || len(got.ActiveMerge.Versions) != 0 ||
 		!slices.Equal(got.ActiveMerge.Statuses, []string{"approved", "needs_sample"}) ||
 		got.LastMerge == nil || got.LastMerge.Summary.Merged != 1 || got.LastMerge.FinishedAt == nil {
 		t.Errorf("uploads and merges = %+v / %+v / %+v", got.LastUpload, got.ActiveMerge, got.LastMerge)

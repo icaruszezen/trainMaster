@@ -448,15 +448,30 @@ export function packageInput(
 
 // ---- 上传与合并 ----
 
+/** 版本备注的最大长度（字符，与后端一致）。 */
+export const VERSION_NOTE_MAX_LENGTH = 500
+
+/** 校验版本备注（去掉首尾空白后），合法时返回 null。 */
+export function validateVersionNote(note: string): string | null {
+  const trimmed = note.trim()
+  if (trimmed === "") {
+    return "请填写版本备注"
+  }
+  if ([...trimmed].length > VERSION_NOTE_MAX_LENGTH) {
+    return `版本备注不能超过 ${VERSION_NOTE_MAX_LENGTH} 个字符`
+  }
+  return null
+}
+
 /** 合并的请求：全部数据集（`datasetId` 为 null）时省略 `dataset_ids`。 */
 export function mergeInput(
   statuses: Iterable<ReviewImageStatus>,
   datasetId: number | null,
-  onExisting: CreateReviewMergeInput["on_existing"]
+  note: string
 ): CreateReviewMergeInput {
   const input: CreateReviewMergeInput = {
     statuses: orderedStatuses(statuses),
-    on_existing: onExisting,
+    note: note.trim(),
   }
   if (datasetId !== null) {
     input.dataset_ids = [datasetId]
@@ -505,7 +520,7 @@ export function uploadSummaryText(summary: ReviewUploadSummary) {
   return parts.filter((part) => part !== null).join("，")
 }
 
-/** 合并结果的摘要，如“合并 16 张，跳过已有标注 2 张，失败 1 张”。 */
+/** 合并结果的摘要，如“合并 16 张，审核状态已改变 2 张，失败 1 张”。 */
 export function mergeSummaryText(summary: ReviewMergeSummary) {
   const parts = [
     `合并 ${formatNumber(summary.merged)} 张`,
@@ -515,10 +530,70 @@ export function mergeSummaryText(summary: ReviewMergeSummary) {
     summary.skipped_empty > 0
       ? `没有审图标注 ${formatNumber(summary.skipped_empty)} 张`
       : null,
+    summary.skipped_changed > 0
+      ? `审核状态已改变 ${formatNumber(summary.skipped_changed)} 张`
+      : null,
     summary.conflicts > 0 ? `冲突 ${formatNumber(summary.conflicts)} 张` : null,
     summary.failed > 0 ? `失败 ${formatNumber(summary.failed)} 张` : null,
   ]
   return parts.filter((part) => part !== null).join("，")
+}
+
+/** 旧的合并（直接写进数据集的标注文件）对已有标注的处理。 */
+export const onExistingLabels: Record<"skip" | "overwrite", string> = {
+  skip: "跳过已有标注的图片",
+  overwrite: "覆盖已有标注",
+}
+
+/**
+ * 合并生成的版本，如“审图1.0”或“line-a 审图1.0、line-b 审图1.2”（多个数据集时带
+ * 数据集名称）；`datasetId` 只列这个数据集的。正在生成、已删除的不列出，没有时
+ * 为空字符串。
+ */
+export function mergeVersionsText(
+  merge: Pick<ReviewMerge, "versions" | "dataset_ids">,
+  datasets: readonly { id: number; name: string }[],
+  datasetId: number | null = null
+) {
+  const versions = merge.versions.filter(
+    (version) =>
+      version.status === "ready" &&
+      (datasetId === null || version.dataset_id === datasetId)
+  )
+  const named = datasetId === null && merge.dataset_ids.length > 1
+  return versions
+    .map((version) => {
+      if (!named) {
+        return version.name
+      }
+      const name =
+        datasets.find((dataset) => dataset.id === version.dataset_id)?.name ??
+        `#${version.dataset_id}`
+      return `${name} ${version.name}`
+    })
+    .join("、")
+}
+
+/**
+ * 合并的结果说明：生成了哪些版本（旧的合并为它对已有标注的处理）。用于合并
+ * 记录的摘要。
+ */
+export function mergeOutcomeText(
+  merge: Pick<
+    ReviewMerge,
+    "versions" | "dataset_ids" | "on_existing" | "status"
+  >,
+  datasets: readonly { id: number; name: string }[],
+  datasetId: number | null = null
+) {
+  if (merge.on_existing !== null) {
+    return `直接写入数据集，${onExistingLabels[merge.on_existing]}`
+  }
+  if (merge.status !== "succeeded") {
+    return "没有生成版本"
+  }
+  const versions = mergeVersionsText(merge, datasets, datasetId)
+  return versions ? `生成 ${versions}` : "没有生成版本"
 }
 
 /** 合并了哪些数据集：全部时为“全部数据集”，否则为名称（已不在任务中的按编号）。 */

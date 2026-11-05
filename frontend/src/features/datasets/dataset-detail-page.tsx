@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 import { useQuery } from "@tanstack/react-query"
 import {
   ArrowLeft,
@@ -45,6 +45,7 @@ import {
   type Dataset,
   type ImageFilters,
   type ImageStatusFilter,
+  type VersionSelection,
 } from "@/features/datasets/api"
 import {
   DatasetActionsMenu,
@@ -59,6 +60,7 @@ import {
 } from "@/features/datasets/dataset-images"
 import { DatasetImports } from "@/features/datasets/dataset-imports"
 import { DatasetLabels } from "@/features/datasets/dataset-labels"
+import { DatasetReviewVersions } from "@/features/datasets/dataset-review-versions"
 import {
   DatasetReviews,
   DatasetReviewsCount,
@@ -70,6 +72,7 @@ import {
 import { ImportDialog } from "@/features/datasets/import-dialog"
 import { ImportProgressCard } from "@/features/datasets/import-progress-card"
 import { LoadError } from "@/features/datasets/load-error"
+import { BASE_ONLY } from "@/features/datasets/versions"
 import { workspacePath } from "@/features/annotation/workspace-params"
 import { DatasetProjectBadges } from "@/features/projects/dataset-project-badges"
 import { DatasetProjectsDialog } from "@/features/projects/dataset-projects-dialog"
@@ -131,9 +134,15 @@ function DatasetNotFound() {
   )
 }
 
-type DetailTab = "images" | "labels" | "imports" | "reviews"
+type DetailTab = "images" | "labels" | "imports" | "reviews" | "versions"
 
-const TABS: readonly DetailTab[] = ["images", "labels", "imports", "reviews"]
+const TABS: readonly DetailTab[] = [
+  "images",
+  "labels",
+  "imports",
+  "reviews",
+  "versions",
+]
 
 const STATUS_VALUES: ImageStatusFilter[] = [
   "all",
@@ -202,7 +211,8 @@ function DatasetDetail({ id }: { id: number }) {
   const [editing, setEditing] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [assigning, setAssigning] = useState(false)
-  const [exporting, setExporting] = useState(false)
+  // 打开下载对话框时选中的版本；null 时对话框关闭。
+  const [exporting, setExporting] = useState<VersionSelection | null>(null)
 
   usePageTitle(query.data?.name)
 
@@ -250,7 +260,7 @@ function DatasetDetail({ id }: { id: number }) {
               </Button>
               <Button
                 variant="outline"
-                onClick={() => setExporting(true)}
+                onClick={() => setExporting(BASE_ONLY)}
                 disabled={!canExportDataset(dataset)}
                 aria-label="下载"
               >
@@ -313,7 +323,7 @@ function DatasetDetail({ id }: { id: number }) {
         onValueChange={(value) => search.setTab(value as DetailTab)}
         className="gap-4"
       >
-        <TabsList className="w-full sm:w-fit">
+        <ScrollingTabsList value={search.tab}>
           <TabsTrigger value="images" className="px-3">
             图片
             <span className="text-xs text-muted-foreground tabular-nums">
@@ -333,7 +343,15 @@ function DatasetDetail({ id }: { id: number }) {
             审核记录
             <DatasetReviewsCount datasetId={dataset.id} />
           </TabsTrigger>
-        </TabsList>
+          <TabsTrigger value="versions" className="px-3">
+            审图版本
+            {dataset.version_count > 0 && (
+              <span className="text-xs text-muted-foreground tabular-nums">
+                {formatNumber(dataset.version_count)}
+              </span>
+            )}
+          </TabsTrigger>
+        </ScrollingTabsList>
         <TabsContent value="images">
           <DatasetImages
             dataset={dataset}
@@ -349,7 +367,17 @@ function DatasetDetail({ id }: { id: number }) {
           <DatasetImports dataset={dataset} />
         </TabsContent>
         <TabsContent value="reviews">
-          <DatasetReviews dataset={dataset} />
+          <DatasetReviews
+            dataset={dataset}
+            onShowVersions={() => search.setTab("versions")}
+          />
+        </TabsContent>
+        <TabsContent value="versions">
+          <DatasetReviewVersions
+            dataset={dataset}
+            onExport={setExporting}
+            onShowReviews={() => search.setTab("reviews")}
+          />
         </TabsContent>
       </Tabs>
 
@@ -374,9 +402,48 @@ function DatasetDetail({ id }: { id: number }) {
       />
       <ExportDialog
         dataset={exporting ? dataset : null}
-        onOpenChange={setExporting}
+        selection={exporting ?? undefined}
+        onOpenChange={(open) => !open && setExporting(null)}
       />
     </>
+  )
+}
+
+/**
+ * 标签列表：手机宽度下放不下一行时横向滚动（不撑宽页面），并把选中的标签滚到
+ * 可见处（如打开 ?tab=versions 的链接时）。
+ */
+function ScrollingTabsList({
+  value,
+  children,
+}: {
+  value: string
+  children: ReactNode
+}) {
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const scroller = ref.current
+    const tab = scroller?.querySelector<HTMLElement>(
+      '[role="tab"][data-state="active"]'
+    )
+    if (!scroller || !tab) {
+      return
+    }
+    // 只横向滚动标签列表；scrollIntoView 可能连页面一起滚动。
+    const box = scroller.getBoundingClientRect()
+    const rect = tab.getBoundingClientRect()
+    if (rect.left < box.left) {
+      scroller.scrollLeft -= box.left - rect.left
+    } else if (rect.right > box.right) {
+      scroller.scrollLeft += rect.right - box.right
+    }
+  }, [value])
+  return (
+    <div ref={ref} className="scrollbar-auto-hide overflow-x-auto">
+      <TabsList className="w-max min-w-full sm:w-fit sm:min-w-0">
+        {children}
+      </TabsList>
+    </div>
   )
 }
 

@@ -340,28 +340,41 @@ func TestYOLODataYAML(t *testing.T) {
 		return out
 	}
 	classes := []string{"scratch", `say "hi"`}
-	y := string(yoloDataYAML("ds", classes, imgs("images/train/a.jpg", "images/val/b.jpg", "images/test/c.jpg"), ""))
+	y := string(yoloDataYAML("ds", classes, imgs("images/train/a.jpg", "images/val/b.jpg", "images/test/c.jpg"), "", false))
 	for _, part := range []string{"train: images/train\n", "val: images/val\n", "test: images/test\n", "nc: 2\n",
 		"  0: \"scratch\"\n", `  1: "say \"hi\""` + "\n"} {
 		if !strings.Contains(y, part) {
 			t.Errorf("missing %q in\n%s", part, y)
 		}
 	}
-	y = string(yoloDataYAML("ds", classes, imgs("train/a.jpg", "valid/b.jpg"), "images/"))
+	y = string(yoloDataYAML("ds", classes, imgs("train/a.jpg", "valid/b.jpg"), "images/", false))
 	if !strings.Contains(y, "val: images/valid\n") || strings.Contains(y, "test:") {
 		t.Errorf("valid split:\n%s", y)
 	}
 	for _, paths := range [][]string{{"train/a.jpg", "b.jpg", "val/c.jpg"}, {"train/a.jpg"}, {"train/a.jpg", "val/b.jpg", "extra/c.jpg"}} {
-		y = string(yoloDataYAML("ds", classes, imgs(paths...), "images/"))
-		if !strings.Contains(y, "train: images\nval: images\n") {
+		y = string(yoloDataYAML("ds", classes, imgs(paths...), "images/", false))
+		if !strings.Contains(y, "train: images\nval: images\n") || strings.Contains(y, "部分图片") {
 			t.Errorf("%v: want no split\n%s", paths, y)
 		}
+	}
+	// A download of some of the images (versions without the base) says so.
+	y = string(yoloDataYAML("ds", classes, imgs("train/a.jpg"), "images/", true))
+	if !strings.Contains(y, "# 本次导出只含数据集的部分图片，图片没有按 train / val 子文件夹划分") ||
+		!strings.Contains(y, "train: images\nval: images\n") {
+		t.Errorf("subset:\n%s", y)
+	}
+	y = string(yoloDataYAML("ds", classes, imgs("train/a.jpg", "val/b.jpg"), "images/", true))
+	if !strings.Contains(y, "# 本次导出只含数据集的部分图片。\ntrain: images/train\nval: images/val\n") {
+		t.Errorf("split subset:\n%s", y)
+	}
+	if y = string(yoloDataYAML("ds", classes, imgs("train/a.jpg", "val/b.jpg"), "images/", false)); strings.Contains(y, "部分图片") {
+		t.Errorf("split, all images:\n%s", y)
 	}
 }
 
 func TestYOLODataYAMLFolderNameNewline(t *testing.T) {
 	for _, br := range []string{"\n", "\r", "\u0085", "\u2028", "\u2029"} {
-		y := string(yoloDataYAML("ds"+br+"path: /elsewhere", []string{"a"}, nil, ""))
+		y := string(yoloDataYAML("ds"+br+"path: /elsewhere", []string{"a"}, nil, "", false))
 		if strings.Contains(y, br+"path:") {
 			t.Errorf("folder name with %q starts a YAML key:\n%s", br, y)
 		}

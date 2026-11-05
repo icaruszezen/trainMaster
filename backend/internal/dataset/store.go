@@ -571,9 +571,23 @@ func upsertImages(ctx context.Context, db interface {
 	return tx.Commit(ctx)
 }
 
-func deleteImages(ctx context.Context, q querier, datasetID int64, ids []int64) error {
+// deleteImages deletes images by ID, upsertBatchSize per transaction. The
+// review images of each batch (deleted with them) are locked first, in
+// image order, as the end of a review merge locks the ones it marks
+// merged: the two do not deadlock.
+func deleteImages(ctx context.Context, db interface {
+	Begin(context.Context) (pgx.Tx, error)
+}, datasetID int64, ids []int64) error {
 	for chunk := range slices.Chunk(ids, upsertBatchSize) {
-		if _, err := q.Exec(ctx, "DELETE FROM dataset_images WHERE dataset_id = $1 AND id = ANY($2)", datasetID, chunk); err != nil {
+		err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `SELECT 1 FROM review_images WHERE image_id = ANY($1)
+				ORDER BY image_id, id FOR UPDATE`, chunk); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, "DELETE FROM dataset_images WHERE dataset_id = $1 AND id = ANY($2)", datasetID, chunk)
+			return err
+		})
+		if err != nil {
 			return fmt.Errorf("delete images: %w", err)
 		}
 	}

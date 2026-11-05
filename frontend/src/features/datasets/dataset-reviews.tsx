@@ -1,6 +1,6 @@
 /**
  * 数据集详情的“审核记录”标签页：包括这个数据集的审图任务，显示这个数据集的
- * 审核进度与合并情况。每个审图任务的标注单独保存，可以选择合并到数据集。
+ * 审核进度与合并情况。每个审图任务的标注单独保存，合并时生成数据集的审图版本。
  */
 import { useMemo, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
@@ -43,7 +43,9 @@ import {
 import { reviewDetailPath } from "@/features/reviews/params"
 import {
   inferredImageCount,
+  mergeOutcomeText,
   mergeSummaryText,
+  mergeVersionsText,
   reviewEntryPath,
   reviewModelText,
   reviewModelTitle,
@@ -78,7 +80,14 @@ export function DatasetReviewsCount({ datasetId }: { datasetId: number }) {
   )
 }
 
-export function DatasetReviews({ dataset }: { dataset: Dataset }) {
+export function DatasetReviews({
+  dataset,
+  onShowVersions,
+}: {
+  dataset: Dataset
+  /** 切换到“审图版本”标签页。 */
+  onShowVersions?: () => void
+}) {
   const query = useQuery(datasetReviewsQuery(dataset.id))
   const wide = useMediaQuery("(min-width: 48rem)")
   const [createOpen, setCreateOpen] = useState(false)
@@ -93,8 +102,13 @@ export function DatasetReviews({ dataset }: { dataset: Dataset }) {
       return
     }
     if (merge.status === "succeeded") {
-      toast.success("已合并到数据集", {
+      const versions = mergeVersionsText(merge, [], dataset.id)
+      toast.success(versions ? `已生成 ${versions}` : "合并完成", {
         description: mergeSummaryText(merge.summary),
+        action:
+          versions && onShowVersions
+            ? { label: "查看版本", onClick: onShowVersions }
+            : undefined,
       })
     } else {
       toast.error("合并没有完成", { description: merge.error || undefined })
@@ -131,7 +145,7 @@ export function DatasetReviews({ dataset }: { dataset: Dataset }) {
           </EmptyMedia>
           <EmptyTitle className="text-base">还没有审核记录</EmptyTitle>
           <EmptyDescription>
-            用模型识别这个数据集的图片，逐张确认识别结果；审图标注单独保存，确认后可以选择合并到这个数据集。
+            用模型识别这个数据集的图片，逐张确认识别结果；审图标注单独保存，确认后可以合并为这个数据集的审图版本。
           </EmptyDescription>
         </EmptyHeader>
         <EmptyContent>
@@ -159,7 +173,7 @@ export function DatasetReviews({ dataset }: { dataset: Dataset }) {
       {items.length > 0 && (
         <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="text-sm text-muted-foreground">
-            每个审图任务的标注单独保存，只有合并后才会写进这个数据集。
+            每个审图任务的标注单独保存，合并后成为这个数据集的审图版本，不修改数据集的标注文件。
           </p>
           <Button
             size="sm"
@@ -207,27 +221,31 @@ function otherDatasetsNote(merge: ReviewMerge, review: DatasetReview) {
 }
 
 /**
- * 这个数据集的合并情况：已合并的张数（这个数据集的，合并可能包括别的数据集）、
- * 最近一次合并的时间；进行中或中断时显示合并的状态。没有合并过时为 null。
+ * 这个数据集的合并情况：最近一次合并生成的版本（这个数据集的，合并可能包括
+ * 别的数据集）或已合并的张数、最近一次合并的时间；进行中或中断时显示合并的
+ * 状态。没有合并过时为 null。
  */
 function latestMerge(review: DatasetReview) {
   const merge = review.dataset_merges[0]
   if (!merge) {
     return null
   }
-  const merged = review.dataset.counts.merged
+  const datasetId = review.dataset.id
+  const versions = mergeVersionsText(merge, [], datasetId)
   return {
     text:
       merge.status === "running"
         ? `正在合并 ${formatNumber(merge.done)} / ${formatNumber(merge.total)}`
         : merge.status === "failed"
           ? "合并中断"
-          : `已合并 ${formatNumber(merged)} 张`,
+          : versions
+            ? `已生成 ${versions}`
+            : `已合并 ${formatNumber(review.dataset.counts.merged)} 张`,
     time: merge.finished_at ?? merge.created_at,
     title: review.dataset_merges
       .map(
         (item) =>
-          `${formatDateTime(item.finished_at ?? item.created_at)}：${statusesText(item.statuses)}${otherDatasetsNote(item, review)}，${item.status === "running" ? "进行中" : item.status === "failed" ? "中断" : mergeSummaryText(item.summary)}`
+          `${formatDateTime(item.finished_at ?? item.created_at)}：${statusesText(item.statuses)}${otherDatasetsNote(item, review)}，${item.status === "running" ? "进行中" : item.status === "failed" ? "中断" : `${mergeSummaryText(item.summary)}，${mergeOutcomeText(item, [], datasetId)}`}${item.note ? `\n备注：${item.note}` : ""}`
       )
       .join("\n"),
   }
@@ -297,7 +315,7 @@ function RowActions({
           review.active_merge
             ? "正在合并，查看进度"
             : mergeable
-              ? "把审图标注合并到这个数据集"
+              ? "把审图标注合并为这个数据集的审图版本"
               : "还没有已审核或需加样的图片"
         }
       >

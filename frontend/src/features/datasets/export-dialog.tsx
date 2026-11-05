@@ -1,11 +1,15 @@
 /**
- * 下载数据集：选择导出格式，由浏览器直接下载服务端生成的 zip。
+ * 下载数据集：选择版本与导出格式，由浏览器直接下载服务端生成的 zip。
+ *
+ * 数据集有审图版本时可以多选版本（见 versions.ts）：只有基础版本时与没有版本时
+ * 一样；选了审图版本时下载的内容（图片数、标签）由服务端按所选版本统计。
  *
  * YOLO 需要类别顺序（类别编号）。数据集属于项目时使用项目的类别列表的顺序，
  * 与用这个项目训练时一致；属于多个项目且各项目的顺序不同时，由用户选择用
  * 哪个项目的。不属于任何项目时手动指定（文本框或 classes.txt）。
  */
 import {
+  useEffect,
   useId,
   useMemo,
   useRef,
@@ -33,6 +37,7 @@ import { toast } from "sonner"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   Dialog,
   DialogContent,
@@ -48,9 +53,12 @@ import {
   FieldTitle,
 } from "@/components/ui/field"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import {
   createExport,
+  datasetVersionsQuery,
+  exportPreviewQuery,
   labelsQuery,
   lastYoloImportQuery,
   liveDatasetQuery,
@@ -59,6 +67,9 @@ import {
   type Dataset,
   type DatasetLabel,
   type DatasetProjectRef,
+  type DatasetVersion,
+  type ExportPreview,
+  type VersionSelection,
 } from "@/features/datasets/api"
 import { AnnotationFormatPicker } from "@/features/datasets/annotation-format-picker"
 import {
@@ -73,13 +84,26 @@ import {
   ClassListField,
 } from "@/features/datasets/class-list-field"
 import {
+  BASE_ONLY,
+  previewNotes,
+  previewText,
+  readyVersions,
+  selectionInput,
+  selectionMode,
+  selectionModeText,
+  versionCountsText,
+  versionSelection,
+  versionSourceText,
+  type SelectionMode,
+} from "@/features/datasets/versions"
+import {
   projectClassesQuery,
   refreshMembership,
   type ProjectClassList,
 } from "@/features/projects/api"
-import { isPermanentError } from "@/lib/api"
+import { isPermanentError, type ListResponse } from "@/lib/api"
 import { startDownload } from "@/lib/download"
-import { formatBytes, formatNumber } from "@/lib/format"
+import { formatBytes, formatNumber, formatRelativeTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
 /** 每种格式下载后的目录结构（与服务端的打包方式一致）。 */
@@ -110,14 +134,24 @@ const classNamesOf = (list: UseQueryResult<ProjectClassList>) =>
 type ExportDialogProps = {
   dataset: Dataset | null
   onOpenChange: (open: boolean) => void
+  /** 打开时选中的版本，默认只有基础版本。 */
+  selection?: VersionSelection
 }
 
-export function ExportDialog({ dataset, onOpenChange }: ExportDialogProps) {
+export function ExportDialog({
+  dataset,
+  onOpenChange,
+  selection = BASE_ONLY,
+}: ExportDialogProps) {
   return (
     <Dialog open={dataset !== null} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl">
         {dataset && (
-          <ExportForm dataset={dataset} onDone={() => onOpenChange(false)} />
+          <ExportForm
+            dataset={dataset}
+            initialSelection={selection}
+            onDone={() => onOpenChange(false)}
+          />
         )}
       </DialogContent>
     </Dialog>
@@ -126,9 +160,11 @@ export function ExportDialog({ dataset, onOpenChange }: ExportDialogProps) {
 
 function ExportForm({
   dataset: opened,
+  initialSelection,
   onDone,
 }: {
   dataset: Dataset
+  initialSelection: VersionSelection
   onDone: () => void
 }) {
   // 读取最新的数据集，而不是只用打开时传入的：所属项目决定使用哪个项目的
@@ -141,8 +177,59 @@ function ExportForm({
   const { projects } = dataset
   const inProjects = projects.length > 0
 
+  // ---- 版本 ----
+  const versions = useQuery(datasetVersionsQuery(dataset.id))
+  const versionItems = versions.data?.items
+  const ready = useMemo(() => readyVersions(versionItems ?? []), [versionItems])
+  const [includeBase, setIncludeBase] = useState(initialSelection.include_base)
+  const [chosenIds, setChosenIds] = useState<ReadonlySet<number>>(
+    () => new Set(initialSelection.version_ids)
+  )
+  // 版本列表读到后只保留其中可以下载的（在别处删除的版本不再选中）。
+  const selection = useMemo(
+    () =>
+      versionSelection(
+        includeBase,
+        versionItems
+          ? [...chosenIds].filter((id) => ready.some((v) => v.id === id))
+          : chosenIds
+      ),
+    [includeBase, chosenIds, versionItems, ready]
+  )
+  const mode = selectionMode(selection)
+  const withVersions = mode === "overlay" || mode === "versions"
+  const preview = useQuery({
+    ...exportPreviewQuery(dataset.id, selection),
+    enabled: withVersions,
+  })
+  const previewData = withVersions ? preview.data : undefined
+  // 切换选择时先显示上一次的统计（placeholder），新的统计到来之前不能下载。
+  const previewLoading =
+    withVersions && (preview.isPending || preview.isPlaceholderData)
+  const nothingToExport =
+    mode === "none" ||
+    (withVersions && !previewLoading && previewData?.image_count === 0)
+
+  // 统计失败多半是所选的版本已被删除：刷新版本列表，不再选中它（refetch 不变）。
+  const previewFailed =
+    withVersions && preview.isError && isPermanentError(preview.error)
+  const refetchVersions = versions.refetch
+  useEffect(() => {
+    if (previewFailed) {
+      void refetchVersions()
+    }
+  }, [previewFailed, refetchVersions])
+
+  // 下载的图片的标签：只有基础版本时是数据集的标签，选了审图版本时按所选版本
+  // 统计（与类别顺序对照）。默认的类别顺序总是由数据集的标签生成，只在所选
+  // 版本中出现的标签排在最后，选不选版本类别编号都不变。
   const labels = useQuery(labelsQuery(dataset.id))
-  const labelItems = labels.data?.items
+  const datasetLabels = labels.data?.items
+  const labelItems = withVersions ? previewData?.labels : datasetLabels
+  const versionLabels = withVersions ? previewData?.labels : undefined
+  const labelsPending =
+    labels.isPending ||
+    (withVersions && previewData === undefined && preview.isPending)
 
   // ---- 属于项目：使用（所选）项目的类别列表 ----
   const projectGroupRef = useRef<HTMLDivElement>(null)
@@ -181,13 +268,19 @@ function ExportForm({
   const yoloImport = lastYolo.data ?? null
   const importedClasses = yoloImport?.classes
   // 请求都有结果后才有默认顺序；在此之前不能按默认顺序下载。
-  const defaultsPending = labels.isPending || lastYolo.isPending
+  const defaultsPending = labelsPending || lastYolo.isPending
   const defaultText = useMemo(
     () =>
       defaultsPending
         ? ""
-        : toClassListText(defaultClassOrder(labelItems ?? [], importedClasses)),
-    [defaultsPending, labelItems, importedClasses]
+        : toClassListText(
+            defaultClassOrder(
+              datasetLabels ?? [],
+              importedClasses,
+              versionLabels
+            )
+          ),
+    [defaultsPending, datasetLabels, importedClasses, versionLabels]
   )
   const classesText = classesDraft ?? defaultText
   const classList = useMemo(() => parseClassList(classesText), [classesText])
@@ -210,12 +303,13 @@ function ExportForm({
   // 时不能下载：页面上还看不到将要使用的顺序。读取失败时可以下载，由服务端
   // 按项目当前的类别列表生成。
   const waiting =
-    isYolo &&
-    (inProjects
-      ? projectList
-        ? projectList.isPending
-        : projectLists.some((list) => list.isPending)
-      : classesDraft === null && defaultsPending)
+    previewLoading ||
+    (isYolo &&
+      (inProjects
+        ? projectList
+          ? projectList.isPending
+          : projectLists.some((list) => list.isPending)
+        : classesDraft === null && defaultsPending))
   // 所选项目还没有类别列表：服务端也会拒绝，页面上提示去项目中设置。
   const noClasses = isYolo && inProjects && projectClasses?.length === 0
 
@@ -235,6 +329,10 @@ function ExportForm({
       if (input.project_id !== undefined && isPermanentError(error)) {
         refreshMembership()
       }
+      // 所选的版本可能已被删除：刷新版本列表，不再选中它。
+      if (input.version_ids?.length && isPermanentError(error)) {
+        void versions.refetch()
+      }
     },
   })
 
@@ -250,14 +348,24 @@ function ExportForm({
     setClassesDraft(text)
     mutation.reset()
   }
+  const changeBase = (checked: boolean) => {
+    setIncludeBase(checked)
+    mutation.reset()
+  }
+  const changeVersions = (ids: Iterable<number>) => {
+    setChosenIds(new Set(ids))
+    mutation.reset()
+  }
 
+  const blocked = mutation.isPending || waiting || noClasses || nothingToExport
   const submit = (event: FormEvent) => {
     event.preventDefault()
-    if (mutation.isPending || waiting || noClasses) {
+    if (blocked) {
       return
     }
     setSubmitted(true)
-    let input: CreateExportInput = { format }
+    const base: CreateExportInput = { format, ...selectionInput(selection) }
+    let input = base
     if (isYolo && inProjects) {
       if (!project) {
         projectGroupRef.current
@@ -265,28 +373,65 @@ function ExportForm({
           ?.focus()
         return
       }
-      input = { format, project_id: project.id }
+      input = { ...base, project_id: project.id }
     } else if (isYolo) {
       if (classList.error) {
         classFieldRef.current?.focus()
         return
       }
-      input = { format, classes: classList.classes }
+      input = { ...base, classes: classList.classes }
     }
     mutation.mutate(input)
   }
+
+  const invalidCount = withVersions
+    ? (previewData?.invalid_count ?? 0)
+    : dataset.invalid_count
+  // 有审图版本（或正在生成、正在读取）时显示版本的选择；版本都被删除时，
+  // 不是只选了基础版本也仍然显示，以便改回基础版本。
+  const showVersions =
+    mode !== "base" ||
+    (versionItems?.length ?? 0) > 0 ||
+    (versionItems === undefined &&
+      (dataset.version_count > 0 || initialSelection.version_ids.length > 0))
 
   return (
     <form onSubmit={submit} className="grid min-w-0 gap-6" noValidate>
       <DialogHeader>
         <DialogTitle>下载数据集</DialogTitle>
         <DialogDescription>
-          将“{dataset.name}”的 {formatNumber(dataset.image_count)} 张图片（
-          {formatBytes(dataset.total_bytes)}
-          ）与标注打包为 zip。数据集在服务器上以 VOC
-          格式保存，其它格式在下载时转换。
+          {withVersions ? (
+            <>将“{dataset.name}”的图片与所选版本的标注打包为 zip。</>
+          ) : (
+            <>
+              将“{dataset.name}”的 {formatNumber(dataset.image_count)} 张图片（
+              {formatBytes(dataset.total_bytes)}）与标注打包为 zip。
+            </>
+          )}
+          数据集在服务器上以 VOC 格式保存，其它格式在下载时转换。
         </DialogDescription>
       </DialogHeader>
+
+      {showVersions && (
+        <VersionPicker
+          dataset={dataset}
+          versions={versions}
+          ready={ready}
+          includeBase={selection.include_base}
+          chosen={selection.version_ids}
+          onBaseChange={changeBase}
+          onVersionsChange={changeVersions}
+          mode={mode}
+          preview={previewData}
+          previewLoading={previewLoading}
+          previewError={withVersions ? preview.error : null}
+          onRetryPreview={() => {
+            void preview.refetch()
+            void versions.refetch()
+          }}
+          disabled={mutation.isPending}
+        />
+      )}
 
       <AnnotationFormatPicker
         label="下载格式"
@@ -328,6 +473,10 @@ function ExportForm({
                         : yoloImport
                           ? `默认沿用导入“${yoloImport.file_name}”时的类别顺序（类别编号不变），其余标签按名称排在后面；可直接编辑，或读取训练时使用的 classes.txt。`
                           : "默认按数据集中的标签名称排序；可直接编辑，或读取训练时使用的 classes.txt 以保持类别编号一致。"}
+                  {!defaultsPending &&
+                    !labels.error &&
+                    withVersions &&
+                    "只在所选审图版本中出现的标签排在最后，选不选版本，数据集已有标签的类别编号都不变。"}
                 </>
               }
               onReset={
@@ -340,15 +489,16 @@ function ExportForm({
             />
           )}
 
-          {coverage && <CoverageNotes {...coverage} />}
+          {coverage && (
+            <CoverageNotes {...coverage} withVersions={withVersions} />
+          )}
         </div>
       )}
 
-      {format !== "voc" && dataset.invalid_count > 0 && (
+      {format !== "voc" && invalidCount > 0 && (
         <p className="flex items-start gap-1.5 text-xs text-pretty text-muted-foreground">
           <TriangleAlert className="mt-px size-3.5 shrink-0 text-amber-600 dark:text-amber-500" />
-          {formatNumber(dataset.invalid_count)}{" "}
-          张图片的标注无法解析，导出时只包含图片。
+          {formatNumber(invalidCount)} 张图片的标注无法解析，导出时只包含图片。
         </p>
       )}
 
@@ -367,15 +517,271 @@ function ExportForm({
         >
           取消
         </Button>
-        <Button
-          type="submit"
-          disabled={mutation.isPending || waiting || noClasses}
-        >
+        <Button type="submit" disabled={blocked}>
           {mutation.isPending ? <Spinner aria-hidden /> : <Download />}
           下载
         </Button>
       </DialogFooter>
     </form>
+  )
+}
+
+type VersionPickerProps = {
+  dataset: Dataset
+  versions: UseQueryResult<ListResponse<DatasetVersion>>
+  /** 可以下载的审图版本，新的在前。 */
+  ready: readonly DatasetVersion[]
+  includeBase: boolean
+  /** 选中的审图版本（都在 `ready` 中，除非版本列表还没读到）。 */
+  chosen: readonly number[]
+  onBaseChange: (checked: boolean) => void
+  onVersionsChange: (ids: Iterable<number>) => void
+  mode: SelectionMode
+  /** 选了审图版本时下载的内容。 */
+  preview: ExportPreview | undefined
+  previewLoading: boolean
+  previewError: Error | null
+  onRetryPreview: () => void
+  disabled: boolean
+}
+
+/**
+ * 选择下载的版本（多选）：基础版本与各审图版本。下面是这种组合的说明，选了
+ * 审图版本时还有下载的内容（图片数、目标数）与不按版本导出的图片。
+ */
+function VersionPicker({
+  dataset,
+  versions,
+  ready,
+  includeBase,
+  chosen,
+  onBaseChange,
+  onVersionsChange,
+  mode,
+  preview,
+  previewLoading,
+  previewError,
+  onRetryPreview,
+  disabled,
+}: VersionPickerProps) {
+  const groupId = useId()
+  const building = versions.data?.items.some(
+    (version) => version.status === "building"
+  )
+  const allChosen =
+    ready.length > 0 && ready.every((v) => chosen.includes(v.id))
+  const toggle = (id: number, checked: boolean) =>
+    onVersionsChange(
+      checked ? [...chosen, id] : chosen.filter((item) => item !== id)
+    )
+  const notes = preview ? previewNotes(mode, preview) : []
+
+  return (
+    <Field className="gap-2">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+        <FieldTitle id={groupId}>版本</FieldTitle>
+        {ready.length > 1 && (
+          <Button
+            type="button"
+            variant="link"
+            size="xs"
+            className="h-auto px-0"
+            onClick={() =>
+              onVersionsChange(allChosen ? [] : ready.map((v) => v.id))
+            }
+            disabled={disabled}
+          >
+            {allChosen ? "取消选择审图版本" : "选择全部审图版本"}
+          </Button>
+        )}
+      </div>
+      <FieldDescription className="text-xs">
+        可以多选。每张图片用所选审图版本中最新的、包含它的版本的标注，没有时用基础版本的标注。
+      </FieldDescription>
+
+      <div
+        role="group"
+        aria-labelledby={groupId}
+        className="-m-0.5 grid gap-2 p-0.5 sm:max-h-80 sm:overflow-y-auto"
+      >
+        <VersionOption
+          checked={includeBase}
+          onCheckedChange={onBaseChange}
+          disabled={disabled}
+          title="基础版本"
+          detail={`数据集自己的标注文件 · ${formatNumber(dataset.image_count)} 张图片，${formatNumber(dataset.object_count)} 个目标`}
+        />
+        {ready.map((version) => (
+          <VersionOption
+            key={version.id}
+            checked={chosen.includes(version.id)}
+            onCheckedChange={(checked) => toggle(version.id, checked)}
+            disabled={disabled}
+            title={version.name}
+            note={version.note}
+            detail={versionCountsText(version)}
+            source={`${versionSourceText(version)} · ${formatRelativeTime(version.finished_at ?? version.created_at)}`}
+          />
+        ))}
+        {versions.isPending && <Skeleton className="h-16 rounded-lg" />}
+      </div>
+
+      {versions.error && (
+        <div
+          role="alert"
+          className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-destructive"
+        >
+          <span className="min-w-0 break-words">
+            无法读取审图版本：{versions.error.message}
+          </span>
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            className="text-foreground"
+            onClick={() => void versions.refetch()}
+            disabled={versions.isFetching}
+          >
+            <RefreshCw className={cn(versions.isFetching && "animate-spin")} />
+            {versions.isFetching ? "正在重试…" : "重试"}
+          </Button>
+        </div>
+      )}
+      {building && (
+        <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Spinner className="size-3.5" aria-hidden />
+          有审图版本正在生成（合并还在进行），完成后可以选择。
+        </p>
+      )}
+
+      <p
+        className={cn(
+          "flex items-start gap-1.5 text-xs text-pretty",
+          mode === "none" ? "text-destructive" : "text-muted-foreground"
+        )}
+      >
+        <Info className="mt-px size-3.5 shrink-0" />
+        {selectionModeText(mode)}
+      </p>
+
+      {(mode === "overlay" || mode === "versions") && (
+        <div
+          className="grid gap-1.5 rounded-lg border bg-muted/30 p-3"
+          aria-live="polite"
+          aria-busy={previewLoading || undefined}
+        >
+          {preview ? (
+            <p
+              className={cn(
+                "text-sm tabular-nums transition-opacity",
+                previewLoading && "opacity-60",
+                preview.image_count === 0 && "text-destructive"
+              )}
+            >
+              {preview.image_count === 0
+                ? mode === "versions"
+                  ? "所选版本中没有可以导出的需加样图片。"
+                  : "没有可以导出的图片。"
+                : previewText(mode, preview)}
+            </p>
+          ) : previewError ? (
+            <div
+              role="alert"
+              className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-destructive"
+            >
+              <span className="min-w-0 break-words">
+                无法统计下载的内容：{previewError.message}
+              </span>
+              <Button
+                type="button"
+                variant="outline"
+                size="xs"
+                className="text-foreground"
+                onClick={onRetryPreview}
+              >
+                <RefreshCw />
+                重试
+              </Button>
+            </div>
+          ) : (
+            <p className="flex items-center gap-1.5 text-sm text-muted-foreground">
+              <Spinner className="size-3.5" aria-hidden />
+              正在统计下载的内容…
+            </p>
+          )}
+          {notes.map((note) => (
+            <p
+              key={note}
+              className="flex items-start gap-1.5 text-xs text-pretty text-muted-foreground"
+            >
+              <TriangleAlert className="mt-px size-3.5 shrink-0 text-amber-600 dark:text-amber-500" />
+              {note}
+            </p>
+          ))}
+        </div>
+      )}
+    </Field>
+  )
+}
+
+/** 版本的选项：名称、备注、图片与目标数、来自哪个审图任务。 */
+function VersionOption({
+  checked,
+  onCheckedChange,
+  disabled,
+  title,
+  note,
+  detail,
+  source,
+}: {
+  checked: boolean
+  onCheckedChange: (checked: boolean) => void
+  disabled: boolean
+  title: string
+  note?: string
+  detail: string
+  source?: string
+}) {
+  const id = useId()
+  return (
+    <label
+      htmlFor={id}
+      className={cn(
+        "flex min-w-0 cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors hover:bg-muted/40 has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50",
+        checked && "border-primary/60 bg-muted/40",
+        disabled && "pointer-events-none opacity-60"
+      )}
+    >
+      <Checkbox
+        id={id}
+        checked={checked}
+        onCheckedChange={(next) => onCheckedChange(next === true)}
+        disabled={disabled}
+        className="mt-0.5"
+      />
+      <span className="grid min-w-0 flex-1 gap-0.5">
+        <span className="text-sm font-medium">{title}</span>
+        {note && (
+          <span
+            className="line-clamp-2 text-xs break-words whitespace-pre-line"
+            title={note}
+          >
+            {note}
+          </span>
+        )}
+        <span className="text-xs text-muted-foreground tabular-nums">
+          {detail}
+        </span>
+        {source && (
+          <span
+            className="truncate text-xs text-muted-foreground"
+            title={source}
+          >
+            {source}
+          </span>
+        )}
+      </span>
+    </label>
   )
 }
 
@@ -586,15 +992,17 @@ function ProjectClassState({
 }
 
 /**
- * 类别顺序与数据集标签的对照：不在列表中的标签（它们的目标不会导出），以及
- * 数据集中没有目标、但仍会写入 classes.txt 的类别。
+ * 类别顺序与下载的图片的标签的对照：不在列表中的标签（它们的目标不会导出），
+ * 以及下载的图片中没有目标、但仍会写入 classes.txt 的类别。
  */
 function CoverageNotes({
   missing,
   unused,
+  withVersions,
 }: {
   missing: readonly DatasetLabel[]
   unused: readonly string[]
+  withVersions: boolean
 }) {
   const missingObjects = missing.reduce(
     (sum, label) => sum + label.object_count,
@@ -644,7 +1052,7 @@ function CoverageNotes({
         <p className="flex items-start gap-1.5 text-xs text-pretty text-muted-foreground">
           <Info className="mt-px size-3.5 shrink-0" />
           <span>
-            数据集中没有这些类别的目标：
+            {withVersions ? "导出的图片中" : "数据集中"}没有这些类别的目标：
             {unused.slice(0, LIST_LIMIT).join("、")}
             {unused.length > LIST_LIMIT &&
               ` 等 ${formatNumber(unused.length)} 个`}

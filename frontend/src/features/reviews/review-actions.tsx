@@ -426,7 +426,7 @@ function DeleteReviewForm({
         </AlertDialogDescription>
       </AlertDialogHeader>
       <p className="text-sm text-muted-foreground">
-        数据集中的图片与标注不受影响，已经合并到数据集的标注会保留。
+        数据集中的图片与标注不受影响，合并生成的审图版本会保留。
         {(review.status === "queued" || review.status === "running") &&
           "正在进行的识别会停止。"}
       </p>

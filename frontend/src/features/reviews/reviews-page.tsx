@@ -457,7 +457,7 @@ function ReviewsEmptyState({ onCreate }: { onCreate: () => void }) {
           </Button>
         )}
         <p className="text-xs text-muted-foreground">
-          识别结果只保存在审图任务中，确认后可以选择合并到数据集的标注。
+          识别结果只保存在审图任务中，确认后可以合并为数据集的审图版本。
         </p>
       </EmptyContent>
     </Empty>

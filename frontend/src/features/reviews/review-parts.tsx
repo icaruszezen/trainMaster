@@ -175,6 +175,7 @@ const problemKindLabels: Record<string, string> = {
   invalid: "无效",
   unknown: "不在任务中",
   failed: "失败",
+  skipped: "状态已改变",
 }
 
 /** 默认显示的问题条数，更多时可以展开。 */

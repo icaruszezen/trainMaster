@@ -45,7 +45,12 @@ func (s *server) datasetRoutes(r chi.Router) {
 		r.Post("/imports/{importID}/files", s.uploadImportFiles)
 		r.Post("/imports/{importID}/commit", s.commitDatasetImport)
 		r.Post("/imports/{importID}/cancel", s.cancelDatasetImport)
+		r.Get("/versions", s.listDatasetVersions)
+		r.Get("/versions/{versionID}", s.getDatasetVersion)
+		r.Patch("/versions/{versionID}", s.updateDatasetVersion)
+		r.Delete("/versions/{versionID}", s.deleteDatasetVersion)
 		r.Post("/exports", s.createDatasetExport)
+		r.Get("/exports/preview", s.previewDatasetExport) // before {token}, which "preview" is not
 		r.Get("/exports/{token}", s.downloadDatasetExport)
 		if s.projects != nil {
 			r.Put("/projects", s.setDatasetProjects)
@@ -154,7 +159,7 @@ func notFoundMessage(w http.ResponseWriter, message string) {
 }
 
 // datasetIDs parses {datasetID} and, unless child is "", the child ID
-// parameter ("imageID" or "importID"). It answers 404 for invalid IDs.
+// parameter ("imageID", "importID" or "versionID"). It answers 404 for invalid IDs.
 func datasetIDs(w http.ResponseWriter, r *http.Request, child string) (datasetID, childID int64, ok bool) {
 	if datasetID, ok = pathID(r, "datasetID"); !ok {
 		notFoundMessage(w, "数据集不存在")
@@ -168,6 +173,10 @@ func datasetIDs(w http.ResponseWriter, r *http.Request, child string) (datasetID
 	case "importID":
 		if childID, ok = pathID(r, child); !ok {
 			notFoundMessage(w, "导入任务不存在")
+		}
+	case "versionID":
+		if childID, ok = pathID(r, child); !ok {
+			notFoundMessage(w, "版本不存在（可能已被删除）")
 		}
 	}
 	return datasetID, childID, ok
@@ -725,6 +734,67 @@ func (s *server) cancelDatasetImport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
+// ---- versions ----
+
+func (s *server) listDatasetVersions(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := datasetIDs(w, r, "")
+	if !ok {
+		return
+	}
+	items, err := s.datasets.ListVersions(r.Context(), id)
+	if err != nil {
+		s.datasetError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, NewList(items, len(items)))
+}
+
+func (s *server) getDatasetVersion(w http.ResponseWriter, r *http.Request) {
+	id, versionID, ok := datasetIDs(w, r, "versionID")
+	if !ok {
+		return
+	}
+	v, err := s.datasets.GetVersion(r.Context(), id, versionID)
+	if err != nil {
+		s.datasetError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+type updateVersionRequest struct {
+	Note *string `json:"note"`
+}
+
+func (s *server) updateDatasetVersion(w http.ResponseWriter, r *http.Request) {
+	id, versionID, ok := datasetIDs(w, r, "versionID")
+	if !ok {
+		return
+	}
+	var req updateVersionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	v, err := s.datasets.UpdateVersion(r.Context(), id, versionID, dataset.UpdateVersionInput{Note: req.Note})
+	if err != nil {
+		s.datasetError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+func (s *server) deleteDatasetVersion(w http.ResponseWriter, r *http.Request) {
+	id, versionID, ok := datasetIDs(w, r, "versionID")
+	if !ok {
+		return
+	}
+	if err := s.datasets.DeleteVersion(r.Context(), id, versionID); err != nil {
+		s.datasetError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ---- downloads ----
 
 type createExportRequest struct {
@@ -735,6 +805,57 @@ type createExportRequest struct {
 	// With both, ProjectID wins; other formats ignore them.
 	ProjectID *int64   `json:"project_id"`
 	Classes   []string `json:"classes"`
+	// The versions combined (dataset.VersionSelection): the base version
+	// (default true) and review versions by ID (default none).
+	IncludeBase *bool   `json:"include_base"`
+	VersionIDs  []int64 `json:"version_ids"`
+}
+
+// versionSelection is the selection of a download request; nil for the
+// base version alone.
+func versionSelection(includeBase *bool, versionIDs []int64) *dataset.VersionSelection {
+	base := includeBase == nil || *includeBase
+	if base && len(versionIDs) == 0 {
+		return nil
+	}
+	return &dataset.VersionSelection{IncludeBase: base, VersionIDs: versionIDs}
+}
+
+// previewDatasetExport describes what a download of the versions selected
+// by the query parameters include_base (true or false, default true) and
+// version_ids (comma-separated IDs, default none) would contain.
+func (s *server) previewDatasetExport(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := datasetIDs(w, r, "")
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	base := true
+	if v := q.Get("include_base"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			badRequest(w, "参数 include_base 无效，应为 true 或 false")
+			return
+		}
+		base = b
+	}
+	var ids []int64
+	if v := q.Get("version_ids"); v != "" {
+		for _, f := range strings.Split(v, ",") {
+			n, err := strconv.ParseInt(strings.TrimSpace(f), 10, 64)
+			if err != nil || n <= 0 {
+				badRequest(w, "参数 version_ids 无效，应为以逗号分隔的版本 ID")
+				return
+			}
+			ids = append(ids, n)
+		}
+	}
+	p, err := s.datasets.PreviewExport(r.Context(), id, dataset.VersionSelection{IncludeBase: base, VersionIDs: ids})
+	if err != nil {
+		s.datasetError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
 }
 
 type exportResponse struct {
@@ -752,7 +873,8 @@ func (s *server) createDatasetExport(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	in := dataset.ExportInput{Format: req.Format, Classes: req.Classes}
+	in := dataset.ExportInput{Format: req.Format, Classes: req.Classes,
+		Versions: versionSelection(req.IncludeBase, req.VersionIDs)}
 	if req.Format == dataset.FormatYOLO && req.ProjectID != nil {
 		// Datasets have no class order of their own: the class ids come
 		// from the class list of one of the dataset's projects.
