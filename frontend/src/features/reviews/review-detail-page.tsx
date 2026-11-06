@@ -58,6 +58,7 @@ import {
 } from "@/components/ui/table"
 import { LoadError } from "@/features/datasets/load-error"
 import { TaskProgress } from "@/features/datasets/task-progress"
+import { RECYCLE_BIN_PATH } from "@/features/recycle-bin/recycle-format"
 import { CopyButton } from "@/features/training/command-block"
 import {
   REVIEW_TOOL_DOWNLOAD_URL,
@@ -92,8 +93,12 @@ import {
   ReviewStatusBar,
   ReviewStatusLegend,
   ReviewTaskStatusBadge,
+  waitingForWorkers,
 } from "@/features/reviews/review-parts"
-import { reviewStageLabels } from "@/features/reviews/review-status"
+import {
+  reviewStageLabels,
+  waitingForModel,
+} from "@/features/reviews/review-status"
 import { UploadResultsDialog } from "@/features/reviews/upload-results-dialog"
 import { useMediaQuery } from "@/hooks/use-media-query"
 import { usePageTitle } from "@/hooks/use-page-title"
@@ -337,7 +342,7 @@ function ReviewMeta({ review }: { review: Review }) {
       ) : (
         <span
           className="inline-flex min-w-0 items-center gap-1"
-          title="模型已被删除，审图任务保留了创建时的模型信息"
+          title="模型已被删除，审图任务保留了创建时的模型信息；模型还在回收站中时，恢复后可以继续使用"
         >
           {model}
           <span>（已删除）</span>
@@ -398,7 +403,7 @@ function InferenceStatus({
               : ""}
             {review.model_exists
               ? `重新识别时只识别剩下的 ${formatNumber(left)} 张。`
-              : "模型已被删除，无法重新识别。"}
+              : "模型已被删除，无法重新识别；模型还在回收站中时，恢复后可以重试。"}
           </p>
           <div className="mt-2 flex flex-wrap items-center gap-2">
             {review.model_exists && (
@@ -442,6 +447,7 @@ function InferenceStatus({
   }
 
   const queued = review.status === "queued"
+  const noModel = waitingForModel(review)
   return (
     <Card className="min-w-0 gap-4">
       <CardHeader>
@@ -451,21 +457,27 @@ function InferenceStatus({
           ) : (
             <Spinner />
           )}
-          {queued ? "排队等待识别" : "模型正在识别图片"}
+          {noModel
+            ? "等待恢复模型"
+            : queued
+              ? "排队等待识别"
+              : "模型正在识别图片"}
         </CardTitle>
         <CardDescription>
-          {queued
-            ? review.queue_position !== null && review.queue_position > 1
-              ? `前面还有 ${formatNumber(review.queue_position - 1)} 个审图任务，训练节点按顺序识别。`
-              : "等待训练节点领取。"
-            : `${reviewStageLabels[review.stage] || "正在识别"}${review.node ? `（训练节点 ${review.node.name}）` : ""}。识别完成的图片可以立即开始审核。`}
+          {noModel
+            ? "模型已移入回收站，训练节点不会识别这个任务。"
+            : queued
+              ? review.queue_position !== null && review.queue_position > 1
+                ? `前面还有 ${formatNumber(review.queue_position - 1)} 个审图任务，训练节点按顺序识别。`
+                : "等待训练节点领取。"
+              : `${reviewStageLabels[review.stage] || "正在识别"}${review.node ? `（训练节点 ${review.node.name}）` : ""}。识别完成的图片可以立即开始审核。`}
         </CardDescription>
       </CardHeader>
       <CardContent className="grid gap-3">
         <div className="grid gap-1.5">
           <TaskProgress
             value={
-              queued && counts.inferred === 0
+              queued && !noModel && counts.inferred === 0
                 ? null
                 : percentOf(counts.inferred, counts.total)
             }
@@ -483,7 +495,25 @@ function InferenceStatus({
             )}
           </p>
         </div>
-        {queued && review.workers_online === 0 && (
+        {noModel && (
+          <Alert className="border-amber-500/40 [&>svg]:text-amber-600 dark:[&>svg]:text-amber-500">
+            <TriangleAlert />
+            <AlertTitle>模型在回收站中</AlertTitle>
+            <AlertDescription>
+              <p>
+                在回收站中恢复模型后会自动开始识别；模型在回收站中满 7
+                天、被永久删除后，这个任务会识别失败。
+              </p>
+              <Link
+                to={RECYCLE_BIN_PATH}
+                className="text-foreground underline underline-offset-4"
+              >
+                前往回收站
+              </Link>
+            </AlertDescription>
+          </Alert>
+        )}
+        {waitingForWorkers(review) && (
           <Alert className="border-amber-500/40 [&>svg]:text-amber-600 dark:[&>svg]:text-amber-500">
             <TriangleAlert />
             <AlertTitle>没有可以识别的训练节点</AlertTitle>

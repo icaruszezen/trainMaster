@@ -475,7 +475,8 @@ func TestDatasetAPIArchiveImport(t *testing.T) {
 	wantError(t, e.do("PATCH", base, map[string]any{"description": strings.Repeat("长", 501)}), 422, codeValidationFailed, "500")
 	wantError(t, e.do("PATCH", base, "[]"), 400, codeBadRequest, "")
 
-	// Delete with files.
+	// Delete with files: to the recycle bin, the folder set aside until
+	// it is purged.
 	wantError(t, e.do("DELETE", base+"?delete_files=maybe", nil), 400, codeBadRequest, "delete_files")
 	if rec := e.do("DELETE", base+"?delete_files=true", nil); rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
 		t.Fatalf("delete: status %d, %s", rec.Code, rec.Body)
@@ -483,11 +484,16 @@ func TestDatasetAPIArchiveImport(t *testing.T) {
 	if _, err := os.Lstat(dsPath); !os.IsNotExist(err) {
 		t.Errorf("dataset folder remains: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(e.st.Dir(storage.Cache), "thumbs", strconv.FormatInt(id, 10))); !os.IsNotExist(err) {
-		t.Errorf("thumbnails remain: %v", err)
+	if _, err := os.Stat(filepath.Join(e.st.Dir(storage.Cache), "thumbs", strconv.FormatInt(id, 10))); err != nil {
+		t.Errorf("thumbnails must stay until the purge: %v", err)
 	}
 	wantError(t, e.do("GET", base, nil), 404, codeNotFound, "数据集不存在")
 	wantError(t, e.do("GET", imgURL+"/file", nil), 404, codeNotFound, "数据集不存在")
+	restored := want[dataset.Dataset](t, e.do("POST", fmt.Sprintf("/api/v1/recycle-bin/datasets/%d/restore", id), nil), 200)
+	if restored.ID != id || restored.Path != dsPath {
+		t.Errorf("restored = %+v", restored)
+	}
+	want[dataset.Image](t, e.do("GET", imgURL, nil), 200)
 }
 
 // multipartBody builds a folder upload request body from parts; a part
@@ -614,7 +620,7 @@ func TestDatasetAPIDirectoriesAndJobs(t *testing.T) {
 		t.Fatalf("directories = %v", rawDirs)
 	}
 	wantKeys(t, "directory", rawDirs["items"].([]any)[0].(map[string]any), "name", "path", "registered", "dataset_id",
-		"image_count", "annotation_count", "total_bytes", "approximate", "modified_at")
+		"in_recycle_bin", "image_count", "annotation_count", "total_bytes", "approximate", "modified_at")
 	dirs := want[List[dataset.Directory]](t, e.do("GET", "/api/v1/datasets/directories", nil), 200).Items
 	if dirs[0].Name != "existing" || dirs[0].ImageCount != 2 || dirs[0].AnnotationCount != 1 || dirs[0].Registered ||
 		dirs[0].DatasetID != nil || dirs[0].Path != filepath.Join(root, "existing") || dirs[1].Name != "other" {

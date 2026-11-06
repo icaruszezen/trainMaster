@@ -510,13 +510,21 @@ func TestIntegrationDatasetChangesCascade(t *testing.T) {
 	if got := e.review(t, r.ID); got.Counts.Total != 2 || got.Datasets[0].Counts.Total != 1 {
 		t.Errorf("after removing an image: %+v", got.Counts)
 	}
-	// Deleting a dataset removes it from the review.
-	if _, err := e.datasets.DeleteDataset(ctx, ds2, false); err != nil {
+	// A dataset in the recycle bin leaves the review, and comes back when
+	// restored.
+	if err := e.datasets.DeleteDataset(ctx, ds2, false); err != nil {
 		t.Fatal(err)
 	}
 	got := e.review(t, r.ID)
 	if got.Counts.Total != 1 || len(got.Datasets) != 1 || got.Datasets[0].ID != ds1 {
 		t.Errorf("after deleting a dataset: %+v %+v", got.Counts, got.Datasets)
+	}
+	if _, err := e.datasets.RestoreDataset(ctx, ds2, dataset.RestoreInput{}); err != nil {
+		t.Fatal(err)
+	}
+	got = e.review(t, r.ID)
+	if got.Counts.Total != 2 || len(got.Datasets) != 2 || got.Datasets[1].ID != ds2 {
+		t.Errorf("after restoring the dataset: %+v %+v", got.Counts, got.Datasets)
 	}
 	// A dataset renamed shows its current name.
 	if _, err := e.db.Exec(ctx, "UPDATE datasets SET name = '新名字' WHERE id = $1", ds1); err != nil {
@@ -525,8 +533,9 @@ func TestIntegrationDatasetChangesCascade(t *testing.T) {
 	if got := e.review(t, r.ID); got.Datasets[0].Name != "新名字" {
 		t.Errorf("dataset name = %q", got.Datasets[0].Name)
 	}
-	// The project of the model deleted: the snapshot stays.
-	if _, err := e.models.DeleteProjectModels(ctx, m.Project.ID); err != nil {
+	// The project of the model deleted (to the recycle bin with the
+	// model): the snapshot stays.
+	if err := e.models.DeleteProjectModels(ctx, m.Project.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.projects.DeleteProject(ctx, m.Project.ID); err != nil {

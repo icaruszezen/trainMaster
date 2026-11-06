@@ -253,7 +253,9 @@ func TestReviewAPIFlow(t *testing.T) {
 	wantError(t, e.do("POST", agent+"/results", map[string]any{"results": make([]map[string]any, 501)}, agentHeader...),
 		422, codeValidationFailed, "500")
 	wantError(t, e.do("POST", agent+"/complete", map[string]any{"result": map[string]any{}}, agentHeader...), 409,
-		codeConflict, "还有 1 张图片没有识别")
+		codeConflict, "还有 1 张图片没有识别，审图任务已重新排队")
+	want[map[string]any](t, e.do("POST", "/api/v1/compute/agent/tasks/claim",
+		`{"node_key": "gpu-server-01", "kinds": ["review_inference"]}`, auth...), 200)
 	rest := want[map[string]any](t, e.do("GET", fmt.Sprintf("%s/images?after=%d", agent, ids[1]), nil, agentHeader...), 200)
 	lastID := int64(object(t, rest["items"].([]any)[0], "image")["id"].(float64))
 	want[map[string]any](t, e.do("POST", agent+"/results", map[string]any{"results": []any{

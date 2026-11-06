@@ -13,6 +13,7 @@ var (
 	ErrInvalid               = errors.New("invalid input")               // a field value is not acceptable
 	ErrBadRequest            = errors.New("malformed request")           // the request itself is malformed
 	ErrConflict              = errors.New("conflict")                    // the current state does not allow it
+	ErrNameTaken             = errors.New("name taken")                  // restoring: the name (or folder name) is used by another dataset
 	ErrOffsetMismatch        = errors.New("upload offset mismatch")      // archive chunk at the wrong offset
 	ErrTooLarge              = errors.New("payload too large")           // request body over the limit
 	ErrInsufficientStorage   = errors.New("insufficient storage")        // not enough free disk space

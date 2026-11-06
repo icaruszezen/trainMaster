@@ -230,11 +230,3 @@ type TensorInfo struct {
 	Shape []any  `json:"shape"`
 	Type  string `json:"type"`
 }
-
-// DeleteResult describes a delete that removed the model (or models) but
-// could not remove all of the files. The JSON field names are part of the
-// API (the same shape as dataset.DeleteResult).
-type DeleteResult struct {
-	FilesRemoved bool   `json:"files_removed"` // always false
-	Message      string `json:"message"`       // what is left and where, in Chinese
-}

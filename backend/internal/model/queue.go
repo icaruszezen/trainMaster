@@ -193,7 +193,9 @@ func (s *Service) claimExport(ctx context.Context, nodeID int64) (*Task, error) 
 			UPDATE model_exports SET status = 'running', stage = 'downloading', node_id = $1, attempts = attempts + 1,
 				lease_expires_at = now() + make_interval(secs => $2), size_bytes = NULL, sha256 = '',
 				error = '', error_detail = '', started_at = now(), finished_at = NULL, updated_at = now()
-			WHERE id = (SELECT id FROM model_exports WHERE status = 'queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
+			WHERE id = (SELECT id FROM model_exports WHERE status = 'queued'
+				AND NOT EXISTS (SELECT 1 FROM models dm WHERE dm.id = model_exports.model_id AND dm.deleted_at IS NOT NULL)
+				ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
 			RETURNING id, model_id, options)
 		SELECT c.id, c.options, m.id, m.project_id, m.version, m.yolo_version, m.task, m.file_name,
 			m.size_bytes, m.sha256, m.info

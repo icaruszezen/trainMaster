@@ -23,6 +23,7 @@ const (
 	codeUnknownNode           = "unknown_node"           // 404: heartbeat for a node_key that is not registered (any more); the node registers again
 	codeMethodNotAllowed      = "method_not_allowed"     // 405
 	codeConflict              = "conflict"               // 409: the current state does not allow the operation
+	codeNameTaken             = "name_taken"             // 409: restoring from the recycle bin: the name is taken meanwhile; send a new one
 	codeUploadOffsetMismatch  = "upload_offset_mismatch" // 409: chunk offset differs from the bytes received so far
 	codeAnnotationConflict    = "annotation_conflict"    // 409: the annotation file changed since the version the edit started from
 	codeAnnotationUnpatchable = "annotation_unpatchable" // 409: the annotation file cannot be edited while keeping its other content; regenerate rewrites it

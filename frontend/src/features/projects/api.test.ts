@@ -114,16 +114,6 @@ describe("project writes", () => {
       method: "DELETE",
     })
   })
-
-  it("reports model files that could not be removed", async () => {
-    mockFetch(() =>
-      Response.json({ files_removed: false, message: "部分文件未删除" })
-    )
-    await expect(deleteProject(9, { deleteModels: true })).resolves.toEqual({
-      files_removed: false,
-      message: "部分文件未删除",
-    })
-  })
 })
 
 function project(id: number, name: string): Project {

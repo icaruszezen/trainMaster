@@ -95,6 +95,20 @@ describe("navigation config", () => {
     ])
   })
 
+  it("lists the recycle bin under system management", () => {
+    expect(getNavItem("recycle-bin")).toMatchObject({
+      status: "ready",
+      title: "回收站",
+      path: "/system/recycle-bin",
+      apiPath: "/api/v1/recycle-bin",
+    })
+    expect(findActiveNavItem("/system/recycle-bin")).toMatchObject({
+      group: { id: "system" },
+      item: { id: "recycle-bin" },
+      exact: true,
+    })
+  })
+
   it("looks up items by id", () => {
     expect(getNavItem("datasets").path).toBe("/datasets")
     expect(() => getNavItem("nope" as ModuleId)).toThrow()

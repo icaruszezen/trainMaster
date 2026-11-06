@@ -54,6 +54,10 @@ const (
 
 var msgLeaseLost = fmt.Sprintf("训练节点在识别过程中失去联系（已尝试 %d 次）", maxAttempts)
 
+// msgIncomplete: the node completed the review with images left after
+// maxAttempts claims.
+var msgIncomplete = fmt.Sprintf("训练节点结束识别时还有图片没有识别（已尝试 %d 次）", maxAttempts)
+
 func leaseSeconds() int { return int(model.LeaseDuration / time.Second) }
 
 // Kind is the task kind of the reviews' inference (model.TaskSource).
@@ -85,8 +89,10 @@ func (s *Service) claimOne(ctx context.Context, nodeID int64) (task *Task, skipp
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		var id int64
 		var modelID *int64
-		err := tx.QueryRow(ctx, `SELECT id, model_id FROM reviews WHERE status = 'queued'
-			ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&id, &modelID)
+		// Reviews whose model is in the recycle bin wait for it.
+		err := tx.QueryRow(ctx, `SELECT id, model_id FROM reviews r WHERE status = 'queued'
+				AND NOT EXISTS (SELECT 1 FROM models m WHERE m.id = r.model_id AND m.deleted_at IS NOT NULL)
+			ORDER BY id FOR UPDATE OF r SKIP LOCKED LIMIT 1`).Scan(&id, &modelID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -239,6 +245,11 @@ func (s *Service) OpenTaskModel(ctx context.Context, reviewID, nodeID int64) (*m
 	f, err := s.models.OpenModelFile(ctx, *modelID)
 	if errors.Is(err, model.ErrNotFound) {
 		if _, gerr := s.models.GetModel(ctx, *modelID); errors.Is(gerr, model.ErrNotFound) {
+			if in, err := modelInBin(ctx, s.db, *modelID); err != nil {
+				return nil, err
+			} else if in {
+				return gone(msgModelInBin)
+			}
 			return gone(msgModelDeleted)
 		}
 		return gone(msgModelFileMissing)
@@ -556,30 +567,59 @@ func clampCoord(v float64, limit int) int {
 
 // CompleteTask finishes a review the node holds once every image is
 // inferred: it becomes ready with what the node reported about the run.
+//
+// With images left (a dataset restored from the recycle bin after the
+// node's last listing; it lists from the start on every pass otherwise)
+// it answers 409, and the node gives up: the review goes back to the queue
+// at once, so the next claim infers them instead of waiting for the lease,
+// or fails after maxAttempts claims like a lost lease.
 func (s *Service) CompleteTask(ctx context.Context, reviewID, nodeID int64, result json.RawMessage) (Review, error) {
 	resultJSON, err := json.Marshal(sanitizeResult(result))
 	if err != nil {
 		return Review{}, fmt.Errorf("encode review result: %w", err)
 	}
+	var remaining int
+	var requeued bool
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		if _, err := lockHeld(ctx, tx, reviewID, nodeID); err != nil {
+		attempts, err := lockHeld(ctx, tx, reviewID, nodeID)
+		if err != nil {
 			return err
 		}
-		var remaining int
 		if err := tx.QueryRow(ctx, "SELECT count(*) FROM review_images WHERE review_id = $1 AND NOT inferred", reviewID).
 			Scan(&remaining); err != nil {
 			return err
 		}
 		if remaining > 0 {
-			return newError(ErrConflict, "还有 %d 张图片没有识别", remaining)
+			requeued = attempts < maxAttempts
+			if requeued {
+				_, err = tx.Exec(ctx, `UPDATE reviews SET status = 'queued', stage = '', node_id = NULL,
+						lease_expires_at = NULL, updated_at = now()
+					WHERE id = $1`, reviewID)
+			} else {
+				_, err = tx.Exec(ctx, `UPDATE reviews SET status = 'failed', stage = '', lease_expires_at = NULL,
+						error = $2, finished_at = now(), updated_at = now()
+					WHERE id = $1`, reviewID, msgIncomplete)
+			}
+			return err
 		}
-		_, err := tx.Exec(ctx, `UPDATE reviews SET status = 'ready', stage = '', lease_expires_at = NULL, result = $2,
+		_, err = tx.Exec(ctx, `UPDATE reviews SET status = 'ready', stage = '', lease_expires_at = NULL, result = $2,
 				finished_at = now(), updated_at = now()
 			WHERE id = $1`, reviewID, resultJSON)
 		return err
 	})
 	if err != nil {
 		return Review{}, err
+	}
+	if remaining > 0 {
+		s.models.TouchWorker(nodeID, TaskKind)
+		if requeued {
+			s.models.NotifyTasks()
+			s.log.Warn("review completed with images left; queued again", "review_id", reviewID, "node_id", nodeID,
+				"remaining", remaining)
+			return Review{}, newError(ErrConflict, "还有 %d 张图片没有识别，审图任务已重新排队", remaining)
+		}
+		s.log.Warn("review failed", "review_id", reviewID, "node_id", nodeID, "error", msgIncomplete)
+		return Review{}, newError(ErrConflict, "还有 %d 张图片没有识别", remaining)
 	}
 	s.models.TouchWorker(nodeID, TaskKind)
 	r, err := s.GetReview(ctx, reviewID)

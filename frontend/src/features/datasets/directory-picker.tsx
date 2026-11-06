@@ -19,6 +19,7 @@ import {
   type DatasetDirectory,
 } from "@/features/datasets/api"
 import { LoadError } from "@/features/datasets/load-error"
+import { RECYCLE_BIN_PATH } from "@/features/recycle-bin/recycle-format"
 import { formatBytes, formatNumber, formatRelativeTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -210,18 +211,31 @@ function DirectoryRow({
         {state?.status === "error" && (
           <CircleAlert className="size-4 text-destructive" />
         )}
-        {unavailable && (
+        {unavailable && directory.in_recycle_bin ? (
+          // 使用它的数据集在回收站中（删除时保留了文件夹）：只能恢复那个数据集。
           <>
-            <Badge variant="secondary">已添加</Badge>
-            {directory.dataset_id !== null && (
-              <Link
-                to={`/datasets/${directory.dataset_id}`}
-                className="text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
-              >
-                查看
-              </Link>
-            )}
+            <Badge variant="secondary">在回收站中</Badge>
+            <Link
+              to={RECYCLE_BIN_PATH}
+              className="text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+            >
+              去恢复
+            </Link>
           </>
+        ) : (
+          unavailable && (
+            <>
+              <Badge variant="secondary">已添加</Badge>
+              {directory.dataset_id !== null && (
+                <Link
+                  to={`/datasets/${directory.dataset_id}`}
+                  className="text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+                >
+                  查看
+                </Link>
+              )}
+            </>
+          )
         )}
       </div>
     </li>

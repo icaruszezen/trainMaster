@@ -17,14 +17,20 @@ import (
 
 // reviewSelect reads reviews with their node, their project and their
 // queue position; append WHERE and ORDER BY. The counts, datasets, uploads
-// and merges are loaded by fillReviews.
-const reviewSelect = `SELECT r.id, r.name, r.description, r.model_id IS NOT NULL, r.model_ref, r.options, r.status,
+// and merges are loaded by fillReviews. A model or project in the recycle
+// bin counts as deleted. A queued review whose model is in the bin waits
+// outside the queue (claimOne skips it): it has no position and does not
+// count in the others'.
+const reviewSelect = `SELECT r.id, r.name, r.description,
+		EXISTS (SELECT 1 FROM models m WHERE m.id = r.model_id AND m.deleted_at IS NULL), r.model_ref, r.options, r.status,
 		r.stage, r.attempts, r.node_id, n.name, r.error, r.error_detail, r.result, r.project_id, p.name,
-		CASE WHEN r.status = 'queued' THEN (SELECT count(*) FROM reviews q WHERE q.status = 'queued' AND q.id <= r.id) END,
+		CASE WHEN r.status = 'queued' AND NOT EXISTS (SELECT 1 FROM models m WHERE m.id = r.model_id AND m.deleted_at IS NOT NULL)
+			THEN (SELECT count(*) FROM reviews q WHERE q.status = 'queued' AND q.id <= r.id
+				AND NOT EXISTS (SELECT 1 FROM models m WHERE m.id = q.model_id AND m.deleted_at IS NOT NULL)) END,
 		r.created_at, r.updated_at, r.started_at, r.finished_at
 	FROM reviews r
 	LEFT JOIN compute_nodes n ON n.id = r.node_id
-	LEFT JOIN projects p ON p.id = r.project_id`
+	LEFT JOIN projects p ON p.id = r.project_id AND p.deleted_at IS NULL`
 
 func scanReview(row pgx.Row) (Review, error) {
 	var (

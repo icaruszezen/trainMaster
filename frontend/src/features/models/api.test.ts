@@ -187,22 +187,12 @@ describe("model writes", () => {
     })
   })
 
-  it("deletes a model", async () => {
+  it("moves a model to the recycle bin", async () => {
     const fetchMock = mockFetch(() => new Response(null, { status: 204 }))
     await expect(deleteModel(5)).resolves.toBeUndefined()
     expect(requestOf(fetchMock)).toMatchObject({
       path: "/api/v1/models/5",
       method: "DELETE",
-    })
-  })
-
-  it("reports model files that could not be removed", async () => {
-    mockFetch(() =>
-      Response.json({ files_removed: false, message: "文件夹未能删除" })
-    )
-    await expect(deleteModel(5)).resolves.toEqual({
-      files_removed: false,
-      message: "文件夹未能删除",
     })
   })
 

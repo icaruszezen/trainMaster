@@ -182,11 +182,12 @@ func (s *Service) GetImport(ctx context.Context, datasetID, importID int64) (Imp
 }
 
 // getImport loads a job and tells "no such dataset" from "no such job".
+// The jobs of a dataset in the recycle bin are not found either.
 func (s *Service) getImport(ctx context.Context, q querier, datasetID, importID int64, forUpdate bool) (Import, error) {
 	job, err := queryImport(ctx, q, datasetID, importID, forUpdate)
-	if errors.Is(err, errImportNotFound) {
+	if err == nil || errors.Is(err, errImportNotFound) {
 		if _, derr := queryDataset(ctx, q, datasetID, false); derr != nil {
-			return job, derr
+			return Import{}, derr
 		}
 	}
 	return job, err
@@ -511,6 +512,7 @@ func (s *Service) CancelImport(ctx context.Context, datasetID, importID int64) (
 	job, err := scanImport(s.db.QueryRow(ctx, `UPDATE dataset_imports
 		SET status = 'canceled', finished_at = now(), updated_at = now()
 		WHERE id = $1 AND dataset_id = $2 AND status IN ('uploading', 'queued')
+			AND EXISTS (SELECT 1 FROM datasets WHERE id = $2 AND deleted_at IS NULL)
 		RETURNING `+importColumns, importID, datasetID))
 	if err == nil {
 		s.removeStaging(importID)

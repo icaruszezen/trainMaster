@@ -87,7 +87,7 @@ var errClassesChanged = &Error{Kind: ErrConflict, Message: "类别列表已被�
 // queryClasses reads the class list of a project, locking the project row
 // against other changes of the list when forUpdate is set.
 func queryClasses(ctx context.Context, q querier, projectID int64, forUpdate bool) ([]Class, error) {
-	sql := "SELECT classes FROM projects WHERE id = $1"
+	sql := "SELECT classes FROM projects WHERE id = $1 AND deleted_at IS NULL"
 	if forUpdate {
 		// FOR NO KEY UPDATE, like the membership changes: the row stays
 		// referenceable, so datasets can still be added meanwhile.
@@ -191,7 +191,8 @@ func (s *Service) DatasetClasses(ctx context.Context, datasetID int64) ([]Class,
 	if err := s.datasetExists(ctx, datasetID); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Query(ctx, `SELECT p.classes FROM project_datasets pd JOIN projects p ON p.id = pd.project_id
+	rows, err := s.db.Query(ctx, `SELECT p.classes FROM project_datasets pd
+		JOIN projects p ON p.id = pd.project_id AND p.deleted_at IS NULL
 		WHERE pd.dataset_id = $1 ORDER BY lower(p.name), p.id`, datasetID)
 	if err != nil {
 		return nil, err
@@ -206,7 +207,8 @@ func (s *Service) DatasetClasses(ctx context.Context, datasetID int64) ([]Class,
 // datasetExists fails with a not-found error unless the dataset exists.
 func (s *Service) datasetExists(ctx context.Context, datasetID int64) error {
 	var exists bool
-	if err := s.db.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM datasets WHERE id = $1)", datasetID).Scan(&exists); err != nil {
+	if err := s.db.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM datasets WHERE id = $1 AND deleted_at IS NULL)",
+		datasetID).Scan(&exists); err != nil {
 		return err
 	}
 	if !exists {
@@ -243,7 +245,7 @@ func (s *Service) ExportClasses(ctx context.Context, projectID, datasetID int64)
 	var member bool
 	err := s.db.QueryRow(ctx, `SELECT p.name, p.classes,
 			EXISTS (SELECT 1 FROM project_datasets pd WHERE pd.project_id = p.id AND pd.dataset_id = $2)
-		FROM projects p WHERE p.id = $1`, projectID, datasetID).Scan(&name, &classes, &member)
+		FROM projects p WHERE p.id = $1 AND `+projectLive, projectID, datasetID).Scan(&name, &classes, &member)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, &Error{Kind: ErrInvalid, Message: "所选项目不存在或已被删除，请刷新后重试"}
 	}

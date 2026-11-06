@@ -52,6 +52,11 @@ type Service struct {
 
 	// annotationLocks serializes the annotation edits of an image (by ID).
 	annotationLocks keyedMutex
+	// recycleLocks serializes moving a dataset to the recycle bin and back
+	// (by ID), with the folder that moves after the restore's commit.
+	recycleLocks keyedMutex
+
+	recycleHook RecycleHook // SetRecycleHook
 
 	// base is the context jobs index with after a user cancel; only
 	// stopping the service cancels it.
@@ -87,6 +92,9 @@ func NewService(o Options) *Service {
 func (s *Service) Start(ctx context.Context) error {
 	if err := s.recoverJobs(ctx); err != nil {
 		return fmt.Errorf("recover dataset jobs: %w", err)
+	}
+	if err := s.reconcileRecycleFolders(ctx); err != nil {
+		s.log.Error("check the folders of the recycle bin", "err", err)
 	}
 	if err := s.refreshSortKeys(ctx); err != nil {
 		return fmt.Errorf("update image sort keys: %w", err)
@@ -277,10 +285,10 @@ func (s *Service) createFolderDataset(ctx context.Context, name, desc string) (i
 		if err := checkNameFree(ctx, tx, name, 0); err != nil {
 			return err
 		}
-		if owner, err := datasetUsingDir(ctx, tx, name); err != nil {
+		if owner, err := datasetUsingDir(ctx, tx, name, 0); err != nil {
 			return err
-		} else if owner != "" {
-			return newError(ErrConflict, "文件夹“%s”已被数据集“%s”使用", name, owner)
+		} else if owner != nil {
+			return newError(ErrConflict, "文件夹“%s”已被数据集%s使用", name, owner)
 		}
 		// Compare ignoring case so the data directory stays usable on
 		// case-insensitive file systems (Windows, macOS).
@@ -353,10 +361,10 @@ func (s *Service) registerDirectory(ctx context.Context, name, desc, dirName str
 		if err := checkNameFree(ctx, tx, name, 0); err != nil {
 			return err
 		}
-		if owner, err := datasetUsingDir(ctx, tx, dirName); err != nil {
+		if owner, err := datasetUsingDir(ctx, tx, dirName, 0); err != nil {
 			return err
-		} else if owner != "" {
-			return newError(ErrConflict, "目录“%s”已添加为数据集“%s”", dirName, owner)
+		} else if owner != nil {
+			return newError(ErrConflict, "目录“%s”已添加为数据集%s", dirName, owner)
 		}
 		d, err := insertDataset(ctx, tx, name, dirName, desc, OriginDirectory)
 		if err != nil {
@@ -414,127 +422,9 @@ func (s *Service) UpdateDataset(ctx context.Context, id int64, in UpdateDatasetI
 	return s.GetDataset(ctx, id)
 }
 
-// deletingPrefix marks folders of deleted datasets that are being removed.
+// deletingPrefix marks folders of purged datasets that are being removed.
 // Being hidden, they never show up as directories.
 const deletingPrefix = ".deleting-"
-
-// DeleteResult describes a delete that removed the dataset but could not
-// remove its whole folder. The JSON field names are part of the API.
-type DeleteResult struct {
-	FilesRemoved bool   `json:"files_removed"` // always false
-	Message      string `json:"message"`       // what is left and where, in Chinese
-}
-
-// DeleteDataset deletes a dataset and its index. With deleteFiles it also
-// deletes the dataset folder; otherwise the folder stays and can be
-// registered again. Datasets with a queued or running job cannot be
-// deleted; unfinished uploads are canceled. The result is nil unless the
-// dataset was deleted but its folder could not be removed completely.
-func (s *Service) DeleteDataset(ctx context.Context, id int64, deleteFiles bool) (*DeleteResult, error) {
-	var canceled []int64
-	var dirName, trash string
-	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		d, err := queryDataset(ctx, tx, id, true)
-		if err != nil {
-			return err
-		}
-		dirName = d.DirName
-		busy, err := hasProcessingJob(ctx, tx, id)
-		if err != nil {
-			return err
-		}
-		if busy {
-			return &Error{Kind: ErrConflict, Message: "数据集正在导入或扫描，请等待完成或取消后再删除"}
-		}
-		rows, err := tx.Query(ctx, `UPDATE dataset_imports SET status = 'canceled', finished_at = now(), updated_at = now()
-			WHERE dataset_id = $1 AND status = 'uploading' RETURNING id`, id)
-		if err != nil {
-			return err
-		}
-		if canceled, err = pgx.CollectRows(rows, pgx.RowTo[int64]); err != nil {
-			return err
-		}
-		if err := touchDatasetProjects(ctx, tx, id); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, "DELETE FROM datasets WHERE id = $1", id); err != nil {
-			return err
-		}
-		if deleteFiles {
-			// Move the folder out of the way first: this is atomic and quick,
-			// so the transaction can still roll back, and the slow removal
-			// below cannot leave a half-deleted dataset folder behind.
-			if trash, err = s.moveToTrash(d); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		if trash != "" {
-			if rerr := os.Rename(trash, s.datasetDir(dirName)); rerr != nil {
-				s.log.Error("restore dataset folder after failed delete", "path", trash, "err", rerr)
-			}
-		}
-		return nil, err
-	}
-	for _, jobID := range canceled {
-		s.removeStaging(jobID)
-	}
-	s.removeAllThumbnails(id)
-	s.log.Info("dataset deleted", "dataset_id", id, "delete_files", deleteFiles)
-	if trash != "" {
-		if err := s.removeAll(trash); err != nil {
-			return s.restoreLeftover(id, dirName, trash, err), nil
-		}
-	}
-	return nil, nil
-}
-
-// restoreLeftover handles a dataset folder that could not be removed
-// completely (e.g. files copied in by another user): what is left gets its
-// visible name back, so it can be cleaned up by hand or registered again.
-// If a folder of that name appeared meanwhile, the leftover stays hidden
-// and the janitor keeps trying to remove it.
-func (s *Service) restoreLeftover(datasetID int64, dirName, trash string, removeErr error) *DeleteResult {
-	reason := "部分文件无法删除"
-	if errors.Is(removeErr, fs.ErrPermission) {
-		reason = "权限不足"
-	}
-	dir := s.datasetDir(dirName)
-	if existing, err := s.findDirEntry(dirName); err == nil && existing == "" {
-		if err := os.Rename(trash, dir); err == nil {
-			s.log.Error("dataset folder only partly deleted; kept the rest under its name",
-				"dataset_id", datasetID, "path", dir, "err", removeErr)
-			return &DeleteResult{Message: fmt.Sprintf("数据集已删除，但文件夹未能完全删除（%s）：%s。"+
-				"剩余的文件仍在该文件夹中，可在服务器上处理后手动删除，或通过“添加已有目录”重新添加。", reason, dir)}
-		}
-	}
-	s.log.Error("dataset folder only partly deleted", "dataset_id", datasetID, "path", trash, "err", removeErr)
-	return &DeleteResult{Message: fmt.Sprintf("数据集已删除，但文件夹未能完全删除（%s）：剩余的文件在 %s，请在服务器上手动删除。",
-		reason, trash)}
-}
-
-// moveToTrash renames the folder of d to a hidden name inside datasets/.
-// It refuses symbolic links so deletion never follows one. A missing
-// folder is not an error (nothing to delete).
-func (s *Service) moveToTrash(d Dataset) (string, error) {
-	dir := s.datasetDir(d.DirName)
-	fi, err := os.Lstat(dir)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return "", nil
-	case err != nil:
-		return "", fmt.Errorf("stat dataset folder: %w", err)
-	case !fi.IsDir(): // includes symbolic links
-		return "", &Error{Kind: ErrConflict, Message: "数据集文件夹是符号链接或不是普通文件夹，无法删除其中的文件"}
-	}
-	trash := filepath.Join(s.datasetsDir(), deletingPrefix+strconv.FormatInt(d.ID, 10))
-	if err := os.Rename(dir, trash); err != nil {
-		return "", fmt.Errorf("move dataset folder aside: %w", err)
-	}
-	return trash, nil
-}
 
 // cleanTrash removes folders left behind by deletes that failed midway.
 func (s *Service) cleanTrash() {
@@ -561,6 +451,9 @@ func (s *Service) janitorLoop(ctx context.Context) {
 		}
 		if err := s.cleanStaging(ctx); err != nil && ctx.Err() == nil {
 			s.log.Error("clean dataset import staging", "err", err)
+		}
+		if err := s.purgeExpired(ctx); err != nil && ctx.Err() == nil {
+			s.log.Error("purge datasets from the recycle bin", "err", err)
 		}
 		s.cleanTrash()
 		select {
@@ -591,15 +484,22 @@ func (s *Service) ListDirectories(ctx context.Context) ([]Directory, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read datasets folder: %w", err)
 	}
-	rows, err := s.db.Query(ctx, "SELECT dir_name, id FROM datasets")
+	// The folders of the datasets in use and of those in the recycle bin
+	// that kept their folder in place (deleted without their files).
+	rows, err := s.db.Query(ctx, `SELECT dir_name, id, deleted_at IS NOT NULL FROM datasets
+		WHERE deleted_at IS NULL OR NOT delete_files`)
 	if err != nil {
 		return nil, err
 	}
-	registered := map[string]int64{}
+	type owner struct {
+		id      int64
+		deleted bool
+	}
+	registered := map[string]owner{}
 	var dirName string
-	var id int64
-	if _, err := pgx.ForEachRow(rows, []any{&dirName, &id}, func() error {
-		registered[dirName] = id
+	var o owner
+	if _, err := pgx.ForEachRow(rows, []any{&dirName, &o.id, &o.deleted}, func() error {
+		registered[dirName] = o
 		return nil
 	}); err != nil {
 		return nil, err
@@ -620,8 +520,8 @@ func (s *Service) ListDirectories(ctx context.Context) ([]Directory, error) {
 			continue // removed meanwhile
 		}
 		d := Directory{Name: e.Name(), Path: s.datasetDir(e.Name()), ModifiedAt: info.ModTime().UTC()}
-		if id, ok := registered[e.Name()]; ok {
-			d.Registered, d.DatasetID = true, &id
+		if o, ok := registered[e.Name()]; ok {
+			d.Registered, d.DatasetID, d.InRecycleBin = true, &o.id, o.deleted
 		}
 		out = append(out, d)
 	}

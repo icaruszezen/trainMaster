@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -521,14 +520,14 @@ func TestIntegrationVersionsNotReused(t *testing.T) {
 	projectID := e.project(t, "p")
 	m1 := e.addModel(t, projectID, "yolo11")
 	m2 := e.addModel(t, projectID, "yolo11")
-	if res, err := e.svc.DeleteModel(ctx, m2.ID); err != nil || res != nil {
-		t.Fatalf("DeleteModel = %+v, %v", res, err)
+	if err := e.svc.DeleteModel(ctx, m2.ID); err != nil {
+		t.Fatalf("DeleteModel: %v", err)
 	}
 	if m3 := e.addModel(t, projectID, "yolo11"); m3.Version != 3 {
 		t.Errorf("version after deleting v2 = %d, want 3", m3.Version)
 	}
 	for _, id := range []int64{m1.ID} {
-		if _, err := e.svc.DeleteModel(ctx, id); err != nil {
+		if err := e.svc.DeleteModel(ctx, id); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -595,100 +594,6 @@ func TestIntegrationConcurrentCommits(t *testing.T) {
 			t.Errorf("v%d has no file", m.Version)
 		}
 	}
-}
-
-func TestIntegrationDeleteModel(t *testing.T) {
-	e := newTestEnv(t)
-	ctx := context.Background()
-	projectID := e.project(t, "p")
-	m := e.addModel(t, projectID, "yolo11")
-	_, _, err := e.svc.RequestExport(ctx, m.ID, ExportRequest{Format: "onnx"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := e.modelPath(m, "")
-	if res, err := e.svc.DeleteModel(ctx, m.ID); err != nil || res != nil {
-		t.Fatalf("DeleteModel = %+v, %v", res, err)
-	}
-	if exists(dir) {
-		t.Error("model folder should be removed")
-	}
-	var exports int
-	if err := e.db.QueryRow(ctx, "SELECT count(*) FROM model_exports").Scan(&exports); err != nil || exports != 0 {
-		t.Errorf("exports left: %d, %v", exports, err)
-	}
-	_, err = e.svc.DeleteModel(ctx, m.ID)
-	wantKind(t, err, ErrNotFound, "模型不存在")
-
-	// A model whose folder is gone can still be deleted.
-	m = e.addModel(t, projectID, "yolo11")
-	if err := os.RemoveAll(e.modelPath(m, "")); err != nil {
-		t.Fatal(err)
-	}
-	if res, err := e.svc.DeleteModel(ctx, m.ID); err != nil || res != nil {
-		t.Errorf("delete without folder = %+v, %v", res, err)
-	}
-
-	// The folder cannot be removed completely: the record is gone, the rest
-	// keeps its name.
-	m = e.addModel(t, projectID, "yolo11")
-	e.svc.removeAll = func(string) error { return &fs.PathError{Op: "unlinkat", Path: "x", Err: fs.ErrPermission} }
-	res, err := e.svc.DeleteModel(ctx, m.ID)
-	if err != nil || res == nil || res.FilesRemoved || !strings.Contains(res.Message, "权限不足") ||
-		!strings.Contains(res.Message, e.modelPath(m, "")) {
-		t.Fatalf("DeleteModel = %+v, %v", res, err)
-	}
-	if !exists(e.modelPath(m, "model.pt")) {
-		t.Error("the leftover should be back under its name")
-	}
-	if _, err := e.svc.GetModel(ctx, m.ID); !errors.Is(err, ErrNotFound) {
-		t.Errorf("model should be deleted: %v", err)
-	}
-	e.svc.removeAll = os.RemoveAll
-}
-
-func TestIntegrationDeleteProjectModels(t *testing.T) {
-	e := newTestEnv(t)
-	ctx := context.Background()
-	projectID, other := e.project(t, "p"), e.project(t, "q")
-	e.addModel(t, projectID, "yolo11")
-	e.addModel(t, projectID, "yolo26")
-	kept := e.addModel(t, other, "yolo11")
-	if res, err := e.svc.DeleteProjectModels(ctx, projectID); err != nil || res != nil {
-		t.Fatalf("DeleteProjectModels = %+v, %v", res, err)
-	}
-	if ms, _ := e.svc.ListModels(ctx, ModelQuery{}); len(ms) != 1 || ms[0].ID != kept.ID {
-		t.Errorf("models left = %+v", ms)
-	}
-	if exists(filepath.Join(e.st.Dir(storage.Models), fmt.Sprintf("project-%d", projectID))) {
-		t.Error("the project's model folder should be removed")
-	}
-	// Now the project itself can go; an upload in progress goes with it and
-	// its staged file is cleaned up.
-	up := e.upload(t, projectID, "yolo11", fakePT(t, detectInfo("yolo11"), ""))
-	if _, err := e.db.Exec(ctx, "DELETE FROM projects WHERE id = $1", projectID); err != nil {
-		t.Fatal(err)
-	}
-	_, _, err := e.svc.CommitUpload(ctx, up.ID, CommitInput{})
-	wantKind(t, err, ErrNotFound, "上传任务不存在")
-	if err := e.svc.cleanUploadTemp(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if exists(e.svc.uploadDir(up.ID)) {
-		t.Error("staged file of the deleted project's upload should be removed")
-	}
-	if res, err := e.svc.DeleteProjectModels(ctx, 99999); err != nil || res != nil {
-		t.Errorf("DeleteProjectModels of a missing project = %+v, %v", res, err)
-	}
-
-	// Leftovers are reported once for all models.
-	e.addModel(t, other, "yolo11")
-	e.svc.removeAll = func(string) error { return errors.New("busy") }
-	res, err := e.svc.DeleteProjectModels(ctx, other)
-	if err != nil || res == nil || !strings.Contains(res.Message, "部分文件无法删除") || !strings.Contains(res.Message, "另有 1 个模型") {
-		t.Errorf("DeleteProjectModels with leftovers = %+v, %v", res, err)
-	}
-	e.svc.removeAll = os.RemoveAll
 }
 
 func TestIntegrationProjectDeletedDuringCommit(t *testing.T) {
@@ -1057,11 +962,16 @@ func TestIntegrationInterruptedCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Deleting the project's models clears its leftovers, so that its
-	// folder goes too.
-	if _, err := e.svc.DeleteProjectModels(ctx, projectID); err != nil {
+	// Once the project's models are purged, removing its folder clears its
+	// leftovers, so that the folder goes too.
+	if err := e.svc.DeleteProjectModels(ctx, projectID); err != nil {
 		t.Fatal(err)
 	}
+	e.expireModels(t, projectID)
+	if err := e.svc.purgeExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e.svc.RemoveProjectFolder(ctx, projectID)
 	if exists(filepath.Join(e.st.Dir(storage.Models), projectDir)) {
 		entries, _ := os.ReadDir(filepath.Join(e.st.Dir(storage.Models), projectDir))
 		t.Errorf("project folder kept: %v", entries)

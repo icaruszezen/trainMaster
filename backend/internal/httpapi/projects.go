@@ -8,7 +8,6 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
-	"github.com/icaruszezen/trainmaster/backend/internal/model"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 )
 
@@ -57,6 +56,8 @@ func projectErrorStatus(kind error) (int, string) {
 		return http.StatusUnprocessableEntity, codeValidationFailed
 	case project.ErrConflict, project.ErrHasModels:
 		return http.StatusConflict, codeConflict
+	case project.ErrNameTaken:
+		return http.StatusConflict, codeNameTaken
 	}
 	return http.StatusInternalServerError, codeInternal
 }
@@ -142,9 +143,8 @@ func (s *server) updateProject(w http.ResponseWriter, r *http.Request) {
 }
 
 // deleteProject deletes a project; one with models only with
-// ?delete_models=true, which deletes the models (and their files) first.
-// Like deleting a dataset, it answers 200 with what is left when some
-// model folders could not be removed completely.
+// ?delete_models=true, which moves the models to the recycle bin first
+// (the project stays with them there, out of use, see package project).
 func (s *server) deleteProject(w http.ResponseWriter, r *http.Request) {
 	id, ok := projectID(w, r)
 	if !ok {
@@ -159,24 +159,20 @@ func (s *server) deleteProject(w http.ResponseWriter, r *http.Request) {
 		}
 		deleteModels = b
 	}
-	var leftover *model.DeleteResult
 	if deleteModels && s.models != nil {
-		res, err := s.models.DeleteProjectModels(r.Context(), id)
-		if err != nil {
+		if err := s.models.DeleteProjectModels(r.Context(), id); err != nil {
 			s.modelError(w, r, err)
 			return
 		}
-		leftover = res
 	}
-	// A model added after the models were deleted makes this fail with 409;
-	// deleting again deletes it too.
+	// A model added after the models were moved makes this fail with 409;
+	// deleting again moves it too.
 	if err := s.projects.DeleteProject(r.Context(), id); err != nil {
 		s.projectError(w, r, err)
 		return
 	}
-	if leftover != nil {
-		writeJSON(w, http.StatusOK, leftover)
-		return
+	if s.models != nil {
+		s.models.RemoveProjectFolder(r.Context(), id) // deleted for good: its folder is empty
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

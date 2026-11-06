@@ -50,9 +50,11 @@ func (s *Service) CreateUpload(ctx context.Context, in CreateUploadInput) (Uploa
 	if err := s.checkFreeSpace(in.FileSize); err != nil {
 		return Upload{}, err
 	}
+	// FOR KEY SHARE waits for the project being deleted (FOR UPDATE) and
+	// then reads it again: one moved to the recycle bin takes no uploads.
 	up, err := scanUpload(s.db.QueryRow(ctx, `INSERT INTO model_uploads (project_id, yolo_version, description, file_name,
 			file_size, status)
-		SELECT id, $2, $3, $4, $5, 'uploading' FROM projects WHERE id = $1
+		SELECT id, $2, $3, $4, $5, 'uploading' FROM projects WHERE id = $1 AND deleted_at IS NULL FOR KEY SHARE
 		RETURNING `+uploadColumns, in.ProjectID, yolo, desc, name, in.FileSize))
 	if errors.Is(err, errUploadNotFound) {
 		return Upload{}, errProjectGone

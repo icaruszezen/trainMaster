@@ -3,18 +3,14 @@ package dataset
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -672,7 +668,7 @@ func TestIntegrationUploadProtocol(t *testing.T) {
 	// Only one scan at a time; queued jobs block deletion.
 	_, err = e.svc.StartScan(ctx, d.ID)
 	wantKind(t, err, ErrConflict, "正在导入或扫描")
-	_, err = e.svc.DeleteDataset(ctx, d.ID, true)
+	err = e.svc.DeleteDataset(ctx, d.ID, true)
 	wantKind(t, err, ErrConflict, "正在导入或扫描")
 
 	// Cancel: queued and uploading jobs end at once; finished ones stay.
@@ -714,79 +710,6 @@ func TestIntegrationUploadProtocol(t *testing.T) {
 type iotestErrReader struct{}
 
 func (iotestErrReader) Read([]byte) (int, error) { return 0, errors.New("connection reset") }
-
-func TestIntegrationDeleteDataset(t *testing.T) {
-	e := newTestEnv(t, false)
-	ctx := context.Background()
-
-	keep, _ := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "keep-files"})
-	writeFiles(t, keep.Path, map[string][]byte{"a.png": pngFile(t, 2, 2)})
-	upload, _ := e.svc.CreateImport(ctx, keep.ID, CreateImportInput{Source: SourceFolder})
-	if res, err := e.svc.DeleteDataset(ctx, keep.ID, false); err != nil || res != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(keep.Path, "a.png")); err != nil {
-		t.Errorf("files must stay without delete_files: %v", err)
-	}
-	if _, err := os.Stat(e.svc.stagingDir(upload.ID)); !os.IsNotExist(err) {
-		t.Errorf("staging of the canceled upload remains: %v", err)
-	}
-	_, err := e.svc.GetDataset(ctx, keep.ID)
-	wantKind(t, err, ErrNotFound, "数据集不存在")
-	_, err = e.svc.DeleteDataset(ctx, keep.ID, false)
-	wantKind(t, err, ErrNotFound, "数据集不存在")
-
-	// The folder can be registered again afterwards.
-	dirName := "keep-files"
-	again, err := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "again", Directory: &dirName})
-	if err != nil {
-		t.Fatalf("re-register: %v", err)
-	}
-	if busy, _ := e.svc.CancelImport(ctx, again.ID, again.ActiveImport.ID); busy.Status != StatusCanceled {
-		t.Fatalf("cancel scan = %+v", busy)
-	}
-
-	// delete_files removes the folder, its thumbnails, and never follows a
-	// symbolic link inside it.
-	outside := t.TempDir()
-	writeFiles(t, outside, map[string][]byte{"precious.png": pngFile(t, 2, 2)})
-	if err := os.Symlink(outside, filepath.Join(again.Path, "link")); err != nil {
-		t.Fatal(err)
-	}
-	writeFiles(t, e.svc.thumbDir(again.ID), map[string][]byte{"1-sm-x.jpg": []byte("thumb")})
-	if res, err := e.svc.DeleteDataset(ctx, again.ID, true); err != nil || res != nil {
-		t.Fatalf("delete with files: %+v, %v", res, err)
-	}
-	if _, err := os.Lstat(again.Path); !os.IsNotExist(err) {
-		t.Errorf("dataset folder still exists: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(outside, "precious.png")); err != nil {
-		t.Errorf("deletion followed a symbolic link: %v", err)
-	}
-	if _, err := os.Stat(e.svc.thumbDir(again.ID)); !os.IsNotExist(err) {
-		t.Errorf("thumbnails remain: %v", err)
-	}
-	if entries, _ := os.ReadDir(e.datasetsDir()); len(entries) != 0 {
-		t.Errorf("datasets folder holds %v", entries)
-	}
-
-	// A dataset folder replaced by a symbolic link is not deleted through it.
-	sym, _ := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "sym"})
-	if err := os.Remove(sym.Path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, sym.Path); err != nil {
-		t.Fatal(err)
-	}
-	_, err = e.svc.DeleteDataset(ctx, sym.ID, true)
-	wantKind(t, err, ErrConflict, "符号链接")
-	if _, err := e.svc.GetDataset(ctx, sym.ID); err != nil {
-		t.Errorf("a refused delete must keep the dataset: %v", err)
-	}
-	if _, err := e.svc.DeleteDataset(ctx, sym.ID, false); err != nil {
-		t.Errorf("delete without files: %v", err)
-	}
-}
 
 func TestIntegrationRecoveryAndJanitor(t *testing.T) {
 	e := newTestEnv(t, false)
@@ -1021,55 +944,6 @@ func TestIntegrationNonUTF8Names(t *testing.T) {
 	wantSummary(t, job.Summary, map[string]int64{sumImagesAdded: 1, sumNamesInvalid: 2})
 	if d, _ = e.svc.GetDataset(ctx, d.ID); d.ImageCount != 2 {
 		t.Errorf("dataset after import = %+v", d)
-	}
-}
-
-func TestIntegrationDeleteLeavesUndeletableFiles(t *testing.T) {
-	e := newTestEnv(t, false)
-	ctx := context.Background()
-	// Like a folder copied in by another user: some files cannot be removed.
-	denied := func(path string) error {
-		_ = os.Remove(filepath.Join(path, "a.png"))
-		return &fs.PathError{Op: "unlinkat", Path: filepath.Join(path, "root-owned", "b.png"), Err: syscall.EACCES}
-	}
-	e.svc.removeAll = denied
-
-	d, _ := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "leftover"})
-	writeFiles(t, d.Path, map[string][]byte{"a.png": pngFile(t, 2, 2), "root-owned/b.png": pngFile(t, 2, 2)})
-	res, err := e.svc.DeleteDataset(ctx, d.ID, true)
-	if err != nil || res == nil || res.FilesRemoved || !strings.Contains(res.Message, "权限不足") || !strings.Contains(res.Message, d.Path) {
-		t.Fatalf("DeleteDataset = %+v, %v", res, err)
-	}
-	_, err = e.svc.GetDataset(ctx, d.ID)
-	wantKind(t, err, ErrNotFound, "数据集不存在")
-	// What is left is visible under its old name and can be added again.
-	if _, err := os.Stat(filepath.Join(d.Path, "root-owned", "b.png")); err != nil {
-		t.Errorf("leftover not restored: %v", err)
-	}
-	if dirs, err := e.svc.ListDirectories(ctx); err != nil || len(dirs) != 1 || dirs[0].Name != "leftover" || dirs[0].Registered {
-		t.Errorf("ListDirectories = %+v, %v", dirs, err)
-	}
-	raw, _ := json.Marshal(res)
-	var body map[string]any
-	if err := json.Unmarshal(raw, &body); err != nil || len(body) != 2 || body["files_removed"] != false || body["message"] != res.Message {
-		t.Errorf("JSON = %s", raw)
-	}
-
-	// A folder with the old name appeared meanwhile: the rest stays hidden.
-	taken, _ := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "taken"})
-	e.svc.removeAll = func(path string) error {
-		if err := os.Mkdir(taken.Path, 0o755); err != nil {
-			t.Error(err)
-		}
-		return denied(path)
-	}
-	trash := filepath.Join(e.datasetsDir(), deletingPrefix+strconv.FormatInt(taken.ID, 10))
-	res, err = e.svc.DeleteDataset(ctx, taken.ID, true)
-	if err != nil || res == nil || !strings.Contains(res.Message, trash) {
-		t.Fatalf("DeleteDataset = %+v, %v", res, err)
-	}
-	if fi, err := os.Stat(trash); err != nil || !fi.IsDir() {
-		t.Errorf("leftover should stay at %s: %v", trash, err)
 	}
 }
 

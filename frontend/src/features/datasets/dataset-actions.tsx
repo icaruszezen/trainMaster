@@ -65,6 +65,12 @@ import {
   validateDescription,
 } from "@/features/datasets/naming"
 import { projectKeys } from "@/features/projects/api"
+import {
+  refreshAfterDatasetMove,
+  restoreDataset,
+} from "@/features/recycle-bin/api"
+import { RECYCLE_RETENTION_DAYS } from "@/features/recycle-bin/recycle-format"
+import { toastMovedToBin } from "@/features/recycle-bin/recycle-toast"
 import { ApiError } from "@/lib/api"
 import { formatNumber } from "@/lib/format"
 import { queryClient } from "@/lib/query-client"
@@ -373,25 +379,15 @@ function DeleteDatasetForm({
 
   const mutation = useMutation({
     mutationFn: () => deleteDataset(dataset.id, deleteFiles),
-    onSuccess: (result) => {
+    onSuccess: () => {
       queryClient.removeQueries({ queryKey: datasetKeys.detail(dataset.id) })
-      void queryClient.invalidateQueries({ queryKey: datasetKeys.lists() })
-      void queryClient.invalidateQueries({
-        queryKey: datasetKeys.directories(),
+      // 数据集暂时离开它所属的项目与审图任务。
+      refreshAfterDatasetMove()
+      toastMovedToBin({
+        title: `已将数据集“${dataset.name}”移入回收站`,
+        undo: () => restoreDataset(dataset.id).then(refreshAfterDatasetMove),
+        undoneTitle: `已恢复数据集“${dataset.name}”`,
       })
-      // 数据集会从它所属的项目中移出。
-      void queryClient.invalidateQueries({ queryKey: projectKeys.all })
-      if (result?.files_removed === false) {
-        // 记录已删除，但文件夹没能完全删除（如权限不足）：说明留在了哪里。
-        toast.warning(`已删除数据集“${dataset.name}”`, {
-          description: result.message,
-          duration: 15_000,
-        })
-      } else {
-        toast.success(`已删除数据集“${dataset.name}”`, {
-          description: deleteFiles ? "数据集文件夹已从磁盘删除。" : undefined,
-        })
-      }
       onDeleted()
     },
   })
@@ -401,7 +397,8 @@ function DeleteDatasetForm({
       <AlertDialogHeader>
         <AlertDialogTitle>删除数据集“{dataset.name}”？</AlertDialogTitle>
         <AlertDialogDescription>
-          将删除数据集记录、图片索引、导入记录与缩略图缓存。
+          数据集会移入回收站，保留 {RECYCLE_RETENTION_DAYS}{" "}
+          天，期间可以恢复（回到原来的项目与审图任务）；到期后自动永久删除数据集记录、图片索引、导入记录与缩略图缓存。
         </AlertDialogDescription>
       </AlertDialogHeader>
 
@@ -422,7 +419,7 @@ function DeleteDatasetForm({
           />
           <span className="grid gap-1">
             <span className="font-medium">
-              同时删除磁盘上的数据集文件夹（不可恢复）
+              永久删除时同时删除磁盘上的数据集文件夹
             </span>
             <code className="font-mono text-xs break-all text-muted-foreground">
               {dataset.path}
@@ -431,19 +428,22 @@ function DeleteDatasetForm({
         </label>
         {dataset.projects.length > 0 && (
           <p className="text-muted-foreground">
-            数据集也会从所属的 {formatNumber(dataset.projects.length)} 个项目（
+            数据集会暂时移出所属的 {formatNumber(dataset.projects.length)}{" "}
+            个项目（
             {dataset.projects.map((project) => project.name).join("、")}
-            ）中移出。
+            ），恢复时回来。
           </p>
         )}
         {deleteFiles ? (
           <p className="text-destructive">
-            整个文件夹将被永久删除，无法找回：包括其中的所有文件和子文件夹，不只是已索引的{" "}
-            {formatNumber(dataset.image_count)} 张图片与标注文件。
+            {RECYCLE_RETENTION_DAYS}{" "}
+            天后整个文件夹将被永久删除，无法找回：包括其中的所有文件和子文件夹，不只是已索引的{" "}
+            {formatNumber(dataset.image_count)}{" "}
+            张图片与标注文件。在回收站期间文件夹改为隐藏，名称可以再用。
           </p>
         ) : (
           <p className="text-muted-foreground">
-            磁盘上的文件夹会保留，之后可以通过“添加已有目录”重新添加为数据集。
+            磁盘上的文件夹保留在原处；数据集永久删除后，可以通过“添加已有目录”重新添加为数据集。
           </p>
         )}
         {mutation.error && (
@@ -463,7 +463,7 @@ function DeleteDatasetForm({
           disabled={mutation.isPending}
         >
           {mutation.isPending && <Spinner aria-hidden />}
-          {deleteFiles ? "删除数据集和文件夹" : "删除数据集"}
+          移入回收站
         </Button>
       </AlertDialogFooter>
     </>

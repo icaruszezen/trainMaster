@@ -148,6 +148,9 @@ func (r *runner) claim(ctx context.Context) (*Import, error) {
 			SELECT q.id FROM dataset_imports q
 			WHERE q.status = 'queued' AND NOT EXISTS (
 				SELECT 1 FROM dataset_imports r WHERE r.dataset_id = q.dataset_id AND r.status = 'running')
+				-- Never one of a dataset in the recycle bin (deleting refuses
+				-- while a job is queued; this only guards that).
+				AND EXISTS (SELECT 1 FROM datasets d WHERE d.id = q.dataset_id AND d.deleted_at IS NULL)
 			ORDER BY q.id
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED)

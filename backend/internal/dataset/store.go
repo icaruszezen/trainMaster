@@ -27,11 +27,14 @@ const upsertBatchSize = 500
 const datasetColumns = `id, name, description, dir_name, origin, image_count, annotated_count, empty_count,
 	invalid_count, object_count, label_count, total_bytes, scanned_at, created_at, updated_at`
 
-func scanDataset(row pgx.Row) (Dataset, error) {
+func scanDataset(row pgx.Row) (Dataset, error) { return scanDatasetWith(row) }
+
+// scanDatasetWith scans datasetColumns followed by the extra columns.
+func scanDatasetWith(row pgx.Row, extra ...any) (Dataset, error) {
 	var d Dataset
-	err := row.Scan(&d.ID, &d.Name, &d.Description, &d.DirName, &d.Origin, &d.ImageCount, &d.AnnotatedCount,
-		&d.EmptyCount, &d.InvalidCount, &d.ObjectCount, &d.LabelCount, &d.TotalBytes, &d.ScannedAt, &d.CreatedAt,
-		&d.UpdatedAt)
+	err := row.Scan(append([]any{&d.ID, &d.Name, &d.Description, &d.DirName, &d.Origin, &d.ImageCount,
+		&d.AnnotatedCount, &d.EmptyCount, &d.InvalidCount, &d.ObjectCount, &d.LabelCount, &d.TotalBytes,
+		&d.ScannedAt, &d.CreatedAt, &d.UpdatedAt}, extra...)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return d, errDatasetNotFound
 	}
@@ -50,8 +53,10 @@ func utcPtr(t *time.Time) *time.Time {
 	return &u
 }
 
+// queryDataset reads a dataset in use: one in the recycle bin is not found
+// (recycle.go reads those).
 func queryDataset(ctx context.Context, q querier, id int64, forUpdate bool) (Dataset, error) {
-	sql := "SELECT " + datasetColumns + " FROM datasets WHERE id = $1"
+	sql := "SELECT " + datasetColumns + " FROM datasets WHERE id = $1 AND deleted_at IS NULL"
 	if forUpdate {
 		sql += " FOR UPDATE"
 	}
@@ -67,7 +72,7 @@ type DatasetQuery struct {
 
 func queryDatasets(ctx context.Context, q querier, f DatasetQuery) ([]Dataset, error) {
 	rows, err := q.Query(ctx, `SELECT `+datasetColumns+` FROM datasets d
-		WHERE ($1 = '' OR strpos(lower(name), lower($1)) > 0 OR strpos(lower(description), lower($1)) > 0)
+		WHERE deleted_at IS NULL AND ($1 = '' OR strpos(lower(name), lower($1)) > 0 OR strpos(lower(description), lower($1)) > 0)
 			AND ($2::bigint = 0 OR EXISTS (SELECT 1 FROM project_datasets pd WHERE pd.dataset_id = d.id AND pd.project_id = $2::bigint))
 			AND NOT ($3::boolean AND EXISTS (SELECT 1 FROM project_datasets pd WHERE pd.dataset_id = d.id))
 		ORDER BY updated_at DESC, id DESC`, f.Search, f.ProjectID, f.NoProject)
@@ -85,11 +90,13 @@ const (
 
 var errNameTaken = &Error{Kind: ErrConflict, Message: "已存在同名数据集"}
 
-// checkNameFree fails with errNameTaken if another dataset (not exceptID)
-// already uses name, ignoring case.
+// checkNameFree fails with errNameTaken if another dataset in use (not
+// exceptID) already has name, ignoring case. The names of the datasets in
+// the recycle bin are free.
 func checkNameFree(ctx context.Context, q querier, name string, exceptID int64) error {
 	var exists bool
-	err := q.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM datasets WHERE lower(name) = lower($1) AND id <> $2)",
+	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM datasets
+		WHERE lower(name) = lower($1) AND id <> $2 AND deleted_at IS NULL)`,
 		name, exceptID).Scan(&exists)
 	if err != nil {
 		return err
@@ -100,15 +107,37 @@ func checkNameFree(ctx context.Context, q querier, name string, exceptID int64) 
 	return nil
 }
 
-// datasetUsingDir returns the name of the dataset registered for dirName
-// (ignoring case), or "".
-func datasetUsingDir(ctx context.Context, q querier, dirName string) (string, error) {
-	var name string
-	err := q.QueryRow(ctx, "SELECT name FROM datasets WHERE lower(dir_name) = lower($1)", dirName).Scan(&name)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", nil
+// dirOwner is the dataset a folder of datasets/ belongs to.
+type dirOwner struct {
+	ID      int64
+	Name    string
+	Deleted bool // the dataset is in the recycle bin (deleted without its files, which stay in place)
+}
+
+// String describes the owner in messages: “<name>” or “<name>”（在回收站中）.
+func (o dirOwner) String() string {
+	if o.Deleted {
+		return "“" + o.Name + "”（在回收站中，可以在回收站中恢复它）"
 	}
-	return name, err
+	return "“" + o.Name + "”"
+}
+
+// datasetUsingDir returns the dataset registered for dirName (ignoring
+// case), nil if none. A dataset in the recycle bin keeps its folder unless
+// it was deleted with its files (the unique index datasets_dir_name_key
+// has the same condition). exceptID is left out.
+func datasetUsingDir(ctx context.Context, q querier, dirName string, exceptID int64) (*dirOwner, error) {
+	var o dirOwner
+	err := q.QueryRow(ctx, `SELECT id, name, deleted_at IS NOT NULL FROM datasets
+		WHERE lower(dir_name) = lower($1) AND (deleted_at IS NULL OR NOT delete_files) AND id <> $2`,
+		dirName, exceptID).Scan(&o.ID, &o.Name, &o.Deleted)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &o, nil
 }
 
 func insertDataset(ctx context.Context, q querier, name, dirName, description, origin string) (Dataset, error) {
@@ -199,7 +228,7 @@ func touchDatasetProjects(ctx context.Context, tx pgx.Tx, id int64) error {
 // by name.
 func queryDatasetProjects(ctx context.Context, q querier, ids []int64) (map[int64][]ProjectRef, error) {
 	rows, err := q.Query(ctx, `SELECT pd.dataset_id, p.id, p.name
-		FROM project_datasets pd JOIN projects p ON p.id = pd.project_id
+		FROM project_datasets pd JOIN projects p ON p.id = pd.project_id AND p.deleted_at IS NULL
 		WHERE pd.dataset_id = ANY($1)
 		ORDER BY pd.dataset_id, lower(p.name), p.id`, ids)
 	if err != nil {
@@ -298,10 +327,17 @@ func insertImport(ctx context.Context, q querier, n newImport) (Import, error) {
 	if classes == nil {
 		classes = []string{}
 	}
-	return scanImport(q.QueryRow(ctx, `INSERT INTO dataset_imports
+	// FOR KEY SHARE waits for the dataset being moved to the recycle bin
+	// (FOR UPDATE) and then reads it again: one in the bin takes no jobs.
+	job, err := scanImport(q.QueryRow(ctx, `INSERT INTO dataset_imports
 		(dataset_id, source, status, on_conflict, annotation_format, classes, file_name, file_size, file_count)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING `+importColumns,
+		SELECT id, $2, $3, $4, $5, $6, $7, $8, $9 FROM datasets WHERE id = $1 AND deleted_at IS NULL FOR KEY SHARE
+		RETURNING `+importColumns,
 		n.DatasetID, n.Source, n.Status, n.OnConflict, format, classes, n.FileName, n.FileSize, n.FileCount))
+	if errors.Is(err, errImportNotFound) {
+		return job, errDatasetNotFound
+	}
+	return job, err
 }
 
 // ---- images ----

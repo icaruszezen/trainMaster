@@ -19,18 +19,25 @@ import {
   reviewImageStatusLabels,
   reviewImageStatusStyles,
   reviewStatusLabels,
+  waitingForModel,
 } from "@/features/reviews/review-status"
 import { formatNumber, formatPercent, percentOf } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
 type TaskStatusReview = Pick<
   Review,
-  "status" | "queue_position" | "counts" | "error" | "workers_online"
+  | "status"
+  | "queue_position"
+  | "counts"
+  | "error"
+  | "workers_online"
+  | "model_exists"
 >
 
 /**
  * 审图任务的识别状态：排队中（第几个）、识别中（已识别 / 总数）、识别完成、
- * 识别失败（悬停显示原因）。`detail` 时排队与识别中带上位置与进度。
+ * 识别失败（悬停显示原因）。`detail` 时排队与识别中带上位置与进度。模型已
+ * 删除（在回收站中）的排队任务不在队列中，显示“等待恢复模型”。
  */
 export function ReviewTaskStatusBadge({
   review,
@@ -74,6 +81,18 @@ export function ReviewTaskStatusBadge({
         </Badge>
       )
     default:
+      if (waitingForModel(review)) {
+        return (
+          <Badge
+            variant="outline"
+            className={cn("font-normal", className)}
+            title="模型在回收站中：恢复模型后才会开始识别，模型被永久删除后任务失败"
+          >
+            <Clock className="text-amber-600 dark:text-amber-500" />
+            等待恢复模型
+          </Badge>
+        )
+      }
       return (
         <Badge
           variant="secondary"
@@ -88,9 +107,13 @@ export function ReviewTaskStatusBadge({
   }
 }
 
-/** 排队且没有可以识别的训练节点（不会开始识别）。 */
+/** 排队且没有可以识别的训练节点（不会开始识别；等待恢复模型的除外）。 */
 export function waitingForWorkers(review: TaskStatusReview) {
-  return review.status === "queued" && review.workers_online === 0
+  return (
+    review.status === "queued" &&
+    review.workers_online === 0 &&
+    !waitingForModel(review)
+  )
 }
 
 /** 审核进度的文字说明，如“待审核 6，已审核 3，需加样 1”。 */

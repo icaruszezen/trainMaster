@@ -450,7 +450,8 @@ func (e *Export) versionAnnotation(ctx context.Context, i int) (*vocAnnotation, 
 	}
 	rows, err := e.db.Query(ctx, `SELECT k.i, vi.objects, vi.width, vi.height
 		FROM unnest($1::int[], $2::bigint[], $3::text[]) AS k (i, v, p)
-		JOIN dataset_version_images vi ON vi.version_id = k.v AND vi.rel_path = k.p`, indexes, versionIDs, paths)
+		JOIN dataset_version_images vi ON vi.version_id = k.v AND vi.rel_path = k.p
+		JOIN dataset_versions dv ON dv.id = vi.version_id AND dv.deleted_at IS NULL`, indexes, versionIDs, paths)
 	if err != nil {
 		return nil, fmt.Errorf("load version annotations: %w", err)
 	}

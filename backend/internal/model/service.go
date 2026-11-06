@@ -177,8 +177,9 @@ func (s *Service) backgroundLoop(ctx context.Context) {
 }
 
 // cleanup cancels stale uploads, clears the model folders of additions
-// interrupted before their commit and removes temporary files that belong
-// to nothing in progress.
+// interrupted before their commit, purges the models whose time in the
+// recycle bin is over and removes temporary files that belong to nothing
+// in progress.
 func (s *Service) cleanup(ctx context.Context) {
 	// Before uploads expire: a recovered file goes back to its upload.
 	s.recoverPendingFolders(ctx)
@@ -190,6 +191,11 @@ func (s *Service) cleanup(ctx context.Context) {
 	}
 	if err := s.cleanExportTemp(ctx); err != nil && ctx.Err() == nil {
 		s.log.Error("clean model export temporary files", "err", err)
+	}
+	// Before the .deleting-* folders are cleaned: a purge that could not
+	// remove its folder completely leaves one.
+	if err := s.purgeExpired(ctx); err != nil && ctx.Err() == nil {
+		s.log.Error("purge models from the recycle bin", "err", err)
 	}
 	s.cleanUnused(s.registrationsRoot(), "")
 	s.cleanUnused(s.modelsDir(), deletingPrefix)

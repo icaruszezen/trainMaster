@@ -44,6 +44,15 @@ func (s *Service) RequestExport(ctx context.Context, modelID int64, req ExportRe
 		var id int64
 		var queued, ready bool
 		err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+			// Moving the model to the recycle bin (FOR UPDATE) waits for this
+			// transaction, or this one sees it in the bin.
+			var live bool
+			if err := tx.QueryRow(ctx, "SELECT true FROM models WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
+				modelID).Scan(&live); errors.Is(err, pgx.ErrNoRows) {
+				return errModelNotFound
+			} else if err != nil {
+				return err
+			}
 			err := tx.QueryRow(ctx, `INSERT INTO model_exports (model_id, format, options, options_key, status)
 				VALUES ($1, $2, $3, $4, 'queued')
 				ON CONFLICT (model_id, format, options_key) DO NOTHING
@@ -114,7 +123,8 @@ func (s *Service) ListExports(ctx context.Context, modelID int64) ([]Export, err
 	if _, err := queryModel(ctx, s.db, modelID); err != nil {
 		return nil, err
 	}
-	rows, err := collectExports(s.db.Query(ctx, exportSelect+" WHERE e.model_id = $1 ORDER BY e.id DESC", modelID))
+	rows, err := collectExports(s.db.Query(ctx, exportSelect+" WHERE e.model_id = $1 AND "+modelLive+
+		" ORDER BY e.id DESC", modelID))
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +162,7 @@ func (s *Service) getExport(ctx context.Context, modelID, exportID int64) (expor
 func (s *Service) DeleteExport(ctx context.Context, modelID, exportID int64) error {
 	var relPath, dirName string
 	err := s.db.QueryRow(ctx, `DELETE FROM model_exports e USING models m
-		WHERE e.id = $1 AND e.model_id = $2 AND m.id = e.model_id
+		WHERE e.id = $1 AND e.model_id = $2 AND m.id = e.model_id AND `+modelLive+`
 		RETURNING e.file_name, m.dir_name`, exportID, modelID).Scan(&relPath, &dirName)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if _, merr := queryModel(ctx, s.db, modelID); merr != nil {

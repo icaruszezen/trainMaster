@@ -379,3 +379,35 @@ func TestOpenRejectsInvalidDSN(t *testing.T) {
 		t.Fatal("expected a parse error")
 	}
 }
+
+// The recycle bin tables of 0012_recycle_bin.sql receive rows moved with
+// SELECT * and give them back the same way, so their columns must stay
+// those of the tables they come from: same names, types, order and
+// nullability.
+func TestIntegrationRecycledTablesMatch(t *testing.T) {
+	db := newPrivateTestDB(t)
+	ctx := context.Background()
+	if err := db.Migrate(ctx, slog.New(slog.DiscardHandler)); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	columns := func(table string) []string {
+		t.Helper()
+		rows, err := db.Query(ctx, `SELECT column_name || ' ' || data_type || ' ' || is_nullable
+			FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1
+			ORDER BY ordinal_position`, table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cols, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cols
+	}
+	for _, table := range []string{"project_datasets", "review_datasets", "review_images"} {
+		want, got := columns(table), columns("recycled_"+table)
+		if len(want) == 0 || !slices.Equal(got, want) {
+			t.Errorf("columns of recycled_%s = %q, want those of %s: %q", table, got, table, want)
+		}
+	}
+}

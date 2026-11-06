@@ -1,6 +1,6 @@
 import { useMemo } from "react"
 import { useQuery } from "@tanstack/react-query"
-import { ArrowLeft, ScanEye } from "lucide-react"
+import { ArrowLeft, ScanEye, Trash2 } from "lucide-react"
 import { Link, useParams } from "react-router"
 
 import { Button } from "@/components/ui/button"
@@ -15,6 +15,7 @@ import {
 import { Progress } from "@/components/ui/progress"
 import { Spinner } from "@/components/ui/spinner"
 import { LoadError } from "@/features/datasets/load-error"
+import { RECYCLE_BIN_PATH } from "@/features/recycle-bin/recycle-format"
 import { reviewQuery, reviewSource, type Review } from "@/features/reviews/api"
 import { parseId, reviewDetailPath } from "@/features/reviews/params"
 import {
@@ -25,6 +26,7 @@ import {
   isInferring,
   reviewStageLabels,
   reviewStatusLabels,
+  waitingForModel,
 } from "@/features/reviews/review-status"
 import { usePageTitle } from "@/hooks/use-page-title"
 import { ApiError } from "@/lib/api"
@@ -81,6 +83,7 @@ function WorkspaceForReview({ id }: { id: number }) {
 /** 还没有识别完成任何图片：显示识别进度，识别出第一批后自动进入审图。 */
 function NotInferred({ review }: { review: Review }) {
   const inferring = isInferring(review)
+  const noModel = waitingForModel(review)
   const percent = percentOf(review.counts.inferred, review.counts.total)
   return (
     <Empty className="min-h-[60svh]">
@@ -89,18 +92,24 @@ function NotInferred({ review }: { review: Review }) {
           {inferring ? <Spinner /> : <ScanEye />}
         </EmptyMedia>
         <EmptyTitle>
-          {inferring ? "模型正在识别图片" : reviewStatusLabels[review.status]}
+          {noModel
+            ? "等待恢复模型"
+            : inferring
+              ? "模型正在识别图片"
+              : reviewStatusLabels[review.status]}
         </EmptyTitle>
         <EmptyDescription>
-          {review.status === "queued"
-            ? review.queue_position
-              ? `排队中（第 ${formatNumber(review.queue_position)} 个），等待训练节点开始识别。`
-              : "排队中，等待训练节点开始识别。"
-            : review.status === "running"
-              ? `${reviewStageLabels[review.stage] || "正在识别"}，识别完成的图片可以立即开始审核。`
-              : review.status === "failed"
-                ? `识别失败：${review.error || "未知原因"}。请在审图任务页面重新识别。`
-                : "还没有识别完成的图片。"}
+          {noModel
+            ? "模型在回收站中：恢复模型后才会开始识别，模型被永久删除后任务识别失败。"
+            : review.status === "queued"
+              ? review.queue_position
+                ? `排队中（第 ${formatNumber(review.queue_position)} 个），等待训练节点开始识别。`
+                : "排队中，等待训练节点开始识别。"
+              : review.status === "running"
+                ? `${reviewStageLabels[review.stage] || "正在识别"}，识别完成的图片可以立即开始审核。`
+                : review.status === "failed"
+                  ? `识别失败：${review.error || "未知原因"}。请在审图任务页面重新识别。`
+                  : "还没有识别完成的图片。"}
         </EmptyDescription>
       </EmptyHeader>
       <EmptyContent className="w-full max-w-sm">
@@ -113,12 +122,22 @@ function NotInferred({ review }: { review: Review }) {
             </p>
           </div>
         )}
-        <Button variant="outline" asChild>
-          <Link to={reviewDetailPath(review.id)}>
-            <ArrowLeft />
-            返回审图任务
-          </Link>
-        </Button>
+        <div className="flex flex-wrap justify-center gap-2">
+          <Button variant="outline" asChild>
+            <Link to={reviewDetailPath(review.id)}>
+              <ArrowLeft />
+              返回审图任务
+            </Link>
+          </Button>
+          {noModel && (
+            <Button variant="outline" asChild>
+              <Link to={RECYCLE_BIN_PATH}>
+                <Trash2 />
+                前往回收站
+              </Link>
+            </Button>
+          )}
+        </div>
       </EmptyContent>
     </Empty>
   )
