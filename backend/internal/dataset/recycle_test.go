@@ -293,6 +293,15 @@ func TestIntegrationReconcileRecycleFolders(t *testing.T) {
 	if err := e.svc.DeleteDataset(ctx, binned.ID, true); err != nil {
 		t.Fatal(err)
 	}
+	restored, _ := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "restored"})
+	writeFiles(t, restored.Path, map[string][]byte{"a.png": nil})
+	if err := e.svc.DeleteDataset(ctx, restored.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Exec(ctx, "UPDATE datasets SET deleted_at = NULL, delete_files = false WHERE id = $1",
+		restored.ID); err != nil { // a restore that committed, its folder not moved back yet
+		t.Fatal(err)
+	}
 	writeFiles(t, e.svc.recycleDir(999999), map[string][]byte{"a.png": nil}) // its dataset is gone
 	writeFiles(t, filepath.Join(e.datasetsDir(), recyclePrefix+"x"), map[string][]byte{"a.png": nil})
 
@@ -301,6 +310,9 @@ func TestIntegrationReconcileRecycleFolders(t *testing.T) {
 	}
 	if !exists(filepath.Join(live.Path, "a.png")) || exists(e.svc.recycleDir(live.ID)) {
 		t.Error("the folder of a dataset in use was not moved back")
+	}
+	if !exists(filepath.Join(restored.Path, "a.png")) || exists(e.svc.recycleDir(restored.ID)) {
+		t.Error("the folder of a restored dataset was not moved back")
 	}
 	if !exists(e.svc.recycleDir(binned.ID)) {
 		t.Error("the folder of a dataset in the bin must stay aside")

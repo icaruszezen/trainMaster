@@ -53,9 +53,9 @@ func (s *Service) DetachDataset(ctx context.Context, tx pgx.Tx, datasetID int64)
 }
 
 // AttachDataset puts the review rows of a dataset restored from the
-// recycle bin back. A review that is ready but gets back images not
-// inferred yet is queued again, if its model can still be used. It runs in
-// the dataset's transaction, which holds the dataset row FOR UPDATE.
+// recycle bin back. A review that gets back images not inferred yet is
+// queued again (requeueRestored). It runs in the dataset's transaction,
+// which holds the dataset row FOR UPDATE.
 func (s *Service) AttachDataset(ctx context.Context, tx pgx.Tx, datasetID int64) error {
 	ids, err := lockDatasetReviews(ctx, tx, "recycled_review_datasets", datasetID)
 	if err != nil || len(ids) == 0 {
@@ -104,48 +104,88 @@ func lockDatasetReviews(ctx context.Context, tx pgx.Tx, table string, datasetID 
 	return pgx.CollectRows(rows, pgx.RowTo[int64])
 }
 
-// requeueRestored queues the ready reviews among ids again whose restored
-// images of the dataset are not all inferred (as RetryReview does), if
-// their model can still be used: otherwise they would only fail. It
-// returns how many.
+// requeueRestored queues the reviews among ids again whose restored images
+// of the dataset are not all inferred, and returns how many:
+//
+//   - a ready review (as RetryReview does), if its model can still be used
+//     (otherwise it would only fail). A model in the recycle bin counts: the
+//     review waits for it in the queue (claimOne skips it) and fails once
+//     the model is purged, like any review queued for it;
+//   - a running review: the node holding it pages through the images by ID
+//     and has passed the restored ones, so it would finish short of them.
+//     It gets 409 on its next call and stops, and the next claim infers
+//     what is left; the claim it loses does not count as an attempt.
 func (s *Service) requeueRestored(ctx context.Context, tx pgx.Tx, ids []int64, datasetID int64) (int, error) {
-	rows, err := tx.Query(ctx, `SELECT r.id, r.model_id FROM reviews r
-		WHERE r.id = ANY($1) AND r.status = 'ready' AND r.model_id IS NOT NULL
+	rows, err := tx.Query(ctx, `SELECT r.id, r.status, r.model_id FROM reviews r
+		WHERE r.id = ANY($1) AND (r.status = 'running' OR r.status = 'ready' AND r.model_id IS NOT NULL)
 			AND EXISTS (SELECT 1 FROM review_images ri WHERE ri.review_id = r.id AND ri.dataset_id = $2 AND NOT ri.inferred)`,
 		ids, datasetID)
 	if err != nil {
 		return 0, err
 	}
-	type candidate struct{ id, modelID int64 }
+	type candidate struct {
+		id      int64
+		status  string
+		modelID *int64
+	}
 	var candidates []candidate
 	var c candidate
-	if _, err := pgx.ForEachRow(rows, []any{&c.id, &c.modelID}, func() error {
+	if _, err := pgx.ForEachRow(rows, []any{&c.id, &c.status, &c.modelID}, func() error {
 		candidates = append(candidates, c)
 		return nil
 	}); err != nil {
 		return 0, err
 	}
-	var queue []int64
+	var ready, running []int64
 	for _, c := range candidates {
-		m, err := s.models.GetModel(ctx, c.modelID)
-		if errors.Is(err, model.ErrNotFound) {
-			continue // in the recycle bin: RetryReview once it is back
+		if c.status == StatusRunning {
+			running = append(running, c.id)
+			continue
 		}
+		usable, err := s.canInferWith(ctx, tx, *c.modelID)
 		if err != nil {
 			return 0, err
 		}
-		if !m.FileMissing && model.HasBoxes(m.Task) {
-			queue = append(queue, c.id)
+		if usable {
+			ready = append(ready, c.id)
 		}
 	}
-	if len(queue) == 0 {
-		return 0, nil
+	queued := 0
+	if len(ready) > 0 {
+		tag, err := tx.Exec(ctx, `UPDATE reviews SET status = 'queued', stage = '', node_id = NULL, attempts = 0,
+				lease_expires_at = NULL, error = '', error_detail = '', result = NULL, started_at = NULL, finished_at = NULL,
+				updated_at = now()
+			WHERE id = ANY($1) AND status = 'ready'`, ready)
+		if err != nil {
+			return 0, err
+		}
+		queued += int(tag.RowsAffected())
 	}
-	tag, err := tx.Exec(ctx, `UPDATE reviews SET status = 'queued', stage = '', node_id = NULL, attempts = 0,
-			lease_expires_at = NULL, error = '', error_detail = '', result = NULL, started_at = NULL, finished_at = NULL,
-			updated_at = now()
-		WHERE id = ANY($1) AND status = 'ready'`, queue)
-	return int(tag.RowsAffected()), err
+	if len(running) > 0 {
+		tag, err := tx.Exec(ctx, `UPDATE reviews SET status = 'queued', stage = '', node_id = NULL,
+				attempts = greatest(attempts - 1, 0), lease_expires_at = NULL, updated_at = now()
+			WHERE id = ANY($1) AND status = 'running'`, running)
+		if err != nil {
+			return 0, err
+		}
+		queued += int(tag.RowsAffected())
+	}
+	return queued, nil
+}
+
+// canInferWith reports whether a review queued for the model can be
+// inferred: the model is in use (or in the recycle bin, where the review
+// waits for it), its file is there and its task has boxes.
+func (s *Service) canInferWith(ctx context.Context, q querier, modelID int64) (bool, error) {
+	m, err := s.models.GetModel(ctx, modelID)
+	if errors.Is(err, model.ErrNotFound) {
+		// In the recycle bin (the review waits for it), or gone.
+		return modelInBin(ctx, q, modelID)
+	}
+	if err != nil {
+		return false, err
+	}
+	return !m.FileMissing && model.HasBoxes(m.Task), nil
 }
 
 // modelInBin reports whether a model is in the recycle bin.

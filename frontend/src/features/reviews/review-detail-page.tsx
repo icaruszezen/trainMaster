@@ -58,6 +58,7 @@ import {
 } from "@/components/ui/table"
 import { LoadError } from "@/features/datasets/load-error"
 import { TaskProgress } from "@/features/datasets/task-progress"
+import { RECYCLE_BIN_PATH } from "@/features/recycle-bin/recycle-format"
 import { CopyButton } from "@/features/training/command-block"
 import {
   REVIEW_TOOL_DOWNLOAD_URL,
@@ -92,6 +93,8 @@ import {
   ReviewStatusBar,
   ReviewStatusLegend,
   ReviewTaskStatusBadge,
+  waitingForModel,
+  waitingForWorkers,
 } from "@/features/reviews/review-parts"
 import { reviewStageLabels } from "@/features/reviews/review-status"
 import { UploadResultsDialog } from "@/features/reviews/upload-results-dialog"
@@ -442,6 +445,7 @@ function InferenceStatus({
   }
 
   const queued = review.status === "queued"
+  const noModel = waitingForModel(review)
   return (
     <Card className="min-w-0 gap-4">
       <CardHeader>
@@ -451,14 +455,20 @@ function InferenceStatus({
           ) : (
             <Spinner />
           )}
-          {queued ? "排队等待识别" : "模型正在识别图片"}
+          {noModel
+            ? "等待恢复模型"
+            : queued
+              ? "排队等待识别"
+              : "模型正在识别图片"}
         </CardTitle>
         <CardDescription>
-          {queued
-            ? review.queue_position !== null && review.queue_position > 1
-              ? `前面还有 ${formatNumber(review.queue_position - 1)} 个审图任务，训练节点按顺序识别。`
-              : "等待训练节点领取。"
-            : `${reviewStageLabels[review.stage] || "正在识别"}${review.node ? `（训练节点 ${review.node.name}）` : ""}。识别完成的图片可以立即开始审核。`}
+          {noModel
+            ? "模型已删除，训练节点不会识别这个任务。"
+            : queued
+              ? review.queue_position !== null && review.queue_position > 1
+                ? `前面还有 ${formatNumber(review.queue_position - 1)} 个审图任务，训练节点按顺序识别。`
+                : "等待训练节点领取。"
+              : `${reviewStageLabels[review.stage] || "正在识别"}${review.node ? `（训练节点 ${review.node.name}）` : ""}。识别完成的图片可以立即开始审核。`}
         </CardDescription>
       </CardHeader>
       <CardContent className="grid gap-3">
@@ -483,7 +493,25 @@ function InferenceStatus({
             )}
           </p>
         </div>
-        {queued && review.workers_online === 0 && (
+        {noModel && (
+          <Alert className="border-amber-500/40 [&>svg]:text-amber-600 dark:[&>svg]:text-amber-500">
+            <TriangleAlert />
+            <AlertTitle>模型已删除</AlertTitle>
+            <AlertDescription>
+              <p>
+                模型还在回收站中时，恢复后会自动开始识别；模型被永久删除（在回收站中满
+                7 天）后，这个任务会识别失败。
+              </p>
+              <Link
+                to={RECYCLE_BIN_PATH}
+                className="text-foreground underline underline-offset-4"
+              >
+                前往回收站
+              </Link>
+            </AlertDescription>
+          </Alert>
+        )}
+        {waitingForWorkers(review) && (
           <Alert className="border-amber-500/40 [&>svg]:text-amber-600 dark:[&>svg]:text-amber-500">
             <TriangleAlert />
             <AlertTitle>没有可以识别的训练节点</AlertTitle>

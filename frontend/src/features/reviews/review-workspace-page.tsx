@@ -92,15 +92,17 @@ function NotInferred({ review }: { review: Review }) {
           {inferring ? "模型正在识别图片" : reviewStatusLabels[review.status]}
         </EmptyTitle>
         <EmptyDescription>
-          {review.status === "queued"
-            ? review.queue_position
-              ? `排队中（第 ${formatNumber(review.queue_position)} 个），等待训练节点开始识别。`
-              : "排队中，等待训练节点开始识别。"
-            : review.status === "running"
-              ? `${reviewStageLabels[review.stage] || "正在识别"}，识别完成的图片可以立即开始审核。`
-              : review.status === "failed"
-                ? `识别失败：${review.error || "未知原因"}。请在审图任务页面重新识别。`
-                : "还没有识别完成的图片。"}
+          {review.status === "queued" && !review.model_exists
+            ? "模型已删除：模型还在回收站中时，恢复后才会开始识别。"
+            : review.status === "queued"
+              ? review.queue_position
+                ? `排队中（第 ${formatNumber(review.queue_position)} 个），等待训练节点开始识别。`
+                : "排队中，等待训练节点开始识别。"
+              : review.status === "running"
+                ? `${reviewStageLabels[review.stage] || "正在识别"}，识别完成的图片可以立即开始审核。`
+                : review.status === "failed"
+                  ? `识别失败：${review.error || "未知原因"}。请在审图任务页面重新识别。`
+                  : "还没有识别完成的图片。"}
         </EmptyDescription>
       </EmptyHeader>
       <EmptyContent className="w-full max-w-sm">

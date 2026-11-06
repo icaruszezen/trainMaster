@@ -52,6 +52,9 @@ type Service struct {
 
 	// annotationLocks serializes the annotation edits of an image (by ID).
 	annotationLocks keyedMutex
+	// recycleLocks serializes moving a dataset to the recycle bin and back
+	// (by ID), with the folder that moves after the restore's commit.
+	recycleLocks keyedMutex
 
 	recycleHook RecycleHook // SetRecycleHook
 

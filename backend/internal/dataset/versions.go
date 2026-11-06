@@ -464,15 +464,17 @@ func (s *Service) DiscardBuildingVersions(ctx context.Context, tx pgx.Tx) (int64
 }
 
 // MergeVersions returns the versions made by merges (building or ready),
-// by merge, in dataset ID order.
+// by merge, in dataset ID order. Versions in the recycle bin, and those of
+// a dataset in it, are left out.
 func (s *Service) MergeVersions(ctx context.Context, mergeIDs []int64) (map[int64][]VersionRef, error) {
 	out := map[int64][]VersionRef{}
 	if len(mergeIDs) == 0 {
 		return out, nil
 	}
-	rows, err := s.db.Query(ctx, `SELECT merge_id, id, dataset_id, major, minor, status, image_count
-		FROM dataset_versions WHERE merge_id = ANY($1) AND deleted_at IS NULL
-		ORDER BY merge_id, dataset_id, id`, mergeIDs)
+	rows, err := s.db.Query(ctx, `SELECT v.merge_id, v.id, v.dataset_id, v.major, v.minor, v.status, v.image_count
+		FROM dataset_versions v JOIN datasets d ON d.id = v.dataset_id AND d.deleted_at IS NULL
+		WHERE v.merge_id = ANY($1) AND v.deleted_at IS NULL
+		ORDER BY v.merge_id, v.dataset_id, v.id`, mergeIDs)
 	if err != nil {
 		return nil, err
 	}

@@ -106,6 +106,42 @@ func TestIntegrationReviewDatasetRecycle(t *testing.T) {
 	}
 }
 
+// Restored while a node infers the review: the node has paged past the
+// restored images (lower IDs), so the review is queued again without using
+// up the attempt, and the next claim infers them.
+func TestIntegrationReviewDatasetRestoreWhileRunning(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	m := e.addModel(t, e.project(t, "p"), testModel{})
+	ds1 := e.addDataset(t, "ds1", "ds1", testImage{rel: "a.png"})
+	ds2 := e.addDataset(t, "ds2", "ds2", testImage{rel: "b.png"})
+	r := e.create(t, CreateInput{ModelID: m.ID, DatasetIDs: []int64{ds1, ds2}})
+	if err := e.datasets.DeleteDataset(ctx, ds1, false); err != nil {
+		t.Fatal(err)
+	}
+	node := e.node(t, "a")
+	if task := e.claim(t, node); task == nil || task.ID != r.ID || task.Remaining != 1 {
+		t.Fatalf("claim = %+v", task)
+	}
+	if _, err := e.datasets.RestoreDataset(ctx, ds1, dataset.RestoreInput{}); err != nil {
+		t.Fatal(err)
+	}
+	got := e.review(t, r.ID)
+	if got.Status != StatusQueued || got.Attempts != 0 || got.Node != nil || got.Counts.Total != 2 {
+		t.Fatalf("review after the restore = %+v", got)
+	}
+	_, err := e.svc.ListTaskImages(ctx, r.ID, node, 0, 10)
+	wantKind(t, err, ErrConflict, "审图任务的识别已不属于该节点或已结束")
+
+	if task := e.claim(t, node); task == nil || task.ID != r.ID || task.Remaining != 2 {
+		t.Fatalf("claim after the restore = %+v", task)
+	}
+	e.inferAll(t, r.ID, node)
+	if got = e.review(t, r.ID); got.Status != StatusReady || got.Counts.Inferred != 2 || got.Attempts != 1 {
+		t.Fatalf("review after inferring the restored images = %+v", got)
+	}
+}
+
 // A review whose model is in the recycle bin waits for it instead of
 // failing; a review cannot be created with it.
 func TestIntegrationReviewModelRecycle(t *testing.T) {
@@ -121,16 +157,26 @@ func TestIntegrationReviewModelRecycle(t *testing.T) {
 	if task := e.claim(t, node); task != nil {
 		t.Fatalf("claimed %+v with its model in the bin", task)
 	}
-	if got := e.review(t, r.ID); got.Status != StatusQueued || got.ModelExists {
+	if got := e.review(t, r.ID); got.Status != StatusQueued || got.ModelExists || got.QueuePosition != nil {
 		t.Errorf("waiting review = %+v", got)
 	}
+	// It is not ahead of the others in the queue.
+	other := e.addModel(t, e.project(t, "q"), testModel{})
+	r3 := e.create(t, CreateInput{ModelID: other.ID, DatasetIDs: []int64{ds}})
+	if got := e.review(t, r3.ID); got.QueuePosition == nil || *got.QueuePosition != 1 {
+		t.Errorf("review queued after the waiting one = %+v", got)
+	}
+	if task := e.claim(t, node); task == nil || task.ID != r3.ID {
+		t.Fatalf("claim = %+v", task)
+	}
+	e.inferAll(t, r3.ID, node)
 	_, err := e.svc.CreateReview(ctx, CreateInput{ModelID: m.ID, DatasetIDs: []int64{ds}})
 	wantKind(t, err, ErrInvalid, "所选模型不存在或已被删除")
 
 	if _, err := e.models.RestoreModel(ctx, m.ID, model.RestoreInput{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := e.review(t, r.ID); !got.ModelExists {
+	if got := e.review(t, r.ID); !got.ModelExists || got.QueuePosition == nil || *got.QueuePosition != 1 {
 		t.Errorf("review after the restore = %+v", got)
 	}
 	if task := e.claim(t, node); task == nil || task.ID != r.ID {
@@ -150,7 +196,8 @@ func TestIntegrationReviewModelRecycle(t *testing.T) {
 	_, err = e.svc.RetryReview(ctx, r.ID)
 	wantKind(t, err, ErrConflict, "请先在回收站中恢复模型")
 
-	// Restoring a dataset does not queue a review whose model is in the bin.
+	// Restoring a dataset queues a review whose model is in the bin: it
+	// waits for the model like a new one.
 	if _, err := e.models.RestoreModel(ctx, m.ID, model.RestoreInput{}); err != nil {
 		t.Fatal(err)
 	}
@@ -170,14 +217,24 @@ func TestIntegrationReviewModelRecycle(t *testing.T) {
 	if _, err := e.datasets.RestoreDataset(ctx, ds, dataset.RestoreInput{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := e.review(t, r.ID); got.Status != StatusReady || got.Counts.Total != 1 || got.Counts.Inferred != 0 {
-		t.Errorf("review after the restore = %+v", got)
+	if got := e.review(t, r.ID); got.Status != StatusQueued || got.ModelExists || got.Counts.Total != 1 || got.Counts.Inferred != 0 {
+		t.Fatalf("review after the restore = %+v", got)
 	}
-
-	// Purged: the review fails like one whose model was deleted.
+	if task := e.claim(t, node); task != nil {
+		t.Fatalf("claimed %+v with its model in the bin", task)
+	}
 	if _, err := e.models.RestoreModel(ctx, m.ID, model.RestoreInput{}); err != nil {
 		t.Fatal(err)
 	}
+	if task := e.claim(t, node); task == nil || task.ID != r.ID || task.Remaining != 1 {
+		t.Fatalf("claim after restoring the model = %+v", task)
+	}
+	e.inferAll(t, r.ID, node)
+	if got := e.review(t, r.ID); got.Status != StatusReady || got.Counts.Inferred != 1 {
+		t.Fatalf("review after inferring the restored images = %+v", got)
+	}
+
+	// Purged: the review fails like one whose model was deleted.
 	r2 := e.create(t, CreateInput{ModelID: m.ID, DatasetIDs: []int64{ds}})
 	if err := e.models.DeleteModel(ctx, m.ID); err != nil {
 		t.Fatal(err)
@@ -188,5 +245,38 @@ func TestIntegrationReviewModelRecycle(t *testing.T) {
 	e.claim(t, node)
 	if got := e.review(t, r2.ID); got.Status != StatusFailed || got.Error != msgModelDeleted {
 		t.Errorf("review of a purged model = %+v", got)
+	}
+}
+
+// A merge does not list the versions of a dataset in the recycle bin; they
+// come back with it.
+func TestIntegrationMergeVersionsRecycle(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	r, images, ds, _ := e.exchangeReview(t)
+	e.mark(t, r.ID, reviewfile.StatusApproved, images[5])
+	m := e.mergeAndWait(t, r.ID, MergeInput{Statuses: []string{reviewfile.StatusApproved}, Note: "x"})
+	if m.Status != MergeSucceeded || len(m.Versions) != 1 || m.Versions[0].DatasetID != ds[1] {
+		t.Fatalf("merge = %+v", m)
+	}
+	versions := func() []dataset.VersionRef {
+		t.Helper()
+		got, err := e.svc.GetMerge(ctx, r.ID, m.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.Versions
+	}
+	if err := e.datasets.DeleteDataset(ctx, ds[1], false); err != nil {
+		t.Fatal(err)
+	}
+	if v := versions(); len(v) != 0 {
+		t.Errorf("versions with the dataset in the bin = %+v", v)
+	}
+	if _, err := e.datasets.RestoreDataset(ctx, ds[1], dataset.RestoreInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if v := versions(); len(v) != 1 || v[0].ID != m.Versions[0].ID {
+		t.Errorf("versions after the restore = %+v", v)
 	}
 }
