@@ -51,9 +51,10 @@ flowchart LR
 | `internal/config` | 读取并校验 `TM_*` 环境变量；非法值一次性全部报出并退出 |
 | `internal/database` | pgxpool 连接池、启动时连接重试、内置迁移执行器 |
 | `internal/storage` | 数据目录布局、启动时创建与可写检查、磁盘用量、安全路径解析 |
-| `internal/dataset` | 数据集：命名规则、图片与 VOC 标注识别、压缩包解压、目录扫描、缩略图、导入任务执行器、下载打包；审图版本（`versions.go`：版本的生成、编号、修改与删除，下载时按所选版本组合标注，见第 11 节“审图版本”） |
+| `internal/dataset` | 数据集：命名规则、图片与 VOC 标注识别、压缩包解压、目录扫描、缩略图、导入任务执行器、下载打包；审图版本（`versions.go`：版本的生成、编号、修改与删除，下载时按所选版本组合标注，见第 11 节“审图版本”）；回收站（`recycle.go`：数据集与审图版本的移入、恢复与到期清理，见第 12 节） |
 | `internal/project` | 项目：项目的增删改、项目与数据集的多对多关系、按数据集合计的统计与标签分布、项目的类别列表（训练时的类别顺序，标注时的候选类别）、项目的模型数与最新版本 |
-| `internal/model` | 模型仓库：分块上传与提交、项目内的版本分配、模型文件夹与 `model.json`、下载、删除；ONNX 转换的选项、缓存、任务队列（领取、租约、重试）与训练节点的任务接口；为平台训练预留的 `RegisterTrainedModel`（见第 10 节） |
+| `internal/model` | 模型仓库：分块上传与提交、项目内的版本分配、模型文件夹与 `model.json`、下载；回收站（`recycle.go`：移入、恢复与到期清理，见第 12 节）；ONNX 转换的选项、缓存、任务队列（领取、租约、重试）与训练节点的任务接口；为平台训练预留的 `RegisterTrainedModel`（见第 10 节） |
+| `internal/recycle` | 回收站的保留期（`Retention`，7 天）与到期时间的计算，数据集、模型与审图模块共用（见第 12 节） |
 | `internal/model/checkpoint` | 读取 Ultralytics `.pt` 的元数据：zip 中的 `data.pkl` 由只读的 pickle 解释器解析（不执行任何代码），得到任务、类别、输入尺寸、YOLO 版本、训练信息；纯函数，无数据库依赖 |
 | `internal/review` | 模型审图：审图任务的创建、修改与删除；识别任务（实现 `model.TaskSource`，通过训练节点的领取接口下发）、租约与识别结果的写入；审核状态与审图标注；审图包；上传审图结果；合并为数据集审图版本的后台任务（见第 11 节） |
 | `internal/reviewfile` | 审图包的文件格式，平台与本地审图程序共用：清单 `review.json` 的读写与校验、Windows 安全的路径（`SafeSegment`、`Layout`）、审图标注（VOC）的读写与原子替换 |
@@ -69,7 +70,7 @@ flowchart LR
 2. 初始化存储目录：创建根目录和 7 个子目录（见第 5 节）并做可写探测，失败则退出并提示检查挂载目录权限 / PUID、PGID。
 3. 连接数据库：指数退避重试，最长约 60 秒（数据库容器还在启动时会等待），仍失败则以非 0 退出。
 4. `TM_DB_AUTO_MIGRATE=true`（默认）时执行待执行的迁移。
-5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），然后启动任务执行器（见第 6 节）；启动模型仓库的后台任务（见第 10 节“存储与版本号”）与模型审图的后台任务（先把上次运行中断的合并记为失败、删除它们没有生成完的审图版本，见第 11 节“存储”）。
+5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），整理崩溃留下的回收站文件夹（见第 12 节“文件夹”），然后启动任务执行器（见第 6 节）；启动模型仓库的后台任务（见第 10 节“存储与版本号”）与模型审图的后台任务（先把上次运行中断的合并记为失败、删除它们没有生成完的审图版本，见第 11 节“存储”）。
 6. 启动 HTTP 服务；收到 SIGINT / SIGTERM 后停止接收新请求，等待进行中的请求完成（最长 15 秒）；超时后强制关闭剩余连接（取消其请求的 context），最后关闭数据库连接池。还在等待数据库或迁移锁时收到信号，则直接正常退出。收到信号时会立即取消正在执行的导入 / 扫描任务并记为失败（“服务重启，导入被中断”），排队中的任务保留到下次启动执行；HTTP 服务关闭后再等待任务执行器的 worker 退出。进程在写入结果前异常退出时，下次启动由恢复逻辑把任务标记为中断，并重新计算受影响数据集的统计数据。长连接 handler 应通过 `http.Server.RegisterOnShutdown` 在关闭开始时主动结束：训练节点领取任务的长轮询（最长 30 秒）就是这样立即返回 `{"task": null}` 的，以后的 SSE 推送（如训练日志）也应如此。
 
 ## 3. API 约定
@@ -104,6 +105,7 @@ flowchart LR
 | 404 | `unknown_node` | 心跳或任务调用中的 `node_key`（`X-Node-Key`）尚未注册（或节点已被删除），训练节点收到后重新注册 |
 | 405 | `method_not_allowed` | 路径存在但不支持该方法（响应头 `Allow` 列出支持的方法） |
 | 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、下载 YOLO 时所选项目还没有类别列表、标注文件不能在平台中修改、删除在线的训练节点、重新检测离线的训练节点、删除有模型的项目、模型文件未上传完就提交、模型上传的临时文件已丢失、转换任务已不属于该训练节点、审图图片还没有识别完成、审图任务正在合并时删除或再次合并、修改或删除正在生成的审图版本、所选版本中没有可以导出的图片等） |
+| 409 | `name_taken` | 从回收站恢复时名称已被占用：恢复数据集时有同名的数据集（或文件夹名已被使用），恢复模型时一并恢复的项目有同名的项目。带新名称再次恢复即可（数据集为 `name`，模型为 `project_name`），见“回收站接口” |
 | 409 | `annotation_conflict` | 保存 / 删除标注时，标注文件在 `base_version` 之后已被修改（他人在另一个窗口保存，或用其它工具改了文件）。客户端应重新读取图片详情，或带 `force: true` 覆盖 |
 | 409 | `annotation_unpatchable` | 保存标注时，已有的标注文件无法在保留其中平台不编辑的内容的情况下修改（极少见）；带 `regenerate: true` 时按平台的格式重新生成整个文件（`force: true` 只跳过版本检查，不会重新生成） |
 | 409 | `upload_offset_mismatch` | 分块上传（数据集压缩包、模型文件）的 `offset` 与服务端已接收的字节数不一致，客户端应重新获取任务或上传后从 `received_bytes` 续传 |
@@ -130,6 +132,7 @@ flowchart LR
 | 模型仓库相关接口 | 见下方“模型仓库接口” |
 | 模型审图相关接口 | 见下方“模型审图接口” |
 | 计算资源相关接口（含训练节点的任务接口） | 见下方“计算资源接口” |
+| 回收站相关接口 | 见下方“回收站接口” |
 | `/api/v1/annotation/tasks`、`/api/v1/annotation/labels`、`/api/v1/training/jobs`、`/api/v1/evaluations` 及其子路径 | 预留给规划中的模块，任意方法均返回 `501 not_implemented` |
 
 `/api/readyz` 示例：
@@ -178,7 +181,7 @@ flowchart LR
 | `GET /api/v1/datasets/{id}` | 数据集详情；`directory_missing` 表示文件夹已不在磁盘上 |
 | `PATCH /api/v1/datasets/{id}` | 修改名称（只改显示名称，文件夹不变）和描述 |
 | `PUT /api/v1/datasets/{id}/projects` | `{project_ids: [...]}` 设置数据集所属的项目（整体替换，`[]` 表示移出所有项目，缺少该字段时返回 422），返回更新后的数据集；所选项目不存在时返回 422，不做任何修改 |
-| `DELETE /api/v1/datasets/{id}` | 删除数据集记录（同时移出所属的项目）；`?delete_files=true` 同时删除磁盘上的**整个**文件夹与缩略图缓存。成功返回 204；记录已删除但文件夹没能完全删除（如权限不足）时返回 200 `{"files_removed": false, "message": "…"}`，剩余文件恢复为原来的文件夹名，可以重新添加或手动清理。导入 / 扫描正在执行时返回 409 |
+| `DELETE /api/v1/datasets/{id}` | 把数据集移入回收站，返回 204：7 天内可以恢复（`POST /api/v1/recycle-bin/datasets/{id}/restore`），之后自动永久删除，不能提前删除（见第 12 节）。它随之离开所属的项目与审图任务，恢复时回来。`?delete_files=true` 时永久删除时一并删除磁盘上的**整个**文件夹与缩略图缓存（在回收站中时文件夹改名为隐藏的 `.recycle-<ID>`，名称与文件夹名可以再用）；不带时文件夹留在原处，仍属于这个数据集（不能再次添加，只能恢复）。导入 / 扫描正在执行、或正在合并生成审图版本时返回 409；未完成的上传随之取消 |
 | `GET /api/v1/datasets/{id}/images` | 图片列表，固定按图片顺序排列（见“图片顺序”）：`offset`、`limit`（≤ 200）、`status`（`all` / `annotated` 有目标 / `empty` 空标注 / `invalid` 标注无效 / `unannotated` 无标注文件）、`label`、`q`（路径包含） |
 | `GET /api/v1/datasets/{id}/images/{imageId}` | 单张图片详情：`objects` 等标注信息实时从 VOC 文件解析；文件无法解析或已不存在时 `annotation_error` 给出原因。`annotation_version` 是标注文件内容的版本（没有文件时为 `""`），保存时原样带回；`annotation_unsupported` 是文件中平台无法显示的目标数（如多边形，保存时原样保留）；`annotation_blocked` 不为空时说明这张图片不能在平台中保存标注的原因（如同名的 `.xml` 属于另一张图片，见第 6 节“标注”） |
 | `GET /api/v1/datasets/{id}/images/{imageId}/neighbors` | 按图片顺序的上一张 / 下一张：`{prev, next, position, matches, total}`，筛选参数同图片列表（`status`、`label`、`q`）；当前图片不符合筛选条件时 `matches: false`，`prev` / `next` 仍是它前后最近的符合条件的图片 |
@@ -201,7 +204,7 @@ flowchart LR
 | `GET /api/v1/datasets/{id}/versions` | 审图版本 `{items, total}`，新的在前，包括正在生成的（`status: building`，还没有名称与编号）。每项：`id`、`name`（如 `审图1.3`）、`major` / `minor`、`note`、`status`（`building` / `ready`）、图片数 `image_count`、`needs_sample_count`、`approved_count` 与目标数 `object_count`（编号时统计）、来自的审图任务 `review: {id, name}`（任务删除后为 null）、`merge_id`、合并时的快照 `source: {review_id, review_name, merge_id, statuses, model}`、`created_at`、`updated_at`、`finished_at` |
 | `GET /api/v1/datasets/{id}/versions/{versionID}` | 单个版本（字段同列表项）；不存在或不属于这个数据集时 404 |
 | `PATCH /api/v1/datasets/{id}/versions/{versionID}` | `{note}` 修改备注（必填，最多 500 个字符，规则同合并时），返回版本；正在生成时 409 |
-| `DELETE /api/v1/datasets/{id}/versions/{versionID}` | 删除版本与它的标注快照，返回 204，编号不再使用；正在生成时 409。数据集的标注文件与审图任务不受影响 |
+| `DELETE /api/v1/datasets/{id}/versions/{versionID}` | 把版本（连同它的标注快照）移入回收站，返回 204：7 天内可以恢复，之后自动永久删除（见第 12 节）；编号不会再分配给别的版本，恢复后仍是原来的编号。正在生成时 409。数据集的标注文件与审图任务不受影响 |
 | `GET /api/v1/datasets/{id}/exports/{token}` | 下载 zip（`Content-Disposition: attachment`，流式输出，无 Content-Length）；链接 1 小时内可重复使用，失效后 404 |
 
 ### 项目接口
@@ -214,7 +217,7 @@ flowchart LR
 | `POST /api/v1/projects` | `{name, description?, dataset_ids?}` 新建项目，可同时纳入数据集，返回 201。名称不区分大小写唯一（重名 409 `conflict`），最长 64 个字符，不能含控制字符；描述最长 500 个字符，除换行与制表符外不能含控制字符；不合规时返回 422。所选数据集不存在时返回 422，不创建项目 |
 | `GET /api/v1/projects/{id}` | 项目详情（字段同列表项） |
 | `PATCH /api/v1/projects/{id}` | 修改名称和描述（规则同上） |
-| `DELETE /api/v1/projects/{id}` | 删除项目，返回 204。其中的数据集保留，只是不再属于该项目；进行中的模型上传随项目删除（临时文件由清理任务删除）。项目中有模型时返回 409 `conflict`（“项目中有 N 个模型，请先删除模型，或选择同时删除模型”）；`?delete_models=true` 时先逐个删除其模型（记录、转换与文件夹，同 `DELETE /api/v1/models/{modelID}`）再删除项目，有模型文件夹没能完全删除时返回 200 `{"files_removed": false, "message": "…"}`。`delete_models` 不是布尔值时返回 400 |
+| `DELETE /api/v1/projects/{id}` | 删除项目，返回 204。其中的数据集保留，只是不再属于该项目；进行中的模型上传随项目删除（临时文件由清理任务删除）。项目中有模型时返回 409 `conflict`（“项目中有 N 个模型，请先删除模型，或选择同时删除模型”）；`?delete_models=true` 时先把其模型移入回收站（同 `DELETE /api/v1/models/{modelID}`）再删除项目。项目中有模型在回收站中时，项目随它们留在回收站中（不显示，名称可以再用），恢复其中任何一个模型时一并恢复，最后一个模型永久删除时项目才删除（见第 12 节）。`delete_models` 不是布尔值时返回 400 |
 | `GET /api/v1/projects/{id}/datasets` | 项目中的数据集，格式同数据集列表。项目不存在时返回 404（`GET /api/v1/datasets?project_id=` 则返回空列表） |
 | `POST /api/v1/projects/{id}/datasets` | `{dataset_ids: [...]}` 把数据集纳入项目（已在项目中的忽略），返回更新后的项目；`dataset_ids` 为空或有数据集不存在时返回 422，不做任何修改 |
 | `DELETE /api/v1/projects/{id}/datasets/{datasetId}` | 把数据集移出项目，返回 204（数据集本身不受影响；本来就不在项目中也返回 204） |
@@ -224,7 +227,7 @@ flowchart LR
 | `POST /api/v1/projects/{id}/classes` | `{name, color?}` 在列表末尾追加一个类别（`color` 为 `""` 或 `#rrggbb`）；已有同名类别（去掉首尾空白后完全相同）时列表不变。校验同 PUT（超过 1000 个时返回 422），返回列表（格式同 GET）。读取与写入在同一事务中并锁定项目行，并发追加不会互相覆盖 |
 | `GET /api/v1/projects/{id}/models` | 项目中的模型（格式同模型列表），按版本号倒序；项目不存在时返回 404 |
 
-一次最多提交 1000 个 ID。增减数据集（包括删除其中的数据集）和修改类别列表会更新项目的 `updated_at`（提交的类别列表与原来相同时不更新）；项目与数据集之间的写操作都按“先数据集、后项目，各自按 ID 顺序”加行锁，修改类别列表只锁定项目这一行，并发修改同一关系时不会死锁或丢失更新。删除数据集或项目时，关联记录随之级联删除。一个模型只属于一个项目（`models.project_id`，`ON DELETE RESTRICT`：数据库不会在模型文件夹还在时删掉模型记录）；删除项目时在事务中锁定项目行并检查其中的模型数，与分配模型版本号使用同一把行锁，正在提交的模型不会漏删。训练任务上线后也将归属到项目。
+一次最多提交 1000 个 ID。增减数据集（包括删除其中的数据集）和修改类别列表会更新项目的 `updated_at`（提交的类别列表与原来相同时不更新）；项目与数据集之间的写操作都按“先数据集、后项目，各自按 ID 顺序”加行锁，修改类别列表只锁定项目这一行，并发修改同一关系时不会死锁或丢失更新。数据集或项目进入回收站时，它们之间的关联移到 `recycled_project_datasets`，恢复时（另一方仍在使用时）放回，永久删除时随之删除（见第 12 节）。一个模型只属于一个项目（`models.project_id`，`ON DELETE RESTRICT`：数据库不会在模型文件夹还在时删掉模型记录）；删除项目时在事务中锁定项目行并检查其中的模型数（包括回收站中的），与分配模型版本号使用同一把行锁，正在提交的模型不会漏删。训练任务上线后也将归属到项目。
 
 ### 模型仓库接口
 
@@ -235,7 +238,7 @@ flowchart LR
 | `GET /api/v1/models` | 模型列表 `{items, total}`，新的在前（`created_at DESC, id DESC`）。筛选：`project_id`（正整数）、`yolo_version`、`source`（`upload` / `training`）、`q`（说明、原始文件名、项目名，不区分大小写），参数值非法时返回 400。每项带所属项目 `project: {id, name}`、版本号、来源与训练任务 `training_job_id`（上传的模型为 null）、YOLO 版本、任务、原始文件名、大小、SHA256、解析出的 `info`、`file_missing`（`model.pt` 已不在磁盘上）、`export_count`（成功的转换数）与 `download_url` |
 | `GET /api/v1/models/{modelID}` | 模型详情（字段同列表项） |
 | `PATCH /api/v1/models/{modelID}` | `{description}` 修改说明（规则同项目描述：最长 500 个字符，除换行与制表符外不能含控制字符） |
-| `DELETE /api/v1/models/{modelID}` | 删除模型记录、转换记录与整个模型文件夹（含 ONNX 缓存），返回 204；正在执行的转换随之删除，训练节点之后的调用得到 404 而停止。记录已删除但文件夹没能完全删除时返回 200 `{"files_removed": false, "message": "…"}`（同数据集），剩余的文件留在原来的文件夹名下，版本号不会被复用 |
+| `DELETE /api/v1/models/{modelID}` | 把模型移入回收站，返回 204：7 天内可以恢复（`POST /api/v1/recycle-bin/models/{modelID}/restore`），之后自动永久删除模型记录、转换记录与整个模型文件夹（含 ONNX 缓存），不能提前删除（见第 12 节）。在回收站中时文件夹与已完成的转换保留，排队中或转换中的转换随之删除，训练节点之后的调用得到 404 而停止；版本号不会被复用。使用它的审图任务等它恢复（不会领取），永久删除后失败 |
 | `GET /api/v1/models/{modelID}/file` | 下载 `model.pt`（`Content-Disposition: attachment`，文件名 `<项目名>_v<版本>.pt`，`application/octet-stream`，支持 Range 与条件请求）；文件不在磁盘上时 404 `not_found`（“模型文件不存在…”） |
 | `POST /api/v1/models/uploads` | `{project_id, yolo_version, file_name, file_size, description?}` 开始上传，返回 201 与上传 `ModelUpload`（`{id, project_id, yolo_version, description, file_name, file_size, received_bytes, status, detected_yolo_version, error, model_id, …}`）。`yolo_version` 见第 10 节；文件名须以 `.pt` 结尾（不区分大小写）、最长 255 个字符、不能含控制字符；大小 1 字节–8 GiB；项目不存在时返回 422；剩余空间不足文件大小 + 512 MiB 时返回 507 |
 | `GET /api/v1/models/uploads/{uploadID}` | 上传状态：`uploading` → `completed` / `failed` / `canceled` |
@@ -260,8 +263,8 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `POST /api/v1/reviews` | `{name?, description?, model_id, dataset_ids, options?: {conf?, iou?, imgsz?, max_det?}}` 新建审图任务并排队识别，返回 201。规则见第 11 节“新建”：模型不存在、没有检测框、数据集不存在或超出数量、没有图片、参数超出范围时 422；模型文件不在磁盘上时 409 |
 | `GET /api/v1/reviews/{reviewID}` | 审图任务详情（字段同列表项） |
 | `PATCH /api/v1/reviews/{reviewID}` | `{name?, description?}` 修改名称和说明（规则同项目） |
-| `DELETE /api/v1/reviews/{reviewID}` | 删除审图任务与它的文件夹（审图标注），返回 204；数据集与已经生成的审图版本不受影响（版本的 `review` 变为 null，`source` 中仍有任务名称）。正在合并时 409；正在识别时也可以删除，节点之后的调用得到 404 而停止。记录已删除但文件夹没能完全删除时返回 200 `{"files_removed": false, "message": "…"}`（同模型） |
-| `POST /api/v1/reviews/{reviewID}/retry` | 重新识别失败的任务：清零尝试次数与错误后重新排队，返回 202 与任务，从还没有识别的图片继续。不是 `failed` 时 409（“只有识别失败的审图任务可以重试”），模型已被删除或模型文件不在时 409 |
+| `DELETE /api/v1/reviews/{reviewID}` | 删除审图任务与它的文件夹（审图标注），返回 204；数据集与已经生成的审图版本不受影响（版本的 `review` 变为 null，`source` 中仍有任务名称）。正在合并时 409；正在识别时也可以删除，节点之后的调用得到 404 而停止。记录已删除但文件夹没能完全删除时返回 200 `{"files_removed": false, "message": "…"}` |
+| `POST /api/v1/reviews/{reviewID}/retry` | 重新识别失败的任务：清零尝试次数与错误后重新排队，返回 202 与任务，从还没有识别的图片继续。不是 `failed` 时 409（“只有识别失败的审图任务可以重试”），模型已被删除、在回收站中（需先恢复）或模型文件不在时 409 |
 | `GET /api/v1/reviews/{reviewID}/images` | 图片列表，按任务中的顺序：`offset`、`limit`（默认 60，≤ 200）、`status`（`all` / `pending` / `approved` / `needs_sample` / `reviewed`）、`dataset_id`、`label`、`q`（数据集中的路径包含，不区分大小写）、`edited`（`all` / `edited` / `unedited`）、`boxes`（`all` / `with` / `without`）、`inference`（`all` / `failed`），参数值非法时 400。每项带数据集与数据集图片的 ID、路径、尺寸、`inferred`、`inference_error`、目标数与类别、`prediction_count`、`edited`、`status`、`revision`、`reviewed_at`、`merged_at`、`annotation_version` |
 | `GET /api/v1/reviews/{reviewID}/images/{imageID}` | 单张图片详情：另带 `objects`（审图标注，实时从 VOC 文件读取，没有文件时为 `[]`）、`predictions`（模型的框与置信度）、`dataset_name`，以及文件无法使用时的 `annotation_error` |
 | `GET /api/v1/reviews/{reviewID}/images/{imageID}/neighbors` | 按任务中的顺序的上一张 / 下一张：`{prev, next, position, matches, total}`，筛选参数同图片列表（同数据集的 neighbors） |
@@ -281,6 +284,17 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `GET /api/v1/reviews/tool` | 本地审图程序：`{available, file_name: "trainmaster-reviewer.exe", size_bytes, version}`（`version` 为平台的版本，两者一起构建；没有时为 `""`） |
 | `GET /api/v1/reviews/tool/download` | 下载本地审图程序（`application/octet-stream`、`attachment`，支持 Range）；平台没有附带（`TM_REVIEWER_TOOL` 未设置或文件不存在）时 404 |
 | `GET /api/v1/datasets/{id}/reviews` | 数据集的审核记录：包含该数据集的审图任务，新的在前；每项为审图任务加上这个数据集的部分 `dataset`（带这个数据集中的图片数 `counts`）与包含它的最近 5 次合并 `dataset_merges`。数据集不存在时 404 |
+
+### 回收站接口
+
+删除数据集、审图版本与模型（包括删除项目时一并删除的模型）都把它们移入回收站：保留 7 天，期间可以恢复，到期后自动永久删除。**不能提前永久删除**，也没有清空回收站的接口：误删的东西总有 7 天可以找回。见第 12 节。
+
+| 方法与路径 | 说明 |
+|---|---|
+| `GET /api/v1/recycle-bin` | 回收站中的内容：`{retention_days, datasets, versions, models}`，各自按删除时间新的在前。`datasets` 每项是数据集（同 `GET /api/v1/datasets/{id}`）加上 `deleted_at`、永久删除的时间 `purge_at`、`delete_files`、恢复后回到的项目 `restore_projects: [{id, name}]`（仍在使用的）与审图任务数 `review_count`，`directory_missing` 与 `path` 指它在回收站中的文件夹；`versions` 每项是版本（同版本列表）加上 `dataset_name`、`deleted_at`、`purge_at`（数据集也在回收站中且更早到期时为数据集的时间）与 `dataset_deleted`；`models` 每项是模型（同模型列表，没有 `download_url`）加上 `deleted_at`、`purge_at` 与 `project_deleted`（项目随它在回收站中） |
+| `POST /api/v1/recycle-bin/datasets/{id}/restore` | `{name?}`（可选）恢复数据集，返回 200 与数据集：回到原来的名称、文件夹、仍在使用的项目与审图任务。已有同名的数据集，或删除时带 `delete_files` 而文件夹名已被使用时，返回 409 `name_taken`，带 `name` 用新名称恢复（文件夹也改用新名称）。不在回收站中（已恢复或已永久删除）时 404 |
+| `POST /api/v1/recycle-bin/versions/{versionID}/restore` | 恢复审图版本，返回 200 与版本。它的数据集也在回收站中时 409（先恢复数据集）；不在回收站中时 404 |
+| `POST /api/v1/recycle-bin/models/{modelID}/restore` | `{project_name?}`（可选）恢复模型，返回 200 与模型。项目随它在回收站中时一并恢复项目（以及项目与仍在使用的数据集的关联）；项目的名称已被占用时返回 409 `name_taken`，带 `project_name` 用新名称恢复项目。不在回收站中时 404 |
 
 ### 计算资源接口
 
@@ -495,7 +509,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 因此迁移文件中**不要写 `BEGIN` / `COMMIT`**，也不能包含无法在事务中执行的语句（如 `CREATE INDEX CONCURRENTLY`）。
 - 迁移只向前：**已发布的迁移文件不要修改，也不要改名**，需要变更就新增一个文件。
 - 同一个版本号只能对应一个文件。执行器会比对 `schema_migrations` 中记录的文件名：数据库里已执行过的版本号在当前代码中对应另一个文件名时（典型情况是两个分支各自新增了 `0002_*.sql`，又共用一个开发数据库），启动直接失败并给出两个文件名，而不是悄悄跳过。此时给后合入的那个文件换一个新编号；开发数据库可以删掉 `data/postgres` 重建。
-- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）；`0008_create_models.sql` 建立模型仓库的 `models`、`model_uploads`、`model_exports`（转换任务，同时是转换结果的缓存），并为 `projects` 增加 `model_version_seq`（见第 10 节）；`0009_project_classes.sql` 把类别列表从数据集移到项目（`projects.classes`），带上每个项目中数据集原有的列表，然后删除 `datasets.classes`（见第 6 节“类别列表”）；`0010_create_reviews.sql` 建立模型审图的 `reviews`、`review_datasets`、`review_images`、`review_uploads`、`review_merges`（见第 11 节）；`0011_dataset_versions.sql` 建立数据集的审图版本 `dataset_versions`、`dataset_version_images`，为 `datasets` 增加 `review_version_seq`，为 `review_merges` 增加 `note` 并允许 `on_existing` 为空（见第 11 节“审图版本”）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
+- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）；`0008_create_models.sql` 建立模型仓库的 `models`、`model_uploads`、`model_exports`（转换任务，同时是转换结果的缓存），并为 `projects` 增加 `model_version_seq`（见第 10 节）；`0009_project_classes.sql` 把类别列表从数据集移到项目（`projects.classes`），带上每个项目中数据集原有的列表，然后删除 `datasets.classes`（见第 6 节“类别列表”）；`0010_create_reviews.sql` 建立模型审图的 `reviews`、`review_datasets`、`review_images`、`review_uploads`、`review_merges`（见第 11 节）；`0011_dataset_versions.sql` 建立数据集的审图版本 `dataset_versions`、`dataset_version_images`，为 `datasets` 增加 `review_version_seq`，为 `review_merges` 增加 `note` 并允许 `on_existing` 为空（见第 11 节“审图版本”）；`0012_recycle_bin.sql` 为 `datasets`、`dataset_versions`、`models`、`projects` 增加 `deleted_at`（回收站），为 `datasets` 增加 `delete_files`，把名称的唯一索引改为只约束使用中的记录，并建立 `recycled_project_datasets`、`recycled_review_datasets`、`recycled_review_images`（见第 12 节）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
 
 ## 8. 日志
 
@@ -610,9 +624,9 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
   `model.json` 让 `models/` 的拷贝或备份不依赖数据库也能看懂；它在模型入库时写入（先写临时文件再改名），之后不再更新（如项目改名、修改说明）。
 - **入库**（上传的提交与 `RegisterTrainedModel` 共用）：打开文件 → 计算 SHA256 → 解析（`checkpoint.Inspect`）→ 校验 YOLO 版本 → 在一个事务中分配版本号、插入 `models`（上传的提交同时把上传标为 `completed`），并在提交事务前把文件 `os.Rename` 进模型文件夹、写入 `model.json`。任何一步失败都回滚，文件移回 `tmp/`，因此不会出现没有文件夹的模型记录。移入文件之前先在模型文件夹中写入并 `fsync` 标记 `.pending`（`{"upload_id": N}`），事务提交后删除。进程在移入与提交之间崩溃时，留下的是带 `.pending`、没有模型记录的文件夹：启动时与每小时的清理（以及分配到这个版本号、删除项目时）把其中的文件放回仍在等待它的上传（`tmp/model-uploads/<上传ID>/upload.pt`，可以再次提交），再把文件夹改名为 `models/.deleting-pending-…` 由清理删除，这个版本号随之可以使用；有模型记录的（崩溃发生在提交之后）只删除标记；上传正忙或无法判断时保留，下次再试。分配到的版本号对应的文件夹已经存在、又没有 `.pending` 时（如手动恢复的文件），跳过这个版本号而不是覆盖它。解析最多同时进行 2 个（每个最多约 1 秒 CPU 与几百 MB 内存），其余的提交等待空位。上传的提交不因浏览器断开而中断（大文件的哈希需要一些时间），只在服务关闭时取消。
 - **上传**：分块写入 `tmp/model-uploads/<上传ID>/upload.pt`（第一个分块创建文件），每个分块写入前截断到 `offset` 并在写完后 `fsync`，失败的分块不留下数据；之后的分块或提交发现文件已不在、或比已接收的字节数短时返回 409（临时文件已丢失，需要取消后重新上传），不会用 0 补齐；同一个上传的分块与提交串行执行。开始上传与每个分块都检查剩余空间（始终保留 512 MiB）。
-- **删除**：在事务中删除模型与其转换记录，并把文件夹改名为 `models/.deleting-<模型ID>`，事务提交后再删除它；没能完全删除时（如权限不足）剩余的文件恢复为原来的文件夹名，接口返回 200 与说明。版本号不复用，留下的文件夹不会被新模型占用。删除项目带 `delete_models=true` 时逐个这样删除其模型，再删除项目。
+- **删除**：模型移入回收站（`models.deleted_at`），文件夹留在原处，排队中与转换中的转换随之删除；7 天后永久删除时在事务中删除模型与其转换记录，并把文件夹改名为 `models/.deleting-<模型ID>`，事务提交后再删除它，没能完全删除时（如权限不足）剩余的文件由每小时的清理删除。版本号不复用，留下的文件夹不会被新模型占用。见第 12 节。
 - **文件缺失**：模型的 `model.pt` 不在磁盘上（在服务器上被删除或移动）时，详情中 `file_missing` 为 true，下载返回 404，不能请求转换（409）；转换结果文件被删除时，再次请求同样的转换会重新排队。
-- **后台任务**（`model.Service.Start`，服务关闭时 `Stop`）：每 15 秒把租约过期的转换重新排队或置为失败（见第 9 节“任务协议”）；启动时与每小时取消 24 小时没有进展的上传（“上传超时未完成，已自动取消”），清理崩溃留下的带 `.pending` 的模型文件夹（见上），并删除不属于进行中的上传或转换的临时文件夹、没删干净的 `.deleting-*` 文件夹。领取的通知、`workers_online` 与上传的串行锁都在进程内存中，与导入任务执行器一样，**目前只支持单实例部署**。
+- **后台任务**（`model.Service.Start`，服务关闭时 `Stop`）：每 15 秒把租约过期的转换重新排队或置为失败（见第 9 节“任务协议”）；启动时与每小时永久删除在回收站中满 7 天的模型（见第 12 节），取消 24 小时没有进展的上传（“上传超时未完成，已自动取消”），清理崩溃留下的带 `.pending` 的模型文件夹（见上），并删除不属于进行中的上传或转换的临时文件夹、没删干净的 `.deleting-*` 文件夹。领取的通知、`workers_online` 与上传的串行锁都在进程内存中，与导入任务执行器一样，**目前只支持单实例部署**。
 
 ### 解析模型文件
 
@@ -679,7 +693,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `review_uploads` | 上传的审图结果与应用结果：`file_name`、`overwrite`、`summary`、最多 100 条 `problems` |
 | `review_merges` | 合并到数据集的后台任务：`dataset_ids`、`statuses`、版本备注 `note`（`0011`）、`on_existing`（审图版本之前的合并：`skip` / `overwrite`；之后为 NULL）、`status`（`running` → `succeeded` / `failed`）、进度 `total` / `done`、`summary`、`problems`、`error`；部分唯一索引保证一个任务同时只有一个合并在进行。生成的版本见“审图版本” |
 
-- **图片是快照**：创建时按所选数据集的顺序、数据集内按“图片顺序”（第 6 节）写入 `review_images`；之后数据集中新增的图片不会加入。数据集中的图片被删除（重新扫描、覆盖导入）或数据集被删除时，对应的审图图片级联删除。
+- **图片是快照**：创建时按所选数据集的顺序、数据集内按“图片顺序”（第 6 节）写入 `review_images`；之后数据集中新增的图片不会加入。数据集中的图片被删除（重新扫描、覆盖导入）或数据集被永久删除时，对应的审图图片级联删除。数据集在回收站中时，它在审图任务中的记录（`review_datasets` 与 `review_images`）移到 `recycled_review_datasets`、`recycled_review_images`，恢复时原样放回（ID、顺序、审核状态与识别结果都不变），见第 12 节。
 - **计数不存储**：各状态的图片数（`counts`：`total`、`inferred`、`inference_failed`、`pending`、`approved`、`needs_sample`、`edited`、`merged`）总是用 `GROUP BY` 现算，级联删除不会让计数过期。
 - **任务状态**：`queued` → `running` → `ready`；`running` 的任务在节点报告可重试的失败或租约过期时回到 `queued`（最多领取 3 次），否则 `failed`；`failed` 的任务可以“重新识别”（`POST …/retry`：清零尝试次数与错误后排队），继续识别还没有识别的图片。
 - **审核状态**：`pending`（待审核，默认）、`approved`（已审核：识别结果正确，模型不需要再学习这张图片）、`needs_sample`（需加样：这张图片需要参与后续的训练）。只有识别过的图片（`inferred`，包括识别失败的）可以审核与编辑。`edited` 表示审图标注与模型的识别结果不同：按类别名称与坐标作为多重集合比较（顺序、`difficult` / `truncated` 与置信度不算，`reviewfile.SameBoxes`）。
@@ -714,9 +728,9 @@ reviews/
 
 `review.Service` 实现 `model.TaskSource`（`Kind()` 为 `review_inference`，`Claim(ctx, nodeID)`），创建时用 `model.Service.AddTaskSource` 注册，因此复用训练节点的领取接口、长轮询与唤醒（第 9 节“任务协议”）：
 
-1. **领取**：节点在 `kinds` 中带上 `review_inference`。平台先找转换任务（`model_export`），没有时再按注册顺序问各个任务来源；审图任务按 `SELECT … FROM reviews WHERE status = 'queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1` 取最早排队的，置为 `running`、记下节点、`attempts + 1`、租约 60 秒。模型已被删除或模型文件不在时，这个任务直接失败（“模型已被删除，无法识别” / “模型文件不存在，无法识别”），领取继续看下一个（一次最多跳过 20 个）。
+1. **领取**：节点在 `kinds` 中带上 `review_inference`。平台先找转换任务（`model_export`），没有时再按注册顺序问各个任务来源；审图任务按 `SELECT … FROM reviews WHERE status = 'queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1` 取最早排队的，置为 `running`、记下节点、`attempts + 1`、租约 60 秒。模型在回收站中的任务不领取，等模型恢复；模型已被永久删除或模型文件不在时，这个任务直接失败（“模型已被删除，无法识别” / “模型文件不存在，无法识别”），领取继续看下一个（一次最多跳过 20 个）。
 2. **任务**（`review.Task`）：`{kind, id, lease_seconds, model: {id, project_id, version, yolo_version, task, file_name, size_bytes, sha256, class_names}, options, image_count, remaining, model_url, images_url, progress_url, results_url, complete_url, fail_url}`，URL 都在 `/api/v1/compute/agent/review-inferences/<任务ID>/` 下。
-3. **执行**：节点下载模型（`GET model`，支持 Range，读取期间每 15 秒续租；这时才发现模型已删除或文件已不在时任务失败，返回 404），上报进度（`downloading` / `inferring`）；按页取还没有识别的图片（`GET images?after=<上一页最后的 ID>&limit=`，按 ID 排列，带 `remaining`），逐张下载（`GET images/{imageID}/file`）并识别，结果攒批上报（`POST results`，每批最多 500 张、请求体 1 MiB）。
+3. **执行**：节点下载模型（`GET model`，支持 Range，读取期间每 15 秒续租；这时才发现模型已删除（包括移入回收站：“模型已在回收站中，无法识别；在回收站中恢复模型后可以重试”）或文件已不在时任务失败，返回 404），上报进度（`downloading` / `inferring`）；按页取还没有识别的图片（`GET images?after=<上一页最后的 ID>&limit=`，按 ID 排列，带 `remaining`），逐张下载（`GET images/{imageID}/file`）并识别，结果攒批上报（`POST results`，每批最多 500 张、请求体 1 MiB）。
 4. **写入结果**：每个请求在一个事务中处理：识别成功的图片写入 VOC 文件（模型的框，不带置信度与 `difficult` / `truncated` 标记）并记下 `predictions`、`object_count`、`labels`、`annotation_version`；识别失败的图片只记 `inference_error`（中文原因，没有文件）。图片的尺寸（裁剪框、VOC 的 `<size>`）取数据集索引中现在的尺寸（文件被替换后重新扫描时随之更新，图片列表交给节点的也是它），没有时用创建时复制的尺寸，都没有时才用节点上报的，并记到行中。已经识别过的、不属于这个任务的图片 ID 忽略，因此重发同一批结果是安全的；返回 `{lease_seconds, accepted, remaining}`。框按上报的值清洗：类别名称去掉控制字符与首尾空白、最长 255 个字符，名称为空或坐标不是有限值的框丢弃；坐标裁剪到图片范围并取整，面积为 0 的框丢弃；置信度限制在 0–1 并保留 4 位小数；每张图片最多保留置信度最高的 1000 个框。
 5. **完成**：`POST complete`（`{result}`）在还有没识别的图片时返回 409（“还有 N 张图片没有识别”），否则任务为 `ready`。`result` 只保留 `device`、`torch_version`、`ultralytics_version`、`node_name`、`elapsed_seconds`、`images_per_second`。
 6. **租约与失败**：同模型转换：每个调用都续租，平台每 15 秒检查一次，租约过期的任务在领取次数少于 3 次时重新排队，否则失败（“训练节点在识别过程中失去联系（已尝试 3 次）”）；`POST fail`（`{error, detail?, retryable?}`）可重试且领取次数少于 3 次时重新排队，否则失败。重新排队与重试都从还没有识别的图片继续，已经上报的结果保留。任务被删除时节点的调用得到 404，已不属于该节点或已结束时得到 409，节点随之放弃。
@@ -799,7 +813,7 @@ zip 中只有一个顶层文件夹 `审图-<任务ID>-<任务名>/`（`SafeSegme
 - **编号**：版本在合并结束的事务中编号（`FinishReviewVersions`）：按 ID 顺序锁定这次合并涉及的数据集，`review_version_seq` 加 1，加之前的值作为 `minor`（`major` 目前总是 1），版本变为 `ready`。所以同一个数据集的版本按合并**完成**的先后编号，删除的版本号不会再分配，失败的合并不占用编号。审图任务的 `datasets[].next_version` 是按 `review_version_seq` 预计的下一个名称。
 - **版本不变**：`ready` 的版本除了备注不再改变；之后修改审图任务、再次合并都不影响它（再次合并生成下一个版本，包含当时所选状态的全部图片，不只是改过的）。
 - **对应图片**：版本按路径对应数据集的图片，只要数据集中这个路径上的图片的大小与修改时间（索引中的值）与合并时相同，版本就用于这张图片：文件暂时移走、重新扫描后又放回原处（保留修改时间）时也是。路径上换成了别的文件（重新扫描或覆盖导入后大小或修改时间变了）时，版本的标注不再适用；通过平台再次导入同一张图片也算换了文件，因为导入写入的文件修改时间是新的。
-- **删除**：删除版本级联删除它的图片，删除数据集级联删除它的版本；删除审图任务或合并记录时版本保留（`review_id`、`merge_id` 为 NULL）。正在生成的版本不能修改或删除（409）。
+- **删除**：删除版本把它移入回收站（`dataset_versions.deleted_at`），7 天后永久删除，级联删除它的图片；数据集在回收站中时它的版本随它保留，永久删除数据集时级联删除。删除审图任务或合并记录时版本保留（`review_id`、`merge_id` 为 NULL）。正在生成的版本不能修改或删除（409）。见第 12 节。
 
 **下载时组合版本**（`VersionSelection{IncludeBase, VersionIDs}`）：所选的审图版本从新到旧排列；对数据集中的每张图片，取所选版本中最新的、包含这张图片并且仍然适用的版本的标注（`layerSQL`：`DISTINCT ON (rel_path)`，按版本在从新到旧的列表中的位置排序）。
 
@@ -823,3 +837,35 @@ zip 中只有一个顶层文件夹 `审图-<任务ID>-<任务名>/`（`SafeSegme
 - **审核进度**：审图标注就是文件夹中的 VOC 文件（保存方式同平台）；审核状态保存在 `review-progress.json`（`format: "trainmaster-review-progress"`、`version: 1`、`package_id`、`review_id`、`updated_at`，只记状态与包中不同的图片 `[{id, status, reviewed_at}]`，以及最近一次导出 `last_export`），都是原子替换。进度文件损坏时不打开这个包。 页面修改标注与审核状态时带着请求头 `X-Review-Package: <package_id>`：程序中已经换成另一个审图包时返回 409（“程序中已经打开了另一个审图包，这次修改没有保存…”），换包之前排队的修改不会写进新的审图包；不带这个头的请求（脚本）作用于当前打开的包。
 - **导出审图结果**（`export.go`）：在审图包文件夹旁边原子写入 `<文件夹名>-审图结果.zip`（再次导出时替换），其中顶层文件夹 `<审图包文件夹名>-审图结果/` 有 `README.txt`、`kind` 为 `results` 的 `review.json`（包中每张图片及其当前状态，`base_*` 与包中相同）与每张图片现在的 VOC 文件（能读取的都在，`has_annotation`；与包中相同的，平台只在“接着上传”时才算修改）；读不出的改动过的标注文件跳过并计数。
 - **其它**：缩略图 `sm`（320px）用平台的代码生成，缓存在程序缓存目录的 `thumbs\<package_id>\` 中（不是 32 位十六进制的 ID 用它的 SHA-256 命名，不会指到缓存目录之外）（30 天没有再打开的包的缩略图删除）；`lg` 对浏览器能显示的格式直接返回原图，其它格式（如 TIFF）生成 1600px 的 JPEG。最近打开的包（最多 12 个）记在用户配置目录（`%APPDATA%\trainmaster-reviewer`）的 `recent.json` 中；日志写到程序缓存目录的 `reviewer.log`（超过 4 MiB 时另起，旧的保留为 `reviewer.log.1`）。开发时用 `TM_REVIEWER_WEB_DIR` 从磁盘读取页面（见开发指南）。
+
+## 12. 回收站
+
+删除数据集、数据集的审图版本与模型都不会立即删除它们，而是移入回收站：**保留 7 天**（`internal/recycle` 的 `Retention`），期间可以在“系统设置 · 回收站”（`/system/recycle-bin`）中查看与恢复，到期后由后台任务自动永久删除。删除项目时勾选“同时删除模型”的模型同样进入回收站。回收站**不提供提前永久删除**（也没有“清空回收站”）：保留期是强制的，误删的东西总有 7 天可以找回。接口见第 3 节“回收站接口”。
+
+### 软删除
+
+回收站中的记录是软删除的：`deleted_at` 记录移入的时间（`0012_recycle_bin.sql`），其它所有查询都把这样的记录当作不存在（列表、详情、统计、下载、标注、导入、扫描、审图都看不到它）。名称的唯一索引只约束使用中的记录（`WHERE deleted_at IS NULL`），所以回收站中的数据集或项目的名称可以再用；恢复时名称已被占用则返回 409 `name_taken`，带新名称再次恢复。
+
+| 内容 | 回收站中的状态 | 恢复 | 永久删除 |
+|---|---|---|---|
+| 数据集 | 记录、图片索引、导入记录、审图版本都保留；所属项目的关联移到 `recycled_project_datasets`，审图任务中的记录移到 `recycled_review_datasets` / `recycled_review_images`（`RecycleHook`，由 `review.Service` 实现）。带 `delete_files` 删除的，文件夹改名为隐藏的 `datasets/.recycle-<ID>`；不带的，文件夹留在原处（仍属于这个数据集，不能作为新数据集再次添加） | 关联放回（项目或审图任务已删除的除外）；已经识别完的审图任务拿回还没识别的图片时重新排队（模型可用时）；文件夹改回原名（或新名称） | 删除记录（级联删除图片、导入、版本与关联）与缩略图缓存；带 `delete_files` 的删除文件夹，不带的文件夹留在原处，可以再作为数据集添加 |
+| 审图版本 | 版本与它的标注快照保留，下载、合并的编号都不再看到它；编号不会再分配 | 回到版本列表，编号不变；数据集也在回收站中时需先恢复数据集 | 删除版本，级联删除它的图片 |
+| 模型 | 记录、已完成的转换与文件夹（`model.pt`、`model.json`、ONNX 缓存）原样保留，排队中与转换中的转换删除；使用它的审图任务等它恢复 | 原样回到模型仓库；项目也在回收站中时一并恢复项目 | 删除记录与转换记录，删除文件夹；使用它的审图任务随之失败（“模型已被删除，无法识别”） |
+
+**项目**本身不进入回收站，但模型必须属于一个项目（`ON DELETE RESTRICT`）：删除项目时其中有模型在回收站中，项目也被软删除（不显示，名称可以再用，与数据集的关联移到 `recycled_project_datasets`），恢复其中任何一个模型时一并恢复项目（名称被占用时用 `project_name` 换名），最后一个模型永久删除时项目才真正删除。项目中没有回收站中的模型时，删除项目直接删除它。
+
+### 到期删除
+
+到期时间是 `deleted_at + 7 天`（列表中的 `purge_at`）。数据集与审图版本由数据集模块的清理任务（每 30 分钟）永久删除，模型由模型仓库的清理任务（启动时与每小时）永久删除，所以实际删除可能比 `purge_at` 晚一点。永久删除前在事务中锁定记录并再次确认它仍在回收站中且已到期，与恢复同时发生时不会删掉刚恢复的内容。回收站中的项目在最后一个模型删除后由同一清理删除。
+
+### 并发
+
+- 加锁顺序与项目和数据集的写操作相同：先数据集，后项目，再模型；审图任务的记录先锁审图任务（按 ID 顺序）。删除项目时先锁住它的数据集再锁项目，期间有新的关联加入时重试（最多 3 次）。
+- 移入回收站与恢复都在一个事务中完成，与会写入这条记录的操作（导入、上传模型的提交、创建审图任务）用行锁互斥：在插入时带 `FOR KEY SHARE` 再次确认目标仍在使用中，不会把新数据写进回收站中的数据集或项目。
+- 正在导入 / 扫描、或正在合并生成审图版本的数据集不能删除（409）；正在生成的版本不能删除（409）。
+
+### 文件夹
+
+- 文件夹的改名（`.recycle-<ID>` 与原名之间）是事务提交前的最后一步，提交失败时改回。进程恰好在改名与提交之间崩溃时，下次启动时整理：使用中的数据集的 `.recycle-<ID>` 改回原名（原名不存在时），已经没有记录的改名为 `.deleting-<ID>` 由清理删除。
+- 永久删除先把文件夹改名为 `.deleting-<ID>` 再删除；没能删干净时（如权限不足）剩余的文件由之后的清理再次删除。
+- 回收站中的内容仍占用磁盘空间，7 天后才释放。
