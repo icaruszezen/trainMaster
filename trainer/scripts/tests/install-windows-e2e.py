@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 TRAINER_DIR = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(TRAINER_DIR / "tests"))
+sys.path[:0] = [str(TRAINER_DIR), str(TRAINER_DIR / "tests")]
 
 from fake_platform import FakePlatform  # noqa: E402
 
