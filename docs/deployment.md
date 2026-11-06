@@ -603,6 +603,7 @@ journalctl -u trainmaster-trainer -f
 | 检测环境 | `& 'C:\ProgramData\trainMaster\trainer\Scripts\python.exe' -m trainmaster_trainer selftest --env-file 'C:\ProgramData\trainMaster\trainer\trainer.env'` |
 | 停止并删除计划任务 | 重新运行安装命令，只加 `-Uninstall`（安装目录、配置文件与状态目录保留，不再需要时手动删除），然后在“计算资源”页面删除这个节点 |
 
+- 重新运行安装命令时，计划任务在安装期间被禁用（以免它用一半新一半旧的文件启动训练节点），安装结束或出错时恢复。安装过程中关闭了 PowerShell 窗口时它可能保持禁用（`Get-ScheduledTask` 的 `State` 为 `Disabled`）：重新运行安装命令，或运行 `Enable-ScheduledTask -TaskName trainmaster-trainer`。
 - 电脑睡眠时节点离线：接通电源时把睡眠设为“从不”（设置 → 系统 → 电源，或 `powercfg /change standby-timeout-ac 0`），安装脚本发现会睡眠时会提醒。
 - 训练节点只主动连接平台，不需要在 Windows 防火墙中开放端口；平台地址填平台的 IP 地址或域名。
 - 卸载或升级了创建虚拟环境时使用的 Python 后，训练节点无法启动：删除安装目录后重新运行安装命令。

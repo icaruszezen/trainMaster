@@ -619,14 +619,16 @@ function Get-TaskEnvFile($Task, [string]$VenvPython) {
 # 停止计划任务并等待训练节点退出（替换虚拟环境中的文件之前；运行中的 DLL 无法覆盖）。计划任务先禁用：
 # 它每 5 分钟检查一次，训练节点没有在运行时启动它，安装过程中会用一半新一半旧的文件和旧的配置启动。
 # 安装结束时重新注册（启用）它；中途出错或被中断时恢复启用（主流程的 finally）。
-function Stop-Trainer([string]$EnvFilePath) {
+# -Ours：计划任务运行的是本安装目录的训练节点。它已被禁用时（例如上次安装时关闭了窗口，来不及恢复），
+# 这次结束时也启用它：重新运行安装就是要让训练节点运行。
+function Stop-Trainer([string]$EnvFilePath, [switch]$Ours) {
     $task = Get-OurTask
+    if ($task -and ($task.State -ne 'Disabled' -or $Ours)) {
+        if (-not $DryRun) { $Ctx.TaskDisabled = $true }  # 先记下：禁用的过程中被中断时也恢复
+    }
     if ($task -and $task.State -ne 'Disabled') {
         Write-Host "+ Disable-ScheduledTask -TaskName $TaskName（安装期间不自动启动）"
-        if (-not $DryRun) {
-            Disable-ScheduledTask -TaskName $TaskName | Out-Null
-            $Ctx.TaskDisabled = $true
-        }
+        if (-not $DryRun) { Disable-ScheduledTask -TaskName $TaskName | Out-Null }
     }
     if ($task -and $task.State -eq 'Running') {
         Write-Host "+ Stop-ScheduledTask -TaskName $TaskName"
@@ -926,7 +928,7 @@ function Invoke-Install {
         Write-Info "PyTorch 变体：$($chosen.name) —— $($report.recommended.reason)"
     }
 
-    Stop-Trainer $EnvFile
+    Stop-Trainer $EnvFile -Ours:$taskInstalled
     if ($useRoot) {
         if (-not (Test-Path -LiteralPath $tmRoot)) {
             Write-Host "+ 创建 $tmRoot"

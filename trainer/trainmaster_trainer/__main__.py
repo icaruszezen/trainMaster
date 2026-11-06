@@ -87,12 +87,19 @@ class LogFileHandler(logging.handlers.RotatingFileHandler):
         # 上次改名了当前文件、但没能移动备份时，先完成上次的轮转（当前文件下次再轮转）
         if not os.path.exists(pending):
             self.rotate(base, pending)
-        for i in range(self.backupCount - 1, 0, -1):
-            src = self.rotation_filename(f"{base}.{i}")
-            if os.path.exists(src):
-                os.replace(src, self.rotation_filename(f"{base}.{i + 1}"))
+        # 只移动从 .1 开始连续的备份：上次移动到一半失败时，已经移好的备份不再被覆盖（只有备份都在时
+        # 最旧的一个被替换）
+        free = next(
+            (i for i in range(1, self.backupCount) if not os.path.exists(self._backup(i))),
+            self.backupCount,
+        )
+        for i in range(free - 1, 0, -1):
+            os.replace(self._backup(i), self._backup(i + 1))
         if os.path.exists(pending):
-            os.replace(pending, self.rotation_filename(f"{base}.1"))
+            os.replace(pending, self._backup(1))
+
+    def _backup(self, i: int) -> str:
+        return self.rotation_filename(f"{self.baseFilename}.{i}")
 
 
 def setup_logging(level: int, log_file: Path | None = None) -> None:

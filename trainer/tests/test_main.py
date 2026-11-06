@@ -603,6 +603,29 @@ def test_log_file_rotation_keeps_backups_in_order(tmp_path):
         assert f"record {11 - i:02d}" in (tmp_path / f"t.log.{i}").read_text(encoding="utf-8")
 
 
+def test_log_file_rotation_does_not_overwrite_moved_backups(tmp_path):
+    # 上次移动备份到一半失败（.1 被其它程序打开）：.2 空着，.3 以后已经移好。这次只移动 .1，不再覆盖其它备份
+    import logging
+
+    (tmp_path / "t.log").write_text("current\n", encoding="utf-8")
+    (tmp_path / "t.log.1").write_text("old1\n", encoding="utf-8")
+    for i, name in ((3, "old2"), (4, "old3"), (5, "old4")):
+        (tmp_path / f"t.log.{i}").write_text(f"{name}\n", encoding="utf-8")
+    (tmp_path / "t.log.rotating").write_text("rotating\n", encoding="utf-8")
+    handler = cli.LogFileHandler(tmp_path / "t.log")
+    handler.maxBytes = 50
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    try:
+        handler.emit(logging.makeLogRecord({"msg": "next " + "c" * 60}))
+    finally:
+        handler.close()
+    contents = {
+        i: (tmp_path / f"t.log.{i}").read_text(encoding="utf-8").strip()
+        for i in range(1, cli.LOG_FILE_BACKUPS + 1)
+    }
+    assert contents == {1: "rotating", 2: "old1", 3: "old2", 4: "old3", 5: "old4"}
+
+
 def test_log_file_rotation_finishes_an_interrupted_rotation(tmp_path):
     # 上次改名了当前文件、但没能移动备份（备份被其它程序打开）：这次先把它变成第一个备份
     import logging
