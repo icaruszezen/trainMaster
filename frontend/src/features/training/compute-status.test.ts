@@ -19,6 +19,7 @@ import {
   hasOnlineGpuNode,
   isProbing,
   isRedetecting,
+  isWindowsNode,
   memoryStat,
   minCudaDriver,
   nodeStatusText,
@@ -91,6 +92,7 @@ function node(overrides: Partial<ComputeNode> = {}): ComputeNode {
       os: "Ubuntu 22.04.4 LTS",
       kernel: "5.15.0-105-generic",
       arch: "x86_64",
+      platform: "linux",
       in_container: true,
       cpu: {
         model: "Intel(R) Xeon(R) Gold 6330 CPU @ 2.00GHz",
@@ -127,6 +129,24 @@ function issue(
 ): EnvironmentIssue {
   return { level, code, message: code, hint: null }
 }
+
+describe("isWindowsNode", () => {
+  const withPlatform = (platform: string | null) => {
+    const base = node()
+    return { ...base, hardware: { ...base.hardware, platform } }
+  }
+
+  it("recognizes Windows nodes by the reported platform", () => {
+    expect(isWindowsNode(withPlatform("windows"))).toBe(true)
+    expect(isWindowsNode(withPlatform("linux"))).toBe(false)
+    expect(isWindowsNode(withPlatform("darwin"))).toBe(false)
+  })
+
+  it("treats nodes that report no platform as Linux", () => {
+    // Nodes before 0.4.0 do not report it.
+    expect(isWindowsNode(withPlatform(null))).toBe(false)
+  })
+})
 
 describe("node badges", () => {
   it("labels the accelerator", () => {

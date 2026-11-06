@@ -40,6 +40,14 @@ export function isRedetecting(
   return node.environment !== null && isProbing(node)
 }
 
+/**
+ * Windows 训练节点（直接安装，以计划任务运行）：没有 /dev/shm，停止与删除的
+ * 命令也不同。旧版节点不上报 platform（null），按 Linux 处理。
+ */
+export function isWindowsNode(node: Pick<ComputeNode, "hardware">) {
+  return node.hardware.platform === "windows"
+}
+
 /** 加速器标记：“GPU × 2” / “仅 CPU”。 */
 export function acceleratorLabel(node: Pick<ComputeNode, "hardware">) {
   const count = node.hardware.gpus.length

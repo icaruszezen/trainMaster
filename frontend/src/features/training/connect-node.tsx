@@ -1,6 +1,7 @@
 import type { ReactNode } from "react"
 import { useQuery } from "@tanstack/react-query"
 import {
+  AppWindow,
   Globe,
   KeyRound,
   Monitor,
@@ -28,7 +29,10 @@ import {
   TOKEN_PLACEHOLDER,
 } from "@/features/training/connect-commands"
 
-/** 接入说明需要的平台信息；服务器信息还没加载时按“需要令牌”显示（默认部署会生成令牌）。 */
+/**
+ * 接入说明需要的平台信息；服务器信息还没加载时按“需要令牌”（默认部署会生成令牌）
+ * 与“附带 Windows 安装脚本”（Docker 镜像中附带）显示。
+ */
 function useConnectInfo() {
   const server = useQuery(computeServerQuery)
   const tokenRequired = server.data?.node_registration.token_required ?? true
@@ -38,6 +42,9 @@ function useConnectInfo() {
   return {
     tokenRequired,
     serverUrl,
+    /** 平台附带 Windows 安装脚本：Windows 电脑直接从平台下载；否则在仓库目录中运行。 */
+    windowsInstaller:
+      server.data?.node_registration.windows_installer_available ?? true,
     /**
      * 通过 localhost（local）或 IPv6 地址（ipv6）访问页面：命令中的平台地址是
      * 占位符；为 null 时是当前地址。
@@ -52,7 +59,9 @@ function useConnectInfo() {
 
 function Code({ children }: { children: ReactNode }) {
   return (
-    <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.8125rem] break-words text-foreground">
+    // anywhere 而不是 break-words：没有空格的长路径与命令（如
+    // C:\ProgramData\trainMaster\…）不会撑宽手机上的对话框。
+    <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.8125rem] wrap-anywhere text-foreground">
       {children}
     </code>
   )
@@ -151,10 +160,15 @@ function RemoteStartNote() {
   )
 }
 
-/** 空状态中的简要说明：三种接入方式各自的命令。 */
+/** 空状态中的简要说明：四种接入方式各自的命令。 */
 export function ConnectMethodsBrief() {
-  const { commands, tokenRequired, placeholderReason, localOff } =
-    useConnectInfo()
+  const {
+    commands,
+    tokenRequired,
+    placeholderReason,
+    localOff,
+    windowsInstaller,
+  } = useConnectInfo()
 
   return (
     <div className="grid w-full min-w-0 gap-3 text-left">
@@ -180,6 +194,18 @@ export function ConnectMethodsBrief() {
           title="不用 Docker"
           description="在 GPU 机器上的仓库目录中运行"
           commands={[commands.bareMetal]}
+        />
+        <BriefMethod
+          icon={AppWindow}
+          title="Windows 电脑"
+          description={
+            windowsInstaller
+              ? "在 Windows 电脑上的管理员 PowerShell 中运行"
+              : "平台没有附带安装脚本：在 Windows 电脑上的仓库目录中，以管理员 PowerShell 运行"
+          }
+          commands={[
+            windowsInstaller ? commands.windows : commands.windowsFromRepo,
+          ]}
         />
       </ol>
       <div className="grid gap-1 text-xs text-muted-foreground">
@@ -244,7 +270,7 @@ function BriefMethod({
   )
 }
 
-/** “接入节点”对话框：三种方式的完整步骤。 */
+/** “接入节点”对话框：四种方式的完整步骤。 */
 export function ConnectNodeDialog({
   open,
   onOpenChange,
@@ -274,6 +300,7 @@ function ConnectNodeContent() {
     heartbeatSeconds,
     placeholderReason,
     localOff,
+    windowsInstaller,
   } = useConnectInfo()
 
   return (
@@ -281,7 +308,7 @@ function ConnectNodeContent() {
       <DialogHeader>
         <DialogTitle>接入训练节点</DialogTitle>
         <DialogDescription>
-          训练节点是运行在 GPU 机器上的 trainer
+          训练节点是运行在 GPU 机器（Linux 或 Windows）上的 trainer
           服务：自动识别显卡、CPU、内存与磁盘，按驱动选择 PyTorch 的 CUDA
           版本，检测 CUDA / YOLO 环境并定时向平台上报。节点启动后约{" "}
           {heartbeatSeconds ?? 10} 秒内出现在本页，首次检测环境需要几十秒。
@@ -354,6 +381,47 @@ function ConnectNodeContent() {
             <Code>--variant</Code> 可以手动指定 CUDA 版本（如 <Code>cu126</Code>
             ）；使用 pip 镜像时这样传入：
             <Code>sudo env PIP_INDEX_URL=… trainer/scripts/install.sh …</Code>。
+          </p>
+        </Method>
+
+        <Method icon={AppWindow} title="4. Windows 电脑（直接安装）">
+          <p>
+            需要 64 位 Windows 10 / 11（或 Windows Server 2019 及以上）与 NVIDIA
+            驱动，没有显卡时作为 CPU 训练节点。在 Windows 电脑上以管理员身份打开
+            PowerShell（右键“开始”→“终端（管理员）”或“Windows
+            PowerShell（管理员）”）
+            {windowsInstaller
+              ? "粘贴运行：脚本从平台下载训练节点，"
+              : "运行仓库中的安装脚本："}
+            自动选择 CUDA 版本，安装到{" "}
+            <Code>C:\ProgramData\trainMaster\trainer</Code> 的虚拟环境中；
+            <Code>-InstallPython</Code> 在没有 Python 3.10–3.13 时用 winget 安装
+            Python 3.12，<Code>-Service</Code> 注册为开机自启的计划任务{" "}
+            <Code>trainmaster-trainer</Code>
+            （以 SYSTEM
+            运行，不需要登录）。平台地址按其它机器实际能访问的地址与端口填写。
+          </p>
+          {windowsInstaller ? (
+            <CommandBlock command={commands.windows} />
+          ) : (
+            <>
+              <p>
+                平台没有附带 Windows 安装脚本（部署时未设置{" "}
+                <Code>TM_TRAINER_PACKAGE_DIR</Code>）：在 Windows
+                电脑上克隆本仓库，在仓库目录中以管理员身份运行：
+              </p>
+              <CommandBlock command={commands.windowsFromRepo} />
+            </>
+          )}
+          <p className="text-xs">
+            加 <Code>-DryRun</Code> 只打印将要执行的步骤；
+            <Code>-Variant</Code> 可以手动指定 CUDA 版本（如 <Code>cu126</Code>
+            ）；使用 pip 镜像时先运行{" "}
+            <Code>
+              $env:PIP_INDEX_URL='https://mirrors.aliyun.com/pypi/simple'
+            </Code>
+            ；日志在{" "}
+            <Code>C:\ProgramData\trainMaster\state\logs\trainer.log</Code>。
           </p>
         </Method>
       </ol>

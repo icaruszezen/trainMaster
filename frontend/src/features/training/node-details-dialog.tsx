@@ -29,6 +29,7 @@ import {
   environmentBadge,
   isOnline,
   isRedetecting,
+  isWindowsNode,
   nodeStatusText,
   selfTestLabels,
   sortIssues,
@@ -84,6 +85,7 @@ export function NodeDetailsDialog({
 
 function NodeDetails({ node, now }: { node: ComputeNode; now: number }) {
   const { hardware, environment: env } = node
+  const windows = isWindowsNode(node)
 
   return (
     <>
@@ -117,7 +119,7 @@ function NodeDetails({ node, now }: { node: ComputeNode; now: number }) {
 
         <Section title="系统">
           <Fact label="操作系统">{hardware.os ?? "—"}</Fact>
-          <Fact label="内核">
+          <Fact label={windows ? "系统版本" : "内核"}>
             <Mono>{hardware.kernel}</Mono>
           </Fact>
           <Fact label="架构">
@@ -144,7 +146,10 @@ function NodeDetails({ node, now }: { node: ComputeNode; now: number }) {
               {formatBytesValue(hardware.memory.limit_bytes)}
             </Fact>
           )}
-          <Fact label="/dev/shm">{formatBytesValue(hardware.shm_bytes)}</Fact>
+          {/* Windows 没有 /dev/shm。 */}
+          {!windows && (
+            <Fact label="/dev/shm">{formatBytesValue(hardware.shm_bytes)}</Fact>
+          )}
         </Section>
 
         <Section title="显卡与驱动">

@@ -41,6 +41,7 @@ import {
   gpuMetricsOf,
   isOnline,
   isRedetecting,
+  isWindowsNode,
   selfTestLabels,
   sortIssues,
   type EnvironmentBadge,
@@ -450,28 +451,47 @@ function ResourceSection({ node }: { node: ComputeNode }) {
             </p>
           }
         />
-        <div className="grid content-start gap-1.5 text-xs">
-          <div className="flex items-baseline justify-between gap-3">
-            <span className="text-muted-foreground">/dev/shm</span>
-            <span className="font-medium tabular-nums">
-              {formatBytesValue(hardware.shm_bytes)}
-            </span>
+        {isWindowsNode(node) ? (
+          <SystemCell os={hardware.os} />
+        ) : (
+          <div className="grid content-start gap-1.5 text-xs">
+            <div className="flex items-baseline justify-between gap-3">
+              <span className="text-muted-foreground">/dev/shm</span>
+              <span className="font-medium tabular-nums">
+                {formatBytesValue(hardware.shm_bytes)}
+              </span>
+            </div>
+            <p
+              className={cn(
+                "text-muted-foreground",
+                shmSmall &&
+                  "flex items-start gap-1 text-amber-700 dark:text-amber-500"
+              )}
+            >
+              {shmSmall && <TriangleAlert className="mt-px size-3 shrink-0" />}
+              {shmSmall
+                ? "共享内存不足 1 GB，多进程加载数据可能失败"
+                : "共享内存，训练时多进程加载数据使用"}
+            </p>
           </div>
-          <p
-            className={cn(
-              "text-muted-foreground",
-              shmSmall &&
-                "flex items-start gap-1 text-amber-700 dark:text-amber-500"
-            )}
-          >
-            {shmSmall && <TriangleAlert className="mt-px size-3 shrink-0" />}
-            {shmSmall
-              ? "共享内存不足 1 GB，多进程加载数据可能失败"
-              : "共享内存，训练时多进程加载数据使用"}
-          </p>
-        </div>
+        )}
       </div>
     </section>
+  )
+}
+
+/** Windows 节点没有 /dev/shm：资源区的这一格显示系统。 */
+function SystemCell({ os }: { os: string | null }) {
+  return (
+    <div className="grid min-w-0 content-start gap-1.5 text-xs">
+      <div className="flex items-baseline justify-between gap-3">
+        <span className="text-muted-foreground">系统</span>
+        <span className="font-medium">Windows</span>
+      </div>
+      <p className="truncate text-muted-foreground" title={os ?? undefined}>
+        {os ?? "直接运行"}
+      </p>
+    </div>
   )
 }
 
