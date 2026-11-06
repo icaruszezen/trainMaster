@@ -598,7 +598,7 @@ journalctl -u trainmaster-trainer -f
 | 操作 | 命令 |
 |---|---|
 | 查看状态 | `Get-ScheduledTask -TaskName trainmaster-trainer`（`State` 为 `Running`） |
-| 查看日志 | `Get-Content -Wait -Tail 50 C:\ProgramData\trainMaster\state\logs\trainer.log` |
+| 查看日志 | `Get-Content -Encoding UTF8 -Wait -Tail 50 C:\ProgramData\trainMaster\state\logs\trainer.log`（日志为 UTF-8；Windows PowerShell 5.1 不加 `-Encoding UTF8` 时中文显示为乱码） |
 | 修改配置后重启 | 编辑 `trainer.env`，然后 `Stop-ScheduledTask -TaskName trainmaster-trainer; Start-ScheduledTask -TaskName trainmaster-trainer` |
 | 检测环境 | `& 'C:\ProgramData\trainMaster\trainer\Scripts\python.exe' -m trainmaster_trainer selftest --env-file 'C:\ProgramData\trainMaster\trainer\trainer.env'` |
 | 停止并删除计划任务 | 重新运行安装命令，只加 `-Uninstall`（安装目录、配置文件与状态目录保留，不再需要时手动删除），然后在“计算资源”页面删除这个节点 |

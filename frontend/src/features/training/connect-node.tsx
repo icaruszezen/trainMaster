@@ -407,7 +407,8 @@ function ConnectNodeContent() {
             <>
               <p>
                 平台没有附带 Windows 安装脚本（部署时未设置{" "}
-                <Code>TM_TRAINER_PACKAGE_DIR</Code>）：在 Windows
+                <Code>TM_TRAINER_PACKAGE_DIR</Code>
+                ，或该目录不完整、无法读取，见平台的启动日志）：在 Windows
                 电脑上克隆本仓库，在仓库目录中以管理员身份运行：
               </p>
               <CommandBlock command={commands.windowsFromRepo} />

@@ -244,7 +244,13 @@ def test_managed_keys_match_script():
 @needs_powershell
 @pytest.mark.parametrize(
     ("text", "line"),
-    [("A=1\nNOT A LINE\n", 2), ("TM_NODE_NAME='x\n", 1), ('TM_NODE_NAME="x" y\n', 1)],
+    [
+        ("A=1\nNOT A LINE\n", 2),
+        ("TM_NODE_NAME='x\n", 1),
+        ('TM_NODE_NAME="x" y\n', 1),
+        # 其它设置的格式也要检查：训练节点读取时任何一行不对都无法启动
+        ("A=1\nHTTPS_PROXY='http://proxy:3128\n", 2),
+    ],
 )
 def test_read_env_file_errors_like_envfile_py(tmp_path: Path, text: str, line: int):
     path = tmp_path / "trainer.env"

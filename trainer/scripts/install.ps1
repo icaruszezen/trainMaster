@@ -116,7 +116,7 @@ $SidUsers = 'S-1-5-32-545'
 $SidTrustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1850103602-2229827870'
 $SidOwnerRights = 'S-1-3-4'
 # 可变的状态放在哈希表中：函数通过作用域链读取它（在 [scriptblock]::Create 运行时没有 $script: 作用域）
-$Ctx = @{ ExitCode = 0; TempDirs = @(); ConsoleEncoding = $null; PythonEnv = $null; ModulePath = $null }
+$Ctx = @{ ExitCode = 0; TempDirs = @(); ConsoleEncoding = $null; PythonEnv = $null; ModulePath = $null; TaskDisabled = $false }
 
 # ---- 输出与错误 ----
 
@@ -261,15 +261,13 @@ function Read-EnvFile([string]$Path) {
         if ($key -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
             Stop-Install 1 "配置文件 $Path 第 $lineno 行不是 KEY=VALUE 的格式，请修改后重新运行"
         }
-        if ($ManagedKeys -contains $key) {
-            try {
-                $settings[$key] = ConvertFrom-EnvValue $stripped.Substring($eq + 1)
-            } catch {
-                Stop-Install 1 "配置文件 $Path 第 $lineno 行（$key）：$($_.Exception.Message)"
-            }
-        } else {
-            $extra.Add($stripped)
+        # 其它设置也检查格式：训练节点读取配置文件时，任何一行格式不对都无法启动
+        try {
+            $value = ConvertFrom-EnvValue $stripped.Substring($eq + 1)
+        } catch {
+            Stop-Install 1 "配置文件 $Path 第 $lineno 行（$key）：$($_.Exception.Message)，请修改后重新运行"
         }
+        if ($ManagedKeys -contains $key) { $settings[$key] = $value } else { $extra.Add($stripped) }
     }
     return @{ Settings = $settings; Extra = $extra }
 }
@@ -618,9 +616,18 @@ function Get-TaskEnvFile($Task, [string]$VenvPython) {
     return $null
 }
 
-# 停止计划任务并等待训练节点退出（替换虚拟环境中的文件之前；运行中的 DLL 无法覆盖）。
+# 停止计划任务并等待训练节点退出（替换虚拟环境中的文件之前；运行中的 DLL 无法覆盖）。计划任务先禁用：
+# 它每 5 分钟检查一次，训练节点没有在运行时启动它，安装过程中会用一半新一半旧的文件和旧的配置启动。
+# 安装结束时重新注册（启用）它；中途出错或被中断时恢复启用（主流程的 finally）。
 function Stop-Trainer([string]$EnvFilePath) {
     $task = Get-OurTask
+    if ($task -and $task.State -ne 'Disabled') {
+        Write-Host "+ Disable-ScheduledTask -TaskName $TaskName（安装期间不自动启动）"
+        if (-not $DryRun) {
+            Disable-ScheduledTask -TaskName $TaskName | Out-Null
+            $Ctx.TaskDisabled = $true
+        }
+    }
     if ($task -and $task.State -eq 'Running') {
         Write-Host "+ Stop-ScheduledTask -TaskName $TaskName"
         if (-not $DryRun) {
@@ -661,6 +668,14 @@ function Register-TrainerTask([string]$VenvPython, [string]$EnvFilePath, [string
     $settings.Priority = 4  # 计划任务默认以低于正常的优先级运行（7），训练节点使用正常优先级
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($boot, $now) -Principal $principal `
         -Settings $settings -Description 'trainMaster 训练节点（由 trainer\scripts\install.ps1 注册）' -Force | Out-Null
+    $Ctx.TaskDisabled = $false
+    $task = Get-OurTask
+    if ($task.State -eq 'Disabled') { Enable-ScheduledTask -TaskName $TaskName | Out-Null }
+    # 仍有旧的训练节点在运行时（例如安装期间被手动启动），Start-ScheduledTask 不会启动新的（IgnoreNew）
+    if ($task.State -eq 'Running') {
+        Stop-ScheduledTask -TaskName $TaskName
+        for ($i = 0; $i -lt 30 -and (Get-OurTask).State -eq 'Running'; $i++) { Start-Sleep -Seconds 1 }
+    }
     Start-ScheduledTask -TaskName $TaskName
 }
 
@@ -725,7 +740,7 @@ function Invoke-Install {
         } else {
             Stop-Trainer $(if ($taskEnvFile) { $taskEnvFile } else { Join-Path $Prefix 'trainer.env' })
             Write-Host "+ Unregister-ScheduledTask -TaskName $TaskName -Confirm:`$false"
-            if (-not $DryRun) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false }
+            if (-not $DryRun) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false; $Ctx.TaskDisabled = $false }
             Write-Info "已删除计划任务 $TaskName，训练节点不再运行"
         }
         Write-Host "安装目录 $Prefix 与状态目录没有删除；不再需要时可以手动删除（Remove-Item -Recurse -Force <目录>）。"
@@ -890,7 +905,11 @@ function Invoke-Install {
         if ($chosen.name -ne $report.recommended.variant) { Write-Host "使用手动指定的变体：$($chosen.name)" }
         if ($chosen.name -eq 'cpu' -and $gpus.Count -gt 0) { Write-Host '注意：将安装 CPU 版 PyTorch，训练不会使用显卡' }
     }
-    if ($vcMissing) { Write-Host '注意：缺少 Microsoft Visual C++ 运行库（PyTorch 需要），将自动安装' }
+    if ($vcMissing -and $InstallPython) { Write-Host '注意：缺少 Microsoft Visual C++ 运行库（PyTorch 需要），将自动安装' }
+    if ($vcMissing -and -not $InstallPython) {
+        # 只有 -DryRun 会走到这里（实际安装在上面已经停止）
+        Write-Warn "缺少 Microsoft Visual C++ 运行库（PyTorch 需要）：实际安装时会停止。加上 -InstallPython 自动安装，或先安装 $VcRedistUrl"
+    }
     Write-Host ''
 
     # ---- 安装 ----
@@ -899,7 +918,7 @@ function Invoke-Install {
         Write-Info '没有合适的 Python，安装 Python 3.12'
         $basePython = Install-PythonRuntime
     }
-    if ($vcMissing) { Install-VcRuntime }
+    if ($vcMissing -and $InstallPython) { Install-VcRuntime }
     if ($null -eq $chosen -and -not $DryRun) {
         # Python 刚安装：现在检测显卡
         $report = Get-Recommendation $basePython $packageDir
@@ -1021,7 +1040,9 @@ function Invoke-Install {
     } else {
         $checkDir = New-TempDir
         $saved = @{}
-        $overrides = @{ TM_STATE_DIR = $checkDir; TM_DATA_DIR = $checkDir; TM_TORCH_VARIANT = $variantName; TM_ENV_FILE = $EnvFile }
+        # TM_SERVER_URL：修复建议给出从平台下载安装脚本的命令（不连接平台）
+        $overrides = @{ TM_STATE_DIR = $checkDir; TM_DATA_DIR = $checkDir; TM_TORCH_VARIANT = $variantName; TM_ENV_FILE = $EnvFile
+            TM_SERVER_URL = $ServerUrl }
         foreach ($k in $overrides.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $overrides[$k]) }
         try {
             $code = Invoke-Step $venvPython @('-m', 'trainmaster_trainer', 'selftest') -AllowFailure
@@ -1037,6 +1058,11 @@ function Invoke-Install {
         Write-Host "== 计划任务 $TaskName =="
         Register-TrainerTask $venvPython $EnvFile $StateDir
     }
+    if ($Ctx.TaskDisabled) {
+        # 同名的计划任务不是本安装目录的、这次也没有替换它（没有 -Service）：恢复启用
+        Enable-ScheduledTask -TaskName $TaskName | Out-Null
+        $Ctx.TaskDisabled = $false
+    }
 
     Write-Host ''
     if ($DryRun) {
@@ -1051,7 +1077,7 @@ function Invoke-Install {
     if ($registerTask) {
         Write-Host '训练节点已作为计划任务运行（开机自动启动，不需要登录）：'
         Write-Host "  查看状态：Get-ScheduledTask -TaskName $TaskName"
-        Write-Host "  查看日志：Get-Content -Wait -Tail 50 `"$logFile`""
+        Write-Host "  查看日志：Get-Content -Encoding UTF8 -Wait -Tail 50 `"$logFile`""
         Write-Host "  修改配置：编辑 $EnvFile 后运行 Stop-ScheduledTask -TaskName $TaskName; Start-ScheduledTask -TaskName $TaskName"
         Write-Host "  永久停止：Stop-ScheduledTask -TaskName $TaskName; Unregister-ScheduledTask -TaskName $TaskName -Confirm:`$false"
     } else {
@@ -1099,6 +1125,15 @@ try {
     if ($null -ne $Ctx.ConsoleEncoding) { try { [Console]::OutputEncoding = $Ctx.ConsoleEncoding } catch { } }
     if ($Ctx.PythonEnv) { foreach ($k in $Ctx.PythonEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $Ctx.PythonEnv[$k]) } }
     if ($null -ne $Ctx.ModulePath) { $env:PSModulePath = $Ctx.ModulePath }
+    if ($Ctx.TaskDisabled) {
+        # 安装没有完成：恢复原来的计划任务（训练节点继续按原来的设置运行）
+        try {
+            Enable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
+            Write-Host "install: 安装没有完成，已重新启用计划任务 ${TaskName}：5 分钟内按原来的设置重新启动训练节点"
+        } catch {
+            Write-Host "install: 无法重新启用计划任务 ${TaskName}：$($_.Exception.Message)。请运行 Enable-ScheduledTask -TaskName $TaskName" -ForegroundColor Yellow
+        }
+    }
 }
 
 # 用 -File 运行时以退出码报告结果；从平台用 [scriptblock]::Create 运行时设置 $LASTEXITCODE（不关闭窗口）。

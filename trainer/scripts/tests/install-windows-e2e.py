@@ -222,6 +222,9 @@ def run(platform: FakePlatform) -> None:
     expect("沿用配置文件" in out and "TM_NODE_TOKEN" in out, "应沿用配置文件中的设置")
     expect(f"已注册计划任务 {TASK}：安装后更新并重启它" in out, "应更新已注册的计划任务")
     expect("复用已有的虚拟环境" in out, "应复用虚拟环境")
+    expect(
+        "Disable-ScheduledTask" in out, "安装期间应禁用计划任务（避免它启动一半新一半旧的训练节点）"
+    )
     wait_for(
         "训练节点重新注册",
         lambda: (n := platform.node()) and n.get("registrations", 0) > registrations,
@@ -230,6 +233,7 @@ def run(platform: FakePlatform) -> None:
     expect(len(platform.nodes) == 1, f"节点标识应不变：{list(platform.nodes)}")
     expect((STATE_DIR / "node-key").read_text(encoding="utf-8").strip() == node_key, "节点标识变了")
     expect(envfile.load(ENV_FILE)["TM_NODE_TOKEN"] == TOKEN, "令牌应沿用")
+    expect(task_info()["State"] == "Running", "重新运行后计划任务应已启用并在运行")  # type: ignore[index]
 
     step("3. -Uninstall")
     install("-Uninstall")
