@@ -107,7 +107,7 @@ tm_cc_covered() {
 # 设置 TM_VARIANT、TM_VARIANT_REASON、TM_VARIANT_UNSUPPORTED。总是返回 0。
 tm_select_variant() {
 	local driver="$1" raw_ccs="$2" machine="${3:-$(uname -m)}"
-	machine="${machine,,}"
+	machine="$(printf '%s' "$machine" | tr '[:upper:]' '[:lower:]')" # 不用 ${machine,,}：macOS 的 bash 3.2 不支持
 	TM_VARIANT=cpu
 	TM_VARIANT_REASON=""
 	TM_VARIANT_UNSUPPORTED=""

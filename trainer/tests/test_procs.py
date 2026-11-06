@@ -267,3 +267,42 @@ def test_windows_crash_exit_code_from_real_process():
     )
     assert proc.returncode & 0xFFFFFFFF == 0xC0000005
     assert procs.windows_crash(proc.returncode) == "0xC0000005，访问冲突"
+
+
+@pytest.mark.parametrize("wait_slice", [None, 0.05])
+def test_communicate_returns_output_and_times_out(wait_slice):
+    code = "import sys, time; print('hello'); sys.stdout.flush(); time.sleep(float(sys.argv[1]))"
+    quick = subprocess.Popen(
+        [sys.executable, "-c", code, "0.2"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    out, _ = procs.communicate(quick, 30, wait_slice=wait_slice)
+    assert out.strip() == b"hello"
+
+    slow = subprocess.Popen(
+        [sys.executable, "-c", code, "30"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        start = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            procs.communicate(slow, 0.3, wait_slice=wait_slice)
+        assert time.monotonic() - start < 5
+    finally:
+        slow.kill()
+        out, _ = slow.communicate()
+    assert out.strip() == b"hello"  # 超时之前读到的输出没有丢失
+
+
+def test_communicate_waits_in_slices():
+    calls = []
+
+    class FakeProc:
+        args = ["x"]
+
+        def communicate(self, timeout=None):
+            calls.append(timeout)
+            if len(calls) < 4:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            return b"out", b"err"
+
+    assert procs.communicate(FakeProc(), None, wait_slice=0.5) == (b"out", b"err")  # type: ignore[arg-type]
+    assert calls == [0.5, 0.5, 0.5, 0.5]

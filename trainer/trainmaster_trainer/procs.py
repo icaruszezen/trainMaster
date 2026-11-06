@@ -34,6 +34,9 @@ CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NO_WINDOW = 0x08000000
 
 KILL_GRACE = 2.0
+# Windows 上等待子进程时每次最多等这么久（秒）：Python 3.12 及更早版本在 Windows 上等待线程或锁时不能被
+# Ctrl+C 打断，KeyboardInterrupt 只在两次等待之间送达（子进程在新的进程组中，收不到控制台的 Ctrl+C）。
+WAIT_SLICE = 0.5 if WINDOWS else None
 
 
 def popen_kwargs(windows: bool = WINDOWS) -> dict[str, Any]:
@@ -46,6 +49,24 @@ def popen_kwargs(windows: bool = WINDOWS) -> dict[str, Any]:
 def quiet_kwargs(windows: bool = WINDOWS) -> dict[str, Any]:
     """运行短命令（nvidia-smi、powershell 查询）时传给 subprocess.run 的参数：Windows 上不弹出控制台窗口。"""
     return {"creationflags": CREATE_NO_WINDOW} if windows else {}
+
+
+def communicate(
+    proc: subprocess.Popen[Any], timeout: float | None, wait_slice: float | None = WAIT_SLICE
+) -> tuple[Any, Any]:
+    """proc.communicate(timeout=timeout)；wait_slice 不为 None 时分成不超过 wait_slice 秒的多次等待（见
+    WAIT_SLICE），超时同样抛出 subprocess.TimeoutExpired。communicate 超时后可以再次调用，不会丢失输出。"""
+    if wait_slice is None:
+        return proc.communicate(timeout=timeout)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        left = None if deadline is None else deadline - time.monotonic()
+        step = wait_slice if left is None else max(0.0, min(left, wait_slice))
+        try:
+            return proc.communicate(timeout=step)
+        except subprocess.TimeoutExpired:
+            if left is not None and left <= wait_slice:
+                raise subprocess.TimeoutExpired(proc.args, timeout or 0.0) from None
 
 
 # ---------------------------------------------------------------------------

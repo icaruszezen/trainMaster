@@ -856,10 +856,15 @@ class InferenceProcess:
                 self._stderr.add(chunk)
 
     def _receive(self, until: float) -> tuple[str, Any, float] | None:
-        try:
-            return self._messages.get(timeout=max(0.0, until - time.monotonic()))
-        except queue.Empty:
-            return None
+        # Windows 上分成短的多次等待，Ctrl+C 才能打断（见 procs.WAIT_SLICE）
+        while True:
+            left = max(0.0, until - time.monotonic())
+            step = left if procs.WAIT_SLICE is None else min(left, procs.WAIT_SLICE)
+            try:
+                return self._messages.get(timeout=step)
+            except queue.Empty:
+                if step >= left:
+                    return None
 
     def _message(
         self, item: tuple[str, Any, float], image_id: int | None = None

@@ -554,6 +554,8 @@ def test_log_file_keeps_writing_when_rotation_fails(tmp_path, monkeypatch):
     import logging
 
     now = [1000.0]
+    for i in range(1, cli.LOG_FILE_BACKUPS + 1):
+        (tmp_path / f"t.log.{i}").write_text(f"backup {i}", encoding="utf-8")
     handler = cli.LogFileHandler(tmp_path / "t.log", clock=lambda: now[0])
     handler.maxBytes = 100
     handler.setFormatter(logging.Formatter("%(message)s"))
@@ -576,6 +578,50 @@ def test_log_file_keeps_writing_when_rotation_fails(tmp_path, monkeypatch):
     text = (tmp_path / "t.log").read_text(encoding="utf-8")
     assert all(f"line {i} " in text for i in range(10))
     assert "after retry" in text
+    # 失败的轮转不删除、不移动已有的备份
+    for i in range(1, cli.LOG_FILE_BACKUPS + 1):
+        assert (tmp_path / f"t.log.{i}").read_text(encoding="utf-8") == f"backup {i}"
+    assert not (tmp_path / "t.log.rotating").exists()
+
+
+def test_log_file_rotation_keeps_backups_in_order(tmp_path):
+    import logging
+
+    handler = cli.LogFileHandler(tmp_path / "t.log")
+    handler.maxBytes = 50
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    try:
+        for i in range(12):
+            handler.emit(logging.makeLogRecord({"msg": f"record {i:02d} " + "z" * 40}))
+    finally:
+        handler.close()
+    # 每条日志都超过 50 字节：每条一个文件，保留当前文件与 5 个备份
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == ["t.log", *[f"t.log.{i}" for i in range(1, cli.LOG_FILE_BACKUPS + 1)]]
+    assert "record 11" in (tmp_path / "t.log").read_text(encoding="utf-8")
+    for i in range(1, cli.LOG_FILE_BACKUPS + 1):
+        assert f"record {11 - i:02d}" in (tmp_path / f"t.log.{i}").read_text(encoding="utf-8")
+
+
+def test_log_file_rotation_finishes_an_interrupted_rotation(tmp_path):
+    # 上次改名了当前文件、但没能移动备份（备份被其它程序打开）：这次先把它变成第一个备份
+    import logging
+
+    (tmp_path / "t.log.rotating").write_text("interrupted\n", encoding="utf-8")
+    (tmp_path / "t.log.1").write_text("older\n", encoding="utf-8")
+    (tmp_path / "t.log").write_text("current\n", encoding="utf-8")
+    handler = cli.LogFileHandler(tmp_path / "t.log")
+    handler.maxBytes = 50
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    try:
+        handler.emit(logging.makeLogRecord({"msg": "first " + "a" * 60}))
+    finally:
+        handler.close()
+    # 完成上次的轮转；当前文件留到下次轮转
+    assert not (tmp_path / "t.log.rotating").exists()
+    assert (tmp_path / "t.log.2").read_text(encoding="utf-8") == "older\n"
+    assert (tmp_path / "t.log.1").read_text(encoding="utf-8") == "interrupted\n"
+    assert (tmp_path / "t.log").read_text(encoding="utf-8").startswith("current\nfirst ")
 
 
 def test_recommend_runs_without_psutil_and_nvml(tmp_path):

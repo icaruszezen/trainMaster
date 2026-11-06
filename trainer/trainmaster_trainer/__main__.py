@@ -50,7 +50,8 @@ class LogFileHandler(logging.handlers.RotatingFileHandler):
     """TM_LOG_FILE：按大小轮转的日志文件（10 MiB × 6 个）。
 
     Windows 上日志文件被其它程序打开（如 Get-Content -Wait 查看日志）时可能无法改名：这次不轮转，继续写入
-    当前文件，1 分钟后再试（RotatingFileHandler 本身会在每条日志都重试并丢弃这条日志）。
+    当前文件，1 分钟后再试（RotatingFileHandler 本身会在每条日志都重试并丢弃这条日志）。先改名当前文件、
+    再移动备份：RotatingFileHandler 先移动备份、最后才改名当前文件，失败时每次重试都会删掉一个最旧的备份。
     """
 
     def __init__(self, path: str | Path, clock: Any = time.monotonic) -> None:
@@ -70,12 +71,28 @@ class LogFileHandler(logging.handlers.RotatingFileHandler):
         return bool(super().shouldRollover(record))
 
     def doRollover(self) -> None:  # noqa: N802
+        if self.stream:
+            self.stream.close()
+            self.stream = None
         try:
-            super().doRollover()
+            self._rotate_files()
         except OSError:
             self._retry_at = self._clock() + LOG_ROTATE_RETRY
-            if self.stream is None:
-                self.stream = self._open()
+        if self.stream is None:
+            self.stream = self._open()
+
+    def _rotate_files(self) -> None:
+        base = self.baseFilename
+        pending = base + ".rotating"
+        # 上次改名了当前文件、但没能移动备份时，先完成上次的轮转（当前文件下次再轮转）
+        if not os.path.exists(pending):
+            self.rotate(base, pending)
+        for i in range(self.backupCount - 1, 0, -1):
+            src = self.rotation_filename(f"{base}.{i}")
+            if os.path.exists(src):
+                os.replace(src, self.rotation_filename(f"{base}.{i + 1}"))
+        if os.path.exists(pending):
+            os.replace(pending, self.rotation_filename(f"{base}.1"))
 
 
 def setup_logging(level: int, log_file: Path | None = None) -> None:

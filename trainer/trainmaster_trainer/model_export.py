@@ -849,7 +849,7 @@ class ExportProcess:
             return _failed(f"无法启动转换进程：{exc}")
 
         try:
-            stdout, stderr = proc.communicate(timeout=self.timeout)
+            stdout, stderr = procs.communicate(proc, self.timeout)  # Windows 上可以被 Ctrl+C 打断
         except BaseException as exc:
             if not isinstance(exc, subprocess.TimeoutExpired):
                 _kill(proc)  # Ctrl+C 等：不留下孤儿子进程
