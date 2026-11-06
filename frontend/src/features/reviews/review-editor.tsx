@@ -135,6 +135,7 @@ import {
   reviewImageStatusLabels,
   sameBoxes,
   unmatchedPredictions,
+  waitingForModel,
 } from "@/features/reviews/review-status"
 import { ReviewToolbar } from "@/features/reviews/review-toolbar"
 import { useMediaQuery } from "@/hooks/use-media-query"
@@ -720,7 +721,9 @@ function Editor({
       tone: "warning",
       message: isInferring(review)
         ? "这张图片还在识别中，识别完成后才能修改框、标记审核状态。"
-        : "这张图片还没有识别（识别没有完成），重新识别后才能修改框、标记审核状态。",
+        : waitingForModel(review)
+          ? "这张图片还没有识别：模型在回收站中，恢复模型后才会识别。"
+          : "这张图片还没有识别（识别没有完成），重新识别后才能修改框、标记审核状态。",
       action: (
         <Button
           size="sm"

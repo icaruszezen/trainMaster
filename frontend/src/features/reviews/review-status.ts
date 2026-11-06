@@ -97,9 +97,30 @@ export const reviewStageLabels: Record<ReviewStage, string> = {
   inferring: "正在识别",
 }
 
-/** 还在排队或识别中（之后还会有图片识别完成）。 */
-export function isInferring(review: Pick<ReviewSummary, "status">) {
-  return review.status === "queued" || review.status === "running"
+type InferenceState = Pick<
+  ReviewSummary,
+  "status" | "model_exists" | "queue_position"
+>
+
+/**
+ * 排队但模型已删除、还在回收站中：平台把它移出了队列（没有 `queue_position`），
+ * 训练节点不会领取，恢复模型后才开始识别，模型被永久删除后任务失败。模型已被
+ * 永久删除的排队任务仍在队列中（训练节点领取时失败），不算。
+ */
+export function waitingForModel(review: InferenceState) {
+  return (
+    review.status === "queued" &&
+    review.model_exists === false &&
+    review.queue_position === null
+  )
+}
+
+/** 还在排队或识别中（之后还会有图片识别完成）；等待恢复模型的不算。 */
+export function isInferring(review: InferenceState) {
+  return (
+    (review.status === "queued" || review.status === "running") &&
+    !waitingForModel(review)
+  )
 }
 
 /** 一个数据集（`datasetId`）或整个任务（null）的图片数。数据集不在任务中时为整个任务的。 */

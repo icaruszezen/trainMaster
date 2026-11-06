@@ -205,7 +205,7 @@ export type Review = {
 
 /**
  * 审图编辑器用到的审图任务信息（`GET {base}`）。平台返回完整的 {@link Review}；
- * 本地审图程序返回其中这些字段（状态总是 `ready`）。
+ * 本地审图程序返回其中这些字段（状态总是 `ready`，没有可选的字段）。
  */
 export type ReviewSummary = Pick<
   Review,
@@ -217,7 +217,8 @@ export type ReviewSummary = Pick<
   | "status"
   | "counts"
   | "datasets"
-> & { project?: Review["project"] }
+> &
+  Partial<Pick<Review, "project" | "model_exists" | "queue_position">>
 
 export type ReviewLabelCount = { name: string; count: number }
 

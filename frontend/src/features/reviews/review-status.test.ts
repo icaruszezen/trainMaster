@@ -18,6 +18,7 @@ import {
   scopedCounts,
   statusFilterOptions,
   toReviewImage,
+  waitingForModel,
   unmatchedPredictions,
 } from "@/features/reviews/review-status"
 
@@ -155,6 +156,20 @@ describe("counts", () => {
     expect(isInferring({ status: "running" })).toBe(true)
     expect(isInferring({ status: "ready" })).toBe(false)
     expect(isInferring({ status: "failed" })).toBe(false)
+    // 模型在回收站中：移出了队列，等模型恢复。
+    const waiting = {
+      status: "queued",
+      model_exists: false,
+      queue_position: null,
+    } as const
+    expect(waitingForModel(waiting)).toBe(true)
+    expect(isInferring(waiting)).toBe(false)
+    // 模型已被永久删除：仍在队列中，训练节点领取时失败。
+    expect(waitingForModel({ ...waiting, queue_position: 2 })).toBe(false)
+    expect(isInferring({ ...waiting, queue_position: 2 })).toBe(true)
+    // 本地审图程序不返回这些字段。
+    expect(waitingForModel({ status: "queued" })).toBe(false)
+    expect(waitingForModel({ ...waiting, status: "running" })).toBe(false)
   })
 })
 

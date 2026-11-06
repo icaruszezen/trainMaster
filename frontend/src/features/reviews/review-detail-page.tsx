@@ -93,10 +93,12 @@ import {
   ReviewStatusBar,
   ReviewStatusLegend,
   ReviewTaskStatusBadge,
-  waitingForModel,
   waitingForWorkers,
 } from "@/features/reviews/review-parts"
-import { reviewStageLabels } from "@/features/reviews/review-status"
+import {
+  reviewStageLabels,
+  waitingForModel,
+} from "@/features/reviews/review-status"
 import { UploadResultsDialog } from "@/features/reviews/upload-results-dialog"
 import { useMediaQuery } from "@/hooks/use-media-query"
 import { usePageTitle } from "@/hooks/use-page-title"
@@ -463,7 +465,7 @@ function InferenceStatus({
         </CardTitle>
         <CardDescription>
           {noModel
-            ? "模型已删除，训练节点不会识别这个任务。"
+            ? "模型已移入回收站，训练节点不会识别这个任务。"
             : queued
               ? review.queue_position !== null && review.queue_position > 1
                 ? `前面还有 ${formatNumber(review.queue_position - 1)} 个审图任务，训练节点按顺序识别。`
@@ -475,7 +477,7 @@ function InferenceStatus({
         <div className="grid gap-1.5">
           <TaskProgress
             value={
-              queued && counts.inferred === 0
+              queued && !noModel && counts.inferred === 0
                 ? null
                 : percentOf(counts.inferred, counts.total)
             }
@@ -496,11 +498,11 @@ function InferenceStatus({
         {noModel && (
           <Alert className="border-amber-500/40 [&>svg]:text-amber-600 dark:[&>svg]:text-amber-500">
             <TriangleAlert />
-            <AlertTitle>模型已删除</AlertTitle>
+            <AlertTitle>模型在回收站中</AlertTitle>
             <AlertDescription>
               <p>
-                模型还在回收站中时，恢复后会自动开始识别；模型被永久删除（在回收站中满
-                7 天）后，这个任务会识别失败。
+                在回收站中恢复模型后会自动开始识别；模型在回收站中满 7
+                天、被永久删除后，这个任务会识别失败。
               </p>
               <Link
                 to={RECYCLE_BIN_PATH}

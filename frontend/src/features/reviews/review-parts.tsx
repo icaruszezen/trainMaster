@@ -19,6 +19,7 @@ import {
   reviewImageStatusLabels,
   reviewImageStatusStyles,
   reviewStatusLabels,
+  waitingForModel,
 } from "@/features/reviews/review-status"
 import { formatNumber, formatPercent, percentOf } from "@/lib/format"
 import { cn } from "@/lib/utils"
@@ -85,7 +86,7 @@ export function ReviewTaskStatusBadge({
           <Badge
             variant="outline"
             className={cn("font-normal", className)}
-            title="模型已删除：在回收站中恢复模型后才会开始识别，模型被永久删除后任务失败"
+            title="模型在回收站中：恢复模型后才会开始识别，模型被永久删除后任务失败"
           >
             <Clock className="text-amber-600 dark:text-amber-500" />
             等待恢复模型
@@ -104,16 +105,6 @@ export function ReviewTaskStatusBadge({
         </Badge>
       )
   }
-}
-
-/**
- * 排队但模型已删除（在回收站中）：训练节点不会领取，恢复模型后才开始识别，
- * 模型被永久删除后任务失败。
- */
-export function waitingForModel(
-  review: Pick<Review, "status" | "model_exists">
-) {
-  return review.status === "queued" && !review.model_exists
 }
 
 /** 排队且没有可以识别的训练节点（不会开始识别；等待恢复模型的除外）。 */

@@ -106,9 +106,9 @@ func TestIntegrationReviewDatasetRecycle(t *testing.T) {
 	}
 }
 
-// Restored while a node infers the review: the node has paged past the
-// restored images (lower IDs), so the review is queued again without using
-// up the attempt, and the next claim infers them.
+// Restored while a node infers the review: it stays with the node, whose
+// next pass from the start lists the restored images too (even with the
+// model in the bin meanwhile, as the node has its weights already).
 func TestIntegrationReviewDatasetRestoreWhileRunning(t *testing.T) {
 	e := newTestEnv(t)
 	ctx := context.Background()
@@ -123,21 +123,26 @@ func TestIntegrationReviewDatasetRestoreWhileRunning(t *testing.T) {
 	if task := e.claim(t, node); task == nil || task.ID != r.ID || task.Remaining != 1 {
 		t.Fatalf("claim = %+v", task)
 	}
+	page, err := e.svc.ListTaskImages(ctx, r.ID, node, 0, 10)
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("first pass = %+v, %v", page, err)
+	}
+	if err := e.models.DeleteModel(ctx, m.ID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := e.datasets.RestoreDataset(ctx, ds1, dataset.RestoreInput{}); err != nil {
 		t.Fatal(err)
 	}
 	got := e.review(t, r.ID)
-	if got.Status != StatusQueued || got.Attempts != 0 || got.Node != nil || got.Counts.Total != 2 {
+	if got.Status != StatusRunning || got.Attempts != 1 || got.Node == nil || got.Counts.Total != 2 {
 		t.Fatalf("review after the restore = %+v", got)
 	}
-	_, err := e.svc.ListTaskImages(ctx, r.ID, node, 0, 10)
-	wantKind(t, err, ErrConflict, "审图任务的识别已不属于该节点或已结束")
-
-	if task := e.claim(t, node); task == nil || task.ID != r.ID || task.Remaining != 2 {
-		t.Fatalf("claim after the restore = %+v", task)
+	page, err = e.svc.ListTaskImages(ctx, r.ID, node, 0, 10)
+	if err != nil || len(page.Items) != 2 {
+		t.Fatalf("next pass = %+v, %v", page, err)
 	}
 	e.inferAll(t, r.ID, node)
-	if got = e.review(t, r.ID); got.Status != StatusReady || got.Counts.Inferred != 2 || got.Attempts != 1 {
+	if got = e.review(t, r.ID); got.Status != StatusReady || got.Counts.Inferred != 2 {
 		t.Fatalf("review after inferring the restored images = %+v", got)
 	}
 }

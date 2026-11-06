@@ -70,8 +70,7 @@ func (s *Service) DeleteDataset(ctx context.Context, id int64, deleteFiles bool)
 		return err
 	}
 	defer unlock()
-	ctx, cancel := s.detach(ctx)
-	defer cancel()
+	ctx = context.WithoutCancel(ctx) // see commitUnknown
 	var canceled []int64
 	var dirName, moved string
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
@@ -124,12 +123,23 @@ func (s *Service) DeleteDataset(ctx context.Context, id int64, deleteFiles bool)
 		}
 		return nil
 	})
-	if err != nil {
-		if moved != "" {
+	if err != nil && moved != "" {
+		// The rename is the last step, so the commit failed.
+		switch inBin, known := s.commitUnknown(ctx, id, err); {
+		case !known:
+			// Left under .recycle-<id>: reconcileRecycleFolders moves it back
+			// at the next start if the delete was not recorded.
+			return err
+		case inBin:
+			err = nil // recorded after all
+		default:
 			if rerr := os.Rename(moved, s.datasetDir(dirName)); rerr != nil {
 				s.log.Error("restore dataset folder after failed delete", "path", moved, "err", rerr)
 			}
+			return err
 		}
+	}
+	if err != nil {
 		return err
 	}
 	for _, jobID := range canceled {
@@ -139,17 +149,26 @@ func (s *Service) DeleteDataset(ctx context.Context, id int64, deleteFiles bool)
 	return nil
 }
 
-// detach returns a context for a transaction that moves a folder with it:
-// a client going away must not cancel it, least of all during the commit,
-// which would leave it unknown whether the move was recorded. Stopping the
-// service still does.
-func (s *Service) detach(ctx context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	if s.base == nil { // not started (tests)
-		return ctx, cancel
+// commitUnknown reads whether a dataset is in the recycle bin after the
+// commit of a transaction that moved it in or out failed with err: the
+// commit may still have been recorded (the connection broke after the
+// server got it), and the folder has to follow what was. known is false
+// when that cannot be read either.
+//
+// The transactions that move a folder with them run without the request's
+// cancellation (and the service's: a graceful shutdown waits for the
+// request), so that a client going away never makes their outcome unknown.
+func (s *Service) commitUnknown(ctx context.Context, id int64, err error) (inBin, known bool) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	if qerr := s.db.QueryRow(ctx, "SELECT deleted_at IS NOT NULL FROM datasets WHERE id = $1", id).
+		Scan(&inBin); qerr != nil {
+		s.log.Error("cannot tell whether a failed commit moving a dataset was recorded", "dataset_id", id,
+			"err", err, "check_err", qerr)
+		return false, false
 	}
-	stop := context.AfterFunc(s.base, cancel)
-	return ctx, func() { stop(); cancel() }
+	s.log.Warn("commit moving a dataset failed", "dataset_id", id, "in_recycle_bin", inBin, "err", err)
+	return inBin, true
 }
 
 // moveFolder renames the dataset folder dirName to the hidden path to and
@@ -227,18 +246,17 @@ type RestoreInput struct {
 // The folder moves back after the commit, so that whatever happens the
 // dataset is never in the bin while its folder is back under its name
 // (where nothing tells it from a folder added later): a crash before the
-// move leaves a dataset in use with its folder under .recycle-<id>, which
-// reconcileRecycleFolders moves back at the next start, and so does a move
-// that fails.
+// move, a move that fails or a commit whose outcome cannot be read leave a
+// dataset in use with its folder under .recycle-<id>, which
+// reconcileRecycleFolders moves back at the next start.
 func (s *Service) RestoreDataset(ctx context.Context, id int64, in RestoreInput) (Dataset, error) {
 	unlock, err := s.recycleLocks.lock(ctx, id)
 	if err != nil {
 		return Dataset{}, err
 	}
 	defer unlock()
-	ctx, cancel := s.detach(ctx)
-	defer cancel()
-	var moveBack bool
+	ctx = context.WithoutCancel(ctx) // see commitUnknown
+	var done, moveBack bool
 	var dirName string
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		d, err := queryTrashedDataset(ctx, tx, id)
@@ -287,9 +305,15 @@ func (s *Service) RestoreDataset(ctx context.Context, id int64, in RestoreInput)
 			WHERE id = $1`, id, name, dirName); err != nil {
 			return uniqueViolation(err, dirName)
 		}
-		moveBack = d.DeleteFiles
+		moveBack, done = d.DeleteFiles, true
 		return nil
 	})
+	if err != nil && done {
+		// The commit failed.
+		if inBin, known := s.commitUnknown(ctx, id, err); known && !inBin {
+			err = nil // recorded after all
+		}
+	}
 	if err != nil {
 		return Dataset{}, err
 	}

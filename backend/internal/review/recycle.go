@@ -53,8 +53,8 @@ func (s *Service) DetachDataset(ctx context.Context, tx pgx.Tx, datasetID int64)
 }
 
 // AttachDataset puts the review rows of a dataset restored from the
-// recycle bin back. A review that gets back images not inferred yet is
-// queued again (requeueRestored). It runs in the dataset's transaction,
+// recycle bin back. A ready review that gets back images not inferred yet
+// is queued again (requeueRestored). It runs in the dataset's transaction,
 // which holds the dataset row FOR UPDATE.
 func (s *Service) AttachDataset(ctx context.Context, tx pgx.Tx, datasetID int64) error {
 	ids, err := lockDatasetReviews(ctx, tx, "recycled_review_datasets", datasetID)
@@ -104,73 +104,53 @@ func lockDatasetReviews(ctx context.Context, tx pgx.Tx, table string, datasetID 
 	return pgx.CollectRows(rows, pgx.RowTo[int64])
 }
 
-// requeueRestored queues the reviews among ids again whose restored images
-// of the dataset are not all inferred, and returns how many:
+// requeueRestored queues the ready reviews among ids again (as
+// RetryReview does) whose restored images of the dataset are not all
+// inferred, if their model can still be used (otherwise they would only
+// fail), and returns how many. A model in the recycle bin counts: the
+// review waits for it in the queue (claimOne skips it) and fails once the
+// model is purged, like any review queued for it.
 //
-//   - a ready review (as RetryReview does), if its model can still be used
-//     (otherwise it would only fail). A model in the recycle bin counts: the
-//     review waits for it in the queue (claimOne skips it) and fails once
-//     the model is purged, like any review queued for it;
-//   - a running review: the node holding it pages through the images by ID
-//     and has passed the restored ones, so it would finish short of them.
-//     It gets 409 on its next call and stops, and the next claim infers
-//     what is left; the claim it loses does not count as an attempt.
+// A running review is left alone: the node holding it lists the images not
+// inferred yet from the start again after each pass and only completes on
+// an empty one, so it infers the restored images too.
 func (s *Service) requeueRestored(ctx context.Context, tx pgx.Tx, ids []int64, datasetID int64) (int, error) {
-	rows, err := tx.Query(ctx, `SELECT r.id, r.status, r.model_id FROM reviews r
-		WHERE r.id = ANY($1) AND (r.status = 'running' OR r.status = 'ready' AND r.model_id IS NOT NULL)
+	rows, err := tx.Query(ctx, `SELECT r.id, r.model_id FROM reviews r
+		WHERE r.id = ANY($1) AND r.status = 'ready' AND r.model_id IS NOT NULL
 			AND EXISTS (SELECT 1 FROM review_images ri WHERE ri.review_id = r.id AND ri.dataset_id = $2 AND NOT ri.inferred)`,
 		ids, datasetID)
 	if err != nil {
 		return 0, err
 	}
-	type candidate struct {
-		id      int64
-		status  string
-		modelID *int64
-	}
-	var candidates []candidate
-	var c candidate
-	if _, err := pgx.ForEachRow(rows, []any{&c.id, &c.status, &c.modelID}, func() error {
-		candidates = append(candidates, c)
+	candidates := map[int64]int64{} // model by review
+	var id, modelID int64
+	if _, err := pgx.ForEachRow(rows, []any{&id, &modelID}, func() error {
+		candidates[id] = modelID
 		return nil
 	}); err != nil {
 		return 0, err
 	}
-	var ready, running []int64
-	for _, c := range candidates {
-		if c.status == StatusRunning {
-			running = append(running, c.id)
-			continue
-		}
-		usable, err := s.canInferWith(ctx, tx, *c.modelID)
+	var queue []int64
+	for id, modelID := range candidates {
+		usable, err := s.canInferWith(ctx, tx, modelID)
 		if err != nil {
 			return 0, err
 		}
 		if usable {
-			ready = append(ready, c.id)
+			queue = append(queue, id)
 		}
 	}
-	queued := 0
-	if len(ready) > 0 {
-		tag, err := tx.Exec(ctx, `UPDATE reviews SET status = 'queued', stage = '', node_id = NULL, attempts = 0,
-				lease_expires_at = NULL, error = '', error_detail = '', result = NULL, started_at = NULL, finished_at = NULL,
-				updated_at = now()
-			WHERE id = ANY($1) AND status = 'ready'`, ready)
-		if err != nil {
-			return 0, err
-		}
-		queued += int(tag.RowsAffected())
+	if len(queue) == 0 {
+		return 0, nil
 	}
-	if len(running) > 0 {
-		tag, err := tx.Exec(ctx, `UPDATE reviews SET status = 'queued', stage = '', node_id = NULL,
-				attempts = greatest(attempts - 1, 0), lease_expires_at = NULL, updated_at = now()
-			WHERE id = ANY($1) AND status = 'running'`, running)
-		if err != nil {
-			return 0, err
-		}
-		queued += int(tag.RowsAffected())
+	tag, err := tx.Exec(ctx, `UPDATE reviews SET status = 'queued', stage = '', node_id = NULL, attempts = 0,
+			lease_expires_at = NULL, error = '', error_detail = '', result = NULL, started_at = NULL, finished_at = NULL,
+			updated_at = now()
+		WHERE id = ANY($1) AND status = 'ready'`, queue)
+	if err != nil {
+		return 0, err
 	}
-	return queued, nil
+	return int(tag.RowsAffected()), nil
 }
 
 // canInferWith reports whether a review queued for the model can be

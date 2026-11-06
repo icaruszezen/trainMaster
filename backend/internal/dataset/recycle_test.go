@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -276,6 +277,52 @@ func TestIntegrationPurgeLeavesUndeletableFiles(t *testing.T) {
 	e.svc.cleanTrash()
 	if exists(trash) {
 		t.Error("the janitor did not remove the rest")
+	}
+}
+
+// A commit that fails (not recorded) leaves the folder where the dataset
+// says it is.
+func TestIntegrationRecycleFailedCommit(t *testing.T) {
+	e := newTestEnv(t, false)
+	ctx := context.Background()
+	d, _ := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "pics"})
+	writeFiles(t, d.Path, map[string][]byte{"a.png": nil})
+	failCommits := func(on bool) {
+		t.Helper()
+		sql := "DROP TRIGGER fail_commit ON datasets"
+		if on {
+			sql = `CREATE OR REPLACE FUNCTION fail_commit() RETURNS trigger LANGUAGE plpgsql AS
+					$$ BEGIN RAISE EXCEPTION 'commit refused'; END $$;
+				CREATE CONSTRAINT TRIGGER fail_commit AFTER UPDATE ON datasets
+					DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_commit()`
+		}
+		if _, err := e.db.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	failCommits(true)
+	if err := e.svc.DeleteDataset(ctx, d.ID, true); err == nil || !strings.Contains(err.Error(), "commit refused") {
+		t.Fatalf("delete with a failing commit = %v", err)
+	}
+	if !exists(filepath.Join(d.Path, "a.png")) || exists(e.svc.recycleDir(d.ID)) || len(e.trashed(t)) != 0 {
+		t.Error("a delete that was not recorded must leave the folder in place")
+	}
+	failCommits(false)
+	if err := e.svc.DeleteDataset(ctx, d.ID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	failCommits(true)
+	if _, err := e.svc.RestoreDataset(ctx, d.ID, RestoreInput{}); err == nil || !strings.Contains(err.Error(), "commit refused") {
+		t.Fatalf("restore with a failing commit = %v", err)
+	}
+	if exists(d.Path) || !exists(filepath.Join(e.svc.recycleDir(d.ID), "a.png")) || len(e.trashed(t)) != 1 {
+		t.Error("a restore that was not recorded must leave the folder in the bin")
+	}
+	failCommits(false)
+	if got, err := e.svc.RestoreDataset(ctx, d.ID, RestoreInput{}); err != nil || !exists(filepath.Join(got.Path, "a.png")) {
+		t.Fatalf("restore = %+v, %v", got, err)
 	}
 }
 
