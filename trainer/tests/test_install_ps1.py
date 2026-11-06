@@ -345,6 +345,22 @@ def test_dry_run_without_gpu_and_manual_variant(tmp_path: Path):
 
 
 @needs_powershell
+def test_dry_run_with_powershell7_module_path(tmp_path: Path):
+    # 在从 PowerShell 7 中启动的程序（如 CI 中的 Python）里运行 Windows PowerShell 5.1 时继承了 PowerShell 7 的
+    # 模块目录：脚本要去掉它们，否则 Get-Acl / Set-Acl 所在的模块加载失败
+    pwsh_modules = [str(Path(PWSH).parent / "Modules")] if PWSH else []
+    module_path = ";".join([*pwsh_modules, os.environ.get("PSMODULEPATH", "")])
+    (tmp_path / "trainer").mkdir()
+    proc = run_script(
+        "-ServerUrl", "http://192.0.2.1:8080", "-Variant", "cpu", *_dry_run_args(tmp_path),
+        PSMODULEPATH=module_path, TM_NVIDIA_SMI=str(tmp_path / "no-nvidia-smi"),
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stdout
+    assert "无法读取权限" not in proc.stdout
+    assert "Microsoft.PowerShell.Security" not in proc.stdout
+
+
+@needs_powershell
 @pytest.mark.parametrize(
     ("args", "code", "message"),
     [

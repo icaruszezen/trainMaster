@@ -116,7 +116,7 @@ $SidUsers = 'S-1-5-32-545'
 $SidTrustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1850103602-2229827870'
 $SidOwnerRights = 'S-1-3-4'
 # 可变的状态放在哈希表中：函数通过作用域链读取它（在 [scriptblock]::Create 运行时没有 $script: 作用域）
-$Ctx = @{ ExitCode = 0; TempDirs = @(); ConsoleEncoding = $null; PythonEnv = $null }
+$Ctx = @{ ExitCode = 0; TempDirs = @(); ConsoleEncoding = $null; PythonEnv = $null; ModulePath = $null }
 
 # ---- 输出与错误 ----
 
@@ -1076,6 +1076,13 @@ try {
     $env:PYTHONUTF8 = '1'
     $env:PYTHONIOENCODING = 'utf-8'
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    # Windows PowerShell 5.1 在从 PowerShell 7 中启动的程序（如 Python）里运行时继承了 PowerShell 7 的模块目录，
+    # 会加载其中 PowerShell 7 的 Microsoft.PowerShell.Security 等模块而失败（Get-Acl、Set-Acl 不能用）
+    if ($PSVersionTable.PSEdition -ne 'Core' -and $env:PSModulePath) {
+        $Ctx.ModulePath = $env:PSModulePath
+        $env:PSModulePath = @($env:PSModulePath -split ';' |
+                Where-Object { $_ -and $_ -notmatch '(^|\\)PowerShell\\(\d[^\\]*\\)?Modules\\?$' }) -join ';'
+    }
     Invoke-Install
 } catch {
     $message = $_.Exception.Message
@@ -1091,6 +1098,7 @@ try {
     foreach ($dir in $Ctx.TempDirs) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
     if ($null -ne $Ctx.ConsoleEncoding) { try { [Console]::OutputEncoding = $Ctx.ConsoleEncoding } catch { } }
     if ($Ctx.PythonEnv) { foreach ($k in $Ctx.PythonEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $Ctx.PythonEnv[$k]) } }
+    if ($null -ne $Ctx.ModulePath) { $env:PSModulePath = $Ctx.ModulePath }
 }
 
 # 用 -File 运行时以退出码报告结果；从平台用 [scriptblock]::Create 运行时设置 $LASTEXITCODE（不关闭窗口）。
