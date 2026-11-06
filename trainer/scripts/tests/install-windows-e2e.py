@@ -142,6 +142,9 @@ def check_protected(path: Path, users_read: bool) -> None:
 
 
 def main() -> None:
+    # 输出重定向（如 CI）时 Windows 按代码页编码，英文系统的 cp1252 没有中文
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="backslashreplace")  # type: ignore[union-attr]
     if sys.platform != "win32":
         print("只能在 Windows 上运行")
         sys.exit(2)
