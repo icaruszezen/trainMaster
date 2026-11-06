@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import sys
 import types
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pynvml
+import pytest
 
 TRAINER_DIR = Path(__file__).resolve().parent.parent
 
@@ -300,3 +302,45 @@ def make_torchvision(version: str = "0.29.1+cpu") -> types.ModuleType:
     mod = types.ModuleType("torchvision")
     mod.__version__ = version  # type: ignore[attr-defined]
     return mod
+
+
+# ---- 跨平台 ----
+
+WINDOWS = sys.platform == "win32"
+posix_only = pytest.mark.skipif(
+    WINDOWS, reason="只在 Linux / macOS 上运行（信号、进程组、shell 脚本）"
+)
+windows_only = pytest.mark.skipif(not WINDOWS, reason="只在 Windows 上运行")
+
+
+def write_fake_smi(directory: Path, gpus_csv: str, header: str) -> Path:
+    """写出假的 nvidia-smi：--query-gpu 输出 gpus_csv，--query-compute-apps 没有输出，其它参数输出 header。
+    Linux 上是 sh 脚本，Windows 上是 .cmd（cmd 把参数中的 = 与 , 当作分隔符，%1 就是 --query-gpu）。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    if WINDOWS:
+        (directory / "smi-gpus.csv").write_text(gpus_csv, encoding="utf-8")
+        (directory / "smi-header.txt").write_text(header, encoding="utf-8")
+        path = directory / "nvidia-smi.cmd"
+        path.write_text(
+            "@echo off\r\n"
+            'if "%~1"=="--query-gpu" goto gpu\r\n'
+            'if "%~1"=="--query-compute-apps" goto end\r\n'
+            'type "%~dp0smi-header.txt"\r\n'
+            "goto end\r\n"
+            ":gpu\r\n"
+            'type "%~dp0smi-gpus.csv"\r\n'
+            ":end\r\n",
+            encoding="ascii",
+        )
+        return path
+    path = directory / "nvidia-smi"
+    path.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        f"  --query-gpu=*) cat <<'EOF'\n{gpus_csv}EOF\n;;\n"
+        "  --query-compute-apps=*) ;;\n"
+        f"  *) cat <<'EOF'\n{header}EOF\n;;\n"
+        "esac\n"
+    )
+    path.chmod(0o755)
+    return path

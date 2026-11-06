@@ -29,10 +29,19 @@ export type GpuDetectionMethod = "nvml" | "nvidia-smi" | "none"
 
 /** 训练节点的硬件信息：节点启动和“重新检测”时上报。 */
 export type NodeHardware = {
-  /** 容器内为镜像的系统（/etc/os-release 的 PRETTY_NAME）。 */
+  /**
+   * 容器内为镜像的系统（/etc/os-release 的 PRETTY_NAME）；Windows 节点如
+   * "Windows 11 专业版 23H2"（按系统语言）。
+   */
   os: string | null
+  /** Windows 节点为版本号，如 "10.0.22631.4317"。 */
   kernel: string | null
   arch: string | null
+  /**
+   * 节点的操作系统平台："linux" / "windows"（其它系统为 Python 的
+   * platform.system() 小写）。旧版节点不上报，为 null，按 Linux 处理。
+   */
+  platform: string | null
   in_container: boolean
   cpu: {
     model: string | null
@@ -47,7 +56,7 @@ export type NodeHardware = {
     /** cgroup 内存上限；没有限制或不小于物理内存时为 null。 */
     limit_bytes: number | null
   }
-  /** /dev/shm 的大小。 */
+  /** /dev/shm 的大小；Windows 没有 /dev/shm，为 null。 */
   shm_bytes: number | null
   /** 没有 NVIDIA 驱动或无法探测时为 null。 */
   gpu_driver: {
@@ -248,6 +257,11 @@ export type ComputeServer = {
      * 不知道时（不是用 docker compose 启动的）为 null。
      */
     local_trainer_mode: TrainerMode | null
+    /**
+     * 平台是否附带 Windows 训练节点的安装脚本与安装包（TM_TRAINER_PACKAGE_DIR，
+     * 见 `/api/v1/compute/windows/install.ps1`）；没有时在仓库目录中运行安装脚本。
+     */
+    windows_installer_available: boolean
   }
 }
 

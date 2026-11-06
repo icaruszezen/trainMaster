@@ -49,11 +49,15 @@ def write_modules(
     if onnx:
         modules["onnx"] = "make_onnx"
     else:
-        (root / "onnx.py").write_text("raise ImportError('No module named onnx')\n")
+        (root / "onnx.py").write_text(
+            "raise ImportError('No module named onnx')\n", encoding="utf-8"
+        )
     if onnxruntime:
         modules["onnxruntime"] = "make_onnxruntime"
     else:
-        (root / "onnxruntime.py").write_text("raise ImportError('No module named onnxruntime')\n")
+        (root / "onnxruntime.py").write_text(
+            "raise ImportError('No module named onnxruntime')\n", encoding="utf-8"
+        )
     for name, factory in modules.items():
         (root / f"{name}.py").write_text(
             _MODULE_FILE.format(tests=str(TESTS_DIR), factory=factory, root=str(root)),

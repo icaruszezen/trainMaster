@@ -20,7 +20,7 @@ import (
 var (
 	nodeKeys = []string{"id", "node_key", "name", "hostname", "address", "agent_version", "status", "probe_pending",
 		"registered_at", "last_seen_at", "created_at", "hardware", "environment", "metrics", "history"}
-	hardwareKeys     = []string{"os", "kernel", "arch", "in_container", "cpu", "memory", "shm_bytes", "gpu_driver", "gpus", "gpu_detection"}
+	hardwareKeys     = []string{"os", "kernel", "arch", "platform", "in_container", "cpu", "memory", "shm_bytes", "gpu_driver", "gpus", "gpu_detection"}
 	hardwareCPUKeys  = []string{"model", "physical_cores", "logical_cores", "max_mhz", "limit_cores"}
 	hardwareGPUKeys  = []string{"index", "uuid", "name", "memory_total_bytes", "compute_capability", "pci_bus_id", "power_limit_watts", "mig_enabled"}
 	gpuDriverKeys    = []string{"driver_version", "cuda_driver_version", "nvml_version"}
@@ -37,7 +37,7 @@ var (
 	serverKeys        = []string{"hostname", "os", "arch", "kernel", "in_container", "uptime_seconds", "cpu", "memory", "load_average", "nvidia", "node_registration"}
 	serverCPUKeys     = []string{"model", "logical_cores", "physical_cores", "limit_cores", "usage_percent"}
 	serverMemoryKeys  = []string{"total_bytes", "available_bytes", "used_bytes", "limit_bytes"}
-	registrationKeys  = []string{"token_required", "heartbeat_interval_seconds", "offline_after_seconds", "local_trainer_mode"}
+	registrationKeys  = []string{"token_required", "heartbeat_interval_seconds", "offline_after_seconds", "local_trainer_mode", "windows_installer_available"}
 	nodeRegisterKeys  = []string{"node_id", "heartbeat_interval_seconds", "server_time"}
 	nodeHeartbeatKeys = []string{"node_id", "heartbeat_interval_seconds", "probe_requested"}
 )
@@ -45,7 +45,7 @@ var (
 // testHardware, testEnvironment and testMetrics are reports as the node
 // agent sends them (the examples of the data contract).
 const testHardware = `{
-	"os": "Ubuntu 22.04.4 LTS", "kernel": "5.15.0-105-generic", "arch": "x86_64", "in_container": true,
+	"os": "Ubuntu 22.04.4 LTS", "kernel": "5.15.0-105-generic", "arch": "x86_64", "platform": "linux", "in_container": true,
 	"cpu": {"model": "Intel(R) Xeon(R) Gold 6330 CPU @ 2.00GHz", "physical_cores": 28, "logical_cores": 56,
 		"max_mhz": 3100, "limit_cores": 8.0},
 	"memory": {"total_bytes": 134987546624, "limit_bytes": null},
@@ -190,9 +190,10 @@ func TestComputeServerInfo(t *testing.T) {
 	reg := object(t, raw["node_registration"], "node_registration")
 	wantKeys(t, "node_registration", reg, registrationKeys...)
 	// Without TM_TRAINER_MODE (e.g. outside docker compose) the mode of
-	// this machine's own training node is not known.
+	// this machine's own training node is not known; without
+	// TM_TRAINER_PACKAGE_DIR there is no installer for Windows.
 	if reg["token_required"] != false || reg["heartbeat_interval_seconds"] != 10.0 || reg["offline_after_seconds"] != 35.0 ||
-		reg["local_trainer_mode"] != nil {
+		reg["local_trainer_mode"] != nil || reg["windows_installer_available"] != false {
 		t.Errorf("node_registration = %v", reg)
 	}
 
@@ -247,6 +248,9 @@ func TestComputeNodeAPI(t *testing.T) {
 	}
 	hw := object(t, node["hardware"], "hardware")
 	wantKeys(t, "hardware", hw, hardwareKeys...)
+	if hw["platform"] != "linux" || hw["arch"] != "x86_64" {
+		t.Errorf("hardware = %v", hw)
+	}
 	wantKeys(t, "hardware cpu", object(t, hw["cpu"], "cpu"), hardwareCPUKeys...)
 	wantKeys(t, "hardware memory", object(t, hw["memory"], "memory"), "total_bytes", "limit_bytes")
 	wantKeys(t, "gpu_driver", object(t, hw["gpu_driver"], "gpu_driver"), gpuDriverKeys...)
@@ -516,7 +520,9 @@ func TestComputeLenientReports(t *testing.T) {
 	raw := want[map[string]any](t, e.do("GET", nodeURL(id, ""), nil), 200)
 	hw := object(t, raw["hardware"], "hardware")
 	cpu := object(t, hw["cpu"], "cpu")
-	if cpu["logical_cores"] != 8.0 || cpu["max_mhz"] != nil || object(t, hw["gpu_detection"], "detection")["method"] != "none" {
+	// Agents before 0.4.0 report no platform: null, which means Linux.
+	if cpu["logical_cores"] != 8.0 || cpu["max_mhz"] != nil || object(t, hw["gpu_detection"], "detection")["method"] != "none" ||
+		hw["platform"] != nil {
 		t.Errorf("hardware = %v", hw)
 	}
 	m := object(t, raw["metrics"], "metrics")
@@ -528,6 +534,14 @@ func TestComputeLenientReports(t *testing.T) {
 	}
 	// The heartbeat with NaN values succeeds as well.
 	e.heartbeat(t, `{"node_key": "node-a", "metrics": {"cpu_percent": NaN, "gpus": []}}`)
+
+	// The platform is normalized, so the frontend can compare it with
+	// "windows".
+	e.heartbeat(t, `{"node_key": "node-a", "hardware": {"os": "Windows 11 Pro 23H2", "arch": "AMD64", "platform": " Windows "}}`)
+	hw = object(t, want[map[string]any](t, e.do("GET", nodeURL(id, ""), nil), 200)["hardware"], "hardware")
+	if hw["platform"] != "windows" || hw["os"] != "Windows 11 Pro 23H2" || hw["shm_bytes"] != nil {
+		t.Errorf("windows hardware = %v", hw)
+	}
 }
 
 func TestComputeNodeOrder(t *testing.T) {

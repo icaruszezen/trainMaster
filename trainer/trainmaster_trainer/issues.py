@@ -2,7 +2,7 @@
 
 全部是纯函数（不读文件、不调用外部命令），便于逐条测试。issue 的 message / hint 是直接展示给用户的中文；
 hint 中的命令用反引号包住（前端显示为代码，整条 hint 只有一条命令时可以复制），命令按节点的部署方式
-（同一个 compose 中的平台、其它机器上的 compose、裸机安装）给出，见 Deployment。
+（同一个 compose 中的平台、其它机器上的 compose、Linux 裸机安装、Windows 安装）给出，见 Deployment。
 """
 
 from __future__ import annotations
@@ -30,6 +30,11 @@ LOCAL_SERVER_HOST = "app"
 DEFAULT_SERVICE = "trainer"
 DEFAULT_PREFIX = "/opt/trainmaster-trainer"
 INSTALL_SCRIPT = "trainer/scripts/install.sh"
+# Windows（scripts/install.ps1）：平台提供的安装脚本、默认安装目录（%ProgramData% 下）与计划任务名。
+WINDOWS_INSTALLER_PATH = "/api/v1/compute/windows/install.ps1"
+WINDOWS_DEFAULT_PREFIX = r"C:\ProgramData\trainMaster\trainer"
+WINDOWS_TASK = "trainmaster-trainer"
+VC_REDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
 
 
 @dataclass(frozen=True)
@@ -40,7 +45,8 @@ class Deployment:
     - 容器中、平台地址的主机是 app：与平台在同一个 compose 中，用 make up（它先运行 make setup）；
     - 容器中、平台在其它机器上：只启动本机的训练节点服务（make up 或不带服务名的 docker compose up -d
       会在这台机器上再启动一套 postgres 与 app），即 make setup 之后 docker compose up -d --build <服务>；
-    - 不在容器中：裸机安装，重新运行 install.sh（它沿用已有配置文件中的平台地址、令牌等）。
+    - 不在容器中：裸机安装，重新运行 install.sh（它沿用已有配置文件中的平台地址、令牌等）；
+      Windows（Hardware.platform 为 windows）重新运行平台提供的 install.ps1（同样沿用配置文件中的设置）。
     """
 
     server_url: str | None = None  # TM_SERVER_URL，没有设置时按 compose 的默认值 http://app:8080
@@ -51,6 +57,25 @@ class Deployment:
     prefix: str = field(default_factory=lambda: sys.prefix)  # 裸机：install.sh 的安装目录
     # 裸机：训练节点的 CUDA_VISIBLE_DEVICES（没有设置时为 None），见 visible_gpus
     cuda_visible_devices: str | None = None
+    # 裸机：读取的配置文件（run --env-file，Windows 的计划任务使用；没有时为 None）
+    env_file: str | None = None
+    # Windows：%ProgramData%（install.ps1 的默认安装目录在其中；没有时按 C:\ProgramData）
+    program_data: str | None = None
+
+
+def ps_quote(value: str) -> str:
+    """PowerShell 的单引号字符串（其中的单引号写两次）。"""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _ps_path(value: str) -> str:
+    """命令中的 Windows 路径：只有字母、数字与 \\ : . _ - 时原样写出，否则加单引号。"""
+    return value if re.fullmatch(r"[A-Za-z0-9\\:._-]+", value) else ps_quote(value)
+
+
+def _same_path(a: str, b: str) -> bool:
+    """Windows 路径是否相同（不区分大小写，忽略结尾的 \\ 与 /）。"""
+    return a.rstrip("\\/").lower() == b.rstrip("\\/").lower()
 
 
 def _code(command: str) -> str:
@@ -65,8 +90,18 @@ class Fixes:
         deployment: Deployment,
         in_container: bool,
         table: Sequence[Variant] | None = None,
+        *,
+        windows: bool = False,
     ) -> None:
         self.container = in_container
+        # Windows 节点（不在容器中）：命令是在管理员 PowerShell 中运行的 PowerShell 命令。
+        self.windows = windows and not in_container
+        self.server_url = deployment.server_url
+        self.env_file = deployment.env_file
+        program_data = (deployment.program_data or "").rstrip("\\/")
+        self.windows_default_prefix = (
+            program_data + r"\trainMaster\trainer" if program_data else WINDOWS_DEFAULT_PREFIX
+        )
         self.service = deployment.service or DEFAULT_SERVICE
         try:
             host = urlsplit(deployment.server_url).hostname if deployment.server_url else None
@@ -79,7 +114,10 @@ class Fixes:
         info = variants_mod.get_variant(pinned, table) if pinned else None
         self.pinned = pinned if info is not None and info.cuda else None
         self.python = deployment.python
-        self.prefix = deployment.prefix.rstrip("/") or "/"
+        if self.windows:
+            self.prefix = deployment.prefix.rstrip("\\/") or deployment.prefix
+        else:
+            self.prefix = deployment.prefix.rstrip("/") or "/"
 
     # ---- Docker（docker compose）----
 
@@ -106,7 +144,13 @@ class Fixes:
         )
 
     def restart(self) -> str:
-        """修改 .env 中 compose 的设置（如 TM_TRAINER_SHM_SIZE）后重新创建训练节点容器。"""
+        """修改 .env 中 compose 的设置（如 TM_TRAINER_SHM_SIZE）后重新创建训练节点容器；
+        Windows 上重启计划任务（修改配置文件之后）。"""
+        if self.windows:
+            return _code(
+                f"Stop-ScheduledTask -TaskName {WINDOWS_TASK}; "
+                f"Start-ScheduledTask -TaskName {WINDOWS_TASK}"
+            )
         return _code("make up") if self.local else _code(f"docker compose up -d {self.service}")
 
     def toolkit(self) -> str:
@@ -119,13 +163,51 @@ class Fixes:
 
     def install(self, variant: str | None = None) -> str:
         """重新运行安装脚本（在 trainMaster 仓库目录中）：沿用已有配置文件中的平台地址、令牌等，
-        已安装 systemd 服务时同时更新并重启它。"""
+        已安装 systemd 服务时同时更新并重启它。Windows 上见 windows_install。"""
+        if self.windows:
+            return "（在管理员 PowerShell 中运行）：" + _code(self.windows_install(variant))
         args = ["sudo", INSTALL_SCRIPT]
         if variant:
             args += ["--variant", variant]
         if self.prefix != DEFAULT_PREFIX:
             args += ["--prefix", self.prefix]
         return "（在 trainMaster 仓库目录中运行）：" + _code(shlex.join(args))
+
+    # ---- Windows（install.ps1）----
+
+    def windows_install(self, variant: str | None = None) -> str:
+        """重新运行平台提供的 install.ps1：沿用配置文件中的平台地址、令牌、名称等，已注册的计划任务
+        自动更新并重启。安装目录、配置文件不是默认值时带上 -Prefix、-EnvFile。
+
+        平台地址未知时（不会出现：Windows 节点总是从配置文件读取 TM_SERVER_URL）改为在仓库目录中运行。
+        """
+        args: list[str] = []
+        if variant:
+            args += ["-Variant", variant]
+        if not _same_path(self.prefix, self.windows_default_prefix):
+            args += ["-Prefix", _ps_path(self.prefix)]
+        if self.env_file and not _same_path(self.env_file, self.prefix + r"\trainer.env"):
+            args += ["-EnvFile", _ps_path(self.env_file)]
+        tail = "".join(" " + a for a in args)
+        if not self.server_url:
+            return r"powershell -ExecutionPolicy Bypass -File trainer\scripts\install.ps1" + tail
+        url = self.server_url.rstrip("/") + WINDOWS_INSTALLER_PATH
+        command = f"& ([scriptblock]::Create((irm {ps_quote(url)})))" + tail
+        if url.lower().startswith("https://"):
+            # Windows PowerShell 5.1 在较旧的系统上默认不启用 TLS 1.2
+            command = "[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; " + command
+        return command
+
+    def install_driver(self) -> str:
+        """安装或升级 NVIDIA 驱动的说明（不含之后的步骤）。"""
+        if self.windows:
+            return "安装 NVIDIA 显卡驱动（推荐 580 或更新，可从 NVIDIA 官网下载）并重启电脑"
+        return "在宿主机安装 NVIDIA 驱动（推荐 580 或更新）并重启"
+
+    def upgrade_driver(self) -> str:
+        if self.windows:
+            return "升级 NVIDIA 显卡驱动（推荐 580 或更新，可从 NVIDIA 官网下载）并重启电脑"
+        return "升级 NVIDIA 驱动（推荐 580 或更新）并重启"
 
     # ---- 按部署方式选择 ----
 
@@ -172,6 +254,13 @@ class Fixes:
             return _code(
                 f"docker compose exec {self.service} python -m trainmaster_trainer selftest"
             )
+        if self.windows:
+            python = _ps_path(self.python)
+            command = ("& " if python.startswith("'") else "") + python
+            command += " -m trainmaster_trainer selftest"
+            if self.env_file:
+                command += " --env-file " + _ps_path(self.env_file)
+            return _code(command)
         return _code(f"{shlex.quote(self.python)} -m trainmaster_trainer selftest")
 
     def exclude_gpus(self, usable: Sequence[Any]) -> str:
@@ -189,6 +278,14 @@ class Fixes:
                 "（见 docs/deployment.md 第 10.8 节），然后运行 " + self.restart()
             )
         ids = ",".join(str(i) for i in usable)
+        if self.windows:
+            env_file = self.env_file or self.prefix + r"\trainer.env"
+            return (
+                f"训练只使用受支持的显卡：在训练节点的配置文件 {env_file} 中设置 "
+                + _code(f"CUDA_VISIBLE_DEVICES={ids}")
+                + "，然后在管理员 PowerShell 中重启训练节点："
+                + self.restart()
+            )
         return (
             f"训练只使用受支持的显卡：在训练节点的配置文件（默认 {self.prefix}/trainer.env，"
             "安装时用 --env-file 指定了其它文件时为该文件）中设置 "
@@ -279,11 +376,13 @@ def visible_gpus(
 
 
 def recommend(hardware: Mapping[str, Any], table: Sequence[Variant] | None = None) -> Selection:
-    """按本机驱动与显卡推荐变体（与部署脚本使用同一规则）。"""
+    """按本机驱动与显卡推荐变体（与部署脚本使用同一规则；Windows 按 Windows 的最低驱动）。"""
     gpus = hardware.get("gpus") or []
     driver = (hardware.get("gpu_driver") or {}).get("driver_version")
     ccs = [g.get("compute_capability") or ASSUMED_CC for g in gpus]
-    return variants_mod.select_variant(driver, ccs, hardware.get("arch") or None, table)
+    return variants_mod.select_variant(
+        driver, ccs, hardware.get("arch") or None, table, system=hardware.get("platform") or None
+    )
 
 
 _ARCH_RE = re.compile(r"(sm|compute)_(\d+)([a-z]?)")
@@ -314,6 +413,15 @@ def arch_covers(device_cc: int, arch_list: Iterable[str]) -> bool:
 
 def _nvml_hint(error: str, fixes: Fixes) -> str:
     text = error.lower()
+    if fixes.windows:
+        if "not found" in text:
+            return "没有找到 NVIDIA 驱动库（nvml.dll）：" + fixes.install_driver()
+        if "permission" in text:
+            return "当前账户无权访问显卡：确认训练节点以 SYSTEM 或管理员身份运行"
+        return (
+            "NVIDIA 驱动没有正常运行：在设备管理器中检查显卡状态，必要时重新安装驱动并重启电脑，"
+            "或在 PowerShell 中运行 " + _code("nvidia-smi") + " 查看"
+        )
     if "mismatch" in text:
         return (
             "驱动已升级但内核模块仍是旧版本：重启机器（或重新加载 nvidia 内核模块）后再启动训练节点"
@@ -331,6 +439,27 @@ def _nvml_hint(error: str, fixes: Fixes) -> str:
     if "not found" in text:
         return "没有找到 NVIDIA 驱动库（libnvidia-ml）：安装或重新安装 NVIDIA 驱动"
     return "在宿主机运行 " + _code("nvidia-smi") + " 检查驱动状态"
+
+
+_DLL_ERRORS = re.compile(r"winerror (126|127|1114)\b|dll load failed|error loading .*\.dll", re.I)
+_PAGEFILE_ERRORS = re.compile(r"winerror 1455\b|paging file is too small|页面文件太小", re.I)
+
+
+def _import_hint(error: str | None, fixes: Fixes) -> str | None:
+    """Windows 上导入 torch 等失败的常见原因：缺少 VC++ 运行库、虚拟内存（页面文件）太小。"""
+    if not fixes.windows or not error:
+        return None
+    if _PAGEFILE_ERRORS.search(error):
+        return (
+            "Windows 的虚拟内存（页面文件）不足，无法加载 CUDA 运行库：在“系统属性 → 高级 → 性能设置 → 高级 → "
+            "虚拟内存”中改为“系统管理的大小”或调大（建议不少于 16 GB），重启电脑后再试"
+        )
+    if _DLL_ERRORS.search(error):
+        return (
+            f"缺少 Microsoft Visual C++ 运行库：安装 {VC_REDIST_URL}（重新运行安装脚本时加 -InstallPython "
+            "会自动安装），然后重启训练节点：" + fixes.restart()
+        )
+    return None
 
 
 def _cpu_mode_issue(gpu_count: int, fixes: Fixes, *, driver_missing: bool) -> dict[str, Any]:
@@ -411,6 +540,27 @@ def _gpu_detection_issues(
                 _nvml_hint(error, fixes),
             )
         ]
+    if pci_gpu_count and fixes.windows:
+        if error and "not found" not in error.lower():
+            # 驱动已安装（找得到 nvml.dll）但 NVML 初始化失败
+            return [
+                issue(
+                    "warning",
+                    "nvml_error",
+                    f"检测到 {pci_gpu_count} 块 NVIDIA 显卡，但 NVML 初始化失败：{_first_line(error)}，"
+                    "将使用 CPU 训练",
+                    _nvml_hint(error, fixes),
+                )
+            ]
+        return [
+            issue(
+                "warning",
+                "no_gpu",
+                f"检测到 {pci_gpu_count} 块 NVIDIA 显卡，但没有安装 NVIDIA 显卡驱动（或驱动没有正常工作），"
+                "将使用 CPU 训练",
+                fixes.install_driver() + "，然后" + fixes.after_driver(),
+            )
+        ]
     if pci_gpu_count:
         if cpu_mode:
             return [_cpu_mode_issue(pci_gpu_count, fixes, driver_missing=True)]
@@ -447,8 +597,9 @@ def build_environment(
     gpus: list[Mapping[str, Any]] = list(hardware.get("gpus") or [])
     driver = (hardware.get("gpu_driver") or {}).get("driver_version")
     container = bool(hardware.get("in_container"))
+    system = hardware.get("platform") or None
     deployment = deployment or Deployment()
-    fixes = Fixes(deployment, container, table)
+    fixes = Fixes(deployment, container, table, windows=system == variants_mod.WINDOWS)
     # 裸机上 CUDA_VISIBLE_DEVICES 排除的显卡不用于训练：不按它们推荐变体，不支持它们时只作提示（容器中
     # 由 device_ids 限制显卡，NVML 也看不到没有分配的显卡）。全部被排除时 CUDA 不可用（另有问题报告），
     # 仍按全部显卡推荐。
@@ -483,7 +634,7 @@ def build_environment(
                     "error",
                     "torch_missing",
                     f"无法导入 PyTorch：{_first_line(raw.get('torch_error')) or '未安装'}",
-                    fixes.reinstall(),
+                    _import_hint(raw.get("torch_error"), fixes) or fixes.reinstall(),
                 )
             )
         elif raw.get("torchvision_error") or raw.get("torchvision_version") is None:
@@ -492,7 +643,8 @@ def build_environment(
                     "error",
                     "torch_missing",
                     f"无法导入 torchvision：{_first_line(raw.get('torchvision_error')) or '未安装'}",
-                    fixes.reinstall(installed or rec),
+                    _import_hint(raw.get("torchvision_error"), fixes)
+                    or fixes.reinstall(installed or rec),
                 )
             )
         if raw.get("ultralytics_error") or raw.get("ultralytics_version") is None:
@@ -501,7 +653,7 @@ def build_environment(
                     "error",
                     "ultralytics_missing",
                     f"无法导入 Ultralytics（YOLO）：{_first_line(raw.get('ultralytics_error')) or '未安装'}",
-                    fixes.reinstall(),
+                    _import_hint(raw.get("ultralytics_error"), fixes) or fixes.reinstall(),
                 )
             )
 
@@ -511,15 +663,14 @@ def build_environment(
             if rec == "cpu":
                 code, hint = "torch_cpu_build", None
                 driver_ok_any = driver and any(
-                    v.min_driver and variants_mod.version_ge(driver, v.min_driver)
+                    v.driver_for(system) and variants_mod.version_ge(driver, v.driver_for(system))
                     for v in (table or variants_mod.load_variants())
                 )
-                if (hardware.get("arch") or "") in ("x86_64", "amd64") and driver:
+                arch = variants_mod.normalize_machine(hardware.get("arch") or "-")
+                if arch in variants_mod.X86_64 and driver:
                     if not driver_ok_any:
                         code = "driver_too_old"
-                        hint = (
-                            "升级 NVIDIA 驱动（推荐 580 或更新）并重启，然后" + fixes.after_driver()
-                        )
+                        hint = fixes.upgrade_driver() + "，然后" + fixes.after_driver()
                     else:
                         code = "arch_unsupported"
                 issues.append(
@@ -541,7 +692,7 @@ def build_environment(
                     )
                 )
         else:
-            min_driver = variants_mod.min_driver_for_cuda(torch_cuda, table)
+            min_driver = variants_mod.min_driver_for_cuda(torch_cuda, table, system)
             driver_ok = not (
                 driver and min_driver and not variants_mod.version_ge(driver, min_driver)
             )
@@ -650,8 +801,9 @@ def build_environment(
     if self_test.get("status") == "failed":
         detail = (self_test.get("detail") or "").lower()
         if "out of memory" in detail:
+            where = "在 PowerShell 中运行 " if fixes.windows else "在宿主机运行 "
             hint: str | None = (
-                "显存不足：显卡可能被其它程序占用，在宿主机运行 " + _code("nvidia-smi") + " 查看"
+                "显存不足：显卡可能被其它程序占用，" + where + _code("nvidia-smi") + " 查看"
             )
         elif "no kernel image" in detail and rec not in ("cpu", installed):
             hint = fixes.variant(rec)

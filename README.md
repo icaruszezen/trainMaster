@@ -96,15 +96,16 @@ PyTorch 版本的选择规则（变体表 [`trainer/trainmaster_trainer/torch_va
 | `cu118` | 2.7.1 / 0.22.1 | 11.8 | 450.80.02 | 3.7、5.x–9.0：驱动低于 525.60.13 的机器 |
 | `cpu` | 2.14.1 / 0.29.1 | — | — | 没有 NVIDIA 显卡、没有驱动或驱动过旧时 |
 
-例如驱动 550 + RTX 4090 → `cu126`；驱动 570 + RTX 5090 → `cu128`；驱动 580 及以上、RTX 20 系列或更新的显卡 → `cu130`。多块显卡中有不受支持的型号时，选支持显卡最多的变体并提示哪些显卡无法使用；ARM 服务器（如 Grace Hopper）只在驱动 ≥ 580 且显卡为 Ampere 或更新时使用 `cu130`。升级驱动后再次 `make up` 会自动换用更合适的版本；也可以用 `make setup SETUP_ARGS="--variant cu126"` 固定版本。
+例如驱动 550 + RTX 4090 → `cu126`；驱动 570 + RTX 5090 → `cu128`；驱动 580 及以上、RTX 20 系列或更新的显卡 → `cu130`。多块显卡中有不受支持的型号时，选支持显卡最多的变体并提示哪些显卡无法使用；ARM 服务器（如 Grace Hopper）只在驱动 ≥ 580 且显卡为 Ampere 或更新时使用 `cu130`。Windows 电脑的最低驱动略高：CUDA 12.x 为 528.33，11.8 为 452.39（13.0 同为 580）。升级驱动后再次 `make up` 会自动换用更合适的版本；也可以用 `make setup SETUP_ARGS="--variant cu126"` 固定版本。
 
-接入训练节点的三种方式：
+接入训练节点的四种方式：
 
 | 方式 | 做法 |
 |---|---|
 | 平台所在机器（Docker） | `make up`（先自动执行 `make setup`）：有可用的显卡时启动 GPU 训练节点（`trainer` 服务），否则启动 CPU 训练节点（`trainer-cpu`）；Docker 还不能使用显卡时用 `make up SETUP_ARGS="--install-toolkit"` |
 | 其它 GPU 机器（Docker） | 克隆本仓库，`make setup SETUP_ARGS="--server-url http://<平台IP>:8080 --token <令牌>"`（令牌即平台 `.env` 中的 `TM_NODE_TOKEN`），再只启动训练节点：`docker compose up -d --build trainer`（按 `make setup` 最后输出的服务名，选择 CPU 时为 `trainer-cpu`；需要时加 `--install-toolkit` 让脚本安装 NVIDIA Container Toolkit）。不要在这台机器上运行 `make up`，它会再启动一套平台 |
-| 不用 Docker | `sudo trainer/scripts/install.sh --server-url http://<平台IP>:8080 --token <令牌> --systemd`：安装到虚拟环境并注册为 systemd 服务 |
+| 不用 Docker（Linux） | `sudo trainer/scripts/install.sh --server-url http://<平台IP>:8080 --token <令牌> --systemd`：安装到虚拟环境并注册为 systemd 服务 |
+| Windows 电脑 | 在“计算资源 → 接入节点”中复制 Windows 的命令，在这台电脑的管理员 PowerShell 中运行：从平台下载安装脚本，检测显卡与驱动后安装匹配的 PyTorch（没有 Python 时自动安装），并注册为开机以 SYSTEM 运行的计划任务 `trainmaster-trainer`。支持 64 位 Windows 10 / 11、Windows Server 2019 及更新 |
 
 完整说明（手动配置、只使用部分显卡、国内镜像、常见问题）见 [部署文档 · GPU 训练节点](docs/deployment.md#10-gpu-训练节点)。训练节点目前还负责模型仓库的 ONNX 转换（见下一节）与模型审图的识别（见“模型审图”）；训练任务的排队与调度将在后续迭代中实现。
 
@@ -302,7 +303,7 @@ trainMaster/
 │       └── ...
 ├── trainer/                     # 训练节点（Python）：硬件与 CUDA 环境检测、自检、注册与心跳、执行平台的任务
 │   ├── trainmaster_trainer/     # 节点程序；tasks.py 领取任务，model_export.py 执行 pt → ONNX 转换，review_inference.py 执行审图识别，torch_variants.txt 为 PyTorch 变体表
-│   ├── scripts/                 # install.sh（裸机安装）、install-torch.sh、lib/torch-variant.sh（选择变体）
+│   ├── scripts/                 # install.sh（Linux 裸机安装）、install.ps1（Windows）、install-torch.sh、lib/torch-variant.sh（选择变体）
 │   ├── tests/                   # pytest（不需要 GPU 与 torch）
 │   └── Dockerfile               # 训练节点镜像（构建上下文为 trainer/）
 ├── deploy/

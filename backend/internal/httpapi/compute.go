@@ -20,12 +20,20 @@ import (
 // JSON shapes are defined by the types in internal/compute and
 // internal/hostinfo; this file maps HTTP onto compute.Service. The task
 // calls of the nodes (claiming and executing model conversions) are under
-// /agent too; their handlers are in models.go.
+// /agent too; their handlers are in models.go. The downloads that install
+// the training node on a Windows computer are under /windows (handlers in
+// trainer_package.go).
 
 func (s *server) computeRoutes(r chi.Router) {
 	if s.host != nil {
 		r.Get("/server", s.getComputeServer)
 	}
+	// Public like the pages: the install command downloads them before
+	// the node has its token.
+	r.Route("/windows", func(r chi.Router) {
+		r.Get("/install.ps1", s.windowsInstallScript)
+		r.Get("/trainer.zip", s.windowsTrainerPackage)
+	})
 	r.Route("/nodes", func(r chi.Router) {
 		r.Get("/", s.listComputeNodes)
 		r.Route("/{nodeID}", func(r chi.Router) {
@@ -95,6 +103,10 @@ type nodeRegistration struct {
 	// LocalTrainerMode is TM_TRAINER_MODE of this machine's own training
 	// node ("auto", "gpu", "cpu" or "off"); null when not known.
 	LocalTrainerMode *string `json:"local_trainer_mode"`
+	// WindowsInstallerAvailable: the install script and the package of the
+	// training node for Windows computers can both be downloaded
+	// (TM_TRAINER_PACKAGE_DIR is set and complete).
+	WindowsInstallerAvailable bool `json:"windows_installer_available"`
 }
 
 func (s *server) getComputeServer(w http.ResponseWriter, _ *http.Request) {
@@ -102,6 +114,9 @@ func (s *server) getComputeServer(w http.ResponseWriter, _ *http.Request) {
 		TokenRequired:            s.nodeToken != "",
 		HeartbeatIntervalSeconds: s.compute.HeartbeatInterval().Seconds(),
 		OfflineAfterSeconds:      s.compute.OfflineAfter().Seconds(),
+		// A few stats; the page asks every few seconds, so a directory
+		// completed later is shown soon.
+		WindowsInstallerAvailable: s.trainerPackage.Check() == nil,
 	}
 	if s.localTrainerMode != "" {
 		reg.LocalTrainerMode = &s.localTrainerMode

@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import socket
+import sys
 import tempfile
 import unicodedata
 from collections.abc import Mapping
@@ -15,8 +16,21 @@ from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
 
-DEFAULT_STATE_DIR = Path("/var/lib/trainmaster")
-DEFAULT_DATA_DIR = Path("/data")
+WINDOWS = sys.platform == "win32"
+
+
+def _program_data() -> Path:
+    return Path(os.environ.get("PROGRAMDATA") or r"C:\ProgramData")
+
+
+# Windows：状态目录在 C:\ProgramData\trainMaster\state（scripts/install.ps1 的默认值）；没有约定的数据目录，
+# 默认上报状态目录所在磁盘的空间。
+if WINDOWS:
+    DEFAULT_STATE_DIR = _program_data() / "trainMaster" / "state"
+    DEFAULT_DATA_DIR: Path | None = None
+else:
+    DEFAULT_STATE_DIR = Path("/var/lib/trainmaster")
+    DEFAULT_DATA_DIR = Path("/data")
 DEFAULT_SELF_TEST_TIMEOUT = 300.0
 MAX_SELF_TEST_TIMEOUT = 86400.0
 # 一次模型转换（pt → ONNX 子进程）的时间上限；大模型在慢 CPU 上加 nms=True 也只需要几分钟。
@@ -52,13 +66,18 @@ class Config:
     node_token: str | None = None
     node_name: str = "trainer"
     state_dir: Path = DEFAULT_STATE_DIR
-    data_dir: Path = DEFAULT_DATA_DIR
+    data_dir: Path = DEFAULT_DATA_DIR or DEFAULT_STATE_DIR
     torch_variant: str | None = None
     self_test: bool = True
     self_test_timeout: float = DEFAULT_SELF_TEST_TIMEOUT
     export_timeout: float = DEFAULT_EXPORT_TIMEOUT
     inference_image_timeout: float = DEFAULT_INFERENCE_IMAGE_TIMEOUT
     log_level: int = logging.INFO
+    # TM_LOG_FILE：日志另外写入这个文件（按大小轮转）。Windows 的计划任务没有 journald 那样收集输出的地方，
+    # install.ps1 设置为 <状态目录>\logs\trainer.log。
+    log_file: Path | None = None
+    # 读取的配置文件（--env-file，见 envfile.py）；只用于修复建议中的路径，没有使用配置文件时为 None。
+    env_file: Path | None = None
     # 以下三项由 docker-compose.yml 传入，只用于生成修复建议中的命令：
     # 所在的 compose 服务（trainer / trainer-cpu）、make setup 保存的模式（TM_TRAINER_MODE）
     # 与固定的 PyTorch 变体（TM_TRAINER_VARIANT，没有固定时为 None）。
@@ -165,12 +184,24 @@ def _writable_dir(path: Path) -> bool:
     return True
 
 
-def state_dir_candidates(configured: Path, home: str | None = None) -> list[Path]:
-    """状态目录的候选：配置值 → ~/.local/state/trainmaster → 临时目录。healthcheck 也按这个顺序查找心跳文件。"""
+def state_dir_candidates(
+    configured: Path,
+    home: str | None = None,
+    *,
+    windows: bool = WINDOWS,
+    local_appdata: str | None = None,
+) -> list[Path]:
+    """状态目录的候选：配置值 → ~/.local/state/trainmaster（Windows 为 %LOCALAPPDATA%\\trainMaster\\state）
+    → 临时目录。healthcheck 也按这个顺序查找心跳文件。"""
     candidates = [configured]
-    home = home or os.path.expanduser("~")
-    if home and home != "~":
-        candidates.append(Path(home) / ".local" / "state" / "trainmaster")
+    if windows:
+        base = local_appdata if local_appdata is not None else os.environ.get("LOCALAPPDATA", "")
+        if base:
+            candidates.append(Path(base) / "trainMaster" / "state")
+    else:
+        home = home or os.path.expanduser("~")
+        if home and home != "~":
+            candidates.append(Path(home) / ".local" / "state" / "trainmaster")
     uid = os.getuid() if hasattr(os, "getuid") else "user"
     candidates.append(Path(tempfile.gettempdir()) / f"trainmaster-{uid}")
     out: list[Path] = []
@@ -296,6 +327,9 @@ def load(
         except ValueError as exc:
             fail("TM_LOG_LEVEL", exc)
 
+    log_file = Path(_clean(env, "TM_LOG_FILE")) if _clean(env, "TM_LOG_FILE") else None
+    env_file = Path(_clean(env, "TM_ENV_FILE")) if _clean(env, "TM_ENV_FILE") else None
+
     if problems:
         raise ConfigError("；".join(problems))
 
@@ -304,8 +338,9 @@ def load(
         configured_state, home=env.get("HOME"), create=create_state_dir
     )
 
-    data_dir = Path(_clean(env, "TM_DATA_DIR") or DEFAULT_DATA_DIR)
-    if not data_dir.is_dir():
+    raw_data = _clean(env, "TM_DATA_DIR")
+    data_dir = Path(raw_data) if raw_data else DEFAULT_DATA_DIR
+    if data_dir is None or not data_dir.is_dir():
         data_dir = state_dir
 
     return Config(
@@ -320,6 +355,8 @@ def load(
         export_timeout=export_timeout,
         inference_image_timeout=inference_image_timeout,
         log_level=level,
+        log_file=log_file,
+        env_file=env_file,
         trainer_service=service,
         trainer_mode=mode,
         trainer_variant=pinned if pinned and pinned != "auto" else None,

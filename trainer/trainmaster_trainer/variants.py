@@ -2,6 +2,10 @@
 
 规则与 scripts/lib/torch-variant.sh 完全一致（部署脚本、裸机安装脚本用 bash 版本，训练节点用这里的
 Python 版本诊断已安装的 PyTorch 是否匹配本机驱动与显卡）；tests/test_variants.py 会对比两者的结果。
+
+Windows（system="windows"）只有这里的 Python 版本（Windows 安装脚本 install.ps1 通过
+``python -m trainmaster_trainer recommend --json`` 调用）：最低驱动取 min_driver_win 列（Windows 驱动的版本号
+与 Linux 不同），ARM 版 Windows 没有 CUDA 版 PyTorch。bash 版本只用于 Linux。
 """
 
 from __future__ import annotations
@@ -16,11 +20,16 @@ from pathlib import Path
 
 # Jetson 集成显卡（5.3、6.2、7.2、8.7）只能运行为它单独编译的代码。
 JETSON_CCS = frozenset({53, 62, 72, 87})
+WINDOWS = "windows"
+# platform.machine() 的取值：Linux 为 x86_64 / aarch64，macOS 为 arm64，Windows 为 AMD64 / ARM64（大写）。
+X86_64 = ("x86_64", "amd64")
+ARM64 = ("aarch64", "arm64")
+TABLE_COLUMNS = 8
 
 
 @dataclass(frozen=True)
 class Variant:
-    """变体表中的一行。cpu 变体的 cuda、min_driver 为 None，archs 为空。"""
+    """变体表中的一行。cpu 变体的 cuda、min_driver、min_driver_win 为 None，archs 为空。"""
 
     name: str
     torch: str
@@ -29,6 +38,11 @@ class Variant:
     cuda: str | None
     min_driver: str | None
     archs: tuple[int, ...]
+    min_driver_win: str | None = None
+
+    def driver_for(self, system: str | None = None) -> str | None:
+        """该系统上的最低驱动版本：Windows 为 min_driver_win，其它系统为 min_driver。"""
+        return self.min_driver_win if _is_windows(system) else self.min_driver
 
 
 @dataclass(frozen=True)
@@ -48,17 +62,28 @@ def _dash_none(value: str) -> str | None:
     return None if value == "-" else value
 
 
+def _is_windows(system: str | None) -> bool:
+    return (system or "").lower() == WINDOWS
+
+
+def normalize_machine(machine: str | None) -> str:
+    """platform.machine() 的结果转小写（Windows 为 AMD64 / ARM64）；为空时取当前机器。"""
+    return (machine or platform.machine() or "").lower()
+
+
 def parse_table(text: str) -> list[Variant]:
-    """解析变体表：跳过空行与 # 注释行，每行 7 列（空白分隔）。"""
+    """解析变体表：跳过空行与 # 注释行，每行 8 列（空白分隔）。"""
     variants: list[Variant] = []
     for lineno, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         cols = stripped.split()
-        if len(cols) != 7:
-            raise VariantTableError(f"line {lineno}: expected 7 columns, got {len(cols)}")
-        name, torch, torchvision, source, cuda, min_driver, archs = cols
+        if len(cols) != TABLE_COLUMNS:
+            raise VariantTableError(
+                f"line {lineno}: expected {TABLE_COLUMNS} columns, got {len(cols)}"
+            )
+        name, torch, torchvision, source, cuda, min_driver, archs, min_driver_win = cols
         if source not in ("pypi", "pytorch"):
             raise VariantTableError(f"line {lineno}: unknown source {source!r}")
         try:
@@ -74,6 +99,7 @@ def parse_table(text: str) -> list[Variant]:
                 cuda=_dash_none(cuda),
                 min_driver=_dash_none(min_driver),
                 archs=arch_list,
+                min_driver_win=_dash_none(min_driver_win),
             )
         )
     if not variants:
@@ -185,16 +211,19 @@ def select_variant(
     ccs: Iterable[str | int] | str | None,
     machine: str | None = None,
     variants: Sequence[Variant] | None = None,
+    system: str | None = None,
 ) -> Selection:
-    """按驱动版本与显卡计算能力选择 PyTorch 变体（与 tm_select_variant 一致）。
+    """按驱动版本与显卡计算能力选择 PyTorch 变体（Linux 上与 tm_select_variant 一致）。
 
     driver：NVIDIA 驱动版本（如 550.54.15），没有驱动时为 None 或 ""；
     ccs：各显卡的计算能力（"8.6" 或 86），没有显卡时为空；
-    machine：platform.machine()，默认取当前机器。
+    machine：platform.machine()（不区分大小写），默认取当前机器；
+    system：Hardware.platform（"windows" 时按 Windows 的最低驱动选择），默认按 Linux。
     """
     table = list(variants) if variants is not None else list(_default_variants())
     cc_ints = normalize_ccs(ccs)
-    machine = machine or platform.machine()
+    machine = normalize_machine(machine)
+    windows = _is_windows(system)
 
     if not cc_ints:
         return Selection("cpu", "未检测到 NVIDIA 显卡，使用 CPU 版 PyTorch")
@@ -204,7 +233,12 @@ def select_variant(
             "检测到 NVIDIA 显卡，但没有可用的驱动（nvidia-smi 无法运行），使用 CPU 版 PyTorch",
         )
 
-    if machine in ("aarch64", "arm64"):
+    if windows and machine not in X86_64:
+        return Selection(
+            "cpu",
+            f"Windows 上只有 x64（AMD64）电脑有 CUDA 版 PyTorch，当前为 {machine}，使用 CPU 版",
+        )
+    if machine in ARM64:
         # ARM 服务器（Grace Hopper、GB10 等）只有 CUDA 13 的通用构建（sbsa），需要 Ampere 及更新的显卡。
         cu130 = get_variant("cu130", table)
         min_driver = (cu130.min_driver if cu130 else None) or ""
@@ -218,7 +252,7 @@ def select_variant(
             f"ARM 服务器只能使用 CUDA 13 版 PyTorch（需要驱动 ≥ {min_driver} 且显卡为 Ampere 或更新），"
             "当前不满足，使用 CPU 版",
         )
-    if machine not in ("x86_64", "amd64"):
+    if machine not in X86_64:
         return Selection("cpu", f"不支持的平台 {machine}，使用 CPU 版 PyTorch")
 
     total = len(cc_ints)
@@ -229,7 +263,10 @@ def select_variant(
     for v in table:
         if v.name == "cpu":
             continue
-        if not version_ge(driver, v.min_driver or ""):
+        min_driver = v.driver_for(system)
+        if windows and not min_driver:
+            continue  # 表中没有 Windows 的最低驱动：该变体没有 Windows 版
+        if not version_ge(driver, min_driver or ""):
             continue
         driver_ok_any = True
         unsupported = tuple(cc for cc in cc_ints if not cc_covered(cc, v.archs))
@@ -252,7 +289,7 @@ def select_variant(
         )
     if not driver_ok_any:
         cu118 = get_variant("cu118", table)
-        oldest = cu118.min_driver if cu118 and cu118.min_driver else ""
+        oldest = (cu118.driver_for(system) if cu118 else None) or ""
         return Selection(
             "cpu",
             f"驱动 {driver} 过旧：CUDA 版 PyTorch 至少需要驱动 {oldest}（推荐升级到 580 或更新），使用 CPU 版",
@@ -264,39 +301,46 @@ def select_variant(
 
 
 def lowest_cuda_driver(
-    machine: str | None = None, variants: Sequence[Variant] | None = None
+    machine: str | None = None,
+    variants: Sequence[Variant] | None = None,
+    system: str | None = None,
 ) -> str | None:
     """本机架构上 CUDA 版 PyTorch 最低需要的驱动版本：驱动低于它时 select_variant 只能选择 cpu。
 
-    x86_64：变体表中最低的 min_driver；ARM 服务器：cu130 的（只有它有 ARM 版，见 select_variant）；
-    其它平台没有 CUDA 版 PyTorch，为 None。machine 默认取当前机器。
+    x86_64：变体表中最低的最低驱动；ARM 服务器：cu130 的（只有它有 ARM 版，见 select_variant）；
+    其它平台（以及 ARM 版 Windows）没有 CUDA 版 PyTorch，为 None。machine 默认取当前机器；
+    system 为 "windows" 时取 Windows 的最低驱动（min_driver_win）。
     """
     table = list(variants) if variants is not None else list(_default_variants())
-    machine = machine or platform.machine()
-    if machine in ("aarch64", "arm64"):
+    machine = normalize_machine(machine)
+    if machine in ARM64 and not _is_windows(system):
         cu130 = get_variant("cu130", table)
         return cu130.min_driver if cu130 else None
-    if machine not in ("x86_64", "amd64"):
+    if machine not in X86_64:
         return None
     lowest: str | None = None
     for v in table:
-        if v.cuda and v.min_driver and (lowest is None or not version_ge(v.min_driver, lowest)):
-            lowest = v.min_driver
+        min_driver = v.driver_for(system)
+        if v.cuda and min_driver and (lowest is None or not version_ge(min_driver, lowest)):
+            lowest = min_driver
     return lowest
 
 
-def min_driver_for_cuda(cuda: str | None, variants: Sequence[Variant] | None = None) -> str | None:
-    """某个 CUDA 版本的 PyTorch 需要的最低驱动：先找 cuda 完全相同的变体，再找同一主版本的变体。"""
+def min_driver_for_cuda(
+    cuda: str | None, variants: Sequence[Variant] | None = None, system: str | None = None
+) -> str | None:
+    """某个 CUDA 版本的 PyTorch 需要的最低驱动：先找 cuda 完全相同的变体，再找同一主版本的变体。
+    system 为 "windows" 时取 Windows 的最低驱动。"""
     if not cuda:
         return None
     table = variants if variants is not None else _default_variants()
     for v in table:
-        if v.cuda == cuda and v.min_driver:
-            return v.min_driver
+        if v.cuda == cuda and v.driver_for(system):
+            return v.driver_for(system)
     major = cuda.split(".", 1)[0]
     for v in table:
-        if v.cuda and v.cuda.split(".", 1)[0] == major and v.min_driver:
-            return v.min_driver
+        if v.cuda and v.cuda.split(".", 1)[0] == major and v.driver_for(system):
+            return v.driver_for(system)
     return None
 
 

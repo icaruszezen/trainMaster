@@ -15,7 +15,6 @@ import json
 import logging
 import os
 import platform
-import signal
 import subprocess
 import sys
 import threading
@@ -27,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import issues as issues_mod
+from . import procs
 
 if TYPE_CHECKING:
     from .config import Config
@@ -408,6 +408,11 @@ def child_env(
     env["YOLO_CONFIG_DIR"] = str(state_dir / "ultralytics")
     env.setdefault("YOLO_VERBOSE", "False")
     env["PYTHONUNBUFFERED"] = "1"
+    if procs.WINDOWS:
+        # 子进程的 stderr（失败时作为详情）与文本文件都用 UTF-8：管道默认使用系统的 ANSI 代码页（如 GBK），
+        # 中文的错误信息（如 WinError 的说明）按 UTF-8 解码时会变成乱码。
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
     if self_test is not None:
         env["TM_SELF_TEST"] = "true" if self_test else "false"
     # CUDA 默认把最快的显卡排在前面；按 PCI 总线顺序编号才与 NVML / nvidia-smi（页面上的 N 号显卡）一致。
@@ -433,6 +438,8 @@ def deployment_from(cfg: Config) -> issues_mod.Deployment:
         python=sys.executable or "python3",
         prefix=sys.prefix,
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
+        env_file=str(cfg.env_file) if cfg.env_file else None,
+        program_data=os.environ.get("PROGRAMDATA") or None,
     )
 
 
@@ -487,14 +494,15 @@ class EnvironmentDetector:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env=child_env(self.state_dir, self.self_test),
-                    start_new_session=True,  # 超时或停止时连同它启动的进程一起结束
+                    **procs.popen_kwargs(),  # 超时或停止时连同它启动的进程一起结束
                 )
+                procs.attach(self._proc)
             proc = self._proc
         except OSError as exc:
             return failure_raw(f"无法启动环境检测进程：{exc}")
 
         try:
-            stdout, stderr = proc.communicate(timeout=self.timeout)
+            stdout, stderr = procs.communicate(proc, self.timeout)  # Windows 上可以被 Ctrl+C 打断
         except BaseException as exc:
             if not isinstance(exc, subprocess.TimeoutExpired):
                 _kill(proc)  # Ctrl+C 等：不留下孤儿子进程
@@ -518,13 +526,17 @@ class EnvironmentDetector:
 
         if self._cancelled:
             return failure_raw("环境检测已取消", _tail(stderr), elapsed)
-        if proc.returncode < 0:
-            try:
-                name = signal.Signals(-proc.returncode).name
-            except ValueError:
-                name = str(-proc.returncode)
+        name = procs.signal_name(proc.returncode)
+        if name is not None:
             return failure_raw(
                 f"环境检测进程被信号 {name} 终止（可能是内存不足或驱动崩溃）",
+                _tail(stderr),
+                elapsed,
+            )
+        crash = procs.windows_crash(proc.returncode)
+        if crash is not None:
+            return failure_raw(
+                f"环境检测进程崩溃（{crash}；可能是驱动、显卡或 DLL 的问题）",
                 _tail(stderr),
                 elapsed,
             )
@@ -566,26 +578,9 @@ class EnvironmentDetector:
 
 
 def _kill(proc: subprocess.Popen[bytes]) -> None:
-    """结束子进程所在的整个进程组：先 SIGTERM，2 秒后仍未退出则 SIGKILL。"""
-    if proc.poll() is not None:
-        return
-    _signal_group(proc, signal.SIGTERM)
-    try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        _signal_group(proc, signal.SIGKILL)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=2)
-
-
-def _signal_group(proc: subprocess.Popen[bytes], sig: int) -> None:
-    try:
-        os.killpg(proc.pid, sig)
-    except ProcessLookupError:
-        pass
-    except PermissionError:  # 不应发生（子进程是本进程启动的），退回只结束子进程本身
-        with contextlib.suppress(ProcessLookupError):
-            proc.send_signal(sig)
+    """结束子进程及它启动的全部进程（Linux：进程组先 SIGTERM，2 秒后 SIGKILL；Windows：结束 Job 对象，
+    见 procs.py）。"""
+    procs.kill(proc)
 
 
 if __name__ == "__main__":

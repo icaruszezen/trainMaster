@@ -284,6 +284,22 @@ describe("hintLayout", () => {
         "改用 PyTorch 变体 cu128 重新安装（在 trainMaster 仓库目录中运行）：`sudo trainer/scripts/install.sh --variant cu128`"
       ).command
     ).toBe("sudo trainer/scripts/install.sh --variant cu128")
+    // Windows nodes suggest a PowerShell command: quotes, brackets and
+    // parentheses stay as they are.
+    expect(
+      layout(
+        "改用 PyTorch 变体 cu126 重新安装（在管理员 PowerShell 中运行）：`& ([scriptblock]::Create((irm 'http://192.168.1.10:8080/api/v1/compute/windows/install.ps1'))) -Variant cu126`"
+      )
+    ).toEqual({
+      text: [
+        {
+          text: "改用 PyTorch 变体 cu126 重新安装（在管理员 PowerShell 中运行）：",
+          code: false,
+        },
+      ],
+      command:
+        "& ([scriptblock]::Create((irm 'http://192.168.1.10:8080/api/v1/compute/windows/install.ps1'))) -Variant cu126",
+    })
     // Trailing spaces after the command do not count as text after it.
     expect(layout("然后运行 `make up`  ")).toEqual({
       text: [{ text: "然后运行 ", code: false }],

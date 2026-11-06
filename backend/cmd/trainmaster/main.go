@@ -24,6 +24,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/review"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/trainerpkg"
 	"github.com/icaruszezen/trainmaster/backend/internal/web"
 )
 
@@ -122,14 +123,16 @@ func run() error {
 		Compute: compute.NewService(compute.Options{
 			DB: db.Pool, Logger: log, HeartbeatInterval: cfg.NodeHeartbeatInterval,
 		}),
-		Models:           models,
-		Reviews:          reviews,
-		ReviewerTool:     cfg.ReviewerTool,
-		Host:             host,
-		NodeToken:        cfg.NodeToken,
-		LocalTrainerMode: cfg.TrainerMode,
+		Models:            models,
+		Reviews:           reviews,
+		ReviewerTool:      cfg.ReviewerTool,
+		TrainerPackageDir: cfg.TrainerPackageDir,
+		Host:              host,
+		NodeToken:         cfg.NodeToken,
+		LocalTrainerMode:  cfg.TrainerMode,
 	}
 	logReviewerTool(log, cfg.ReviewerTool)
+	logTrainerPackage(log, cfg.TrainerPackageDir)
 	if cfg.WebDir != "" {
 		h, err := web.New(cfg.WebDir)
 		if err != nil {
@@ -211,6 +214,23 @@ func logReviewerTool(log *slog.Logger, path string) {
 		return
 	}
 	log.Info("local reviewer bundled", "path", path, "size_bytes", fi.Size())
+}
+
+// logTrainerPackage reports whether the training node for Windows
+// computers can be installed from the platform: its install script and
+// package (TM_TRAINER_PACKAGE_DIR). Like for the local reviewer, a
+// directory that is missing or incomplete is no error, the downloads are
+// just unavailable; the API looks at it again on every request.
+func logTrainerPackage(log *slog.Logger, dir string) {
+	if dir == "" {
+		log.Info("no Windows training node installer bundled (TM_TRAINER_PACKAGE_DIR is not set)")
+		return
+	}
+	if err := trainerpkg.New(dir).Check(); err != nil {
+		log.Warn("Windows training node installer not found or incomplete; its downloads are unavailable", "dir", dir, "err", err)
+		return
+	}
+	log.Info("Windows training node installer bundled", "dir", dir)
 }
 
 func newLogger(cfg *config.Config) *slog.Logger {

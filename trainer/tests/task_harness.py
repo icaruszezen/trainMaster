@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from fake_platform import FakePlatform
+from fakes import WINDOWS
 
 from trainmaster_trainer.client import Client
 from trainmaster_trainer.tasks import TaskWorker
@@ -69,12 +70,43 @@ def script(tmp_path: Path, body: str, name: str = "child.py") -> list[str]:
     return [sys.executable, str(path)]
 
 
-def gone(pid: int) -> bool:
+def _alive(pid: int) -> bool:
+    if WINDOWS:
+        # Windows 上 os.kill(pid, 0) 是向控制台进程组发送 Ctrl+C（signal.CTRL_C_EVENT 为 0），可能中断测试进程
+        # 本身，不能用来检查进程。用 OpenProcess 打开它：已经结束（只是句柄还没关闭）的进程处于有信号状态。
+        import ctypes
+        from ctypes import wintypes
+
+        synchronize, wait_object_0 = 0x00100000, 0
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k32.OpenProcess(synchronize, False, pid)
+        if not handle:  # ERROR_INVALID_PARAMETER：没有这个进程
+            return False
+        try:
+            return k32.WaitForSingleObject(handle, 0) != wait_object_0
+        finally:
+            k32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return True
-    return False
+        return False
+    return True
+
+
+def gone(pid: int, timeout: float = 5.0) -> bool:
+    """进程 pid 已经结束（最多等待 timeout 秒：Windows 上结束 Job 中的进程是异步的，在 venv 中运行时
+    脚本的 PID 是 venv 启动器的子进程，训练节点只等待了启动器）。"""
+    deadline = time.monotonic() + timeout
+    while _alive(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
 
 
 class Run:

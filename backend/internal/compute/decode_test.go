@@ -191,6 +191,46 @@ func TestDecodeRegister(t *testing.T) {
 	}
 }
 
+func TestDecodeWindowsHardware(t *testing.T) {
+	// The hardware of a Windows node: no container, no /dev/shm and no
+	// cgroup limits.
+	in, err := DecodeRegister([]byte(`{"node_key": "k", "name": "win-01", "hardware": {
+		"os": "Windows 11 专业版 23H2", "kernel": "10.0.22631.4317", "arch": "AMD64", "platform": "windows",
+		"in_container": false, "cpu": {"logical_cores": 16, "limit_cores": null},
+		"memory": {"total_bytes": 34359738368, "limit_bytes": null}, "shm_bytes": null,
+		"gpus": [], "gpu_detection": {"method": "nvml", "error": null, "host_gpu_count": null}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Hardware == nil {
+		t.Fatalf("input = %+v", in)
+	}
+	h := normalizeHardware(*in.Hardware)
+	if h.Platform != Value("windows") || h.OS != Value("Windows 11 专业版 23H2") || h.Kernel != Value("10.0.22631.4317") ||
+		h.Arch != Value("AMD64") || h.InContainer || h.ShmBytes.Valid || h.CPU.LimitCores.Valid || h.Memory.LimitBytes.Valid {
+		t.Errorf("hardware = %+v", h)
+	}
+	data, err := json.Marshal(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"arch":"AMD64","platform":"windows","in_container":false`) {
+		t.Errorf("platform should follow arch: %s", data)
+	}
+
+	// Agents before 0.4.0 send no platform; a value of the wrong type is
+	// unknown as well.
+	for _, hw := range []string{`{"os": "Ubuntu"}`, `{"platform": null}`, `{"platform": 7}`, `{"platform": ["windows"]}`, `{"platform": {}}`} {
+		in, err := DecodeHeartbeat([]byte(`{"node_key": "k", "hardware": ` + hw + `}`))
+		if err != nil || in.Hardware == nil {
+			t.Fatalf("DecodeHeartbeat(%s) = %+v, %v", hw, in, err)
+		}
+		if p := normalizeHardware(*in.Hardware).Platform; p.Valid {
+			t.Errorf("hardware %s: platform = %+v, want null", hw, p)
+		}
+	}
+}
+
 func TestDecodeRejectsNonJSON(t *testing.T) {
 	for _, body := range []string{``, `{`, `{"node_key": "k"} x`, `{"a": 1,}`, `null`, `[]`, `"x"`, `5`, ` `} {
 		if _, err := DecodeRegister([]byte(body)); err == nil {

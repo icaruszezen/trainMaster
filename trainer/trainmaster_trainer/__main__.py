@@ -1,11 +1,15 @@
-"""命令行入口：python -m trainmaster_trainer [run|probe|selftest|export|infer|healthcheck]
+"""命令行入口：python -m trainmaster_trainer [run|probe|selftest|recommend|export|infer|healthcheck]
 
 run          注册到平台并持续上报心跳、执行平台的任务（默认；需要 TM_SERVER_URL）
 probe        打印完整的检测报告（硬件、CUDA 环境、实时指标，JSON），不连接平台，便于排障
 selftest     检测 CUDA / PyTorch / YOLO 环境并执行自检；--json 输出 Environment
+recommend    检测显卡与驱动，给出推荐的 PyTorch 变体（不需要已安装 PyTorch；Windows 安装脚本使用）
 export       在本机把 pt 转换为 ONNX（与平台的转换任务使用同一个子进程），不连接平台，便于排障
 infer        在本机用 pt 识别图片（与平台的审图识别任务使用同一个子进程），不连接平台，便于排障
 healthcheck  最近一次心跳是否及时（Docker HEALTHCHECK 使用）
+
+各命令都接受 --env-file FILE：先从配置文件（KEY=VALUE，见 envfile.py）读取设置，覆盖同名的环境变量。
+Windows 的计划任务用它读取 trainer.env（Linux 由 systemd 的 EnvironmentFile 读取）。
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import logging.handlers
 import os
 import signal
 import sys
@@ -20,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from . import __version__, envfile
 from . import config as config_mod
 
 log = logging.getLogger("trainmaster_trainer")
@@ -34,14 +39,103 @@ _STATUS_TEXT = {
 _SELF_TEST_TEXT = {"passed": "通过", "failed": "失败", "skipped": "跳过"}
 
 
-def setup_logging(level: int) -> None:
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
+LOG_FILE_MAX_BYTES = 10 << 20
+LOG_FILE_BACKUPS = 5
+LOG_ROTATE_RETRY = 60.0
+
+
+class LogFileHandler(logging.handlers.RotatingFileHandler):
+    """TM_LOG_FILE：按大小轮转的日志文件（10 MiB × 6 个）。
+
+    Windows 上日志文件被其它程序打开（如 Get-Content -Wait 查看日志）时可能无法改名：这次不轮转，继续写入
+    当前文件，1 分钟后再试（RotatingFileHandler 本身会在每条日志都重试并丢弃这条日志）。先改名当前文件、
+    再移动备份：RotatingFileHandler 先移动备份、最后才改名当前文件，失败时每次重试都会删掉一个最旧的备份。
+    """
+
+    def __init__(self, path: str | Path, clock: Any = time.monotonic) -> None:
+        super().__init__(
+            path,
+            maxBytes=LOG_FILE_MAX_BYTES,
+            backupCount=LOG_FILE_BACKUPS,
+            encoding="utf-8",
+            delay=True,
+        )
+        self._clock = clock
+        self._retry_at = 0.0
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:  # noqa: N802 -- 覆盖标准库的方法
+        if self._clock() < self._retry_at:
+            return False
+        return bool(super().shouldRollover(record))
+
+    def doRollover(self) -> None:  # noqa: N802
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        try:
+            self._rotate_files()
+        except OSError:
+            self._retry_at = self._clock() + LOG_ROTATE_RETRY
+        if self.stream is None:
+            self.stream = self._open()
+
+    def _rotate_files(self) -> None:
+        base = self.baseFilename
+        pending = base + ".rotating"
+        # 上次改名了当前文件、但没能移动备份时，先完成上次的轮转（当前文件下次再轮转）
+        if not os.path.exists(pending):
+            self.rotate(base, pending)
+        # 只移动从 .1 开始连续的备份：上次移动到一半失败时，已经移好的备份不再被覆盖（只有备份都在时
+        # 最旧的一个被替换）
+        free = next(
+            (i for i in range(1, self.backupCount) if not os.path.exists(self._backup(i))),
+            self.backupCount,
+        )
+        for i in range(free - 1, 0, -1):
+            os.replace(self._backup(i), self._backup(i + 1))
+        if os.path.exists(pending):
+            os.replace(pending, self._backup(1))
+
+    def _backup(self, i: int) -> str:
+        return self.rotation_filename(f"{self.baseFilename}.{i}")
+
+
+def setup_logging(level: int, log_file: Path | None = None) -> None:
+    """日志写到 stderr（没有控制台时省略），设置了 log_file 时同时写入该文件（按大小轮转）。"""
+    handlers: list[logging.Handler] = []
+    if sys.stderr is not None:
+        handlers.append(logging.StreamHandler(sys.stderr))
+    problem = None
+    if log_file is not None:
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            handler = LogFileHandler(log_file)
+            handler.stream = handler._open()  # 现在就打开：无法写入时立即报告
+            handlers.append(handler)
+        except OSError as exc:
+            problem = exc
     logging.basicConfig(
-        stream=sys.stderr,
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-        force=True,
+        level=level, format=LOG_FORMAT, datefmt=LOG_DATEFMT, handlers=handlers, force=True
     )
+    if problem is not None:
+        log.warning("cannot write log file %s: %s", log_file, problem)
+
+
+def apply_env_file(path: str | None) -> bool:
+    """--env-file：读取配置文件并写入环境变量（覆盖同名的已有值），TM_ENV_FILE 记录其绝对路径
+    （修复建议中的命令使用）。出错时打印原因并返回 False。"""
+    if not path:
+        return True
+    try:
+        values = envfile.load(path)
+    except envfile.EnvFileError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return False
+    envfile.apply(values)
+    os.environ["TM_ENV_FILE"] = str(Path(path).absolute())
+    return True
 
 
 def _load_config(require_server: bool = False) -> config_mod.Config | None:
@@ -60,7 +154,7 @@ def cmd_run() -> int:
     cfg = _load_config(require_server=True)
     if cfg is None:
         return 2
-    setup_logging(cfg.log_level)
+    setup_logging(cfg.log_level, cfg.log_file)
     from .agent import Agent
 
     agent = Agent(cfg)
@@ -71,6 +165,8 @@ def cmd_run() -> int:
 
     signal.signal(signal.SIGTERM, handle)
     signal.signal(signal.SIGINT, handle)
+    if hasattr(signal, "SIGBREAK"):  # Windows 控制台的 Ctrl+Break
+        signal.signal(signal.SIGBREAK, handle)
     return agent.run()
 
 
@@ -188,6 +284,122 @@ def cmd_selftest(as_json: bool) -> int:
     else:
         print(format_environment(env))
     return 1 if env.get("status") == "error" else 0
+
+
+def recommend_report(variant: str | None = None) -> dict[str, Any]:
+    """recommend 的结果：本机显卡与驱动、推荐的变体，以及要安装的变体（variant，默认为推荐的）。
+
+    只检测显卡（NVML，失败或没有安装 nvidia-ml-py 时用 nvidia-smi），不导入 torch 与 psutil：安装脚本在
+    创建虚拟环境之前，用系统的 Python 加上 PYTHONPATH 就能运行。Windows 上没有检测到显卡时统计 PCI 总线
+    上的 NVIDIA 显卡（提示“有显卡但没有驱动”）。variant 不在变体表中时抛出 ValueError（中文说明）。
+    """
+    import platform as platform_mod
+
+    from . import gpu as gpu_mod
+    from . import issues, winsys
+    from . import variants as variants_mod
+
+    table = variants_mod.load_variants()
+    names = [v.name for v in table]
+    if variant and variants_mod.get_variant(variant, table) is None:
+        raise ValueError(f"未知的变体 {variant}（可选：{' '.join(names)}）")
+    windows = sys.platform == "win32"
+    # 与 hardware.platform_name 相同（hardware 依赖 psutil，这里不导入）
+    system = "windows" if windows else (platform_mod.system().lower() or None)
+    gp = gpu_mod.probe(windows=windows)
+    gp.sampler.close()
+    pci_gpu_count = winsys.pci_gpu_count() if windows and not gp.gpus else None
+    hw = {
+        "arch": platform_mod.machine() or None,
+        "platform": system,
+        "gpus": gp.gpus,
+        "gpu_driver": gp.driver,
+    }
+    selection = issues.recommend(hw, table)
+    chosen = variants_mod.get_variant(variant or selection.variant, table)
+    assert chosen is not None
+    return {
+        "platform": system,
+        "arch": hw["arch"],
+        "driver": (gp.driver or {}).get("driver_version"),
+        "gpus": [
+            {
+                "index": g.get("index"),
+                "name": g.get("name"),
+                "compute_capability": g.get("compute_capability"),
+                "memory_total_bytes": g.get("memory_total_bytes"),
+            }
+            for g in gp.gpus
+        ],
+        "cc_assumed": any(not g.get("compute_capability") for g in gp.gpus),
+        "assumed_cc": issues.ASSUMED_CC,
+        "detection": gp.detection,
+        "pci_gpu_count": pci_gpu_count,
+        "recommended": {
+            "variant": selection.variant,
+            "reason": selection.reason,
+            "unsupported": [f"{cc // 10}.{cc % 10}" for cc in selection.unsupported],
+        },
+        "variant": {
+            "name": chosen.name,
+            "torch": chosen.torch,
+            "torchvision": chosen.torchvision,
+            "source": chosen.source,
+            "cuda": chosen.cuda,
+            "min_driver": chosen.driver_for(system),
+        },
+        "variants": names,
+    }
+
+
+def format_recommend(report: dict[str, Any]) -> str:
+    """recommend 的中文摘要（与 install.sh 的“检测结果”相同的内容）。"""
+    lines = [f"平台：{report['platform']} {report.get('arch') or ''}".rstrip()]
+    gpus = report.get("gpus") or []
+    if gpus:
+        lines.append(f"显卡：{len(gpus)} 块")
+        for g in gpus:
+            mem = g.get("memory_total_bytes")
+            facts = [f"显存 {mem / (1 << 30):.0f} GiB"] if mem else []
+            facts.append(
+                f"计算能力 {g.get('compute_capability') or report['assumed_cc'] + '（估计）'}"
+            )
+            lines.append(f"  [{g.get('index')}] {g.get('name')}（{'，'.join(facts)}）")
+        lines.append(f"驱动：{report.get('driver') or '未知'}")
+    elif report.get("pci_gpu_count"):
+        lines.append(
+            f"显卡：检测到 {report['pci_gpu_count']} 块 NVIDIA 显卡，但没有可用的驱动"
+            "（安装 NVIDIA 显卡驱动后重新运行安装脚本）"
+        )
+    else:
+        # 没有驱动库（NVML Shared Library Not Found 等）在没有显卡的电脑上是正常的，不显示
+        error = (report.get("detection") or {}).get("error") or ""
+        shown = error if error and "not found" not in error.lower() else ""
+        lines.append("显卡：未检测到 NVIDIA 显卡" + (f"（{shown}）" if shown else ""))
+    rec = report["recommended"]
+    lines.append(f"推荐的 PyTorch 变体：{rec['variant']} —— {rec['reason']}")
+    chosen = report["variant"]
+    if chosen["name"] != rec["variant"]:
+        lines.append(f"使用手动指定的变体：{chosen['name']}")
+    return "\n".join(lines)
+
+
+def cmd_recommend(as_json: bool, variant: str | None) -> int:
+    cfg_level = logging.WARNING
+    if os.environ.get("TM_LOG_LEVEL", "").strip().lower() == "debug":
+        cfg_level = logging.DEBUG
+    setup_logging(cfg_level)
+    try:
+        report = recommend_report(variant)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if as_json:
+        # 只输出 ASCII：Windows PowerShell 按控制台代码页解码子进程的输出，中文会变成乱码
+        print(json.dumps(report, ensure_ascii=True, indent=2))
+    else:
+        print(format_recommend(report))
+    return 0
 
 
 _POSTPROCESS_TEXT = {
@@ -438,6 +650,9 @@ def cmd_healthcheck() -> int:
     return 0 if ok else 1
 
 
+ENV_FILE_HELP = "先从配置文件（每行 KEY=VALUE，如 trainer.env）读取设置，覆盖同名的环境变量"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m trainmaster_trainer",
@@ -445,13 +660,33 @@ def build_parser() -> argparse.ArgumentParser:
         "执行平台的任务（模型的 ONNX 转换、审图识别）。",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--env-file", metavar="FILE", help=ENV_FILE_HELP)
+    # 子命令也接受 --env-file（写在命令之后）；没有指定时保留命令之前的值（SUPPRESS）。
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--env-file", metavar="FILE", default=argparse.SUPPRESS, help=ENV_FILE_HELP)
     sub = parser.add_subparsers(dest="command", metavar="命令")
-    sub.add_parser("run", help="注册到平台并持续上报心跳、执行平台的任务（默认）")
-    sub.add_parser("probe", help="打印硬件、CUDA 环境与实时指标（JSON），不连接平台")
-    selftest = sub.add_parser("selftest", help="检测 CUDA / PyTorch / YOLO 环境并执行自检")
+    sub.add_parser("run", parents=[common], help="注册到平台并持续上报心跳、执行平台的任务（默认）")
+    sub.add_parser(
+        "probe", parents=[common], help="打印硬件、CUDA 环境与实时指标（JSON），不连接平台"
+    )
+    selftest = sub.add_parser(
+        "selftest", parents=[common], help="检测 CUDA / PyTorch / YOLO 环境并执行自检"
+    )
     selftest.add_argument("--json", action="store_true", help="以 JSON 输出检测结果（Environment）")
+    recommend = sub.add_parser(
+        "recommend",
+        parents=[common],
+        help="检测显卡与驱动，给出推荐的 PyTorch 变体（安装脚本使用）",
+        description="检测本机的 NVIDIA 显卡与驱动（不需要已安装 PyTorch），按与部署脚本相同的规则推荐 "
+        "PyTorch 变体，并给出要安装的 torch / torchvision 版本。",
+    )
+    recommend.add_argument(
+        "--variant", metavar="VARIANT", help="手动指定变体（cu130、cu126 …、cpu），默认为推荐的变体"
+    )
+    recommend.add_argument("--json", action="store_true", help="以 JSON 输出（安装脚本使用）")
     export = sub.add_parser(
         "export",
+        parents=[common],
         help="在本机把 pt 转换为 ONNX（与平台的转换任务相同），不连接平台",
         description="在本机把 Ultralytics 的 pt 模型转换为 ONNX（在 CPU 上，离线），打印转换结果。"
         "与平台的转换任务使用同一个子进程，便于排查转换失败的原因。",
@@ -480,6 +715,7 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--json", action="store_true", help="以 JSON 输出转换结果")
     infer = sub.add_parser(
         "infer",
+        parents=[common],
         help="在本机用 pt 识别图片（与平台的审图识别相同），不连接平台",
         description="在本机用 Ultralytics 的 pt 模型识别图片（有 CUDA 时在 cuda:0 上，离线），打印检测框。"
         "与平台的审图识别任务使用同一个子进程（安全加载模型、按存储的像素方向读取图片），"
@@ -517,12 +753,30 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--device", help="设备（cpu、cuda:0 …），默认有 CUDA 时为 cuda:0，否则 cpu")
     infer.add_argument("--task", help="模型任务（detect、segment 等），默认从模型文件读取")
     infer.add_argument("--json", action="store_true", help="以 JSON 输出识别结果")
-    sub.add_parser("healthcheck", help="检查最近一次心跳是否及时（Docker HEALTHCHECK 使用）")
+    sub.add_parser(
+        "healthcheck",
+        parents=[common],
+        help="检查最近一次心跳是否及时（Docker HEALTHCHECK 使用）",
+    )
     return parser
 
 
+def tolerate_unencodable_output(windows: bool = sys.platform == "win32") -> None:
+    """Windows 上输出重定向到管道或文件时按系统的代码页编码（英文系统为 cp1252，没有中文），打印中文会抛出
+    UnicodeEncodeError，命令在做完事情之后失败。改为把无法编码的字符写成 \\uXXXX。控制台、
+    PYTHONIOENCODING=utf-8（install.ps1 这样运行）与中文系统的代码页都能编码中文，不受影响。"""
+    if not windows:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if getattr(stream, "errors", None) == "strict" and hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    tolerate_unencodable_output()
     args = build_parser().parse_args(argv)
+    if not apply_env_file(args.env_file):
+        return 2
     command = args.command or "run"
     if command == "run":
         return cmd_run()
@@ -530,6 +784,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_probe()
     if command == "selftest":
         return cmd_selftest(args.json)
+    if command == "recommend":
+        return cmd_recommend(args.json, args.variant)
     if command == "export":
         return cmd_export(args)
     if command == "infer":

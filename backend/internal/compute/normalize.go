@@ -36,6 +36,7 @@ const (
 var (
 	nodeKeyPattern           = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 	computeCapabilityPattern = regexp.MustCompile(`^[0-9]{1,2}\.[0-9]{1,2}$`)
+	platformPattern          = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
 )
 
 // validateNodeKey checks the node_key of a registration or heartbeat.
@@ -165,6 +166,7 @@ func normalizeHardware(h Hardware) Hardware {
 		OS:          optText(h.OS, maxText),
 		Kernel:      optText(h.Kernel, maxText),
 		Arch:        optText(h.Arch, maxText),
+		Platform:    normalizePlatform(h.Platform),
 		InContainer: h.InContainer,
 		CPU: HardwareCPU{
 			Model:         optText(h.CPU.Model, maxText),
@@ -217,6 +219,21 @@ func normalizeHardware(h Hardware) Hardware {
 	}
 	out.GPUs = byIndex(out.GPUs, func(g GPU) Null[int64] { return g.Index })
 	return out
+}
+
+// normalizePlatform keeps a reported platform as a short lower-case name
+// ("Windows " is "windows"); anything that does not look like the name of
+// an operating system is unknown. The frontend compares it with
+// "windows", so it must not differ from what the agent meant by case or
+// spaces.
+func normalizePlatform(n Null[string]) Null[string] {
+	if !n.Valid {
+		return n
+	}
+	if s := strings.ToLower(strings.TrimSpace(n.V)); platformPattern.MatchString(s) {
+		return Value(s)
+	}
+	return Null[string]{}
 }
 
 // byIndex drops the GPUs without a valid index (metrics are matched to

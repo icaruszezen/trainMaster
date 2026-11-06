@@ -21,6 +21,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Spinner } from "@/components/ui/spinner"
+import { CommandBlock } from "@/features/training/command-block"
 import {
   cacheNode,
   deleteNode,
@@ -29,8 +30,16 @@ import {
   refreshNodes,
   type ComputeNode,
 } from "@/features/training/compute-api"
-import { isOnline, isProbing } from "@/features/training/compute-status"
+import {
+  isOnline,
+  isProbing,
+  isWindowsNode,
+} from "@/features/training/compute-status"
 import { ApiError } from "@/lib/api"
+
+/** 永久停止 Windows 节点：停止并删除开机自启的计划任务（需要管理员）。 */
+const WINDOWS_STOP_COMMAND =
+  "Stop-ScheduledTask -TaskName trainmaster-trainer; Unregister-ScheduledTask -TaskName trainmaster-trainer -Confirm:$false"
 
 /** 请求节点重新检测硬件与 CUDA 环境；节点在下一次心跳时开始检测。 */
 export function useProbeNode() {
@@ -186,18 +195,36 @@ function DeleteNodeForm({
         <AlertDialogTitle className="break-all">
           删除节点“{node.name}”？
         </AlertDialogTitle>
-        <AlertDialogDescription>
-          只删除平台中的节点记录与最近的指标历史，不影响那台机器上的文件。只要那台机器上的
-          trainer
-          服务还在运行，恢复连接后节点就会自动重新注册。要永久移除，先在那台机器上停止训练节点：Docker
-          部署运行 <Command>docker compose stop trainer</Command>（CPU 节点为{" "}
-          <Command>trainer-cpu</Command>；平台所在的机器上之后的{" "}
-          <Command>make up</Command> 会再次启动它，改用{" "}
-          <Command>make up SETUP_ARGS="--mode off"</Command>
-          ，以后要恢复时运行 <Command>make up SETUP_ARGS="--mode auto"</Command>
-          ），直接安装的运行{" "}
-          <Command>sudo systemctl disable --now trainmaster-trainer</Command>。
-        </AlertDialogDescription>
+        {isWindowsNode(node) ? (
+          // Windows 节点以计划任务运行，没有 Docker 部署。命令较长，与以命令
+          // 结尾的修复建议一样单独一行显示，可以复制。
+          <AlertDialogDescription asChild>
+            <div className="grid w-full min-w-0 gap-2">
+              <p>
+                只删除平台中的节点记录与最近的指标历史，不影响那台电脑上的文件。只要那台电脑上的
+                trainer
+                服务还在运行，恢复连接后节点就会自动重新注册。要永久移除，先在那台电脑上以管理员身份在
+                PowerShell 中停止并删除计划任务：
+              </p>
+              <CommandBlock command={WINDOWS_STOP_COMMAND} />
+            </div>
+          </AlertDialogDescription>
+        ) : (
+          <AlertDialogDescription>
+            只删除平台中的节点记录与最近的指标历史，不影响那台机器上的文件。只要那台机器上的
+            trainer
+            服务还在运行，恢复连接后节点就会自动重新注册。要永久移除，先在那台机器上停止训练节点：Docker
+            部署运行 <Command>docker compose stop trainer</Command>（CPU 节点为{" "}
+            <Command>trainer-cpu</Command>；平台所在的机器上之后的{" "}
+            <Command>make up</Command> 会再次启动它，改用{" "}
+            <Command>make up SETUP_ARGS="--mode off"</Command>
+            ，以后要恢复时运行{" "}
+            <Command>make up SETUP_ARGS="--mode auto"</Command>
+            ），直接安装的运行{" "}
+            <Command>sudo systemctl disable --now trainmaster-trainer</Command>
+            。
+          </AlertDialogDescription>
+        )}
       </AlertDialogHeader>
       {online && (
         <p role="alert" className="text-sm text-destructive">

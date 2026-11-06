@@ -98,6 +98,8 @@ class FakePlatform:
         # 返回 DROP 时断开连接。
         self.hooks: dict[str, Callable[[dict[str, Any] | None, dict[str, Any]], Any]] = {}
         self.free_bytes: int | None = None
+        # 不需要令牌的下载（GET 路径 → (内容, Content-Type)），如 Windows 的安装脚本与安装包
+        self.files: dict[str, tuple[bytes, str]] = {}
         # 审图识别任务（review_inference）
         self.reviews: dict[int, dict[str, Any]] = {}
         self._next_review = 12
@@ -146,6 +148,10 @@ class FakePlatform:
                     return
                 if mode == "503":
                     self._send(503, {"error": {"code": "unavailable", "message": "服务暂不可用"}})
+                    return
+                if method == "GET" and self.path in platform.files:
+                    data, content_type = platform.files[self.path]
+                    self._send(200, data, content_type)
                     return
                 if mode == "422":
                     self._send(

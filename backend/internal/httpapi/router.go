@@ -18,6 +18,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/review"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/trainerpkg"
 )
 
 // Database is what the handlers need from the database layer;
@@ -65,6 +66,11 @@ type Options struct {
 	// (TM_REVIEWER_TOOL), served by GET /api/v1/reviews/tool/download.
 	// Empty, or a file that is not there: none is bundled.
 	ReviewerTool string
+	// TrainerPackageDir is the source directory of the training node for
+	// Windows computers (TM_TRAINER_PACKAGE_DIR), from which (with Compute)
+	// GET /api/v1/compute/windows/install.ps1 and /trainer.zip are served.
+	// Empty, or a directory that is not complete: none is bundled.
+	TrainerPackageDir string
 	// Host describes the server machine for GET /api/v1/compute/server,
 	// which is mounted only when Host and Compute are both set.
 	Host *hostinfo.Host
@@ -103,13 +109,16 @@ type server struct {
 	localTrainerMode string
 	// reviewerTool is Options.ReviewerTool.
 	reviewerTool string
+	// trainerPackage serves Options.TrainerPackageDir; never nil.
+	trainerPackage *trainerpkg.Source
 }
 
 // NewHandler returns the root HTTP handler.
 func NewHandler(o Options) http.Handler {
 	s := &server{log: o.Logger, db: o.DB, storage: o.Storage, datasets: o.Datasets, compute: o.Compute,
 		models: o.Models, reviews: o.Reviews, reviewerTool: o.ReviewerTool, host: o.Host, nodeToken: o.NodeToken,
-		localTrainerMode: o.LocalTrainerMode, startedAt: o.StartedAt}
+		localTrainerMode: o.LocalTrainerMode, startedAt: o.StartedAt,
+		trainerPackage: trainerpkg.New(o.TrainerPackageDir)}
 	if o.Datasets != nil {
 		s.projects = o.Projects
 	}

@@ -18,7 +18,7 @@ from typing import Any
 
 import inference_fakes
 import pytest
-from fakes import TRAINER_DIR
+from fakes import TRAINER_DIR, posix_only, windows_only
 from inference_fakes import FakeBoxes, fake_image
 from task_harness import gone, script
 
@@ -64,7 +64,9 @@ def install(monkeypatch, tmp_path: Path | None = None, **config: Any):
 
 def calls(tmp_path: Path) -> list[dict[str, Any]]:
     path = tmp_path / "calls.jsonl"
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def weights(tmp_path: Path) -> str:
@@ -483,7 +485,9 @@ def run_child(
         [sys.executable, "-m", "trainmaster_trainer.review_inference", "--spec", spec_json],
         input="".join(line + "\n" for line in requests),
         capture_output=True,
-        text=True,
+        # 协议的 JSON 是 UTF-8（含中文）；不指定时 Windows 上按系统的代码页（如 cp1252）解码
+        encoding="utf-8",
+        errors="replace",
         env={**child_env(tmp_path, **config), **(env or {})},
         timeout=60,
     )
@@ -710,7 +714,12 @@ def test_process_startup_failure_detail_includes_stderr(tmp_path):
     ("body", "expected"),
     [
         ("import sys\nprint('Segmentation fault', file=sys.stderr)\nsys.exit(139)\n", "识别进程意外退出（退出码 139）"),
-        ("import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n", "识别进程被信号 SIGKILL 终止（可能是内存不足）"),
+        # Windows 没有 SIGKILL（也没有被信号结束的负数退出码）：进程崩溃时退出码是 NTSTATUS，这里模拟访问冲突
+        # （os._exit 的参数是 C 的 int）
+        pytest.param("import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n",
+                     "识别进程被信号 SIGKILL 终止（可能是内存不足）", marks=posix_only),
+        pytest.param("import os\nos._exit(0xC0000005 - (1 << 32))\n", "识别进程崩溃（0xC0000005，访问冲突）",
+                     marks=windows_only),
         ("print('not json')\n", "识别进程的输出无法解析"),
         ("import json\nprint(json.dumps({'id': 1}))\n", "识别进程的输出无法解析（没有 ready）"),
     ],
@@ -774,7 +783,8 @@ def test_process_image_timeout_kills_process_group(tmp_path):
 def test_process_timeout_counts_from_the_previous_reply(tmp_path):
     # 两张图片同时发出：第二张的时间从第一张回答时算起（子进程那时才开始处理它）
     body = "    time.sleep(0.7)\n" + ECHO_REPLY
-    proc = process(tmp_path, script(tmp_path, ready_child(body)), timeout=1)
+    # 1.2 秒：每张图片留出 0.5 秒的余量（Windows 的 CI 较慢），从发出算起的 1.4 秒仍然超过它
+    proc = process(tmp_path, script(tmp_path, ready_child(body)), timeout=1.2)
     proc.start(InferenceSpec(weights="/w.pt"))
     proc.send(1, "/a.jpg")
     proc.send(2, "/b.jpg")
@@ -788,10 +798,15 @@ def test_process_timeout_counts_from_the_previous_reply(tmp_path):
     [
         ('    print(json.dumps({"id": 99, "ok": True}), flush=True)\n',
          "识别进程的回答与请求不对应（收到 99 的结果，应为 1）", False),
-        ("    os.kill(os.getpid(), 9)\n", "识别进程被信号 SIGKILL 终止（可能是内存不足）", True),
+        # Windows 上 os.kill 是 TerminateProcess（退出码就是信号的编号），没有被信号结束的负数退出码
+        pytest.param("    os.kill(os.getpid(), 9)\n", "识别进程被信号 SIGKILL 终止（可能是内存不足）", True,
+                     marks=posix_only),
         # 只有 SIGKILL（系统的 OOM killer）可能是内存不足
-        ("    os.kill(os.getpid(), 11)\n", "识别进程崩溃（信号 SIGSEGV）", True),
-        ("    os.kill(os.getpid(), 15)\n", "识别进程被信号 SIGTERM 终止", True),
+        pytest.param("    os.kill(os.getpid(), 11)\n", "识别进程崩溃（信号 SIGSEGV）", True, marks=posix_only),
+        pytest.param("    os.kill(os.getpid(), 15)\n", "识别进程被信号 SIGTERM 终止", True, marks=posix_only),
+        # Windows 上进程崩溃时退出码是 NTSTATUS（os._exit 的参数是 C 的 int）
+        pytest.param("    os._exit(0xC0000005 - (1 << 32))\n", "识别进程崩溃（0xC0000005，访问冲突）", True,
+                     marks=windows_only),
         # 子进程报告的无法继续的错误（显存不足、显卡出错）对每张图片都一样：不算这张图片的问题
         ('    print(json.dumps({"ok": False, "error": "显卡出错", "detail": "CUDA"}), flush=True)\n    sys.exit(1)\n',
          "显卡出错", False),
@@ -1051,12 +1066,17 @@ def test_task_info_validation(overrides, field):
 def run_cli(tmp_path: Path, *args: str, **config: Any) -> subprocess.CompletedProcess:
     env = child_env(tmp_path, **config)
     env.update(
-        HOME=str(tmp_path / "home"), TM_STATE_DIR=str(tmp_path / "state"), TM_DATA_DIR=str(tmp_path)
+        HOME=str(tmp_path / "home"),
+        TM_STATE_DIR=str(tmp_path / "state"),
+        TM_DATA_DIR=str(tmp_path),
+        # 命令行的输出用 UTF-8：Windows 上输出到管道时默认使用 ANSI 代码页（如 cp1252），中文无法编码
+        PYTHONIOENCODING="utf-8",
     )
     return subprocess.run(
         [sys.executable, "-m", "trainmaster_trainer", "infer", *args],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         timeout=120,
     )
@@ -1111,10 +1131,12 @@ def test_cli_infer_model_failure(tmp_path):
     proc = run_cli(tmp_path, "--weights", weights(tmp_path), "--json", a, task="classify")
     data = json.loads(proc.stdout)
     assert data["ok"] is False and data["error"] == "分类模型没有检测框，不能用于审图"
-    # 详情附带子进程的 stderr（加载模型时 ultralytics 的输出被转到 stderr）
-    assert (
-        data["detail"] == "ultralytics prints to stdout while loading\nC extension writes to fd 1"
-    )
+    # 详情附带子进程的 stderr（加载模型时 ultralytics 的输出被转到 stderr）；按行比较：Windows 上 print 写到
+    # stderr 的换行是 \r\n，C 扩展直接写 fd 的是 \n
+    assert data["detail"].splitlines() == [
+        "ultralytics prints to stdout while loading",
+        "C extension writes to fd 1",
+    ]
 
 
 @pytest.mark.parametrize(

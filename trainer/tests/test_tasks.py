@@ -18,6 +18,7 @@ from typing import Any
 import export_fakes
 import pytest
 from fake_platform import CLAIM, DROP, FakePlatform, wait_until
+from fakes import WINDOWS
 from task_harness import NODE_KEY, TOKEN, FakeClock, Run, Waits, gone, script
 
 from trainmaster_trainer import model_export, tasks
@@ -87,7 +88,9 @@ def test_export_end_to_end(platform, tmp_path, fake_ml, caplog):
 
     ultralytics_calls = [json.loads(line) for line in calls.read_text().splitlines()]
     assert ultralytics_calls[0]["task"] == "detect"
-    assert ultralytics_calls[0]["weights"].endswith(f"model-export-{export_id}/model.pt")
+    # 按路径的各部分比较（Windows 上的分隔符是 \）
+    weights = Path(ultralytics_calls[0]["weights"])
+    assert weights.parts[-2:] == (f"model-export-{export_id}", "model.pt")
     assert ultralytics_calls[1] == {
         "call": "export",
         "format": "onnx",
@@ -334,11 +337,18 @@ def test_export_timeout(platform, tmp_path):
 
 
 def test_child_crash(platform, tmp_path):
-    cmd = script(tmp_path, "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n")
+    if WINDOWS:
+        # Windows 没有 SIGKILL：进程崩溃时退出码是 NTSTATUS，这里模拟访问冲突（os._exit 的参数是 C 的 int）。
+        body = "import os\nos._exit(0xC0000005 - (1 << 32))\n"
+        error = "转换进程崩溃（0xC0000005，访问冲突）"
+    else:
+        body = "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n"
+        error = "转换进程被信号 SIGKILL 终止"
+    cmd = script(tmp_path, body)
     export_id = platform.add_export(PT)
     with Run(tmp_path, platform, export_command=cmd):
         exp = finished(platform, export_id)
-    assert exp["fails"][0]["error"].startswith("转换进程被信号 SIGKILL 终止")
+    assert exp["fails"][0]["error"].startswith(error)
 
 
 def test_onnx_outside_work_dir_is_rejected(platform, tmp_path):

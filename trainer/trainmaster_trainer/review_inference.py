@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, TypeVar
 
-from . import __version__
+from . import __version__, procs
 from .client import ApiError, Client, TransportError, json_safe
 from .environment import _kill, summarize_exception
 from .model_export import (
@@ -726,10 +726,11 @@ class InferenceProcess:
                     stderr=subprocess.PIPE,
                     env=inference_env(self.state_dir),
                     cwd=cwd,
-                    start_new_session=True,  # 超时或停止时连同它启动的进程一起结束
+                    **procs.popen_kwargs(),  # 超时或停止时连同它启动的进程一起结束
                 )
             except OSError as exc:
                 raise InferenceError(f"无法启动识别进程：{exc}") from None
+            procs.attach(self._proc)
             proc = self._proc
         assert proc.stdout is not None and proc.stderr is not None
         for target, stream, name in (
@@ -855,10 +856,15 @@ class InferenceProcess:
                 self._stderr.add(chunk)
 
     def _receive(self, until: float) -> tuple[str, Any, float] | None:
-        try:
-            return self._messages.get(timeout=max(0.0, until - time.monotonic()))
-        except queue.Empty:
-            return None
+        # Windows 上分成短的多次等待，Ctrl+C 才能打断（见 procs.WAIT_SLICE）
+        while True:
+            left = max(0.0, until - time.monotonic())
+            step = left if procs.WAIT_SLICE is None else min(left, procs.WAIT_SLICE)
+            try:
+                return self._messages.get(timeout=step)
+            except queue.Empty:
+                if step >= left:
+                    return None
 
     def _message(
         self, item: tuple[str, Any, float], image_id: int | None = None
@@ -910,18 +916,19 @@ class InferenceProcess:
         stderr = self.stderr_tail()
         if self._cancelled:
             return InferenceError("识别已取消", stderr, cancelled=True)
-        if code is not None and code < 0:
-            try:
-                name = signal.Signals(-code).name
-            except ValueError:
-                name = str(-code)
-            if -code == signal.SIGKILL:
+        name = procs.signal_name(code)
+        if code is not None and name is not None:
+            if procs.killed_by_sigkill(code):
                 message = f"识别进程被信号 {name} 终止（可能是内存不足）"
             elif -code in _CRASH_SIGNALS:
                 message = f"识别进程崩溃（信号 {name}）"
             else:
                 message = f"识别进程被信号 {name} 终止"
             return InferenceError(message, stderr, image_id=image_id)
+        crash = procs.windows_crash(code)
+        if crash is not None:
+            hint = "（可能是内存不足）" if procs.out_of_memory_crash(code) else ""
+            return InferenceError(f"识别进程崩溃（{crash}）{hint}", stderr, image_id=image_id)
         return InferenceError(f"识别进程意外退出（退出码 {code}）", stderr, image_id=image_id)
 
     def _timed_out(self, message: str, image_id: int | None = None) -> InferenceError:

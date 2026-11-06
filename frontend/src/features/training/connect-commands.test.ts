@@ -13,6 +13,10 @@ describe("connectCommands", () => {
       remoteStart: "docker compose up -d --build trainer",
       bareMetal:
         "sudo trainer/scripts/install.sh --server-url http://192.168.1.10:8080 --token <令牌> --systemd",
+      windows:
+        "& ([scriptblock]::Create((irm 'http://192.168.1.10:8080/api/v1/compute/windows/install.ps1'))) -ServerUrl 'http://192.168.1.10:8080' -Token '<令牌>' -InstallPython -Service",
+      windowsFromRepo:
+        "powershell -ExecutionPolicy Bypass -File trainer\\scripts\\install.ps1 -ServerUrl 'http://192.168.1.10:8080' -Token '<令牌>' -InstallPython -Service",
     })
   })
 
@@ -24,6 +28,56 @@ describe("connectCommands", () => {
     expect(commands.bareMetal).toBe(
       "sudo trainer/scripts/install.sh --server-url http://192.168.1.10:8080 --systemd"
     )
+    expect(commands.windows).toBe(
+      "& ([scriptblock]::Create((irm 'http://192.168.1.10:8080/api/v1/compute/windows/install.ps1'))) -ServerUrl 'http://192.168.1.10:8080' -InstallPython -Service"
+    )
+    expect(commands.windowsFromRepo).toBe(
+      "powershell -ExecutionPolicy Bypass -File trainer\\scripts\\install.ps1 -ServerUrl 'http://192.168.1.10:8080' -InstallPython -Service"
+    )
+  })
+
+  it("enables TLS 1.2 before downloading the Windows installer over https", () => {
+    // Windows PowerShell 5.1 does not enable TLS 1.2 by default.
+    const { windows, windowsFromRepo } = connectCommands({
+      serverUrl: "https://train.example.com",
+      tokenRequired: true,
+    })
+    expect(windows).toBe(
+      "[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; & ([scriptblock]::Create((irm 'https://train.example.com/api/v1/compute/windows/install.ps1'))) -ServerUrl 'https://train.example.com' -Token '<令牌>' -InstallPython -Service"
+    )
+    // The script from the repository downloads nothing before it starts.
+    expect(windowsFromRepo).toBe(
+      "powershell -ExecutionPolicy Bypass -File trainer\\scripts\\install.ps1 -ServerUrl 'https://train.example.com' -Token '<令牌>' -InstallPython -Service"
+    )
+    // Plain http needs no TLS.
+    expect(connectCommands({ serverUrl, tokenRequired: true }).windows).toMatch(
+      /^& /
+    )
+  })
+
+  it("doubles single quotes in the Windows commands' PowerShell strings", () => {
+    const { windows, windowsFromRepo } = connectCommands({
+      serverUrl: "http://it's.example:8080",
+      tokenRequired: false,
+    })
+    expect(windows).toBe(
+      "& ([scriptblock]::Create((irm 'http://it''s.example:8080/api/v1/compute/windows/install.ps1'))) -ServerUrl 'http://it''s.example:8080' -InstallPython -Service"
+    )
+    expect(windowsFromRepo).toBe(
+      "powershell -ExecutionPolicy Bypass -File trainer\\scripts\\install.ps1 -ServerUrl 'http://it''s.example:8080' -InstallPython -Service"
+    )
+  })
+
+  it("keeps the server URL placeholder inside the PowerShell quotes", () => {
+    // Pages opened through localhost show a placeholder host to replace.
+    const { windows } = connectCommands({
+      serverUrl: "http://<平台服务器 IP>:8080",
+      tokenRequired: true,
+    })
+    expect(windows).toContain(
+      "(irm 'http://<平台服务器 IP>:8080/api/v1/compute/windows/install.ps1')"
+    )
+    expect(windows).toContain("-ServerUrl 'http://<平台服务器 IP>:8080'")
   })
 
   it("re-enables this machine's trainer after --mode off", () => {

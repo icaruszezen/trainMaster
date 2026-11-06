@@ -53,6 +53,14 @@ type Config struct {
 	// TM_WEB_DIR it is not checked here: a missing file only makes the
 	// download unavailable.
 	ReviewerTool string
+	// TrainerPackageDir is the source directory of the training node for
+	// Windows computers, laid out like the repository's trainer/ directory
+	// (TM_TRAINER_PACKAGE_DIR; the Docker image sets /app/tools/trainer).
+	// The platform serves its scripts/install.ps1 and a zip of the sources.
+	// Empty: none is bundled. Like TM_REVIEWER_TOOL it is not checked here:
+	// a missing or incomplete directory only makes the downloads
+	// unavailable.
+	TrainerPackageDir string
 }
 
 // Limits of the training node settings.
@@ -121,8 +129,9 @@ func Load(getenv func(string) string) (*Config, error) {
 		DataDir:   get("TM_DATA_DIR", "./data"),
 		WebDir:    get("TM_WEB_DIR", ""),
 		LogFormat: strings.ToLower(get("TM_LOG_FORMAT", "text")),
-		// A path, so trimmed like the other paths.
-		ReviewerTool: get("TM_REVIEWER_TOOL", ""),
+		// Paths, so trimmed like the other paths.
+		ReviewerTool:      get("TM_REVIEWER_TOOL", ""),
+		TrainerPackageDir: get("TM_TRAINER_PACKAGE_DIR", ""),
 	}
 
 	if err := checkListenAddr(cfg.HTTPAddr); err != nil {
