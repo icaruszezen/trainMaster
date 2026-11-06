@@ -320,7 +320,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `GET /api/v1/compute/agent/review-inferences/{reviewID}/images/{imageID}/file` | 下载一张图片（数据集中的原图，支持 Range）并续租；文件或数据集文件夹已不存在时 404 `not_found`（带数据集的说明；不用 409，它表示任务已不属于这个节点），节点把这张图片报为识别失败 |
 | `POST /api/v1/compute/agent/review-inferences/{reviewID}/progress` | `{stage: "downloading" \| "inferring", message?}` 上报进度并续租，返回 `{"lease_seconds": 60}` |
 | `POST /api/v1/compute/agent/review-inferences/{reviewID}/results` | 上报一批识别结果：`{results: [{id, ok, width, height, boxes: [{name, class_id, confidence, xmin, ymin, xmax, ymax}], error}]}`（每批最多 500 张），在一个事务中写入并续租，返回 `{lease_seconds, accepted, remaining}`；已经识别过的、不属于任务的图片忽略（可以安全重发） |
-| `POST /api/v1/compute/agent/review-inferences/{reviewID}/complete` | `{result: {...}}` 结束识别，任务为 `ready`，返回审图任务；还有没识别的图片时 409（“还有 N 张图片没有识别”） |
+| `POST /api/v1/compute/agent/review-inferences/{reviewID}/complete` | `{result: {...}}` 结束识别，任务为 `ready`，返回审图任务；还有没识别的图片时 409（“还有 N 张图片没有识别”），任务不再属于该节点：重新排队，领取满 3 次时失败（见第 11 节“识别任务”） |
 | `POST /api/v1/compute/agent/review-inferences/{reviewID}/fail` | `{error, detail?, retryable?}` 报告失败，规则同转换任务的 `fail`（领取次数少于 3 次且可重试时重新排队），返回审图任务 |
 
 - 配置了 `TM_NODE_TOKEN` 时，`/agent/*` 必须带 `Authorization: Bearer <令牌>`，否则返回 401 `unauthorized`（常量时间比较）；浏览器使用的其它接口不需要令牌（平台目前没有登录）。
@@ -733,7 +733,7 @@ reviews/
 2. **任务**（`review.Task`）：`{kind, id, lease_seconds, model: {id, project_id, version, yolo_version, task, file_name, size_bytes, sha256, class_names}, options, image_count, remaining, model_url, images_url, progress_url, results_url, complete_url, fail_url}`，URL 都在 `/api/v1/compute/agent/review-inferences/<任务ID>/` 下。
 3. **执行**：节点下载模型（`GET model`，支持 Range，读取期间每 15 秒续租；这时才发现模型已删除（包括移入回收站：“模型已在回收站中，无法识别；在回收站中恢复模型后可以重试”）或文件已不在时任务失败，返回 404），上报进度（`downloading` / `inferring`）；按页取还没有识别的图片（`GET images?after=<上一页最后的 ID>&limit=`，按 ID 排列，带 `remaining`），逐张下载（`GET images/{imageID}/file`）并识别，结果攒批上报（`POST results`，每批最多 500 张、请求体 1 MiB）。
 4. **写入结果**：每个请求在一个事务中处理：识别成功的图片写入 VOC 文件（模型的框，不带置信度与 `difficult` / `truncated` 标记）并记下 `predictions`、`object_count`、`labels`、`annotation_version`；识别失败的图片只记 `inference_error`（中文原因，没有文件）。图片的尺寸（裁剪框、VOC 的 `<size>`）取数据集索引中现在的尺寸（文件被替换后重新扫描时随之更新，图片列表交给节点的也是它），没有时用创建时复制的尺寸，都没有时才用节点上报的，并记到行中。已经识别过的、不属于这个任务的图片 ID 忽略，因此重发同一批结果是安全的；返回 `{lease_seconds, accepted, remaining}`。框按上报的值清洗：类别名称去掉控制字符与首尾空白、最长 255 个字符，名称为空或坐标不是有限值的框丢弃；坐标裁剪到图片范围并取整，面积为 0 的框丢弃；置信度限制在 0–1 并保留 4 位小数；每张图片最多保留置信度最高的 1000 个框。
-5. **完成**：`POST complete`（`{result}`）在还有没识别的图片时返回 409（“还有 N 张图片没有识别”），否则任务为 `ready`。`result` 只保留 `device`、`torch_version`、`ultralytics_version`、`node_name`、`elapsed_seconds`、`images_per_second`。
+5. **完成**：`POST complete`（`{result}`）使任务为 `ready`。还有没识别的图片时（如节点最后一次列出图片之后，有数据集从回收站恢复）返回 409（“还有 N 张图片没有识别，审图任务已重新排队”），节点随之放弃，任务立即重新排队，下一次领取识别剩下的图片，不用等租约过期；领取满 3 次时改为失败（“训练节点结束识别时还有图片没有识别（已尝试 3 次）”）。`result` 只保留 `device`、`torch_version`、`ultralytics_version`、`node_name`、`elapsed_seconds`、`images_per_second`。
 6. **租约与失败**：同模型转换：每个调用都续租，平台每 15 秒检查一次，租约过期的任务在领取次数少于 3 次时重新排队，否则失败（“训练节点在识别过程中失去联系（已尝试 3 次）”）；`POST fail`（`{error, detail?, retryable?}`）可重试且领取次数少于 3 次时重新排队，否则失败。重新排队与重试都从还没有识别的图片继续，已经上报的结果保留。任务被删除时节点的调用得到 404，已不属于该节点或已结束时得到 409，节点随之放弃。
 7. **排队与在线节点**：排队中的任务带 `queue_position`（在排队的审图任务中的位置，从 1 起；模型在回收站中的任务不在队列中，没有位置，也不算在别的任务的位置里，页面显示“等待恢复模型”）；`workers_online` 是最近 60 秒内在领取中提供过 `review_inference`、或上报过任务的节点数（`model.Service.WorkersOnline(kind)`，按类型统计，正在执行转换的节点仍算作提供了审图识别）。为 0 时页面提示没有可以识别的训练节点。
 
@@ -849,7 +849,7 @@ zip 中只有一个顶层文件夹 `审图-<任务ID>-<任务名>/`（`SafeSegme
 
 | 内容 | 回收站中的状态 | 恢复 | 永久删除 |
 |---|---|---|---|
-| 数据集 | 记录、图片索引、导入记录、审图版本都保留；所属项目的关联移到 `recycled_project_datasets`，审图任务中的记录移到 `recycled_review_datasets` / `recycled_review_images`（`RecycleHook`，由 `review.Service` 实现）。带 `delete_files` 删除的，文件夹改名为隐藏的 `datasets/.recycle-<ID>`；不带的，文件夹留在原处（仍属于这个数据集，不能作为新数据集再次添加） | 关联放回（项目或审图任务已删除的除外）；已经识别完的审图任务拿回还没识别的图片时重新排队（模型可用或在回收站中时，后者等模型恢复）；正在识别的不变，节点每一轮都从头列出还没有识别的图片，下一轮会识别它们；文件夹在事务提交后改回原名（或新名称） | 删除记录（级联删除图片、导入、版本与关联）与缩略图缓存；带 `delete_files` 的删除文件夹，不带的文件夹留在原处，可以再作为数据集添加 |
+| 数据集 | 记录、图片索引、导入记录、审图版本都保留；所属项目的关联移到 `recycled_project_datasets`，审图任务中的记录移到 `recycled_review_datasets` / `recycled_review_images`（`RecycleHook`，由 `review.Service` 实现）。带 `delete_files` 删除的，文件夹改名为隐藏的 `datasets/.recycle-<ID>`；不带的，文件夹留在原处（仍属于这个数据集，不能作为新数据集再次添加） | 关联放回（项目或审图任务已删除的除外）；已经识别完的审图任务拿回还没识别的图片时重新排队（模型可用或在回收站中时，后者等模型恢复）；正在识别的不变，节点每一轮都从头列出还没有识别的图片，下一轮会识别它们（节点已经列完、正要结束时，结束被拒绝，任务立即重新排队，见第 11 节“识别任务”）；文件夹在事务提交后改回原名（或新名称） | 删除记录（级联删除图片、导入、版本与关联）与缩略图缓存；带 `delete_files` 的删除文件夹，不带的文件夹留在原处，可以再作为数据集添加 |
 | 审图版本 | 版本与它的标注快照保留，版本列表、下载与审图任务的合并记录都不再显示它（数据集在回收站中时，它的版本也一样）；编号不会再分配 | 回到版本列表，编号不变；数据集也在回收站中时需先恢复数据集 | 删除版本，级联删除它的图片 |
 | 模型 | 记录、已完成的转换与文件夹（`model.pt`、`model.json`、ONNX 缓存）原样保留，排队中与转换中的转换删除；使用它的审图任务等它恢复 | 原样回到模型仓库；项目也在回收站中时一并恢复项目 | 删除记录与转换记录，删除文件夹；使用它的审图任务随之失败（“模型已被删除，无法识别”） |
 
@@ -868,6 +868,7 @@ zip 中只有一个顶层文件夹 `审图-<任务ID>-<任务名>/`（`SafeSegme
 ### 文件夹
 
 - 移入回收站时，文件夹改名为 `.recycle-<ID>` 是事务提交前的最后一步，提交失败时改回；恢复时反过来，事务提交后才改回原名。这样崩溃在任何时候发生，都不会出现数据集还在回收站中、文件夹却已回到原名的情况（原名下的文件夹与之后新放进去的无法区分）。下次启动时整理：使用中的数据集的 `.recycle-<ID>` 改回原名（原名不存在时；删除的事务没有提交，或恢复后没来得及改回、改回失败），已经没有记录的改名为 `.deleting-<ID>` 由清理删除。
-- 同一个数据集的删除与恢复在进程内串行（连同提交后的改名）。这两个事务不随请求或服务关闭取消（优雅关闭会等请求完成），客户端断开不会让提交的结果不确定；提交仍然失败时（如数据库连接中断）重新读取数据集是否在回收站中，文件夹按实际的结果放置，读不到时留在 `.recycle-<ID>`，由下次启动时的整理处理。
+- 同一个数据集的删除与恢复在进程内串行（连同提交后的改名）。这两个事务不随请求或服务关闭取消（优雅关闭会等请求完成），客户端断开不会让提交的结果不确定；提交仍然失败时（如数据库连接中断）重新读取数据集是否在回收站中，文件夹按实际的结果放置，读不到时留在 `.recycle-<ID>`，由下次启动时的整理处理。读取时带 `FOR SHARE`，会等服务器还在处理的那次提交结束。
+- 使用中的数据集的文件夹留在 `.recycle-<ID>` 时（上面那些出错的情况，在下次启动之前），再次删除它会先把文件夹改回原名（原名下也有文件夹时返回 409，请先检查这两个文件夹），所以不删除文件的删除不会把文件留在永久删除时会清理的位置；启动时的整理也把不删除文件、在回收站中的数据集的 `.recycle-<ID>` 改回原名。
 - 永久删除先把文件夹改名为 `.deleting-<ID>` 再删除；没能删干净时（如权限不足）剩余的文件由之后的清理再次删除。
 - 回收站中的内容仍占用磁盘空间，7 天后才释放。

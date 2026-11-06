@@ -59,6 +59,7 @@ import { CreateReviewDialog } from "@/features/reviews/create-review-dialog"
 import { parseId } from "@/features/reviews/params"
 import { useReviewActions } from "@/features/reviews/review-actions"
 import { ReviewList } from "@/features/reviews/review-list"
+import { isInferring } from "@/features/reviews/review-status"
 import { useDebouncedValue } from "@/hooks/use-debounced-value"
 import { formatNumber, formatPercent, percentOf } from "@/lib/format"
 
@@ -359,9 +360,8 @@ function ReviewsSummary({ reviews }: { reviews: Review[] }) {
       approved: sum.approved + review.counts.approved,
       needsSample: sum.needsSample + review.counts.needs_sample,
       merged: sum.merged + review.counts.merged,
-      inferring:
-        sum.inferring +
-        (review.status === "queued" || review.status === "running" ? 1 : 0),
+      // 等待恢复模型的不算（见 waitingForModel）。
+      inferring: sum.inferring + (isInferring(review) ? 1 : 0),
       failed: sum.failed + (review.status === "failed" ? 1 : 0),
     }),
     {

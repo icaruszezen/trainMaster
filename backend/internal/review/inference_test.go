@@ -211,9 +211,16 @@ func TestIntegrationInference(t *testing.T) {
 		t.Errorf("501 results: %v", err)
 	}
 
-	// Completing early is refused; then the last image and done.
+	// Completing early is refused and queues it again (the node gives up
+	// on the 409); the next claim finishes it.
 	_, err = e.svc.CompleteTask(ctx, r.ID, node, nil)
-	wantKind(t, err, ErrConflict, "还有 1 张图片没有识别")
+	wantKind(t, err, ErrConflict, "还有 1 张图片没有识别，审图任务已重新排队")
+	if got := e.review(t, r.ID); got.Status != StatusQueued || got.Node != nil || got.Attempts != 1 || got.FinishedAt != nil {
+		t.Fatalf("review completed early = %+v", got)
+	}
+	if task := e.claim(t, node); task == nil || task.ID != r.ID || task.Remaining != 1 {
+		t.Fatalf("claim after completing early = %+v", task)
+	}
 	if _, err := e.svc.SubmitResults(ctx, r.ID, node, []ImageResult{{ID: ids[3], OK: false, Error: "图片文件不存在"}}); err != nil {
 		t.Fatal(err)
 	}

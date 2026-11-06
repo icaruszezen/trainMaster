@@ -326,6 +326,35 @@ func TestIntegrationRecycleFailedCommit(t *testing.T) {
 	}
 }
 
+// A folder left under .recycle-<id> while the dataset is in use (a move
+// that went wrong, until the next start) goes back under its name when the
+// dataset is deleted, so a delete that keeps the files keeps them.
+func TestIntegrationRecycleLeftoverFolder(t *testing.T) {
+	e := newTestEnv(t, false)
+	ctx := context.Background()
+	d, _ := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "pics"})
+	writeFiles(t, d.Path, map[string][]byte{"a.png": nil})
+	if err := os.Rename(d.Path, e.svc.recycleDir(d.ID)); err != nil {
+		t.Fatal(err)
+	}
+	writeFiles(t, d.Path, map[string][]byte{"b.png": nil})
+	err := e.svc.DeleteDataset(ctx, d.ID, false)
+	wantKind(t, err, ErrConflict, "同时存在")
+	if err := os.RemoveAll(d.Path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := e.svc.DeleteDataset(ctx, d.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(filepath.Join(d.Path, "a.png")) || exists(e.svc.recycleDir(d.ID)) {
+		t.Error("the leftover folder was not moved back before the delete")
+	}
+	if items := e.trashed(t); len(items) != 1 || items[0].DeleteFiles || items[0].DirectoryMissing {
+		t.Errorf("recycle bin = %+v", items)
+	}
+}
+
 // What a crash between renaming a folder and the commit leaves behind is
 // repaired at startup.
 func TestIntegrationReconcileRecycleFolders(t *testing.T) {
@@ -349,6 +378,14 @@ func TestIntegrationReconcileRecycleFolders(t *testing.T) {
 		restored.ID); err != nil { // a restore that committed, its folder not moved back yet
 		t.Fatal(err)
 	}
+	kept, _ := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "kept"})
+	writeFiles(t, kept.Path, map[string][]byte{"a.png": nil})
+	if err := e.svc.DeleteDataset(ctx, kept.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(kept.Path, e.svc.recycleDir(kept.ID)); err != nil { // its folder belongs under its name
+		t.Fatal(err)
+	}
 	writeFiles(t, e.svc.recycleDir(999999), map[string][]byte{"a.png": nil}) // its dataset is gone
 	writeFiles(t, filepath.Join(e.datasetsDir(), recyclePrefix+"x"), map[string][]byte{"a.png": nil})
 
@@ -360,6 +397,9 @@ func TestIntegrationReconcileRecycleFolders(t *testing.T) {
 	}
 	if !exists(filepath.Join(restored.Path, "a.png")) || exists(e.svc.recycleDir(restored.ID)) {
 		t.Error("the folder of a restored dataset was not moved back")
+	}
+	if !exists(filepath.Join(kept.Path, "a.png")) || exists(e.svc.recycleDir(kept.ID)) {
+		t.Error("the folder of a dataset in the bin kept with its files was not moved back")
 	}
 	if !exists(e.svc.recycleDir(binned.ID)) {
 		t.Error("the folder of a dataset in the bin must stay aside")

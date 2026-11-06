@@ -2,6 +2,7 @@ package review
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
@@ -144,6 +145,86 @@ func TestIntegrationReviewDatasetRestoreWhileRunning(t *testing.T) {
 	e.inferAll(t, r.ID, node)
 	if got = e.review(t, r.ID); got.Status != StatusReady || got.Counts.Inferred != 2 {
 		t.Fatalf("review after inferring the restored images = %+v", got)
+	}
+}
+
+// Restored after the node's last (empty) listing: completing is refused
+// and the review goes back to the queue at once; after maxAttempts claims
+// it fails instead.
+func TestIntegrationReviewDatasetRestoreBeforeComplete(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	m := e.addModel(t, e.project(t, "p"), testModel{})
+	ds1 := e.addDataset(t, "ds1", "ds1", testImage{rel: "a.png"})
+	ds2 := e.addDataset(t, "ds2", "ds2", testImage{rel: "b.png"})
+	r := e.create(t, CreateInput{ModelID: m.ID, DatasetIDs: []int64{ds1, ds2}})
+	if err := e.datasets.DeleteDataset(ctx, ds1, false); err != nil {
+		t.Fatal(err)
+	}
+	node := e.node(t, "a")
+	// Infer what is listed, list again (empty), restore, complete.
+	finish := func(reviewID, restore int64) error {
+		t.Helper()
+		page, err := e.svc.ListTaskImages(ctx, reviewID, node, 0, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var results []ImageResult
+		for _, img := range page.Items {
+			results = append(results, ImageResult{ID: img.ID, OK: true})
+		}
+		if len(results) > 0 {
+			if _, err := e.svc.SubmitResults(ctx, reviewID, node, results); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if page, err := e.svc.ListTaskImages(ctx, reviewID, node, 0, 10); err != nil || len(page.Items) != 0 {
+			t.Fatalf("last pass = %+v, %v", page, err)
+		}
+		if _, err := e.datasets.RestoreDataset(ctx, restore, dataset.RestoreInput{}); err != nil {
+			t.Fatal(err)
+		}
+		_, err = e.svc.CompleteTask(ctx, reviewID, node, nil)
+		return err
+	}
+	if task := e.claim(t, node); task == nil || task.ID != r.ID {
+		t.Fatalf("claim = %+v", task)
+	}
+	wantKind(t, finish(r.ID, ds1), ErrConflict, "还有 1 张图片没有识别，审图任务已重新排队")
+	if got := e.review(t, r.ID); got.Status != StatusQueued || got.Node != nil || got.Attempts != 1 || got.Counts.Inferred != 1 {
+		t.Fatalf("review after the refused completion = %+v", got)
+	}
+	if task := e.claim(t, node); task == nil || task.ID != r.ID || task.Remaining != 1 {
+		t.Fatalf("claim after the refused completion = %+v", task)
+	}
+	e.inferAll(t, r.ID, node)
+	if got := e.review(t, r.ID); got.Status != StatusReady || got.Counts.Inferred != 2 {
+		t.Fatalf("review after inferring the restored images = %+v", got)
+	}
+
+	// On the last attempt it fails instead, and can be retried.
+	ds3 := e.addDataset(t, "ds3", "ds3", testImage{rel: "c.png"})
+	ds4 := e.addDataset(t, "ds4", "ds4", testImage{rel: "d.png"})
+	r2 := e.create(t, CreateInput{ModelID: m.ID, DatasetIDs: []int64{ds3, ds4}})
+	if err := e.datasets.DeleteDataset(ctx, ds3, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Exec(ctx, "UPDATE reviews SET attempts = $2 WHERE id = $1", r2.ID, maxAttempts-1); err != nil {
+		t.Fatal(err)
+	}
+	if task := e.claim(t, node); task == nil || task.ID != r2.ID {
+		t.Fatalf("last claim = %+v", task)
+	}
+	err := finish(r2.ID, ds3)
+	wantKind(t, err, ErrConflict, "还有 1 张图片没有识别")
+	if strings.Contains(err.Error(), "重新排队") {
+		t.Errorf("the last attempt must not queue it again: %v", err)
+	}
+	if got := e.review(t, r2.ID); got.Status != StatusFailed || got.Error != msgIncomplete || got.FinishedAt == nil {
+		t.Fatalf("review after the last refused completion = %+v", got)
+	}
+	if retried, err := e.svc.RetryReview(ctx, r2.ID); err != nil || retried.Status != StatusQueued {
+		t.Fatalf("retry = %+v, %v", retried, err)
 	}
 }
 

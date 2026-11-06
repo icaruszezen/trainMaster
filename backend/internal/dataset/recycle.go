@@ -79,6 +79,9 @@ func (s *Service) DeleteDataset(ctx context.Context, id int64, deleteFiles bool)
 			return err
 		}
 		dirName = d.DirName
+		if err := s.recoverRecycledFolder(id, dirName); err != nil {
+			return err
+		}
 		busy, err := hasProcessingJob(ctx, tx, id)
 		if err != nil {
 			return err
@@ -161,7 +164,9 @@ func (s *Service) DeleteDataset(ctx context.Context, id int64, deleteFiles bool)
 func (s *Service) commitUnknown(ctx context.Context, id int64, err error) (inBin, known bool) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
-	if qerr := s.db.QueryRow(ctx, "SELECT deleted_at IS NOT NULL FROM datasets WHERE id = $1", id).
+	// FOR SHARE waits for the row lock of the transaction, which the server
+	// may still be committing, and then reads what it left.
+	if qerr := s.db.QueryRow(ctx, "SELECT deleted_at IS NOT NULL FROM datasets WHERE id = $1 FOR SHARE", id).
 		Scan(&inBin); qerr != nil {
 		s.log.Error("cannot tell whether a failed commit moving a dataset was recorded", "dataset_id", id,
 			"err", err, "check_err", qerr)
@@ -169,6 +174,29 @@ func (s *Service) commitUnknown(ctx context.Context, id int64, err error) (inBin
 	}
 	s.log.Warn("commit moving a dataset failed", "dataset_id", id, "in_recycle_bin", inBin, "err", err)
 	return inBin, true
+}
+
+// recoverRecycledFolder moves the folder of a dataset in use back from
+// .recycle-<id> to dirName, where a move that went wrong left it until the
+// next start (commitUnknown, reconcileRecycleFolders): deleting the dataset
+// then keeps or sets aside its real folder, and a delete that keeps the
+// files never leaves them where the purge would remove them.
+func (s *Service) recoverRecycledFolder(id int64, dirName string) error {
+	aside := s.recycleDir(id)
+	if _, err := os.Lstat(aside); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("stat recycled dataset folder: %w", err)
+	}
+	if _, err := os.Lstat(s.datasetDir(dirName)); !errors.Is(err, fs.ErrNotExist) {
+		return newError(ErrConflict, "数据集文件夹“%s”与回收站留下的文件夹“%s”同时存在，请先检查这两个文件夹（合并或移走其中一个）后再删除",
+			dirName, filepath.Base(aside))
+	}
+	if err := os.Rename(aside, s.datasetDir(dirName)); err != nil {
+		return fmt.Errorf("move dataset folder back from the recycle bin: %w", err)
+	}
+	s.log.Warn("moved the folder of a dataset in use back from the recycle bin", "dataset_id", id, "dir_name", dirName)
+	return nil
 }
 
 // moveFolder renames the dataset folder dirName to the hidden path to and
@@ -452,9 +480,10 @@ func (s *Service) ListTrashedDatasets(ctx context.Context) ([]TrashedDataset, er
 // reconcileRecycleFolders repairs what a crash between renaming a folder
 // and the commit leaves in the data directory: the folder of a dataset in
 // use found under .recycle-<id> (its delete was rolled back, or it was
-// restored and its folder not moved back yet) goes back under its name,
-// and one of a dataset that is gone is left to the janitor (renamed to
-// .deleting-<id>). Start runs it before anything else uses the folders.
+// restored and its folder not moved back yet) goes back under its name, as
+// does one of a dataset in the bin deleted without its files, and one of a
+// dataset that is gone is left to the janitor (renamed to .deleting-<id>).
+// Start runs it before anything else uses the folders.
 func (s *Service) reconcileRecycleFolders(ctx context.Context) error {
 	entries, err := os.ReadDir(s.datasetsDir())
 	if errors.Is(err, fs.ErrNotExist) {
@@ -484,7 +513,8 @@ func (s *Service) reconcileRecycleFolders(ctx context.Context) error {
 			return err
 		case trashed && deleteFiles:
 			// In the bin, as it should be.
-		case !trashed:
+		default:
+			// In use, or in the bin with its folder kept under its name.
 			target := s.datasetDir(dirName)
 			if _, err := os.Lstat(target); !errors.Is(err, fs.ErrNotExist) {
 				s.log.Error("dataset in use has a recycled folder and a folder under its name; left both alone",
