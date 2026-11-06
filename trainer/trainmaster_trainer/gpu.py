@@ -405,6 +405,8 @@ class NvidiaSmi:
                 [self.path, *args],
                 capture_output=True,
                 text=True,
+                # 输出按系统的代码页解码；进程表中的路径等可能含有无法解码的字节，不能因此检测失败
+                errors="replace",
                 timeout=self.timeout,
                 check=False,
                 **procs.quiet_kwargs(),

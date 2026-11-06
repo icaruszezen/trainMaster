@@ -7,7 +7,7 @@ import shutil
 import subprocess
 
 import pytest
-from fakes import TRAINER_DIR
+from fakes import TRAINER_DIR, posix_only
 
 from trainmaster_trainer import variants
 from trainmaster_trainer.variants import (
@@ -160,7 +160,10 @@ def test_parse_table_rejects_bad_rows():
 
 def test_load_variants_from_path(tmp_path):
     path = tmp_path / "table.txt"
-    path.write_text("# test\ncu999 9.9 9.9 pytorch 99.9 999 120 998\ncpu 9.9 9.9 pytorch - - - -\n")
+    path.write_text(
+        "# test\ncu999 9.9 9.9 pytorch 99.9 999 120 998\ncpu 9.9 9.9 pytorch - - - -\n",
+        encoding="utf-8",
+    )
     table = variants.load_variants(path)
     assert [v.name for v in table] == ["cu999", "cpu"]
     assert select_variant("999", "12.0", "x86_64", table).variant == "cu999"
@@ -309,6 +312,9 @@ def test_infer_variant(version, cuda, expected):
 
 
 # ---- 与 bash 实现逐项对比 ----
+#
+# bash 版本只用于 Linux（Windows 只用 Python 版本）；Windows 上找到的 bash 可能是 WSL 的启动器，
+# Git Bash 读到的输入行带 \r（文本模式写入 CRLF），所以与 bash 的对比只在 POSIX 上运行。
 
 _BASH_SELECT = r"""
 set -euo pipefail
@@ -339,6 +345,7 @@ def _run_bash(script: str, lines: list[str]) -> list[str]:
         input="\n".join(lines) + "\n",
         capture_output=True,
         text=True,
+        encoding="utf-8",  # 输出中有中文说明，不能按系统的代码页解码
         check=True,
         timeout=600,
     )
@@ -390,6 +397,7 @@ CC_SETS = [
 ]
 
 
+@posix_only
 @needs_bash
 def test_select_variant_matches_bash():
     cases = [(d, c, "x86_64") for d, c in itertools.product(DRIVERS, CC_SETS)]
@@ -411,6 +419,7 @@ def test_select_variant_matches_bash():
     assert not mismatches, "\n".join(mismatches[:20])
 
 
+@posix_only
 @needs_bash
 def test_primitives_match_bash():
     versions = ["580", "580.65.06", "525.60.13", "525.60.12", "1000", "470.256.02", "550", "0", ""]

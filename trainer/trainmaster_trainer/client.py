@@ -259,9 +259,10 @@ class Client:
                         return
                     yield chunk
 
+        chunks = body()
         req = urllib.request.Request(
             self.base_url + path,
-            data=body(),
+            data=chunks,
             headers=self._headers(
                 headers,
                 **{
@@ -272,7 +273,11 @@ class Client:
             ),
             method="PUT",
         )
-        return self._json_response(req, timeout)
+        try:
+            return self._json_response(req, timeout)
+        finally:
+            # 发送中途出错时生成器停在 yield 处，文件要等它被回收才关闭；Windows 上之后删除工作目录会失败
+            chunks.close()
 
     def register(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.post("/api/v1/compute/agent/register", payload)

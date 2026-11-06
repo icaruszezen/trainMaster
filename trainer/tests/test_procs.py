@@ -149,6 +149,10 @@ class FakeJob:
         self.calls.append("terminate")
         return self.terminated
 
+    def wait_empty(self, timeout: float) -> bool:
+        self.calls.append("wait")
+        return True
+
     def close(self) -> None:
         self.calls.append("close")
 
@@ -164,7 +168,10 @@ def test_kill_windows_uses_job_then_tree(monkeypatch, terminated):
         if terminated:
             proc.kill()  # 假的 Job 不会真的结束进程
         procs.kill(proc, grace=5.0, windows=True)
-        assert job.calls == ["terminate", "close"]
+        # 结束后等 Job 中的进程（包括虚拟环境启动器启动的解释器）全部退出
+        assert job.calls == (
+            ["terminate", "wait", "close"] if terminated else ["terminate", "close"]
+        )
         assert trees == ([] if terminated else [proc.pid])
         assert proc not in procs._jobs
     finally:
@@ -253,7 +260,10 @@ def test_out_of_memory_crash():
 
 @windows_only
 def test_windows_crash_exit_code_from_real_process():
+    # os._exit 的参数是 C 的 int：0xC0000005 超出范围（OverflowError，退出码为 1），用有符号形式，
+    # 系统按 32 位无符号数作为进程的退出码。
     proc = subprocess.run(
-        [sys.executable, "-c", "import os; os._exit(0xC0000005)"], timeout=60, check=False
+        [sys.executable, "-c", "import os; os._exit(-1073741819)"], timeout=60, check=False
     )
+    assert proc.returncode & 0xFFFFFFFF == 0xC0000005
     assert procs.windows_crash(proc.returncode) == "0xC0000005，访问冲突"

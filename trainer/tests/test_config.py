@@ -8,7 +8,7 @@ import socket
 from pathlib import Path
 
 import pytest
-from fakes import posix_only
+from fakes import WINDOWS, posix_only
 
 from trainmaster_trainer import config
 from trainmaster_trainer.config import Config, ConfigError
@@ -263,7 +263,7 @@ def test_state_dir_not_created_when_asked(tmp_path):
     assert not cfg.state_dir.exists()
 
 
-@posix_only
+@posix_only  # os.getuid 只在 POSIX 上有；Windows 的候选见 test_state_dir_candidates_on_windows
 def test_state_dir_candidates(tmp_path):
     configured = tmp_path / "configured"
     candidates = config.state_dir_candidates(configured, home=str(tmp_path / "home"))
@@ -275,7 +275,7 @@ def test_state_dir_candidates(tmp_path):
     assert len(config.state_dir_candidates(candidates[1], home=str(tmp_path / "home"))) == 2
 
 
-@posix_only
+@posix_only  # PUID 与 os.getuid：只有 Linux 的 Docker 镜像以 root 运行 HEALTHCHECK
 def test_healthcheck_dirs_include_puid_temp_dir(tmp_path, monkeypatch):
     # HEALTHCHECK 以 root 运行，训练节点以 PUID 运行：也查找 PUID 的临时目录。
     monkeypatch.setattr(config.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
@@ -289,11 +289,16 @@ def test_healthcheck_dirs_include_puid_temp_dir(tmp_path, monkeypatch):
         assert config.healthcheck_dirs(configured, env) == config.state_dir_candidates(configured)
 
 
-def test_unwritable_state_dir_falls_back_to_home(tmp_path):
+def test_unwritable_state_dir_falls_back_to_home(tmp_path, monkeypatch):
+    # Windows 上退回到 %LOCALAPPDATA%\trainMaster\state（不使用 HOME）
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
     blocker = tmp_path / "file"
     blocker.write_text("not a directory")
     path, warning = config.resolve_state_dir(blocker / "state", home=str(tmp_path / "home"))
-    assert path == tmp_path / "home" / ".local" / "state" / "trainmaster"
+    if WINDOWS:
+        assert path == tmp_path / "AppData" / "Local" / "trainMaster" / "state"
+    else:
+        assert path == tmp_path / "home" / ".local" / "state" / "trainmaster"
     assert path.is_dir()
     assert warning is not None and "not writable" in warning
 
@@ -305,11 +310,14 @@ def test_no_writable_state_dir(tmp_path, monkeypatch):
     assert warning is not None and "no writable state directory" in warning
 
 
-def test_load_reports_state_dir_fallback(tmp_path):
+def test_load_reports_state_dir_fallback(tmp_path, monkeypatch):
+    # Windows 上退回到 %LOCALAPPDATA% 下：放在临时目录中，不在本机真实的目录中创建状态目录
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
     blocker = tmp_path / "file"
     blocker.write_text("x")
     cfg = config.load(base_env(tmp_path, TM_STATE_DIR=str(blocker)))
     assert cfg.state_dir != blocker
+    assert tmp_path in cfg.state_dir.parents
     assert cfg.state_dir_warning
 
 

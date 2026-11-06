@@ -14,6 +14,7 @@ import json
 import logging
 import random
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -76,6 +77,10 @@ def default_task_worker(agent: Agent) -> TaskWorker:
     )
 
 
+# Windows 上分段等待的长度（秒），见 Agent.wait
+WAIT_SLICE = 0.5
+
+
 class Agent:
     def __init__(
         self,
@@ -91,6 +96,7 @@ class Agent:
         node_key: str | None = None,
         hostname: str | None = None,
         task_worker: Callable[[Agent], TaskWorker | None] | None = None,
+        wait_slice: float | None = WAIT_SLICE if sys.platform == "win32" else None,
     ) -> None:
         if not config.server_url:
             raise ValueError("server_url is required")
@@ -106,6 +112,7 @@ class Agent:
             deployment=self.deployment,
         )
         self._sleep = sleep
+        self._wait_slice = wait_slice
         self._clock = clock
         self._wall_clock = wall_clock
         self._backoff = Backoff(rng=rng)
@@ -160,8 +167,15 @@ class Agent:
         if seconds > 0:
             if self._sleep is not None:
                 self._sleep(seconds)
-            else:
+            elif self._wait_slice is None:
                 self._stop.wait(seconds)
+            else:
+                # Windows 上 Event.wait 不会被信号打断：Ctrl+C / Ctrl+Break 的处理函数要等它返回才运行，
+                # 等待最长可达心跳间隔或退避时间。分段等待，收到信号后很快停止。
+                deadline = time.monotonic() + seconds
+                while (left := deadline - time.monotonic()) > 0:
+                    if self._stop.wait(min(left, self._wait_slice)):
+                        break
         return self._stop.is_set()
 
     def run(self) -> int:

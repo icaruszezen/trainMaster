@@ -270,13 +270,14 @@ def test_probe_drops_limits_not_below_host(tmp_path: Path, monkeypatch):
 
 def test_probe_reads_host_driver_when_no_gpu_is_visible(tmp_path: Path):
     # 容器中没有传入显卡：NVML 看不到显卡，宿主机的驱动版本只能从 /proc 读取（只用于诊断，不上报）。
+    # 宿主机的显卡数（/proc/driver/nvidia/gpus/0000:01:00.0）由替换的显卡探测给出，不写这个目录：
+    # 目录名中的冒号在 Windows 上不是合法的文件名。
     write_files(
         tmp_path,
         {
             ".dockerenv": "",
             "proc/driver/nvidia/version": "NVRM version: NVIDIA UNIX x86_64 Kernel Module  "
             "440.100  Fri May 29 08:45:51 UTC 2020\n",
-            "proc/driver/nvidia/gpus/0000:01:00.0/information": "Model: x\n",
         },
     )
     no_gpu = gpu.GpuProbe(
@@ -407,7 +408,10 @@ def test_metrics_first_cpu_percent_is_null(tmp_path: Path):
         first["memory_used_bytes"] > 0 and first["memory_total_bytes"] >= first["memory_used_bytes"]
     )
     assert first["gpus"] == [{"index": 0}]
-    assert len(first["load_average"]) == 3
+    if hasattr(os, "getloadavg"):
+        assert len(first["load_average"]) == 3
+    else:  # Windows 没有 os.getloadavg：load_average 为 null
+        assert first["load_average"] is None
     second = collector.collect()
     assert isinstance(second["cpu_percent"], float)
     assert 0 <= second["cpu_percent"] <= 100
@@ -422,7 +426,8 @@ def test_metrics_after_prime_and_failures(tmp_path: Path, monkeypatch):
     def no_loadavg():
         raise OSError("not supported")
 
-    monkeypatch.setattr(hardware.os, "getloadavg", no_loadavg)
+    # Windows 没有 os.getloadavg：raising=False 时同样替换（测试结束后删除）
+    monkeypatch.setattr(hardware.os, "getloadavg", no_loadavg, raising=False)
     m = collector.collect()
     assert m["cpu_percent"] is not None
     assert m["load_average"] is None

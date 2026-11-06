@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
-from fakes import TRAINER_DIR, make_torch, make_torchvision, make_ultralytics
+from fakes import TRAINER_DIR, WINDOWS, make_torch, make_torchvision, make_ultralytics
 
 from trainmaster_trainer import environment
 from trainmaster_trainer.config import Config
@@ -292,7 +292,9 @@ def test_child_main_keeps_stdout_clean(tmp_path: Path):
     proc = subprocess.run(
         [sys.executable, "-c", _CHILD_WITH_FAKES.format(tests=str(TESTS_DIR))],
         capture_output=True,
-        text=True,
+        # 结果 JSON 是 UTF-8（含中文）；不指定时 Windows 上按系统的代码页（如 cp1252）解码
+        encoding="utf-8",
+        errors="replace",
         env=env,
         timeout=60,
         check=True,
@@ -310,7 +312,8 @@ def test_child_main_no_self_test_flag(tmp_path: Path):
     proc = subprocess.run(
         [sys.executable, "-c", _CHILD_WITH_FAKES.format(tests=str(TESTS_DIR)), "--no-self-test"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         timeout=60,
         check=True,
@@ -489,20 +492,29 @@ def test_detect_nonzero_exit(tmp_path: Path):
 
 
 def test_detect_killed_by_signal(tmp_path: Path):
-    cmd = script(tmp_path, "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n")
+    if WINDOWS:
+        # Windows 没有 SIGKILL：进程崩溃时退出码是 NTSTATUS，这里模拟访问冲突（os._exit 的参数是 C 的 int）。
+        cmd = script(tmp_path, "import os\nos._exit(0xC0000005 - (1 << 32))\n")
+        expected = "环境检测进程崩溃（0xC0000005，访问冲突"
+    else:
+        cmd = script(tmp_path, "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n")
+        expected = "环境检测进程被信号 SIGKILL 终止"
     raw = detector(tmp_path, cmd).run_child()
-    assert "SIGKILL" in raw["self_test"]["message"]
+    assert expected in raw["self_test"]["message"]
 
 
 def test_detect_timeout_kills_process_group(tmp_path: Path):
     marker = tmp_path / "grandchild-alive"
+    # 先拼出孙进程的代码再用 repr 嵌入：Windows 路径中的反斜杠不能直接放进字符串字面量
+    grandchild = (
+        f"import time, pathlib; time.sleep(3); pathlib.Path({str(marker)!r}).write_text('x')"
+    )
     cmd = script(
         tmp_path,
         f"""
         import subprocess, sys, time
         # 孙进程继承了管道：超时后必须连同它一起结束，否则读取输出会一直等待。
-        subprocess.Popen([sys.executable, "-c",
-            "import time, pathlib; time.sleep(3); pathlib.Path({str(marker)!r}).write_text('x')"])
+        subprocess.Popen([sys.executable, "-c", {grandchild!r}])
         print("working", file=sys.stderr, flush=True)
         time.sleep(30)
         """,

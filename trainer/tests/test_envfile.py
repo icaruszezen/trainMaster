@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from fakes import TRAINER_DIR
+from fakes import TRAINER_DIR, posix_only
 
 from trainmaster_trainer import envfile
 from trainmaster_trainer.envfile import EnvFileError
@@ -106,6 +106,8 @@ def test_apply_overrides_existing_values():
     assert environ == {"TM_NODE_NAME": "new", "PATH": "/bin", "CUDA_VISIBLE_DEVICES": "1"}
 
 
+# install.sh 只在 Linux 上运行；Windows 上找到的 bash 可能是 WSL 的启动器，Git Bash 解析命令行参数的规则也不同
+@posix_only
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not available")
 def test_reads_what_install_sh_writes():
     # install.sh 的 env_quote（双引号，转义 \ " $ `）写出的值能原样读回。

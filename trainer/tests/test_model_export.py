@@ -16,7 +16,7 @@ from typing import Any
 
 import export_fakes
 import pytest
-from fakes import TRAINER_DIR
+from fakes import TRAINER_DIR, WINDOWS
 
 from trainmaster_trainer import model_export
 from trainmaster_trainer.model_export import (
@@ -653,7 +653,9 @@ def run_child(
     return subprocess.run(
         [sys.executable, "-m", "trainmaster_trainer.model_export", "--spec", spec_json],
         capture_output=True,
-        text=True,
+        # 结果 JSON 总是 UTF-8（含中文）；不指定时 Windows 上按系统的代码页（如 cp1252）解码
+        encoding="utf-8",
+        errors="replace",
         env={**child_env(tmp_path, **config), **(env or {})},
         timeout=60,
     )
@@ -679,7 +681,7 @@ def test_child_main_turns_on_safe_load(tmp_path):
         tmp_path, json.dumps(s.to_json()), {model_export.SAFE_LOAD_ENV: "0"}, calls_file=str(calls)
     )
     assert proc.returncode == 0, proc.stderr
-    assert json.loads(calls.read_text().splitlines()[0])["safe_load"] is True
+    assert json.loads(calls.read_text(encoding="utf-8").splitlines()[0])["safe_load"] is True
 
 
 def test_child_main_failure_exit_code(tmp_path):
@@ -793,9 +795,15 @@ def test_process_nonzero_exit_without_json(tmp_path):
 
 
 def test_process_killed_by_signal(tmp_path):
-    cmd = script(tmp_path, "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n")
-    out = process(tmp_path, cmd).run(spec(tmp_path))
-    assert out["error"].startswith("转换进程被信号 SIGKILL 终止（可能是内存不足）")
+    if WINDOWS:
+        # Windows 没有 SIGKILL：进程崩溃时退出码是 NTSTATUS，这里模拟访问冲突（os._exit 的参数是 C 的 int）。
+        body = "import os\nos._exit(0xC0000005 - (1 << 32))\n"
+        expected = "转换进程崩溃（0xC0000005，访问冲突），用时 "
+    else:
+        body = "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n"
+        expected = "转换进程被信号 SIGKILL 终止（可能是内存不足）"
+    out = process(tmp_path, script(tmp_path, body)).run(spec(tmp_path))
+    assert out["error"].startswith(expected), out["error"]
 
 
 @pytest.mark.parametrize(
@@ -809,12 +817,16 @@ def test_process_malformed_output(tmp_path, output):
 
 def test_process_timeout_kills_process_group(tmp_path):
     marker = tmp_path / "grandchild-alive"
+    # 孙进程的代码整体用 repr 嵌入：路径直接写在 "..." 中时，Windows 路径的反斜杠（C:\Users…）会被解释为
+    # 转义序列，孙进程因语法错误立即退出，测试就没有检查到任何东西。
+    grandchild = (
+        f"import time, pathlib; time.sleep(3); pathlib.Path({str(marker)!r}).write_text('x')"
+    )
     cmd = script(
         tmp_path,
         f"""
         import subprocess, sys, time
-        subprocess.Popen([sys.executable, "-c",
-            "import time, pathlib; time.sleep(3); pathlib.Path({str(marker)!r}).write_text('x')"])
+        subprocess.Popen([sys.executable, "-c", {grandchild!r}])
         print("exporting", file=sys.stderr, flush=True)
         time.sleep(30)
         """,
@@ -898,11 +910,15 @@ def run_cli(tmp_path: Path, *args: str, **config: Any) -> subprocess.CompletedPr
         HOME=str(tmp_path / "home"),
         TM_STATE_DIR=str(tmp_path / "state"),
         TM_DATA_DIR=str(tmp_path),
+        # 命令行按 stdout / stderr 的编码打印中文摘要。Windows 上输出到管道时默认使用系统的代码页（runner 上是
+        # 不能表示中文的 cp1252），这里与 UTF-8 的终端一样指定 UTF-8。
+        PYTHONIOENCODING="utf-8",
     )
     return subprocess.run(
         [sys.executable, "-m", "trainmaster_trainer", "export", *args],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         timeout=120,
     )

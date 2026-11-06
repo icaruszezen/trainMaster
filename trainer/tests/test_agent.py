@@ -15,9 +15,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+import psutil
 import pytest
 from fake_platform import HEARTBEAT, REGISTER, FakePlatform, wait_until
-from fakes import TRAINER_DIR
+from fakes import TRAINER_DIR, WINDOWS
 
 from trainmaster_trainer import __version__, gpu
 from trainmaster_trainer.agent import Agent, Backoff, check_heartbeat
@@ -179,12 +180,14 @@ def test_register_then_heartbeat_with_environment(platform, tmp_path, caplog):
         assert last["environment"] is None and last["hardware"] is None
         assert isinstance(last["metrics"]["cpu_percent"], float)
 
-        data = json.loads((tmp_path / "heartbeat").read_text())
-        assert data["interval_seconds"] == 10 and data["node_id"] == 1
         assert h.agent.registered and h.agent.node_id == 1
         # 心跳之间按服务端给出的间隔等待
         assert h.clock.sleeps[-1] == pytest.approx(10.0)
     assert h.detector.calls == 1
+    # 主循环停止后再读心跳文件：运行时每次心跳都用 os.replace 替换它，Windows 上读取时打开着的文件
+    # 不能被替换，刚替换完时也可能暂时打不开（PermissionError）。
+    data = json.loads((tmp_path / "heartbeat").read_text(encoding="utf-8"))
+    assert data["interval_seconds"] == 10 and data["node_id"] == 1
     messages = [r.getMessage() for r in caplog.records]
     assert any("registered with" in m for m in messages)
     assert any("environment detection finished" in m for m in messages)
@@ -388,7 +391,8 @@ def test_server_unreachable_at_start(tmp_path):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     with Harness(tmp_path, f"http://127.0.0.1:{port}") as h:
-        wait_until(lambda: len(h.clock.sleeps) >= 4)
+        # Windows 上连接没有监听的端口要约 2 秒才被拒绝（系统收到 RST 后还会重试），4 次尝试约 8 秒
+        wait_until(lambda: len(h.clock.sleeps) >= 4, timeout=30)
         assert not h.agent.registered
     assert not (tmp_path / "heartbeat").exists()
 
@@ -459,6 +463,20 @@ def test_unexpected_client_error_does_not_stop_loop(platform, tmp_path, caplog):
     assert any("unexpected error in the agent loop" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize("wait_slice", [None, 0.05])
+def test_wait_returns_soon_after_stop(tmp_path, wait_slice):
+    # Windows 上分段等待（Event.wait 不会被信号打断，信号处理函数要等它返回才运行）
+    cfg = Config(server_url="http://127.0.0.1:9", state_dir=tmp_path, data_dir=tmp_path)
+    agent = Agent(cfg, node_key="k", wait_slice=wait_slice)
+    started = time.monotonic()
+    assert agent.wait(0.2) is False
+    assert 0.18 <= time.monotonic() - started < 5
+    threading.Timer(0.1, agent.stop).start()
+    started = time.monotonic()
+    assert agent.wait(30) is True
+    assert time.monotonic() - started < 5
+
+
 def test_agent_requires_server_url(tmp_path):
     with pytest.raises(ValueError):
         Agent(Config(state_dir=tmp_path), node_key="k")
@@ -466,7 +484,7 @@ def test_agent_requires_server_url(tmp_path):
 
 def test_heartbeat_file_write_failure_is_logged_once(platform, tmp_path, caplog):
     state = tmp_path / "state-file"
-    state.write_text("not a directory")
+    state.write_text("not a directory", encoding="utf-8")
     cfg = Config(server_url=platform.url, node_token=TOKEN, state_dir=state, data_dir=tmp_path)
     clock = FakeClock()
     agent = Agent(
@@ -544,7 +562,8 @@ def test_stop_interrupts_a_running_export(platform, tmp_path):
     child = tmp_path / "child.py"
     child.write_text(
         f"import os, pathlib, time\npathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
-        "time.sleep(30)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
     )
     created: list[TaskWorker] = []
     factory = worker_factory(
@@ -557,15 +576,16 @@ def test_stop_interrupts_a_running_export(platform, tmp_path):
     started = None
     with Harness(tmp_path, platform.url, task_worker=factory):
         wait_until(lambda: pid_file.exists() and pid_file.read_text())
-        pid = int(pid_file.read_text())
+        exporter = psutil.Process(int(pid_file.read_text()))
         started = time.monotonic()
     # Harness 退出时调用 agent.stop()：结束转换子进程，上报可重试的失败后才退出
     assert time.monotonic() - started < 10
     exp = platform.export(export_id)
     assert exp["status"] == "queued"
     assert exp["fails"][0]["retryable"] is True
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    # 子进程已被结束。不用 os.kill(pid, 0) 检查：Windows 上信号 0 是 CTRL_C_EVENT（发送 Ctrl+C），
+    # 不能判断进程是否存在。is_running 按启动时间排除 PID 被复用；Windows 上进程的 PID 可能稍后才消失。
+    wait_until(lambda: not exporter.is_running(), timeout=5)
 
 
 def test_registration_state_for_the_task_worker(tmp_path):
@@ -630,7 +650,9 @@ def test_backoff_sequence():
 
 def write_heartbeat(d: Path, unix: float, interval: float = 10) -> None:
     d.mkdir(parents=True, exist_ok=True)
-    (d / "heartbeat").write_text(json.dumps({"unix": unix, "interval_seconds": interval}))
+    (d / "heartbeat").write_text(
+        json.dumps({"unix": unix, "interval_seconds": interval}), encoding="utf-8"
+    )
 
 
 def test_check_heartbeat(tmp_path: Path):
@@ -648,15 +670,15 @@ def test_check_heartbeat(tmp_path: Path):
 
 
 def test_check_heartbeat_ignores_corrupt_files(tmp_path: Path):
-    (tmp_path / "heartbeat").write_text("{not json")
+    (tmp_path / "heartbeat").write_text("{not json", encoding="utf-8")
     assert not check_heartbeat([tmp_path], now=0)[0]
-    (tmp_path / "heartbeat").write_text(json.dumps({"interval_seconds": 10}))
+    (tmp_path / "heartbeat").write_text(json.dumps({"interval_seconds": 10}), encoding="utf-8")
     assert not check_heartbeat([tmp_path], now=0)[0]
     write_heartbeat(tmp_path, 100, interval=60)
     assert check_heartbeat([tmp_path], now=100 + 3 * 60 + 29)[0]
 
 
-# ---- 端到端：python -m trainmaster_trainer run 收到 SIGTERM 后退出码为 0 ----
+# ---- 端到端：python -m trainmaster_trainer run 收到 SIGTERM（Windows 上为 Ctrl+Break）后退出码为 0 ----
 
 
 def test_run_command_end_to_end_and_sigterm(platform, tmp_path: Path):
@@ -664,6 +686,8 @@ def test_run_command_end_to_end_and_sigterm(platform, tmp_path: Path):
     env = dict(
         os.environ,
         PYTHONPATH=str(TRAINER_DIR),
+        # 子进程的输出用 UTF-8：Windows 上输出到管道或文件时默认使用 ANSI 代码页（如 cp1252），中文无法编码
+        PYTHONIOENCODING="utf-8",
         TM_SERVER_URL=platform.url,
         TM_NODE_TOKEN=TOKEN,
         TM_NODE_NAME="e2e-node",
@@ -672,36 +696,49 @@ def test_run_command_end_to_end_and_sigterm(platform, tmp_path: Path):
         TM_LOG_LEVEL="debug",
         TM_NVIDIA_SMI=str(tmp_path / "no-nvidia-smi"),
     )
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "trainmaster_trainer", "run"],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    # Windows 上 send_signal(SIGTERM) 就是 TerminateProcess，不会执行信号处理函数：训练节点在新的进程组中
+    # 运行，向这个进程组发送 Ctrl+Break（CTRL_BREAK_EVENT，不会发给 pytest 自己），它收到 SIGBREAK 后
+    # 同样正常停止。
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if WINDOWS else 0
+    stop_signal, signal_name = (
+        (signal.CTRL_BREAK_EVENT, "SIGBREAK") if WINDOWS else (signal.SIGTERM, "SIGTERM")
     )
+    # 日志写到文件而不是管道：DEBUG 日志可能写满管道的缓冲区（Windows 上默认只有 4 KiB），
+    # 测试结束前不读取时训练节点会阻塞在写日志上。
+    log_path = tmp_path / "trainer.log"
+    with log_path.open("wb") as log_file:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "trainmaster_trainer", "run"],
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+        )
     try:
         node = wait_until(lambda: registered(platform), timeout=30)
         assert node["name"] == "e2e-node"
         wait_until(lambda: node.get("environment") is not None, timeout=60)
         assert node["environment"]["status"] in ("error", "cpu_only", "ready")
         wait_until(lambda: node.get("heartbeats", 0) >= 2, timeout=30)
-        key = (tmp_path / "state" / "node-key").read_text().strip()
+        key = (tmp_path / "state" / "node-key").read_text(encoding="utf-8").strip()
         assert key in platform.nodes
 
         health = subprocess.run(
             [sys.executable, "-m", "trainmaster_trainer", "healthcheck"],
             env=env,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
         )
         assert health.returncode == 0, health.stderr
-        proc.send_signal(signal.SIGTERM)
-        _, stderr = proc.communicate(timeout=30)
+        proc.send_signal(stop_signal)
+        proc.wait(timeout=30)
     finally:
         if proc.poll() is None:
             proc.kill()
-            proc.communicate()
-    assert proc.returncode == 0, stderr
-    assert "received SIGTERM, stopping" in stderr
-    assert "trainer stopped" in stderr
+            proc.wait()
+    output = log_path.read_text(encoding="utf-8", errors="replace")
+    assert proc.returncode == 0, output
+    assert f"received {signal_name}, stopping" in output
+    assert "trainer stopped" in output

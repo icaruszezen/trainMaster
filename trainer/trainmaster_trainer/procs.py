@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import weakref
 from typing import Any
 
@@ -65,6 +66,48 @@ class _Job:
                 return False
             return bool(self._kernel32.TerminateJobObject(self.handle, exit_code))
 
+    def active_processes(self) -> int | None:
+        """Job 中还没有退出的进程数；查询失败时为 None。"""
+        import ctypes
+        from ctypes import wintypes
+
+        class Accounting(ctypes.Structure):  # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+            _fields_ = [
+                ("TotalUserTime", ctypes.c_int64),
+                ("TotalKernelTime", ctypes.c_int64),
+                ("ThisPeriodTotalUserTime", ctypes.c_int64),
+                ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                ("TotalPageFaultCount", wintypes.DWORD),
+                ("TotalProcesses", wintypes.DWORD),
+                ("ActiveProcesses", wintypes.DWORD),
+                ("TotalTerminatedProcesses", wintypes.DWORD),
+            ]
+
+        job_object_basic_accounting_information = 1
+        info = Accounting()
+        with self._lock:
+            if not self.handle:
+                return None
+            ok = self._kernel32.QueryInformationJobObject(
+                self.handle,
+                job_object_basic_accounting_information,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+                None,
+            )
+        return int(info.ActiveProcesses) if ok else None
+
+    def wait_empty(self, timeout: float) -> bool:
+        """等待 Job 中的进程全部退出（最多 timeout 秒）；返回是否已全部退出（无法查询时为 False）。"""
+        deadline = time.monotonic() + timeout
+        while True:
+            active = self.active_processes()
+            if active is None or active == 0:
+                return active == 0
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
     def close(self) -> None:
         with self._lock:
             handle, self.handle = self.handle, 0
@@ -98,6 +141,14 @@ def _load_kernel32() -> Any:
     k32.AssignProcessToJobObject.restype = wintypes.BOOL
     k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
     k32.TerminateJobObject.restype = wintypes.BOOL
+    k32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPDWORD,
+    ]
+    k32.QueryInformationJobObject.restype = wintypes.BOOL
     k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     k32.OpenProcess.restype = wintypes.HANDLE
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
@@ -239,6 +290,10 @@ def _kill_windows(proc: subprocess.Popen[Any], grace: float) -> None:
     if job is not None:
         try:
             terminated = job.terminate()
+            if terminated:
+                # TerminateJobObject 不等进程退出。从虚拟环境运行时 python.exe 只是启动器，真正的解释器是
+                # 它的子进程：只等 proc 的话，解释器可能还占着工作目录中的文件（之后无法删除）与显存。
+                job.wait_empty(grace)
         finally:
             job.close()
         if not terminated:

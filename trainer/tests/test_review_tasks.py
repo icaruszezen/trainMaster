@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import shutil
@@ -16,6 +17,7 @@ from typing import Any
 import inference_fakes
 import pytest
 from fake_platform import CLAIM, DROP, FakePlatform, wait_until
+from fakes import WINDOWS
 from inference_fakes import fake_image
 from task_harness import NODE_KEY, TOKEN, Run, gone, script
 
@@ -80,7 +82,9 @@ def action(request: dict[str, Any]) -> str:
 
 
 def recorded(calls: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+    if not calls.exists():
+        return []
+    return [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
 
 
 def results_posted(platform: FakePlatform, review_id: int) -> list[list[dict[str, Any]]]:
@@ -219,7 +223,9 @@ def test_review_inference_end_to_end(platform, tmp_path, fake_ml, caplog):
 
     model_calls = recorded(calls)
     assert model_calls[0]["call"] == "YOLO" and model_calls[0]["task"] == "detect"
-    assert model_calls[0]["weights"].endswith(f"review-inference-{review_id}/model.pt")
+    # 按路径的各部分比较（Windows 上的分隔符是 \）
+    weights = Path(model_calls[0]["weights"])
+    assert weights.parts[-2:] == (f"review-inference-{review_id}", "model.pt")
     assert model_calls[0]["safe_load"] is True
     predict = [c for c in model_calls if c["call"] == "predict"]
     assert [c["tag"] for c in predict] == ["warmup", "bus", "", ""]  # 损坏的图片没有交给模型
@@ -373,13 +379,18 @@ def test_keeps_the_lease_with_progress(platform, tmp_path):
         review = finished(platform, review_id)
     assert review["status"] == "ready", review
     progress = review["progress"]
-    assert progress[:2] == [("downloading", "正在下载模型"), ("inferring", "正在加载模型")]
-    inferring = [message for stage, message in progress[2:] if stage == "inferring"]
+    messages = [message for _, message in progress]
+    # 下载模型 → 加载模型 → 识别。续租线程每 0.1 秒上报一次当前的进度，某一步超过 0.1 秒时（如 Windows 上
+    # 启动 Python 子进程较慢）同一条进度会重复出现
+    assert progress[0] == ("downloading", "正在下载模型")
+    loading = messages.index("正在加载模型")
+    assert messages[:loading] == ["正在下载模型"] * loading
+    assert all(stage == "inferring" for stage, _ in progress[loading:])
+    inferring = list(itertools.dropwhile(lambda m: m == "正在加载模型", messages[loading:]))
     assert len(inferring) >= 5  # 识别时定期续租
     # 进度是平台上已经识别的图片数（含上次运行识别的那一张）；结果攒批上报后才增加
     assert inferring[0] == "已识别 1 / 4"
     assert set(inferring) <= {"已识别 1 / 4", "已识别 2 / 4", "已识别 3 / 4", "已识别 4 / 4"}
-    assert all(stage == "inferring" for stage, _ in progress[1:])
 
 
 def test_results_are_reported_while_waiting(platform, tmp_path, monkeypatch):
@@ -505,12 +516,20 @@ def test_image_timeout_is_skipped_when_retried(platform, tmp_path, fake_ml):
 def test_child_crash_on_one_image_is_skipped_when_retried(platform, tmp_path):
     # 子进程识别第 2 张图片时崩溃（如解码器出错）：这张图片记为识别失败，任务失败（不可重试，换一个节点
     # 也会崩溃）；用户重新识别时跳过它，继续识别其余的图片
+    if WINDOWS:
+        # Windows 上 os.kill 是 TerminateProcess（退出码就是信号的编号，不算崩溃）：进程崩溃时退出码是
+        # NTSTATUS，这里模拟访问冲突（os._exit 的参数是 C 的 int）。
+        crash = "        os._exit(0xC0000005 - (1 << 32))\n"
+        reason = "0xC0000005，访问冲突"
+    else:
+        crash = "        import signal\n        os.kill(os.getpid(), signal.SIGSEGV)\n"
+        reason = "信号 SIGSEGV"
     body = (
         '    if req["id"] == 2:\n'
-        "        import signal\n"
         "        print('decoder crashed', file=sys.stderr, flush=True)\n"
-        "        os.kill(os.getpid(), signal.SIGSEGV)\n"
-        "        time.sleep(5)\n" + ANSWER
+        + crash
+        + "        time.sleep(5)\n"
+        + ANSWER
     )
     cmd = ready_child(tmp_path, body)
     review_id = platform.add_review(PT, {i: fake_image(40, 30) for i in range(1, 6)})
@@ -519,7 +538,7 @@ def test_child_crash_on_one_image_is_skipped_when_retried(platform, tmp_path):
         assert review["status"] == "failed", review
         assert review["attempts"] == 1
         fail = review["fails"][0]
-        assert fail["error"] == "识别进程崩溃（信号 SIGSEGV）"  # 不是“可能是内存不足”
+        assert fail["error"] == f"识别进程崩溃（{reason}）"  # 不是“可能是内存不足”
         assert fail["retryable"] is False
         assert "decoder crashed" in fail["detail"]
         assert fail["detail"].endswith(
@@ -528,7 +547,7 @@ def test_child_crash_on_one_image_is_skipped_when_retried(platform, tmp_path):
         assert review["images"][2]["result"] == {
             "id": 2,
             "ok": False,
-            "error": "识别这张图片时识别进程崩溃（信号 SIGSEGV）",
+            "error": f"识别这张图片时识别进程崩溃（{reason}）",
         }
         assert [img["inferred"] for img in review["images"].values()] == [
             True,

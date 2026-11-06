@@ -134,6 +134,8 @@ def pci_gpu_count(runner: Runner = subprocess.run, timeout: float = PNP_TIMEOUT)
             ],
             capture_output=True,
             text=True,
+            # 本地化的错误信息（标准错误）可能不是 ANSI 代码页的编码，不能因此抛出 UnicodeDecodeError
+            errors="replace",
             timeout=timeout,
             check=False,
             **procs.quiet_kwargs(),

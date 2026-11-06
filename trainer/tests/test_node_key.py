@@ -8,6 +8,7 @@ import stat
 import uuid
 
 import pytest
+from fakes import WINDOWS, posix_only
 
 from trainmaster_trainer import node_key
 
@@ -18,8 +19,9 @@ def test_generated_once_and_reused(tmp_path, caplog):
     key = node_key.load_or_create(state)
     uuid.UUID(key)
     path = state / "node-key"
-    assert path.read_text() == key + "\n"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert path.read_text(encoding="utf-8") == key + "\n"
+    if not WINDOWS:  # Windows 上 os.chmod 只能设置只读属性，没有权限位
+        assert stat.S_IMODE(path.stat().st_mode) == 0o644
     assert node_key.load_or_create(state) == key
     assert node_key.read(state) == key
     assert sum("generated a new node key" in r.getMessage() for r in caplog.records) == 1
@@ -34,11 +36,12 @@ def test_existing_key_with_whitespace_is_kept(tmp_path):
 
 @pytest.mark.parametrize("content", ["", "bad key", "x" * 65, "键", "a/b"])
 def test_invalid_key_is_replaced(tmp_path, caplog, content):
-    (tmp_path / "node-key").write_text(content)
+    # 与读取方相同用 UTF-8 写入（Windows 上默认的代码页 cp1252 无法编码“键”）
+    (tmp_path / "node-key").write_text(content, encoding="utf-8")
     assert node_key.read(tmp_path) is None
     key = node_key.load_or_create(tmp_path)
     assert node_key.is_valid(key) and key != content.strip()
-    assert (tmp_path / "node-key").read_text().strip() == key
+    assert (tmp_path / "node-key").read_text(encoding="utf-8").strip() == key
     if content.strip():
         assert any("is invalid" in r.getMessage() for r in caplog.records)
 
@@ -87,6 +90,7 @@ def test_atomic_write_cleans_up_on_failure(tmp_path, monkeypatch):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["file"]
 
 
+@posix_only  # Windows 上 os.chmod 只能设置只读属性，0o600 之类的权限位不成立
 def test_atomic_write_mode(tmp_path):
     target = tmp_path / "secret"
     node_key.atomic_write_text(target, "x", mode=0o600)

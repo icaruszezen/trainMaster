@@ -11,9 +11,12 @@ from fakes import (
     GPU_IS_LOST,
     LIBRARY_MISMATCH,
     NOT_SUPPORTED,
+    WINDOWS,
     Err,
     make_nvml,
+    posix_only,
     rtx4090,
+    write_fake_smi,
     write_files,
 )
 
@@ -219,13 +222,20 @@ def test_cuda_driver_version_formatting():
     ],
 )
 def test_nvml_init_failure_without_smi(code, text, tmp_path):
-    write_files(tmp_path, {"proc/driver/nvidia/gpus/0000:01:00.0/information": "Model: x\n"})
+    # Windows 上没有 /proc/driver/nvidia，probe 不读取它（host_gpu_count 为 None）；PCI 地址作为目录名含冒号，
+    # Windows 上也不能创建
+    if not WINDOWS:
+        write_files(tmp_path, {"proc/driver/nvidia/gpus/0000:01:00.0/information": "Model: x\n"})
     result = gpu.probe(
         nvml_loader=lambda: make_nvml(init_error=code), find_smi=False, root=tmp_path
     )
     assert result.gpus == []
     assert result.driver is None
-    assert result.detection == {"method": "none", "error": text, "host_gpu_count": 1}
+    assert result.detection == {
+        "method": "none",
+        "error": text,
+        "host_gpu_count": None if WINDOWS else 1,
+    }
     assert result.sampler.sample() == []
 
 
@@ -416,17 +426,8 @@ def test_find_nvidia_smi_override():
 
 
 def test_fake_nvidia_smi_script(tmp_path: Path):
-    """用真实的可执行脚本代替 nvidia-smi（与部署脚本测试的方式相同）。"""
-    script = tmp_path / "nvidia-smi"
-    script.write_text(
-        "#!/bin/sh\n"
-        'case "$1" in\n'
-        f"  --query-gpu=*) cat <<'EOF'\n{SMI_CSV}EOF\n;;\n"
-        "  --query-compute-apps=*) ;;\n"
-        f"  *) cat <<'EOF'\n{SMI_HEADER}EOF\n;;\n"
-        "esac\n"
-    )
-    script.chmod(0o755)
+    """用真实的可执行脚本代替 nvidia-smi（与部署脚本测试的方式相同；Linux 上是 sh 脚本，Windows 上是 .cmd）。"""
+    script = write_fake_smi(tmp_path, SMI_CSV, SMI_HEADER)
     result = gpu.probe(nvml_loader=lambda: make_nvml(init_error=1), smi_path=str(script))
     assert len(result.gpus) == 2
     assert result.driver["driver_version"] == "550.54.15"
@@ -436,6 +437,9 @@ def test_fake_nvidia_smi_script(tmp_path: Path):
 # ---- /proc、/sys、/dev ----
 
 
+# /proc/driver/nvidia 与 /sys/bus/pci 只在 Linux 上读取（Windows 上用 winsys）；其中的 PCI 地址（0000:01:00.0）
+# 作为目录名含冒号，Windows 上不能创建。
+@posix_only
 def test_host_gpu_count(tmp_path: Path):
     assert gpu.host_gpu_count(tmp_path) is None
     (tmp_path / "proc/driver/nvidia/gpus").mkdir(parents=True)
@@ -481,6 +485,7 @@ def test_host_driver_version(tmp_path: Path):
     assert gpu.host_driver_version(tmp_path) == "440.100"
 
 
+@posix_only  # 同 test_host_gpu_count：PCI 地址作为目录名含冒号
 def test_pci_gpu_count(tmp_path: Path):
     assert gpu.pci_gpu_count(tmp_path) is None
     write_files(
