@@ -339,3 +339,217 @@ def test_format_environment_minimal():
     assert "  版本：Python ?\n" in text
     assert "已安装 未知，按本机驱动与显卡推荐 未知" in text
     assert text.endswith("  自检：未知")
+
+
+# ---- --env-file（Windows 的计划任务用它读取 trainer.env）----
+
+
+def test_env_file_is_applied_before_loading_config(tmp_path):
+    env_file = tmp_path / "trainer.env"
+    env_file.write_text("TM_LOG_LEVEL='loud'\n", encoding="utf-8")
+    # 配置文件中的值覆盖环境变量：TM_LOG_LEVEL 不合法，报告配置错误
+    proc = run_cli(tmp_path, "probe", "--env-file", str(env_file), TM_LOG_LEVEL="info")
+    assert proc.returncode == 2
+    assert proc.stderr.startswith("配置错误：TM_LOG_LEVEL")
+    # 也可以写在命令之前
+    proc = run_cli(tmp_path, "--env-file", str(env_file), "probe", TM_LOG_LEVEL="info")
+    assert proc.returncode == 2
+
+
+def test_env_file_errors_exit_2(tmp_path):
+    proc = run_cli(tmp_path, "run", "--env-file", str(tmp_path / "missing.env"))
+    assert proc.returncode == 2
+    assert "配置错误：配置文件" in proc.stderr and "不存在" in proc.stderr
+    bad = tmp_path / "bad.env"
+    bad.write_text("TM_SERVER_URL='http://x\n", encoding="utf-8")
+    proc = run_cli(tmp_path, "run", "--env-file", str(bad))
+    assert proc.returncode == 2
+    assert "第 1 行（TM_SERVER_URL）：缺少结尾的引号" in proc.stderr
+
+
+def test_apply_env_file_sets_tm_env_file(tmp_path, monkeypatch):
+    env_file = tmp_path / "trainer.env"
+    env_file.write_text("TM_NODE_NAME='节点 1'\nCUDA_VISIBLE_DEVICES=1\n", encoding="utf-8")
+    monkeypatch.setenv("TM_NODE_NAME", "old")
+    monkeypatch.delenv("TM_ENV_FILE", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert cli.apply_env_file(str(env_file))
+    assert os.environ["TM_NODE_NAME"] == "节点 1"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "1"
+    assert os.environ["TM_ENV_FILE"] == str(env_file.absolute())
+    assert cli.apply_env_file(None)
+
+
+def test_env_file_reaches_the_fix_commands(tmp_path):
+    # TM_ENV_FILE 是 Deployment.env_file（Windows 修复建议中的 -EnvFile 与 selftest --env-file）
+    from trainmaster_trainer.environment import deployment_from
+
+    env = {"TM_STATE_DIR": str(tmp_path / "s"), "TM_ENV_FILE": str(tmp_path / "t.env")}
+    cfg = config_load(env)
+    assert deployment_from(cfg).env_file == str(tmp_path / "t.env")
+
+
+def config_load(env):
+    from trainmaster_trainer import config
+
+    return config.load(env)
+
+
+# ---- recommend（安装脚本使用）----
+
+SMI_GPUS = (
+    "0, GPU-aaaa, NVIDIA GeForce RTX 4090, 24564, 1024, 35, 45, 120.40, 450.00, 30, 8.9, "
+    "00000000:01:00.0\n"
+)
+SMI_HEADER = (
+    "| NVIDIA-SMI 581.57                 Driver Version: 581.57         CUDA Version: 13.0     |\n"
+)
+
+
+def test_recommend_json_without_gpu(tmp_path):
+    proc = run_cli(tmp_path, "recommend", "--json")
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    assert report["recommended"]["variant"] == "cpu"
+    assert report["variant"]["name"] == "cpu"
+    assert report["variant"]["torch"] and report["variant"]["torchvision"]
+    assert report["gpus"] == [] and report["driver"] is None
+    assert report["variants"] == ["cu130", "cu126", "cu128", "cu118", "cpu"]
+    assert report["platform"] == ("windows" if sys.platform == "win32" else "linux")
+
+
+def test_recommend_with_nvidia_smi(tmp_path):
+    from fakes import write_fake_smi
+
+    smi = write_fake_smi(tmp_path / "smi", SMI_GPUS, SMI_HEADER)
+    proc = run_cli(tmp_path, "recommend", "--json", TM_NVIDIA_SMI=str(smi))
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    assert report["driver"] == "581.57"
+    assert report["gpus"][0]["name"] == "NVIDIA GeForce RTX 4090"
+    assert report["gpus"][0]["compute_capability"] == "8.9"
+    assert report["recommended"]["variant"] == "cu130"
+    assert report["variant"] == {
+        "name": "cu130",
+        "torch": "2.14.1",
+        "torchvision": "0.29.1",
+        "source": "pypi",
+        "cuda": "13.0",
+        "min_driver": "580",
+    }
+    # 手动指定变体：推荐不变，variant 为指定的变体（Windows 上最低驱动取 Windows 的值）
+    proc = run_cli(tmp_path, "recommend", "--json", "--variant", "cu126", TM_NVIDIA_SMI=str(smi))
+    report = json.loads(proc.stdout)
+    assert report["recommended"]["variant"] == "cu130"
+    assert report["variant"]["name"] == "cu126"
+    assert report["variant"]["min_driver"] == ("528.33" if sys.platform == "win32" else "525.60.13")
+    # 文字摘要
+    proc = run_cli(tmp_path, "recommend", "--variant", "cu126", TM_NVIDIA_SMI=str(smi))
+    assert proc.returncode == 0, proc.stderr
+    assert "[0] NVIDIA GeForce RTX 4090（显存 24 GiB，计算能力 8.9）" in proc.stdout
+    assert "驱动：581.57" in proc.stdout
+    assert "推荐的 PyTorch 变体：cu130" in proc.stdout
+    assert "使用手动指定的变体：cu126" in proc.stdout
+
+
+def test_recommend_unknown_variant(tmp_path):
+    proc = run_cli(tmp_path, "recommend", "--variant", "cu999")
+    assert proc.returncode == 2
+    assert "未知的变体 cu999（可选：cu130 cu126 cu128 cu118 cpu）" in proc.stderr
+
+
+def test_format_recommend_without_driver():
+    report = {
+        "platform": "windows",
+        "arch": "AMD64",
+        "gpus": [],
+        "driver": None,
+        "pci_gpu_count": 2,
+        "assumed_cc": "7.5",
+        "detection": {"error": "NVML Shared Library Not Found"},
+        "recommended": {"variant": "cpu", "reason": "未检测到 NVIDIA 显卡，使用 CPU 版 PyTorch"},
+        "variant": {"name": "cpu"},
+    }
+    text = cli.format_recommend(report)
+    assert "平台：windows AMD64" in text
+    assert "检测到 2 块 NVIDIA 显卡，但没有可用的驱动" in text
+    report["pci_gpu_count"] = None
+    assert "显卡：未检测到 NVIDIA 显卡\n" in cli.format_recommend(report)
+    report["detection"] = {"error": "Unknown Error"}
+    assert "未检测到 NVIDIA 显卡（Unknown Error）" in cli.format_recommend(report)
+
+
+# ---- TM_LOG_FILE ----
+
+
+def test_setup_logging_writes_log_file(tmp_path):
+    import logging
+
+    path = tmp_path / "logs" / "trainer.log"
+    try:
+        cli.setup_logging(logging.INFO, path)
+        logging.getLogger("trainmaster_trainer.test").info("hello 你好")
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+        assert "hello 你好" in path.read_text(encoding="utf-8")
+    finally:
+        for handler in logging.getLogger().handlers:
+            handler.close()
+        cli.setup_logging(logging.WARNING)
+
+
+def test_setup_logging_reports_unwritable_log_file(tmp_path, capsys):
+    import logging
+
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    try:
+        cli.setup_logging(logging.INFO, blocker / "trainer.log")
+        assert "cannot write log file" in capsys.readouterr().err
+    finally:
+        cli.setup_logging(logging.WARNING)
+
+
+def test_log_file_rotates(tmp_path, monkeypatch):
+    import logging
+
+    monkeypatch.setattr(cli, "LOG_FILE_MAX_BYTES", 200)
+    handler = cli.LogFileHandler(tmp_path / "t.log")
+    handler.maxBytes = 200
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    try:
+        for i in range(20):
+            handler.emit(logging.makeLogRecord({"msg": f"line {i} " + "x" * 40}))
+    finally:
+        handler.close()
+    assert (tmp_path / "t.log.1").is_file()
+    assert (tmp_path / "t.log").stat().st_size <= 200
+
+
+def test_log_file_keeps_writing_when_rotation_fails(tmp_path, monkeypatch):
+    # Windows：日志文件被其它程序打开时无法改名。这次不轮转，1 分钟后再试，日志不丢失。
+    import logging
+
+    now = [1000.0]
+    handler = cli.LogFileHandler(tmp_path / "t.log", clock=lambda: now[0])
+    handler.maxBytes = 100
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    attempts = []
+
+    def failing_rotate(source, dest):
+        attempts.append(dest)
+        raise PermissionError(32, "另一个程序正在使用此文件，进程无法访问。")
+
+    handler.rotator = failing_rotate
+    try:
+        for i in range(10):
+            handler.emit(logging.makeLogRecord({"msg": f"line {i} " + "y" * 30}))
+        assert len(attempts) == 1  # 失败后 60 秒内不再尝试
+        now[0] += cli.LOG_ROTATE_RETRY + 1
+        handler.emit(logging.makeLogRecord({"msg": "after retry"}))
+        assert len(attempts) == 2
+    finally:
+        handler.close()
+    text = (tmp_path / "t.log").read_text(encoding="utf-8")
+    assert all(f"line {i} " in text for i in range(10))
+    assert "after retry" in text

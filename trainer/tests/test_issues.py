@@ -1223,3 +1223,286 @@ def test_arch_covers(cc, archs, expected):
 )
 def test_format_bytes(n, expected):
     assert format_bytes(n) == expected
+
+
+# ---- Windows 节点（Hardware.platform = windows）：命令是管理员 PowerShell 中的 install.ps1 ----
+
+WIN_PREFIX = r"C:\ProgramData\trainMaster\trainer"
+WIN = Deployment(
+    server_url=REMOTE_URL,
+    python=WIN_PREFIX + r"\Scripts\python.exe",
+    prefix=WIN_PREFIX,
+    env_file=WIN_PREFIX + r"\trainer.env",
+    program_data=r"C:\ProgramData",
+)
+WIN_INSTALLER = (
+    "& ([scriptblock]::Create((irm 'http://192.168.1.10:8080/api/v1/compute/windows/install.ps1')))"
+)
+
+
+def win_hw(gpus: list[dict[str, Any]] | None = None, **kw: Any) -> dict[str, Any]:
+    kw.setdefault("arch", "AMD64")
+    h = hw(gpus, container=False, shm=None, **kw)
+    h.update(os="Windows 11 Pro 23H2", kernel="10.0.22631.4317", platform="windows")
+    return h
+
+
+def win_env(hardware, r, *, deployment: Deployment = WIN, **kw: Any) -> dict[str, Any]:
+    return env_of(hardware, r, deployment=deployment, **kw)
+
+
+def test_windows_ready_gpu_node():
+    env = win_env(win_hw([gpu()], driver="581.57"), raw())
+    assert env["status"] == "ready"
+    assert env["recommended_variant"] == "cu130"
+    assert env["issues"] == []
+
+
+def test_windows_recommendation_uses_windows_drivers():
+    # 527.41 在 Linux 上满足 CUDA 12（525.60.13），在 Windows 上不满足（528.33）
+    env = win_env(
+        win_hw([gpu(cc="7.5")], driver="527.41"),
+        raw(cuda="11.8", archs=None),
+        torch_variant="cu118",
+    )
+    assert env["recommended_variant"] == "cu118"
+    linux = env_of(
+        hw([gpu(cc="7.5")], driver="527.41", container=False), raw(), torch_variant="cu130"
+    )
+    assert linux["recommended_variant"] == "cu126"
+
+
+def test_windows_variant_hint_reruns_platform_installer():
+    env = win_env(
+        win_hw([gpu(cc="12.0")], driver="572.16"),
+        raw(cuda="12.6", archs=CU126_ARCHS),
+        torch_variant="cu126",
+    )
+    issue = only(env, "arch_unsupported")
+    assert issue["hint"] == (
+        "改用 PyTorch 变体 cu128 重新安装（在管理员 PowerShell 中运行）：`"
+        + WIN_INSTALLER
+        + " -Variant cu128`"
+    )
+
+
+def test_windows_cpu_build_hint():
+    # Windows 上从 PyPI 装的 torch 是 CPU 版
+    env = win_env(win_hw([gpu()], driver="581.57"), cpu_raw(), torch_variant=None)
+    issue = only(env, "torch_cpu_build")
+    assert issue["level"] == "error"
+    assert WIN_INSTALLER + " -Variant cu130" in issue["hint"]
+    assert "sudo" not in issue["hint"] and "install.sh" not in issue["hint"]
+
+
+def test_windows_driver_too_old_for_installed_variant():
+    env = win_env(
+        win_hw([gpu()], driver="527.41"), raw(cuda="12.6", archs=CU126_ARCHS), torch_variant="cu126"
+    )
+    issue = only(env, "driver_too_old")
+    assert "要求的最低版本 528.33" in issue["message"]
+
+
+def test_windows_driver_too_old_for_any_cuda_build():
+    env = win_env(win_hw([gpu(cc="7.5")], driver="451.82"), cpu_raw(), torch_variant="cpu")
+    issue = only(env, "driver_too_old")
+    assert "452.39" in issue["message"]
+    assert issue["hint"].startswith("升级 NVIDIA 显卡驱动")
+    assert WIN_INSTALLER in issue["hint"] and "-Variant" not in issue["hint"]
+
+
+def test_windows_pci_gpus_without_driver():
+    hardware = win_hw([], error="NVML Shared Library Not Found")
+    env = win_env(hardware, cpu_raw(), torch_variant="cpu", pci_gpu_count=1)
+    issue = only(env, "no_gpu")
+    assert issue["level"] == "warning"
+    assert "没有安装 NVIDIA 显卡驱动" in issue["message"]
+    assert issue["hint"].startswith("安装 NVIDIA 显卡驱动")
+    assert WIN_INSTALLER in issue["hint"]
+    assert "宿主机" not in issue["hint"] and "Toolkit" not in issue["hint"]
+
+
+def test_windows_pci_gpus_with_broken_nvml():
+    hardware = win_hw([], error="Driver Not Loaded")
+    env = win_env(hardware, cpu_raw(), torch_variant="cpu", pci_gpu_count=1)
+    issue = only(env, "nvml_error")
+    assert "设备管理器" in issue["hint"]
+    assert "内核模块" not in issue["hint"]
+
+
+def test_windows_nvml_error_with_nvidia_smi_fallback():
+    hardware = win_hw(
+        [gpu()], driver="581.57", method="nvidia-smi", error="NVML Shared Library Not Found"
+    )
+    env = win_env(hardware, raw())
+    assert "nvml.dll" in only(env, "nvml_error")["hint"]
+
+
+def test_windows_mixed_gpus_hint_edits_trainer_env_and_restarts_task():
+    gpus = [
+        gpu(0, "Tesla P40", cc="6.1"),
+        gpu(1, "RTX 5090", cc="12.0"),
+        gpu(2, "RTX 5090", cc="12.0"),
+    ]
+    env = win_env(win_hw(gpus, driver="581.57"), raw(), torch_variant="cu130")
+    issue = only(env, "arch_unsupported")
+    assert issue["level"] == "warning"
+    assert issue["hint"] == (
+        r"训练只使用受支持的显卡：在训练节点的配置文件 C:\ProgramData\trainMaster\trainer\trainer.env 中设置 "
+        "`CUDA_VISIBLE_DEVICES=1,2`，然后在管理员 PowerShell 中重启训练节点："
+        "`Stop-ScheduledTask -TaskName trainmaster-trainer; Start-ScheduledTask -TaskName trainmaster-trainer`"
+    )
+
+
+@pytest.mark.parametrize(
+    ("python", "env_file", "command"),
+    [
+        (
+            WIN_PREFIX + r"\Scripts\python.exe",
+            WIN_PREFIX + r"\trainer.env",
+            r"`C:\ProgramData\trainMaster\trainer\Scripts\python.exe -m trainmaster_trainer selftest "
+            r"--env-file C:\ProgramData\trainMaster\trainer\trainer.env`",
+        ),
+        (
+            r"D:\Train Master\Scripts\python.exe",
+            None,
+            r"`& 'D:\Train Master\Scripts\python.exe' -m trainmaster_trainer selftest`",
+        ),
+    ],
+)
+def test_windows_self_test_hint(python, env_file, command):
+    deployment = Deployment(
+        server_url=REMOTE_URL, python=python, prefix=WIN_PREFIX, env_file=env_file
+    )
+    failed = {
+        "status": "failed",
+        "device": "cuda:0",
+        "duration_ms": 10,
+        "message": "x",
+        "detail": "boom",
+    }
+    env = win_env(win_hw([gpu()], driver="581.57"), raw(self_test=failed), deployment=deployment)
+    assert command in only(env, "self_test_failed")["hint"]
+
+
+@pytest.mark.parametrize(
+    ("deployment", "expected"),
+    [
+        (
+            Deployment(
+                server_url="https://tm.example.com/",
+                prefix=WIN_PREFIX,
+                program_data=r"C:\ProgramData",
+            ),
+            "[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; "
+            "& ([scriptblock]::Create((irm 'https://tm.example.com/api/v1/compute/windows/install.ps1')))"
+            " -Variant cu128",
+        ),
+        (
+            Deployment(
+                server_url=REMOTE_URL,
+                prefix=r"D:\tm\trainer",
+                env_file=r"D:\tm\trainer\trainer.env",
+                program_data=r"C:\ProgramData",
+            ),
+            WIN_INSTALLER + r" -Variant cu128 -Prefix D:\tm\trainer",
+        ),
+        (
+            Deployment(
+                server_url=REMOTE_URL,
+                prefix=r"c:\programdata\TRAINMASTER\trainer\\",
+                env_file=r"D:\My Configs\trainer.env",
+                program_data=r"C:\ProgramData",
+            ),
+            WIN_INSTALLER + r" -Variant cu128 -EnvFile 'D:\My Configs\trainer.env'",
+        ),
+        (
+            Deployment(server_url=None, prefix=WIN_PREFIX),
+            r"powershell -ExecutionPolicy Bypass -File trainer\scripts\install.ps1 -Variant cu128",
+        ),
+    ],
+)
+def test_windows_installer_command(deployment, expected):
+    env = win_env(
+        win_hw([gpu(cc="12.0")], driver="572.16"),
+        raw(cuda="12.6", archs=CU126_ARCHS),
+        torch_variant="cu126",
+        deployment=deployment,
+    )
+    assert only(env, "arch_unsupported")["hint"].endswith("`" + expected + "`")
+
+
+def test_ps_quote():
+    assert issues.ps_quote("a'b") == "'a''b'"
+    assert issues.ps_quote("") == "''"
+
+
+@pytest.mark.parametrize(
+    ("error", "part"),
+    [
+        (
+            'OSError: [WinError 126] 找不到指定的模块。 Error loading "C:\\x\\torch\\lib\\c10.dll" '
+            "or one of its dependencies.",
+            "Microsoft Visual C++ 运行库",
+        ),
+        ("OSError: [WinError 1114] 动态链接库(DLL)初始化例程失败。", "Microsoft Visual C++ 运行库"),
+        (
+            "ImportError: DLL load failed while importing _C: 找不到指定的模块。",
+            "Microsoft Visual C++ 运行库",
+        ),
+        ("OSError: [WinError 1455] 页面文件太小，无法完成操作。", "虚拟内存（页面文件）"),
+        (
+            "OSError: [WinError 1455] The paging file is too small for this operation to complete.",
+            "虚拟内存",
+        ),
+    ],
+)
+def test_windows_import_errors_have_specific_hints(error, part):
+    env = win_env(win_hw([gpu()], driver="581.57"), raw(torch=None, torch_error=error))
+    hint = only(env, "torch_missing")["hint"]
+    assert part in hint
+    if "运行库" in part:
+        assert issues.VC_REDIST_URL in hint
+        assert "Start-ScheduledTask -TaskName trainmaster-trainer" in hint
+
+
+def test_windows_other_import_errors_reinstall():
+    env = win_env(
+        win_hw([gpu()], driver="581.57"),
+        raw(torch=None, torch_error="ModuleNotFoundError: No module named 'torch'"),
+    )
+    assert only(env, "torch_missing")["hint"].startswith(
+        "重新运行安装脚本（在管理员 PowerShell 中运行）：`" + WIN_INSTALLER
+    )
+
+
+def test_windows_import_hints_only_on_windows():
+    error = "ImportError: DLL load failed while importing _C"
+    env = env_of(hw([gpu()], container=False), raw(torch=None, torch_error=error))
+    assert "Visual C++" not in only(env, "torch_missing")["hint"]
+
+
+def test_windows_never_suggests_linux_or_docker_commands():
+    cases = [
+        win_env(
+            win_hw([gpu(cc="12.0")], driver="572.16"),
+            raw(cuda="12.6", archs=CU126_ARCHS),
+            torch_variant="cu126",
+        ),
+        win_env(win_hw([gpu()], driver="527.41"), cpu_raw(), torch_variant="cpu"),
+        win_env(
+            win_hw([], error="NVML Shared Library Not Found"),
+            cpu_raw(),
+            torch_variant="cpu",
+            pci_gpu_count=2,
+        ),
+        win_env(
+            win_hw([gpu()], driver="581.57"),
+            raw(available=False, cuda_error="no CUDA GPUs are available"),
+        ),
+    ]
+    for env in cases:
+        for item in env["issues"]:
+            text = (item["message"] or "") + (item["hint"] or "")
+            for word in ("sudo", "systemctl", "docker", "make ", "install.sh", "/dev/", "宿主机"):
+                assert word not in text, (word, item)

@@ -8,6 +8,7 @@ import socket
 from pathlib import Path
 
 import pytest
+from fakes import posix_only
 
 from trainmaster_trainer import config
 from trainmaster_trainer.config import Config, ConfigError
@@ -262,6 +263,7 @@ def test_state_dir_not_created_when_asked(tmp_path):
     assert not cfg.state_dir.exists()
 
 
+@posix_only
 def test_state_dir_candidates(tmp_path):
     configured = tmp_path / "configured"
     candidates = config.state_dir_candidates(configured, home=str(tmp_path / "home"))
@@ -273,6 +275,7 @@ def test_state_dir_candidates(tmp_path):
     assert len(config.state_dir_candidates(candidates[1], home=str(tmp_path / "home"))) == 2
 
 
+@posix_only
 def test_healthcheck_dirs_include_puid_temp_dir(tmp_path, monkeypatch):
     # HEALTHCHECK 以 root 运行，训练节点以 PUID 运行：也查找 PUID 的临时目录。
     monkeypatch.setattr(config.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
@@ -314,3 +317,45 @@ def test_config_is_frozen(tmp_path):
     cfg = Config(state_dir=tmp_path)
     with pytest.raises(AttributeError):
         cfg.node_name = "x"  # type: ignore[misc]
+
+
+def test_state_dir_candidates_on_windows(tmp_path):
+    configured = tmp_path / "configured"
+    local = tmp_path / "AppData" / "Local"
+    candidates = config.state_dir_candidates(configured, windows=True, local_appdata=str(local))
+    assert candidates[0] == configured
+    assert candidates[1] == local / "trainMaster" / "state"
+    assert candidates[2].name.startswith("trainmaster-")
+    # 没有 LOCALAPPDATA 时只有配置值与临时目录
+    assert len(config.state_dir_candidates(configured, windows=True, local_appdata="")) == 2
+
+
+def test_log_file_and_env_file(tmp_path):
+    cfg = config.load(
+        base_env(
+            tmp_path,
+            TM_LOG_FILE=str(tmp_path / "logs" / "trainer.log"),
+            TM_ENV_FILE=str(tmp_path / "trainer.env"),
+        )
+    )
+    assert cfg.log_file == tmp_path / "logs" / "trainer.log"
+    assert cfg.env_file == tmp_path / "trainer.env"
+    cfg = config.load(base_env(tmp_path, TM_LOG_FILE="  "))
+    assert cfg.log_file is None and cfg.env_file is None
+
+
+def test_windows_defaults():
+    # Windows 的默认状态目录在 %ProgramData% 下，没有默认的数据目录（上报状态目录所在磁盘）。
+    if config.WINDOWS:
+        assert config._program_data() / "trainMaster" / "state" == config.DEFAULT_STATE_DIR
+        assert config.DEFAULT_DATA_DIR is None
+    else:
+        assert Path("/var/lib/trainmaster") == config.DEFAULT_STATE_DIR
+        assert Path("/data") == config.DEFAULT_DATA_DIR
+
+
+def test_program_data(monkeypatch):
+    monkeypatch.setenv("PROGRAMDATA", r"D:\ProgramData")
+    assert str(config._program_data()) == r"D:\ProgramData"
+    monkeypatch.delenv("PROGRAMDATA")
+    assert str(config._program_data()) == r"C:\ProgramData"

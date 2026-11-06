@@ -14,12 +14,17 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable, Sequence
+import sys
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from . import procs
+
 log = logging.getLogger(__name__)
+
+WINDOWS = sys.platform == "win32"
 
 MIB = 1024 * 1024
 SMI_TIMEOUT = 15.0
@@ -268,13 +273,38 @@ class SmiError(RuntimeError):
     pass
 
 
-def find_nvidia_smi(env: dict[str, str] | None = None) -> str | None:
-    """TM_NVIDIA_SMI 可指定替身命令（测试用）；否则在 PATH 中查找。"""
+def _env_value(env: Mapping[str, str], name: str) -> str:
+    """Windows 的环境变量名不区分大小写（os.environ 如此，测试传入的普通 dict 不是）。"""
+    for key, value in env.items():
+        if key.upper() == name.upper() and value.strip():
+            return value.strip()
+    return ""
+
+
+def find_nvidia_smi(env: Mapping[str, str] | None = None, *, windows: bool = WINDOWS) -> str | None:
+    """TM_NVIDIA_SMI 可指定替身命令（测试用）；否则在 PATH 中查找。
+
+    Windows：驱动把 nvidia-smi.exe 装在 System32（DCH 驱动）或 C:\\Program Files\\NVIDIA Corporation\\NVSMI
+    （旧驱动）；PATH 中没有时也查找这两个位置。
+    """
     env = os.environ if env is None else env
     override = env.get("TM_NVIDIA_SMI", "").strip()
     if override:
         return override
-    return shutil.which("nvidia-smi")
+    found = shutil.which("nvidia-smi")
+    if found or not windows:
+        return found
+    candidates = []
+    system_root = _env_value(env, "SystemRoot")
+    if system_root:
+        candidates.append(Path(system_root) / "System32" / "nvidia-smi.exe")
+    program_files = _env_value(env, "ProgramW6432") or _env_value(env, "ProgramFiles")
+    if program_files:
+        candidates.append(Path(program_files) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe")
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 def smi_value(raw: str | None) -> str | None:
@@ -377,6 +407,7 @@ class NvidiaSmi:
                 text=True,
                 timeout=self.timeout,
                 check=False,
+                **procs.quiet_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise SmiError(f"cannot run {self.path}: {exc}") from exc
@@ -533,12 +564,14 @@ def probe(
     smi_path: str | None = None,
     find_smi: bool = True,
     runner: Runner = subprocess.run,
+    windows: bool = WINDOWS,
 ) -> GpuProbe:
     """探测显卡：NVML → nvidia-smi → 没有显卡。
 
     smi_path 为空且 find_smi 为 True 时自动查找 nvidia-smi（TM_NVIDIA_SMI 或 PATH）。
+    Windows 上没有 /proc/driver/nvidia，host_gpu_count 为 None（它只用于诊断容器）。
     """
-    host_count = host_gpu_count(root)
+    host_count = None if windows else host_gpu_count(root)
     nvml_error: str | None = None
     try:
         nvml = nvml_loader()
@@ -557,7 +590,7 @@ def probe(
                 sampler=sampler,
             )
 
-    path = smi_path or (find_nvidia_smi() if find_smi else None)
+    path = smi_path or (find_nvidia_smi(windows=windows) if find_smi else None)
     if path:
         smi = NvidiaSmi(str(path), runner=runner)
         try:

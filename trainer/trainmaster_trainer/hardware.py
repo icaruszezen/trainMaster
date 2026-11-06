@@ -1,6 +1,7 @@
 """本机硬件（Hardware）与实时指标（Metrics）：CPU、内存、cgroup 限制、/dev/shm、磁盘，显卡委托 gpu.py。
 
-所有文件读取都基于可替换的根目录 root（默认 /），测试用临时目录模拟 /proc、/sys、/etc。
+Linux 上所有文件读取都基于可替换的根目录 root（默认 /），测试用临时目录模拟 /proc、/sys、/etc。
+Windows 上系统名称、版本与 CPU 型号读取注册表（winsys.py，读取函数可替换），没有 cgroup 与 /dev/shm（为 null）。
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import os
 import platform
 import re
 import shutil
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,8 +20,11 @@ from typing import Any
 import psutil
 
 from . import gpu as gpu_mod
+from . import winsys
 
 log = logging.getLogger(__name__)
+
+WINDOWS = sys.platform == "win32"
 
 # cgroup v1 用一个接近 int64 上限的数表示“不限制”；不小于物理内存的值一律视为不限制。
 _CGROUP_V1_UNLIMITED = 1 << 62
@@ -120,7 +125,9 @@ def cpu_model(root: Path) -> str | None:
     return None
 
 
-def cpu_max_mhz(root: Path) -> float | None:
+def cpu_max_mhz(
+    root: Path, *, windows: bool = False, read: winsys.Reader | None = None
+) -> float | None:
     try:
         freq = psutil.cpu_freq()
     except Exception as exc:  # psutil 在部分虚拟机 / 容器中读取频率会出错
@@ -128,6 +135,8 @@ def cpu_max_mhz(root: Path) -> float | None:
         freq = None
     if freq is not None and freq.max and freq.max > 0:
         return round(float(freq.max), 1)
+    if windows:
+        return winsys.cpu_mhz(read or winsys.read_hklm)
     raw = _read(
         root / "sys" / "devices" / "system" / "cpu" / "cpu0" / "cpufreq" / "cpuinfo_max_freq"
     )
@@ -238,8 +247,11 @@ def cgroup_limits(root: Path) -> tuple[float | None, int | None]:
 
 
 def shm_bytes(root: Path) -> int | None:
+    statvfs = getattr(os, "statvfs", None)  # Windows 没有 statvfs，也没有 /dev/shm
+    if statvfs is None:
+        return None
     try:
-        st = os.statvfs(root / "dev" / "shm")
+        st = statvfs(root / "dev" / "shm")
     except OSError:
         return None
     size = st.f_blocks * st.f_frsize
@@ -262,13 +274,25 @@ class HardwareProbe:
     host_driver_version: str | None = None
 
 
+def platform_name(windows: bool = WINDOWS) -> str | None:
+    """Hardware.platform：windows、linux（其它系统为 platform.system() 的小写，如 darwin）。"""
+    if windows:
+        return "windows"
+    return platform.system().lower() or None
+
+
 def probe(
     root: str | Path = "/",
     *,
     gpu_probe: Callable[[], gpu_mod.GpuProbe] | None = None,
+    windows: bool = WINDOWS,
+    read_registry: winsys.Reader | None = None,
+    windows_pci_gpu_count: Callable[[], int | None] | None = None,
 ) -> HardwareProbe:
+    """探测本机硬件。windows：按 Windows 探测（默认取当前系统）；read_registry 与 windows_pci_gpu_count
+    替换读取注册表与统计 PCI 显卡的函数（测试用）。"""
     root = Path(root)
-    gp = gpu_probe() if gpu_probe is not None else gpu_mod.probe(root=root)
+    gp = gpu_probe() if gpu_probe is not None else gpu_mod.probe(root=root, windows=windows)
 
     logical = psutil.cpu_count(logical=True) or os.cpu_count()
     try:
@@ -283,30 +307,52 @@ def probe(
         log.debug("psutil.virtual_memory failed: %s", exc)
         total_mem = None
 
-    limit_cores, limit_mem = cgroup_limits(root)
-    if limit_cores is not None and logical and limit_cores >= logical:
-        limit_cores = None
-    if limit_mem is not None and total_mem and limit_mem >= total_mem:
-        limit_mem = None
+    if windows:
+        read = read_registry or winsys.read_hklm
+        limit_cores = limit_mem = None
+        os_text, kernel = winsys.os_name(read), winsys.os_version(read)
+        model, container, shm = winsys.cpu_model(read), False, None
+        max_mhz = cpu_max_mhz(root, windows=True, read=read)
+    else:
+        limit_cores, limit_mem = cgroup_limits(root)
+        if limit_cores is not None and logical and limit_cores >= logical:
+            limit_cores = None
+        if limit_mem is not None and total_mem and limit_mem >= total_mem:
+            limit_mem = None
+        os_text, kernel = os_pretty_name(root), platform.release() or None
+        model, container, shm = cpu_model(root), in_container(root), shm_bytes(root)
+        max_mhz = cpu_max_mhz(root)
 
     hardware = {
-        "os": os_pretty_name(root),
-        "kernel": platform.release() or None,
+        "os": os_text,
+        "kernel": kernel,
         "arch": platform.machine() or None,
-        "in_container": in_container(root),
+        "platform": platform_name(windows),
+        "in_container": container,
         "cpu": {
-            "model": cpu_model(root),
+            "model": model,
             "physical_cores": physical or None,
             "logical_cores": logical or None,
-            "max_mhz": cpu_max_mhz(root),
+            "max_mhz": max_mhz,
             "limit_cores": None if limit_cores is None else round(limit_cores, 2),
         },
         "memory": {"total_bytes": total_mem, "limit_bytes": limit_mem},
-        "shm_bytes": shm_bytes(root),
+        "shm_bytes": shm,
         "gpu_driver": gp.driver,
         "gpus": gp.gpus,
         "gpu_detection": gp.detection,
     }
+    if windows:
+        # 驱动没有安装时 NVML 与 nvidia-smi 都看不到显卡：用 PCI 设备提示“有显卡但没有驱动”。
+        # Windows 上没有 /dev/nvidia* 与 /proc/driver/nvidia（只有容器中才需要它们诊断）。
+        counter = windows_pci_gpu_count or winsys.pci_gpu_count
+        return HardwareProbe(
+            hardware=hardware,
+            gpu=gp,
+            device_nodes=[],
+            pci_gpu_count=None if gp.gpus else counter(),
+            host_driver_version=None,
+        )
     return HardwareProbe(
         hardware=hardware,
         gpu=gp,

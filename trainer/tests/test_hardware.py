@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
+import pytest
 from fakes import write_files
 
 from trainmaster_trainer import gpu, hardware
@@ -180,6 +182,7 @@ def test_no_cgroup(tmp_path: Path):
     assert hardware.cgroup_limits(tmp_path) == (None, None)
 
 
+@pytest.mark.skipif(not hasattr(os, "statvfs"), reason="Windows 没有 statvfs 与 /dev/shm")
 def test_shm_bytes(tmp_path: Path):
     assert hardware.shm_bytes(tmp_path) is None
     (tmp_path / "dev" / "shm").mkdir(parents=True)
@@ -213,12 +216,13 @@ def test_probe_builds_contract_shape(tmp_path: Path, monkeypatch):
     )
     (tmp_path / "dev" / "shm").mkdir()
     monkeypatch.setattr(hardware.psutil, "cpu_count", lambda logical=True: 16 if logical else 8)
-    result = hardware.probe(tmp_path, gpu_probe=_fake_gpu_probe)
+    result = hardware.probe(tmp_path, gpu_probe=_fake_gpu_probe, windows=False)
     hw = result.hardware
     assert set(hw) == {
         "os",
         "kernel",
         "arch",
+        "platform",
         "in_container",
         "cpu",
         "memory",
@@ -228,6 +232,7 @@ def test_probe_builds_contract_shape(tmp_path: Path, monkeypatch):
         "gpu_detection",
     }
     assert hw["os"] == "Debian GNU/Linux 12 (bookworm)"
+    assert hw["platform"] == hardware.platform_name(False)
     assert hw["in_container"] is True
     assert hw["cpu"]["model"] == "Test CPU"
     assert hw["cpu"]["logical_cores"] == 16 and hw["cpu"]["physical_cores"] == 8
@@ -254,7 +259,7 @@ def test_probe_drops_limits_not_below_host(tmp_path: Path, monkeypatch):
     no_gpu = gpu.GpuProbe(
         driver=None, gpus=[], detection={"method": "none", "error": None, "host_gpu_count": None}
     )
-    result = hardware.probe(tmp_path, gpu_probe=lambda: no_gpu)
+    result = hardware.probe(tmp_path, gpu_probe=lambda: no_gpu, windows=False)
     assert result.hardware["cpu"]["limit_cores"] is None
     assert result.hardware["cpu"]["physical_cores"] is None
     assert result.hardware["memory"]["limit_bytes"] is None
@@ -277,10 +282,94 @@ def test_probe_reads_host_driver_when_no_gpu_is_visible(tmp_path: Path):
     no_gpu = gpu.GpuProbe(
         driver=None, gpus=[], detection={"method": "none", "error": None, "host_gpu_count": 1}
     )
-    result = hardware.probe(tmp_path, gpu_probe=lambda: no_gpu)
+    result = hardware.probe(tmp_path, gpu_probe=lambda: no_gpu, windows=False)
     assert result.host_driver_version == "440.100"
     assert result.hardware["gpu_driver"] is None
     assert "440.100" not in repr(result.hardware)
+
+
+# ---- Windows（注册表与 PCI 显卡统计用替换函数，在 Linux 上也能测试）----
+
+WINDOWS_REGISTRY = {
+    ("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "ProductName"): "Windows 10 Pro",
+    ("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "DisplayVersion"): "23H2",
+    ("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "CurrentBuildNumber"): "22631",
+    ("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "CurrentMajorVersionNumber"): 10,
+    ("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "CurrentMinorVersionNumber"): 0,
+    ("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "UBR"): 4317,
+    ("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString"): (
+        "13th Gen Intel(R) Core(TM) i9-13900K  "
+    ),
+    ("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "~MHz"): 2995,
+}
+
+
+def _registry(key, name):
+    return WINDOWS_REGISTRY.get((key, name))
+
+
+def test_probe_on_windows(tmp_path: Path, monkeypatch):
+    # Linux 的文件（cgroup、/dev/shm、os-release）在 Windows 上不读取。
+    write_files(
+        tmp_path,
+        {
+            "etc/os-release": 'PRETTY_NAME="Debian"\n',
+            ".dockerenv": "",
+            "sys/fs/cgroup/cgroup.controllers": "cpu memory\n",
+            "sys/fs/cgroup/cpu.max": "200000 100000\n",
+        },
+    )
+    monkeypatch.setattr(hardware.psutil, "cpu_freq", lambda: None)
+    counted = []
+    result = hardware.probe(
+        tmp_path,
+        gpu_probe=_fake_gpu_probe,
+        windows=True,
+        read_registry=_registry,
+        windows_pci_gpu_count=lambda: counted.append(1) or 1,
+    )
+    hw = result.hardware
+    assert hw["platform"] == "windows"
+    assert hw["os"] == "Windows 11 Pro 23H2"
+    assert hw["kernel"] == "10.0.22631.4317"
+    assert hw["in_container"] is False
+    assert hw["shm_bytes"] is None
+    assert hw["cpu"]["model"] == "13th Gen Intel(R) Core(TM) i9-13900K"
+    assert hw["cpu"]["max_mhz"] == 2995.0
+    assert hw["cpu"]["limit_cores"] is None
+    assert hw["memory"]["limit_bytes"] is None
+    assert result.device_nodes == []
+    assert result.host_driver_version is None
+    # 已经检测到显卡：不统计 PCI 设备
+    assert result.pci_gpu_count is None and not counted
+
+
+def test_probe_on_windows_counts_pci_gpus_without_driver(tmp_path: Path):
+    no_gpu = gpu.GpuProbe(
+        driver=None,
+        gpus=[],
+        detection={
+            "method": "none",
+            "error": "NVML Shared Library Not Found",
+            "host_gpu_count": None,
+        },
+    )
+    result = hardware.probe(
+        tmp_path,
+        gpu_probe=lambda: no_gpu,
+        windows=True,
+        read_registry=lambda key, name: None,
+        windows_pci_gpu_count=lambda: 2,
+    )
+    assert result.pci_gpu_count == 2
+    assert result.hardware["os"] is None  # 注册表读不到时为 null
+    assert result.hardware["platform"] == "windows"
+
+
+def test_platform_name():
+    assert hardware.platform_name(True) == "windows"
+    if sys.platform.startswith("linux"):
+        assert hardware.platform_name(False) == "linux"
 
 
 def test_probe_real_machine_smoke():

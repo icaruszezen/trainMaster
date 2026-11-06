@@ -26,7 +26,6 @@ import logging
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -36,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from . import __version__, procs
 from .client import ApiError, Client, Transfer, TransportError, json_safe
 from .environment import _kill, _short_error, _tail, child_env, summarize_exception
 
@@ -106,6 +105,13 @@ _EXPORT_ENV_NAMES = frozenset(
         "PYTHONUTF8", "PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "VIRTUAL_ENV",
         "LD_LIBRARY_PATH", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "MPLCONFIGDIR", "CUDA_DEVICE_ORDER",
         "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+        # Windows：没有 SYSTEMROOT 时 Python 无法初始化（随机数、socket），其余是系统目录、用户目录与 CPU 信息
+        # （os.environ 在 Windows 上的键是大写的）。
+        "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "USERPROFILE", "HOMEDRIVE",
+        "HOMEPATH", "USERNAME", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES",
+        "PROGRAMFILES(X86)", "PROGRAMW6432", "COMMONPROGRAMFILES", "ALLUSERSPROFILE", "PUBLIC",
+        "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL",
+        "PROCESSOR_REVISION", "OS",
     }
 )  # fmt: skip
 _EXPORT_ENV_PREFIXES = ("LC_", "YOLO_")
@@ -835,8 +841,9 @@ class ExportProcess:
                     stderr=subprocess.PIPE,
                     env=export_env(self.state_dir),
                     cwd=cwd,
-                    start_new_session=True,  # 超时或停止时连同它启动的进程一起结束
+                    **procs.popen_kwargs(),  # 超时或停止时连同它启动的进程一起结束
                 )
+                procs.attach(self._proc)
             proc = self._proc
         except OSError as exc:
             return _failed(f"无法启动转换进程：{exc}")
@@ -868,14 +875,14 @@ class ExportProcess:
 
         if self._cancelled:
             return _failed("转换已取消", stderr_tail, cancelled=True)
-        if proc.returncode < 0:
-            try:
-                name = signal.Signals(-proc.returncode).name
-            except ValueError:
-                name = str(-proc.returncode)
+        name = procs.signal_name(proc.returncode)
+        if name is not None:
             return _failed(
                 f"转换进程被信号 {name} 终止（可能是内存不足），用时 {elapsed:.0f} 秒", stderr_tail
             )
+        crash = procs.windows_crash(proc.returncode)
+        if crash is not None:
+            return _failed(f"转换进程崩溃（{crash}），用时 {elapsed:.0f} 秒", stderr_tail)
         lines = [line for line in stdout.decode("utf-8", "replace").splitlines() if line.strip()]
         try:
             data = json.loads(lines[-1])

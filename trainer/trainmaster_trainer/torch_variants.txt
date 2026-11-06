@@ -15,15 +15,19 @@
 #   min_driver   最低 NVIDIA 驱动版本（Linux，CUDA 小版本兼容所需的最低版本）；cpu 为 -
 #   archs        为 x86_64 编译的计算能力（10×主版本+次版本，如 86 = 8.6）。同一主版本中次版本号
 #                不小于它的显卡都能运行（如 86 也覆盖 8.9 的 RTX 40 系列）；cpu 为 -
+#   min_driver_win  Windows 上的最低 NVIDIA 驱动版本（Windows 驱动的版本号与 Linux 不同）；cpu 为 -。
+#                Windows 版一律从 PyTorch 官方索引安装（PyPI 上的 Windows 版 torch 只有 CPU 版），
+#                编译的架构按 archs 列判断
 #
 # 排列顺序即自动选择的优先顺序：取第一个驱动版本满足、且支持全部显卡的变体；都不满足时退回 cpu。
 # 数据来源：PyTorch 发布兼容矩阵（RELEASE.md）、各版本构建脚本中的 TORCH_CUDA_ARCH_LIST，
-# 以及 CUDA Toolkit 发布说明中小版本兼容所需的最低驱动（13.x ≥ 580，12.x ≥ 525.60.13，11.x ≥ 450.80.02）。
+# 以及 CUDA Toolkit 发布说明中小版本兼容所需的最低驱动（Linux：13.x ≥ 580，12.x ≥ 525.60.13，
+# 11.x ≥ 450.80.02；Windows：13.x ≥ 580，12.x ≥ 528.33，11.x ≥ 452.39）。
 # 升级版本时同时核对这三处，并运行 trainer/tests 与 trainer/scripts/tests 中的测试。
 #
-# variant torch   torchvision source  cuda min_driver archs
-cu130     2.14.1  0.29.1      pypi    13.0 580        75,80,86,90,100,120
-cu126     2.14.1  0.29.1      pytorch 12.6 525.60.13  50,60,70,75,80,86,90
-cu128     2.11.0  0.26.0      pytorch 12.8 525.60.13  75,80,86,90,100,120
-cu118     2.7.1   0.22.1      pytorch 11.8 450.80.02  37,50,60,70,75,80,86,90
-cpu       2.14.1  0.29.1      pytorch -    -          -
+# variant torch   torchvision source  cuda min_driver archs                   min_driver_win
+cu130     2.14.1  0.29.1      pypi    13.0 580        75,80,86,90,100,120     580
+cu126     2.14.1  0.29.1      pytorch 12.6 525.60.13  50,60,70,75,80,86,90    528.33
+cu128     2.11.0  0.26.0      pytorch 12.8 525.60.13  75,80,86,90,100,120     528.33
+cu118     2.7.1   0.22.1      pytorch 11.8 450.80.02  37,50,60,70,75,80,86,90 452.39
+cpu       2.14.1  0.29.1      pytorch -    -          -                       -

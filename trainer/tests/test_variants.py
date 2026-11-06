@@ -149,18 +149,18 @@ def test_select_variant_reasons_are_chinese_and_specific():
 
 def test_parse_table_rejects_bad_rows():
     with pytest.raises(VariantTableError):
-        parse_table("cu130 2.14.1 0.29.1 pypi 13.0 580\n")
+        parse_table("cu130 2.14.1 0.29.1 pypi 13.0 580 75\n")  # 缺少 min_driver_win
     with pytest.raises(VariantTableError):
-        parse_table("cu130 2.14.1 0.29.1 conda 13.0 580 75\n")
+        parse_table("cu130 2.14.1 0.29.1 conda 13.0 580 75 580\n")
     with pytest.raises(VariantTableError):
-        parse_table("cu130 2.14.1 0.29.1 pypi 13.0 580 7x\n")
+        parse_table("cu130 2.14.1 0.29.1 pypi 13.0 580 7x 580\n")
     with pytest.raises(VariantTableError):
         parse_table("# only comments\n\n")
 
 
 def test_load_variants_from_path(tmp_path):
     path = tmp_path / "table.txt"
-    path.write_text("# test\ncu999 9.9 9.9 pytorch 99.9 999 120\ncpu 9.9 9.9 pytorch - - -\n")
+    path.write_text("# test\ncu999 9.9 9.9 pytorch 99.9 999 120 998\ncpu 9.9 9.9 pytorch - - - -\n")
     table = variants.load_variants(path)
     assert [v.name for v in table] == ["cu999", "cpu"]
     assert select_variant("999", "12.0", "x86_64", table).variant == "cu999"
@@ -199,12 +199,98 @@ def test_lowest_cuda_driver_without_cuda_builds():
 
 def test_lowest_cuda_driver_follows_the_table():
     table = parse_table(
-        "cu999 9.9 9.9 pytorch 99.9 999 120\n"
-        "cu100 9.9 9.9 pytorch 10.0 410.48 75\n"
-        "cpu 9.9 9.9 pytorch - - -\n"
+        "cu999 9.9 9.9 pytorch 99.9 999 120 999.1\n"
+        "cu100 9.9 9.9 pytorch 10.0 410.48 75 411.31\n"
+        "cpu 9.9 9.9 pytorch - - - -\n"
     )
     assert lowest_cuda_driver("x86_64", table) == "410.48"
+    assert lowest_cuda_driver("AMD64", table, system="windows") == "411.31"
     assert lowest_cuda_driver("aarch64", table) is None  # 没有 cu130
+
+
+# ---- Windows：最低驱动取 min_driver_win，ARM 版 Windows 没有 CUDA 版 PyTorch ----
+
+
+def test_table_has_windows_drivers():
+    drivers = {v.name: v.min_driver_win for v in variants.load_variants()}
+    assert drivers == {
+        "cu130": "580",
+        "cu126": "528.33",
+        "cu128": "528.33",
+        "cu118": "452.39",
+        "cpu": None,
+    }
+    assert variants.get_variant("cu126").driver_for("windows") == "528.33"
+    assert variants.get_variant("cu126").driver_for("linux") == "525.60.13"
+    assert variants.get_variant("cu126").driver_for(None) == "525.60.13"
+
+
+WINDOWS_CASES = [
+    # Windows 驱动的版本号：566.36 支持 CUDA 12.7，581.57 支持 CUDA 13
+    ("rtx4090 driver 581", "581.57", "8.9", "AMD64", "cu130", ()),
+    ("rtx3060 driver 566", "566.36", "8.6", "AMD64", "cu126", ()),
+    ("rtx5080 driver 572", "572.16", "12.0", "AMD64", "cu128", ()),
+    ("gtx1080 driver 581", "581.57", "6.1", "AMD64", "cu126", ()),
+    # 528.33 是 CUDA 12 在 Windows 上的最低驱动：527.x 只能用 CUDA 11.8
+    ("t4 driver 527", "527.41", "7.5", "AMD64", "cu118", ()),
+    ("rtx3090 driver 528.33", "528.33", "8.6", "AMD64", "cu126", ()),
+    # 452.39 是 CUDA 11 在 Windows 上的最低驱动（Linux 的 450.80.02 在 Windows 上不够）
+    ("driver 451", "451.82", "7.5", "AMD64", "cpu", ()),
+    ("driver 452.39", "452.39", "7.5", "AMD64", "cu118", ()),
+    ("no gpu", "", "", "AMD64", "cpu", ()),
+    ("gpu without driver", "", "8.6", "AMD64", "cpu", ()),
+    ("windows on arm", "581.57", "8.9", "ARM64", "cpu", ()),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "driver", "ccs", "machine", "expected", "unsupported"),
+    WINDOWS_CASES,
+    ids=[c[0] for c in WINDOWS_CASES],
+)
+def test_select_variant_on_windows(name, driver, ccs, machine, expected, unsupported):
+    sel = select_variant(driver, ccs, machine, system="windows")
+    assert sel.variant == expected
+    assert sel.unsupported == unsupported
+    assert sel.reason
+
+
+def test_select_variant_on_windows_reasons():
+    old = select_variant("451.82", "7.5", "AMD64", system="windows")
+    assert "至少需要驱动 452.39" in old.reason
+    arm = select_variant("581.57", "8.9", "ARM64", system="windows")
+    assert "ARM64" in arm.reason or "arm64" in arm.reason
+    # Linux 的 ARM 服务器不受影响
+    assert select_variant("581.57", "8.9", "ARM64").variant == "cu130"
+
+
+def test_select_variant_on_windows_skips_variants_without_windows_build():
+    table = parse_table(
+        "cu999 9.9 9.9 pytorch 99.9 999 120 -\n"
+        "cu100 9.9 9.9 pytorch 10.0 410.48 120 411.31\n"
+        "cpu 9.9 9.9 pytorch - - - -\n"
+    )
+    assert select_variant("1000", "12.0", "x86_64", table).variant == "cu999"
+    assert select_variant("1000", "12.0", "AMD64", table, system="windows").variant == "cu100"
+
+
+def test_machine_is_case_insensitive():
+    assert select_variant("550.54.15", "8.6", "AMD64").variant == "cu126"
+    assert select_variant("580.65.06", "9.0", "AARCH64").variant == "cu130"
+    assert lowest_cuda_driver("AMD64") == "450.80.02"
+
+
+@pytest.mark.parametrize(
+    ("cuda", "expected"),
+    [("13.0", "580"), ("12.6", "528.33"), ("12.4", "528.33"), ("11.8", "452.39"), ("10.2", None)],
+)
+def test_min_driver_for_cuda_on_windows(cuda, expected):
+    assert min_driver_for_cuda(cuda, system="windows") == expected
+
+
+def test_lowest_cuda_driver_on_windows():
+    assert lowest_cuda_driver("AMD64", system="windows") == "452.39"
+    assert lowest_cuda_driver("ARM64", system="windows") is None
 
 
 @pytest.mark.parametrize(
@@ -312,7 +398,7 @@ def test_select_variant_matches_bash():
         for d, c, m in itertools.product(
             ["", "550.54.15", "580", "590.44.01"],
             ["", "7.5", "8.0", "9.0 12.0", "8.7"],
-            ["aarch64", "arm64", "amd64", "riscv64", "ppc64le"],
+            ["aarch64", "arm64", "amd64", "AMD64", "ARM64", "riscv64", "ppc64le"],
         )
     ]
     out = _run_bash(_BASH_SELECT, ["|".join(c) for c in cases])

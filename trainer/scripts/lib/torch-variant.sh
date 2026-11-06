@@ -28,7 +28,7 @@ tm_variant_names() {
 }
 
 # tm_variant_field <variant> <field>：输出某个变体的一列。
-# field 为 torch、torchvision、source、cuda、min_driver、archs 之一；变体不存在时返回 1。
+# field 为 torch、torchvision、source、cuda、min_driver、archs、min_driver_win 之一；变体不存在时返回 1。
 tm_variant_field() {
 	local variant="$1" field="$2" col
 	case "$field" in
@@ -38,6 +38,7 @@ tm_variant_field() {
 	cuda) col=5 ;;
 	min_driver) col=6 ;;
 	archs) col=7 ;;
+	min_driver_win) col=8 ;;
 	*)
 		echo "tm_variant_field: 未知的列 $field" >&2
 		return 2
@@ -102,10 +103,11 @@ tm_cc_covered() {
 # tm_select_variant <driver_version> <ccs> [machine]
 #   driver_version：NVIDIA 驱动版本（如 550.54.15），没有驱动时为空
 #   ccs：各显卡的计算能力（整数或 8.6 形式，空格分隔），没有显卡时为空
-#   machine：uname -m（默认取当前机器）
+#   machine：uname -m（默认取当前机器；不区分大小写）
 # 设置 TM_VARIANT、TM_VARIANT_REASON、TM_VARIANT_UNSUPPORTED。总是返回 0。
 tm_select_variant() {
 	local driver="$1" raw_ccs="$2" machine="${3:-$(uname -m)}"
+	machine="${machine,,}"
 	TM_VARIANT=cpu
 	TM_VARIANT_REASON=""
 	TM_VARIANT_UNSUPPORTED=""

@@ -159,7 +159,7 @@ def test_register_then_heartbeat_with_environment(platform, tmp_path, caplog):
         assert body["node_key"] == "node-key-1"
         assert body["name"] == "gpu-01"
         assert body["hostname"] == "host-1"
-        assert body["agent_version"] == __version__ == "0.3.0"
+        assert body["agent_version"] == __version__ == "0.4.0"
         assert body["hardware"]["probe"] == 1
         assert body["environment"] is None  # 检测还没有完成
         assert body["metrics"]["cpu_percent"] is None  # 第一次采集
