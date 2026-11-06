@@ -16,6 +16,7 @@ trainMaster 以 Docker Compose 部署：`postgres`（PostgreSQL 17）+ `app`（G
 - 模型仓库下载 ONNX 时，转换由训练节点执行：需要至少一个在线的训练节点（0.2.0 或更新；CPU 训练节点即可，不需要 GPU），见第 10.10 节。没有训练节点时其它功能（包括上传模型、下载 PT）不受影响
 - 模型审图的识别同样由训练节点执行（CPU 训练节点即可，有 GPU 时更快），本地审图程序在用户的 64 位 Windows 10 / 11 电脑上运行，见第 10.11 节
 - `make setup` / `make up` 需要 bash 与 make（Linux、macOS、WSL 中都有）；没有时可以手动配置（见第 10.4 节）
+- 训练节点也可以不用 Docker，直接安装在 Linux（Python 3.10 或更新）或 64 位 Windows 10 / 11、Windows Server 2019 及更新（x64）的电脑上，见第 10.7 节
 
 ## 2. 部署步骤
 
@@ -132,13 +133,14 @@ docker compose --profile '*' down   # 停止并删除全部容器（即 make dow
 | `TM_NODE_TOKEN` | 空 | 来自 `.env` | 训练节点令牌：设置后 `/api/v1/compute/agent/*` 必须带 `Authorization: Bearer <令牌>`。16–256 个可见 ASCII 字符，首尾不能有空白 |
 | `TM_NODE_HEARTBEAT_INTERVAL` | `10s` | 来自 `.env` | 训练节点的心跳间隔（Go duration，2s–5m）；离线判定为 3 × 间隔 + 5 秒 |
 | `TM_TRAINER_MODE` | 空 | 来自 `.env`，默认 `auto` | 本机训练节点的模式（`make setup` 的 `--mode`），只用于页面上的提示：`GET /api/v1/compute/server` 的 `node_registration.local_trainer_mode`。`auto` / `gpu` / `cpu` / `off` 之外的值按 `auto` 处理（不报错），未设置或为空时为 null。启动时读取，修改后需要重新创建 app 容器（`make up`） |
+| `TM_TRAINER_PACKAGE_DIR` | 空 | `/app/tools/trainer` | Windows 训练节点的安装包：目录结构与仓库的 `trainer/` 相同（`pyproject.toml`、`requirements.txt`、`trainmaster_trainer/`、`scripts/install.ps1`）。设置后平台经 `GET /api/v1/compute/windows/install.ps1` 与 `/trainer.zip` 提供安装脚本与安装包（不需要令牌），“接入节点”中 Windows 电脑的命令直接从平台下载它们；为空或文件不全时不提供（页面改为给出在仓库目录中运行的命令）。每次请求时读取文件（安装包在文件变化后重新打包），启动日志说明是否可用，见第 10.7 节 |
 | `TM_REVIEWER_TOOL` | 空 | `/app/tools/trainmaster-reviewer.exe` | 附带的 Windows 本地审图程序，审图任务页面经 `GET /api/v1/reviews/tool/download` 提供下载；为空或文件不存在时不提供（页面提示联系管理员）。每次请求时查找文件，启动日志说明是否找到，见第 10.11 节 |
 
 非法取值（如端口不是数字、未知的日志级别、过短的令牌）会在启动时报错退出，并列出所有有问题的变量。
 
 ### 3.3 训练节点配置（容器内由 compose 和镜像设置）
 
-训练节点（`python -m trainmaster_trainer`）读取下列变量；裸机安装时写在配置文件 `<安装目录>/trainer.env` 中（见第 10.7 节）。空值视为未设置。
+训练节点（`python -m trainmaster_trainer`）读取下列变量；裸机安装时写在配置文件 `<安装目录>/trainer.env` 中（见第 10.7 节）。空值视为未设置。`--env-file <文件>`（放在子命令之前或之后都可以）先读取这个配置文件、写入环境变量（覆盖同名的已有值）：Windows 的计划任务这样运行训练节点（Linux 由 systemd 的 `EnvironmentFile` 读取）。配置文件每行一个 `KEY=VALUE`，值可以用单引号（原样）或双引号（`\`、`"`、`$`、`` ` `` 前加 `\`）括起来，Windows 路径中的反斜杠不需要转义。
 
 | 变量 | 默认值 | 容器内取值 | 说明 |
 |---|---|---|---|
@@ -148,14 +150,15 @@ docker compose --profile '*' down   # 停止并删除全部容器（即 make dow
 | `TM_TRAINER_SERVICE` | 空（按 `trainer` 处理） | `trainer` / `trainer-cpu` | 节点所在的 compose 服务，修复建议中的命令用它（如 `docker compose up -d --build trainer-cpu`）；裸机安装不设置 |
 | `TM_TRAINER_MODE` | `auto` | 来自 `.env` | `make setup` 的模式。为 `cpu` 时节点看到没有传入容器的显卡，给出“已选择 CPU 模式”的提示，而不是“显卡没有传入容器”的警告 |
 | `TM_TRAINER_VARIANT` | 空（不固定） | 来自 `.env`，默认 `auto` | `make setup --variant` 固定的 PyTorch 变体，`auto` 为不固定。固定时修复建议用 `--variant auto` 恢复自动选择，而不是再固定另一个变体 |
-| `TM_STATE_DIR` | `/var/lib/trainmaster` | `/var/lib/trainmaster` | 状态目录：节点标识 `node-key`、心跳文件、Ultralytics 配置、模型转换与审图识别的工作目录 `work/model-export-<ID>/`、`work/review-inference-<ID>/`（结束后删除）；不可写时退回 `~/.local/state/trainmaster`（节点标识不能持久保存，日志中有提示） |
-| `TM_DATA_DIR` | `/data` | `/data` | 数据目录，上报其磁盘空间；不存在时使用状态目录 |
+| `TM_STATE_DIR` | `/var/lib/trainmaster`（Windows 为 `C:\ProgramData\trainMaster\state`） | `/var/lib/trainmaster` | 状态目录：节点标识 `node-key`、心跳文件、Ultralytics 配置、模型转换与审图识别的工作目录 `work/model-export-<ID>/`、`work/review-inference-<ID>/`（结束后删除）；不可写时退回 `~/.local/state/trainmaster`（节点标识不能持久保存，日志中有提示） |
+| `TM_DATA_DIR` | `/data`（Windows 为空） | `/data` | 数据目录，上报其磁盘空间；为空或不存在时使用状态目录 |
 | `TM_TORCH_VARIANT` | 空 | 镜像构建时的变体 | 已安装的 PyTorch 变体，用于诊断 |
 | `TM_SELF_TEST` | `true` | `true` | 检测 CUDA 环境时是否执行自检（矩阵乘法与 YOLO 前向推理） |
 | `TM_SELF_TEST_TIMEOUT` | `300` | `300` | 环境检测子进程的超时秒数 |
 | `TM_EXPORT_TIMEOUT` | `900` | 来自 `.env`，留空为 `900` | 一次模型转换（pt → ONNX 子进程）的超时：秒数，可带 `s` / `m` 后缀（如 `900`、`30m`），大于 0 且不超过 24 小时（规则同 `TM_SELF_TEST_TIMEOUT`），见第 10.10 节 |
 | `TM_INFERENCE_IMAGE_TIMEOUT` | `300` | 来自 `.env`，留空为 `300` | 审图识别时单张图片的超时（从识别子进程开始处理这张图片算起）；启动识别子进程与加载模型也使用它，但至少 120 秒。规则同 `TM_EXPORT_TIMEOUT`，见第 10.11 节 |
 | `TM_LOG_LEVEL` | `info` | 来自 `.env` | debug / info / warn / error |
+| `TM_LOG_FILE` | 空 | 不设置 | 日志文件（同时写到标准错误），按大小轮转：每个 10 MiB，保留 5 个旧文件；文件被其它程序占用、无法轮转时继续写入，1 分钟后再试。Windows 的 `install.ps1` 设置为 `<状态目录>\logs\trainer.log` |
 
 ## 4. 目录权限（PUID / PGID）
 
@@ -204,6 +207,7 @@ docker compose logs -f app       # 确认迁移执行成功、服务正常
 - 新旧版本的平台与训练节点可以混用一段时间（上报的数据允许未知字段），其它机器上的训练节点按第 10.6 节分别升级。
 - **升级到带模型仓库的版本**：迁移 `0008_create_models` 自动执行。ONNX 转换需要 0.2.0 或更新的训练节点（新增依赖 onnx、onnxslim、onnxruntime）：本机的训练节点由 `make up` 重新构建（PyTorch 变体不变时 PyTorch 层使用构建缓存）；其它机器上的训练节点、裸机节点按第 10.10 节升级。旧版训练节点照常注册与上报心跳，只是不领取转换任务；新版训练节点连接旧版平台时同样只是不领取任务（每 5 分钟检查一次平台是否已支持）。
 - **升级到带模型审图的版本**：迁移 `0010_create_reviews` 自动执行，存储目录中的 `reviews/` 在启动时自动创建。审图的识别由训练节点执行（0.3.0 或更新）：本机的训练节点由 `make up` 重新构建；其它机器上的训练节点、裸机节点按 10.10 的方法升级。旧版训练节点照常工作，只是不领取审图任务（任务一直排队，页面提示没有可以识别的训练节点）；新版训练节点连接旧版平台时不受影响。本地审图程序随平台镜像一起构建，不需要另外部署（见 10.11）。
+- **升级到支持 Windows 训练节点的版本**：平台镜像附带 Windows 的安装脚本与安装包（`TM_TRAINER_PACKAGE_DIR`），“接入节点”中多了 Windows 电脑的命令（见 10.7）。训练节点 0.4.0 上报所在的系统，页面据此显示 Windows 节点的系统版本与操作说明；旧版节点不上报，按 Linux 显示。已有的 Linux 节点不需要为此升级。
 - 迁移只向前，不提供自动回滚。需要回退版本时，先恢复升级前的数据库备份（第 6 节），再用保留的旧镜像启动 postgres 与 app（`--no-build`：不构建任何镜像）：
 
   ```bash
@@ -479,18 +483,19 @@ Docker Desktop（Windows 的 WSL 2 后端）自带 GPU 支持，不需要安装�
 
 PyTorch 的 CUDA 版本（变体）由 `make setup` 按驱动与显卡自动选择：按下表顺序，取第一个**驱动版本满足、且支持全部显卡**的变体。表格内容来自 `trainer/trainmaster_trainer/torch_variants.txt`（唯一的数据源，裸机安装与训练节点的诊断使用同一份）：
 
-| 变体 | PyTorch / torchvision | CUDA | 最低驱动 | 编译的显卡架构（计算能力） | 安装来源 |
+| 变体 | PyTorch / torchvision | CUDA | 最低驱动（Linux / Windows） | 编译的显卡架构（计算能力） | 安装来源 |
 |---|---|---|---|---|---|
-| `cu130` | 2.14.1 / 0.29.1 | 13.0 | 580 | 7.5、8.0、8.6、9.0、10.0、12.0 | PyPI（`PIP_INDEX_URL`） |
-| `cu126` | 2.14.1 / 0.29.1 | 12.6 | 525.60.13 | 5.0、6.0、7.0、7.5、8.0、8.6、9.0 | PyTorch 索引 |
-| `cu128` | 2.11.0 / 0.26.0 | 12.8 | 525.60.13 | 7.5、8.0、8.6、9.0、10.0、12.0 | PyTorch 索引 |
-| `cu118` | 2.7.1 / 0.22.1 | 11.8 | 450.80.02 | 3.7、5.0、6.0、7.0、7.5、8.0、8.6、9.0 | PyTorch 索引 |
+| `cu130` | 2.14.1 / 0.29.1 | 13.0 | 580 / 580 | 7.5、8.0、8.6、9.0、10.0、12.0 | PyPI（`PIP_INDEX_URL`） |
+| `cu126` | 2.14.1 / 0.29.1 | 12.6 | 525.60.13 / 528.33 | 5.0、6.0、7.0、7.5、8.0、8.6、9.0 | PyTorch 索引 |
+| `cu128` | 2.11.0 / 0.26.0 | 12.8 | 525.60.13 / 528.33 | 7.5、8.0、8.6、9.0、10.0、12.0 | PyTorch 索引 |
+| `cu118` | 2.7.1 / 0.22.1 | 11.8 | 450.80.02 / 452.39 | 3.7、5.0、6.0、7.0、7.5、8.0、8.6、9.0 | PyTorch 索引 |
 | `cpu` | 2.14.1 / 0.29.1 | — | — | — | PyTorch 索引 |
 
 - 同一主版本中次版本不小于表中架构的显卡都能运行，如 8.6 也覆盖 RTX 40 系列的 8.9、12.0 也覆盖 12.1。常见显卡的计算能力：GTX 10 系列 6.1，V100 7.0，RTX 20 系列与 T4 7.5，A100 8.0，RTX 30 系列 8.6，RTX 40 系列与 L4 8.9，H100 9.0，B200 10.0，RTX 50 系列 12.0。
 - 例子：驱动 550 + RTX 4090 → `cu126`；驱动 570 + RTX 5090 → `cu128`；驱动 580 + RTX 3090 → `cu130`；驱动 580 + GTX 1080 → `cu126`（`cu130` 不支持 6.1）；驱动 470 → `cu118`；驱动低于 450.80.02 → `cpu`。
 - 多块显卡中有不受支持的型号时，选支持显卡最多的变体，并提示哪些显卡无法用于训练。
 - ARM 服务器（aarch64，如 Grace Hopper）只能使用 `cu130`（需要驱动 ≥ 580 且显卡为 Ampere 或更新），否则为 `cpu`。
+- Windows（10.7）按 Windows 的最低驱动选择；只有 x64 电脑有 CUDA 版 PyTorch（ARM 版 Windows 为 `cpu`）。Windows 版 PyTorch 一律从 PyTorch 索引安装（PyPI 上的 Windows 版只有 CPU 版），安装来源一列只适用于 Linux。
 - 升级驱动后再次 `make up` 会自动换用更合适的变体并重新构建镜像（镜像标签带变体，不会误用旧镜像）。需要固定某个变体时用 `make setup SETUP_ARGS="--variant cu126"`。
 - 训练节点也会按实际的驱动与显卡检查已安装的变体，不匹配时在“计算资源”页面上给出原因与推荐的变体。
 
@@ -554,6 +559,8 @@ docker compose logs -f trainer
 
 ### 10.7 不用 Docker（裸机安装）
 
+Linux 用 `trainer/scripts/install.sh`，Windows 用 `trainer/scripts/install.ps1`（见下方“Windows 电脑”）。
+
 ```bash
 sudo trainer/scripts/install.sh --server-url http://192.168.1.10:8080 --token <平台的 TM_NODE_TOKEN> --systemd
 systemctl status trainmaster-trainer
@@ -564,6 +571,41 @@ journalctl -u trainmaster-trainer -f
 - 需要 Python 3.10 或更新（`--python` 指定解释器）与 NVIDIA 驱动，不需要 CUDA Toolkit 和 Docker。
 - 可以重复运行：复用已有的虚拟环境，变体变化时重新安装 PyTorch。已有 `<安装目录>/trainer.env` 时沿用其中的 `TM_SERVER_URL`、`TM_NODE_TOKEN`、`TM_NODE_NAME` 与状态 / 数据目录（参数可以覆盖），之前安装过 systemd 服务时重新安装并重启它。因此升级驱动后换变体只需 `sudo trainer/scripts/install.sh --variant cu128`（在 trainMaster 仓库目录中执行；安装目录不是默认的 `/opt/trainmaster-trainer` 时加 `--prefix`），“计算资源”页面上给裸机节点的修复建议也是这种形式；不要对裸机节点运行 `make setup` / `make up`。`--dry-run` 只打印检测结果与将要执行的步骤；全部参数见 `trainer/scripts/install.sh --help`。
 - 镜像加速同样使用 `PIP_INDEX_URL`、`TORCH_INDEX_URL`、`TORCH_FIND_LINKS`（见第 7 节），sudo 时这样传入：`sudo env PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple trainer/scripts/install.sh …`。
+
+#### Windows 电脑
+
+64 位的 Windows 10 / 11 或 Windows Server 2019 及更新（x64）可以直接作为训练节点，不需要 Docker、WSL 或 CUDA Toolkit，只需要 NVIDIA 驱动（没有显卡时作为 CPU 训练节点）。在“计算资源 → 接入节点”中选择“Windows 电脑（直接安装）”，复制命令，在这台电脑上以管理员身份打开 PowerShell（右键“开始”→“终端（管理员）”或“Windows PowerShell（管理员）”）运行，例如：
+
+```powershell
+& ([scriptblock]::Create((irm 'http://192.168.1.10:8080/api/v1/compute/windows/install.ps1'))) -ServerUrl 'http://192.168.1.10:8080' -Token '<平台的 TM_NODE_TOKEN>' -InstallPython -Service
+```
+
+命令从平台下载安装脚本 `trainer/scripts/install.ps1` 与训练节点的安装包（平台的 Docker 镜像附带它们，见第 3.2 节的 `TM_TRAINER_PACKAGE_DIR`）并运行，PowerShell 窗口在安装结束后保持打开。平台没有附带时，页面给出的是在仓库目录中运行的命令：在这台电脑上克隆 trainMaster 仓库，在仓库目录中运行 `powershell -ExecutionPolicy Bypass -File trainer\scripts\install.ps1 -ServerUrl … -Token … -InstallPython -Service`。
+
+安装脚本做的事：
+
+- 用 NVML（失败时用 `nvidia-smi`）检测显卡与驱动，按 10.3 的规则与 Windows 的最低驱动选择 PyTorch 变体，`-Variant` 可手动指定；有 NVIDIA 显卡但没有可用的驱动时提示先安装驱动（推荐 580 或更新）。
+- 需要 64 位的 Python 3.10–3.13（不支持 Microsoft Store 版）与 Microsoft Visual C++ 运行库（PyTorch 需要）。没有时 `-InstallPython` 为所有用户安装 Python 3.12 与运行库：优先用 winget，没有 winget 时下载 python.org 与微软的安装程序；`-Python` 指定已有的解释器。
+- 在 `C:\ProgramData\trainMaster\trainer`（`-Prefix`）中创建虚拟环境，从 PyTorch 索引安装带变体后缀的 PyTorch（如 `torch==2.14.1+cu130`；PyPI 上的 Windows 版只有 CPU 版），确认装上的正是这个变体，再安装 Ultralytics 与训练节点。
+- 写入配置文件 `C:\ProgramData\trainMaster\trainer\trainer.env`（`-EnvFile`，变量见第 3.3 节），状态目录为 `C:\ProgramData\trainMaster\state`（`-StateDir`），日志写到其中的 `logs\trainer.log`，然后自检。
+- `-Service` 注册并启动计划任务 `trainmaster-trainer`：开机时以 SYSTEM 运行，不需要登录；训练节点没有在运行时（崩溃或被结束）每 5 分钟重新启动它。不加 `-Service` 时只安装，最后给出手动运行的命令。
+- 计划任务以 SYSTEM 运行安装目录中的程序，所以 `C:\ProgramData\trainMaster` 及其中的安装目录、状态目录只允许 SYSTEM 与管理员修改（普通用户只读），配置文件（含令牌）只有 SYSTEM 与管理员可以读写。其他用户能修改的已有安装目录会被拒绝；使用其它位置的目录时，上级目录允许普通用户改名或删除的（如另一块磁盘上新建的文件夹）会给出提醒。
+- 可以重复运行，与 Linux 相同：复用已有的虚拟环境，沿用配置文件中的平台地址、令牌、节点名称、目录与手动添加的其它设置（参数可以覆盖），已注册计划任务时更新并重启它。升级驱动后换变体：在管理员 PowerShell 中重新运行页面上的命令并加 `-Variant cu128`（其它参数可以省略），“计算资源”页面给 Windows 节点的修复建议也是这种形式。`-DryRun` 只打印检测结果与将要执行的步骤（不需要管理员）；全部参数：`Get-Help <install.ps1 的路径> -Detailed`。
+- 镜像加速：运行命令之前在同一个 PowerShell 窗口中设置 `$env:PIP_INDEX_URL`、`$env:TORCH_FIND_LINKS` 或 `$env:TORCH_INDEX_URL`（含义见第 7 节），例如 `$env:PIP_INDEX_URL = 'https://mirrors.aliyun.com/pypi/simple'`。
+
+日常管理（在管理员 PowerShell 中）：
+
+| 操作 | 命令 |
+|---|---|
+| 查看状态 | `Get-ScheduledTask -TaskName trainmaster-trainer`（`State` 为 `Running`） |
+| 查看日志 | `Get-Content -Wait -Tail 50 C:\ProgramData\trainMaster\state\logs\trainer.log` |
+| 修改配置后重启 | 编辑 `trainer.env`，然后 `Stop-ScheduledTask -TaskName trainmaster-trainer; Start-ScheduledTask -TaskName trainmaster-trainer` |
+| 检测环境 | `& 'C:\ProgramData\trainMaster\trainer\Scripts\python.exe' -m trainmaster_trainer selftest --env-file 'C:\ProgramData\trainMaster\trainer\trainer.env'` |
+| 停止并删除计划任务 | 重新运行安装命令，只加 `-Uninstall`（安装目录、配置文件与状态目录保留，不再需要时手动删除），然后在“计算资源”页面删除这个节点 |
+
+- 电脑睡眠时节点离线：接通电源时把睡眠设为“从不”（设置 → 系统 → 电源，或 `powercfg /change standby-timeout-ac 0`），安装脚本发现会睡眠时会提醒。
+- 训练节点只主动连接平台，不需要在 Windows 防火墙中开放端口；平台地址填平台的 IP 地址或域名。
+- 卸载或升级了创建虚拟环境时使用的 Python 后，训练节点无法启动：删除安装目录后重新运行安装命令。
 
 ### 10.8 只使用部分显卡
 
@@ -583,7 +625,7 @@ services:
 
 然后 `docker compose up -d trainer`，用 `docker compose exec trainer nvidia-smi -L` 确认容器中看到的显卡。
 
-裸机安装（第 10.7 节）时，在训练节点的配置文件（默认 `<安装目录>/trainer.env`；安装时用 `--env-file` 指定了其它文件时为该文件）中设置 `CUDA_VISIBLE_DEVICES=0,1`（`nvidia-smi -L` 中的序号：`install.sh` 写入了 `CUDA_DEVICE_ORDER=PCI_BUS_ID`，CUDA 的序号与它一致；也可以写 `GPU-…` UUID），然后 `sudo systemctl restart trainmaster-trainer`。新旧显卡混用、没有同时支持全部显卡的 PyTorch 变体时，“计算资源”页面建议的就是这种做法；用它排除了全部不受支持的显卡后，页面上对这些显卡只给出提示，不再警告。
+裸机安装（第 10.7 节）时，在训练节点的配置文件（默认 `<安装目录>/trainer.env`；安装时用 `--env-file` 指定了其它文件时为该文件）中设置 `CUDA_VISIBLE_DEVICES=0,1`（`nvidia-smi -L` 中的序号：`install.sh` 写入了 `CUDA_DEVICE_ORDER=PCI_BUS_ID`，CUDA 的序号与它一致；也可以写 `GPU-…` UUID），然后 `sudo systemctl restart trainmaster-trainer`（Windows 节点的配置文件默认为 `C:\ProgramData\trainMaster\trainer\trainer.env`，修改后在管理员 PowerShell 中 `Stop-ScheduledTask -TaskName trainmaster-trainer; Start-ScheduledTask -TaskName trainmaster-trainer`）。新旧显卡混用、没有同时支持全部显卡的 PyTorch 变体时，“计算资源”页面建议的就是这种做法；用它排除了全部不受支持的显卡后，页面上对这些显卡只给出提示，不再警告。
 
 ### 10.9 国内镜像
 
@@ -595,7 +637,7 @@ services:
 
 - **需要至少一个在线的训练节点，版本 0.2.0 或更新**（“计算资源”页面上显示为“节点 v0.2.0”；`python -m trainmaster_trainer --version`）。转换在 CPU 上进行（转换子进程中 `CUDA_VISIBLE_DEVICES` 为空），不占用显存，也不影响正在进行的训练，所以 **CPU 训练节点（`trainer-cpu`）就足够，不需要 GPU**。`make up` 在没有可用显卡时也会启动 CPU 训练节点；用 `--mode off` 关闭了训练节点的部署不能转换 ONNX（PT 下载不受影响），需要时改为 `make up SETUP_ARGS="--mode cpu"`。
 - **依赖**：转换需要 `onnx`、`onnxslim` 与 `onnxruntime`，版本固定在 `trainer/requirements.txt` 中（1.23.2 / 0.1.98 / 1.23.2），训练节点镜像与 `install.sh` 都会安装。转换用 Ultralytics 的安全加载读取模型文件，需要 PyTorch 2.6 及以上和带安全加载的 Ultralytics：`torch_variants.txt` 中的变体（最旧的 `cu118` 为 2.7.1）与固定的 Ultralytics 版本都满足，不满足时（如自己装了旧版依赖的裸机节点）转换失败并提示升级。镜像构建时会离线做一次 YOLO11n 的 ONNX 转换，依赖不完整或安全加载不可用时构建失败。节点运行时找不到 torch、ultralytics 或 onnx 时不领取转换任务，日志中有 `not claiming model_export tasks: cannot find …`，之后每 5 分钟重新检查一次。
-- **升级训练节点**：本机的 Docker 节点 `make up`（重新构建镜像）；其它机器上的 Docker 节点 `git pull` 后 `make setup`，再 `docker compose up -d --build trainer`（CPU 训练节点为 `trainer-cpu`，见 10.6）；裸机节点在新版的仓库目录中重新运行 `sudo trainer/scripts/install.sh`（沿用已有的配置，安装新增的依赖并重启服务，见 10.7）。
+- **升级训练节点**：本机的 Docker 节点 `make up`（重新构建镜像）；其它机器上的 Docker 节点 `git pull` 后 `make setup`，再 `docker compose up -d --build trainer`（CPU 训练节点为 `trainer-cpu`，见 10.6）；裸机节点在新版的仓库目录中重新运行 `sudo trainer/scripts/install.sh`（沿用已有的配置，安装新增的依赖并重启服务，见 10.7）；Windows 节点在平台升级后，在管理员 PowerShell 中重新运行“接入节点”中的命令（从平台下载新版，沿用配置并重启计划任务，见 10.7）。
 - **离线 / 内网**：转换不访问网络，也不下载任何权重：子进程设置 `YOLO_OFFLINE=1`，并禁止 Ultralytics 在线安装缺少的依赖（`YOLO_AUTOINSTALL=False`）。依赖只在构建镜像（或运行 `install.sh`）时从 PyPI（`PIP_INDEX_URL`，可用内网镜像，见第 7 节）安装；离线服务器导入在联网机器上构建的训练节点镜像即可（第 7 节）。
 - **超时**：一次转换最长 `TM_EXPORT_TIMEOUT`（默认 900 秒），超时后转换失败，可以减小输入尺寸后重试，或延长超时。Docker 部署时在 `.env` 中设置（如 `TM_EXPORT_TIMEOUT=30m`，见 `.env.example`），然后 `docker compose up -d trainer`（CPU 训练节点为 `trainer-cpu`）；裸机节点写在配置文件 `<安装目录>/trainer.env` 中（重新运行 `install.sh` 时会保留），然后 `sudo systemctl restart trainmaster-trainer`。
 - **磁盘**：转换在训练节点状态目录的 `work/model-export-<ID>/` 中进行（Docker 为 `TM_HOST_TRAINER_DIR`），需要约 3 倍于模型文件的剩余空间，结束后删除。平台一侧，结果先写入存储目录的 `tmp/model-exports/` 再移入模型文件夹：节点上传前先带上文件大小询问平台，平台空间不足时转换直接失败（“上传转换结果失败：磁盘剩余空间不足…”），不会反复重试。
@@ -664,6 +706,11 @@ services:
 | 宿主机有显卡，页面提示显卡没有传入容器（`gpu_not_passed_through`） | 运行的是 `trainer-cpu`（Docker 不能使用显卡时 `make setup` 选择了 CPU），或 `trainer` 没有拿到显卡：`make up SETUP_ARGS="--install-toolkit"` 安装 / 配置 NVIDIA Container Toolkit 并启动 GPU 训练节点（需要 sudo；其它机器上用 `make setup SETUP_ARGS="--install-toolkit"` 再启动它输出的服务）。有意选择了 CPU 模式（`--mode cpu`）时页面只显示“已选择 CPU 模式”的提示；宿主机驱动过旧、CUDA 版 PyTorch 都不能使用时页面提示的是驱动过旧，先升级驱动（见上面“宿主机 NVIDIA 驱动过旧”一行） |
 | `make setup` 提示没能验证 Docker 能否使用显卡（离线或无法访问镜像仓库） | 拉取 `TRAINER_PYTHON_IMAGE` 失败，只能按 Docker 的配置判断：配置镜像加速或内网镜像仓库（第 7 节），或先 `docker load` 导入该镜像，再运行 `make setup` |
 | 训练节点一直显示离线或没有出现 | `docker compose logs trainer` 查看：401 / “节点令牌不正确” → 平台与训练节点的 `TM_NODE_TOKEN` 不一致（修改 `.env` 后平台 `make up`，其它机器上的节点 `docker compose up -d trainer`）；连接失败 → 检查 `TM_SERVER_URL` 与防火墙 |
+| Windows 节点一直显示离线或没有出现 | 在管理员 PowerShell 中 `Get-ScheduledTask -TaskName trainmaster-trainer` 查看计划任务是否在运行，再看日志 `C:\ProgramData\trainMaster\state\logs\trainer.log`：401 / “节点令牌不正确” → 修改 `trainer.env` 中的 `TM_NODE_TOKEN` 后重启计划任务（见 10.7）；连接失败 → 在这台电脑的浏览器中打开 `TM_SERVER_URL` 确认能访问平台；没有日志 → 安装时没有加 `-Service`（重新运行安装命令并加上）。电脑睡眠期间节点离线 |
+| Windows 上 `irm` 报“无法连接到远程服务器”、404 或“平台没有附带 Windows 训练节点的安装脚本” | 连接失败时确认这台电脑能访问平台地址（https 地址的命令开头已启用 TLS 1.2）；404 → 平台不是用 Docker 镜像运行，没有设置 `TM_TRAINER_PACKAGE_DIR`（见第 3.2 节）：设置它，或在这台电脑上克隆仓库，在仓库目录中运行 `powershell -ExecutionPolicy Bypass -File trainer\scripts\install.ps1 …` |
+| Windows 上安装或自检时无法导入 PyTorch：`WinError 126`、`DLL load failed`、`Error loading …dll` | 缺少 Microsoft Visual C++ 运行库：安装 https://aka.ms/vs/17/release/vc_redist.x64.exe，或重新运行安装命令并加 `-InstallPython`（会一并安装运行库） |
+| Windows 上导入 PyTorch 时报 `WinError 1455`（页面文件太小） | 虚拟内存不足（CUDA 版 PyTorch 的 DLL 很大）：在“系统 → 高级系统设置 → 性能 → 设置 → 高级 → 虚拟内存”中改为“系统管理的大小”或调大页面文件，重启后再试 |
+| Windows 上安装脚本提示“没有找到 64 位的 Python 3.10–3.13”或 Python 是 Microsoft Store 版 | 加 `-InstallPython` 重新运行（用 winget 或 python.org 的安装程序为所有用户安装 Python 3.12），或自己从 python.org 安装 64 位 Python（勾选 Install for all users）；以 SYSTEM 运行的计划任务不能使用 Microsoft Store 版的 Python |
 | 两台机器在页面上显示为同一个节点（主机名、显卡在两台机器之间来回变化），平台日志中有“两台机器使用了同一个节点标识” | 拷贝了 `./data/trainer`（或克隆了装好训练节点的虚拟机），两台机器的 `node-key` 相同：在其中一台上删除状态目录中的 `node-key` 并重启训练节点，见第 6 节 |
 | `make up` 提示“警告：训练节点（…）没有构建或启动成功” | 平台已经启动，只是训练节点没有起来：按上面的错误信息处理。构建训练节点镜像时下载 PyTorch 失败或超时 → 在 `.env` 中设置 `PIP_INDEX_URL`、`TORCH_FIND_LINKS` 等国内镜像（第 7 节）后重新 `make up` |
 | 构建训练节点镜像时下载 PyTorch 很慢或超时 | 设置 `PIP_INDEX_URL`、`TORCH_FIND_LINKS` 等国内镜像，见第 7 节 |

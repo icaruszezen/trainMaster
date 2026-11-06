@@ -6,6 +6,7 @@ tests/fakes.py 中的假模块，通过 PYTHONPATH 上的同名模块文件加�
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fakes import TRAINER_DIR
+from fakes import TRAINER_DIR, WINDOWS
 
 from trainmaster_trainer import __main__ as cli
 from trainmaster_trainer import __version__
@@ -31,23 +32,29 @@ import fakes
 
 
 def fake_ml(root: Path, *, torch: dict[str, Any] | None = None, ultralytics: bool = True) -> Path:
-    """写出假的 torch / torchvision / ultralytics 模块文件，返回要加入 PYTHONPATH 的目录。"""
+    """写出假的 torch / torchvision / ultralytics 模块文件，返回要加入 PYTHONPATH 的目录。
+
+    Python 按 UTF-8 读取源文件：写入时同样指定 UTF-8（路径中可能有中文，Windows 默认使用 ANSI 代码页）。"""
     root.mkdir(parents=True, exist_ok=True)
     tests = str(TESTS_DIR)
     if torch is not None:
         (root / "torch.py").write_text(
             _FAKE_MODULE.format(
                 tests=tests, body=f"sys.modules[__name__] = fakes.make_torch(**{torch!r})"
-            )
+            ),
+            encoding="utf-8",
         )
         (root / "torchvision.py").write_text(
             _FAKE_MODULE.format(
                 tests=tests, body="sys.modules[__name__] = fakes.make_torchvision()"
-            )
+            ),
+            encoding="utf-8",
         )
     if ultralytics:
         body = "import torch\nsys.modules[__name__] = fakes.make_ultralytics(torch.calls)"
-        (root / "ultralytics.py").write_text(_FAKE_MODULE.format(tests=tests, body=body))
+        (root / "ultralytics.py").write_text(
+            _FAKE_MODULE.format(tests=tests, body=body), encoding="utf-8"
+        )
     return root
 
 
@@ -65,15 +72,25 @@ def run_cli(tmp_path: Path, *args: str, extra_path: Path | None = None, **env_ex
         TM_DATA_DIR=str(tmp_path),
         TM_NVIDIA_SMI=str(tmp_path / "no-nvidia-smi"),
         TM_TORCH_VARIANT="cpu",
+        # 命令行按 stdout / stderr 的编码打印中文。Windows 上输出到管道时默认使用系统的代码页（runner 上是
+        # 不能表示中文的 cp1252），这里与 install.ps1 一样指定 UTF-8。
+        PYTHONIOENCODING="utf-8",
     )
     env.update(env_extra)
     return subprocess.run(
         [sys.executable, "-m", "trainmaster_trainer", *args],
         env=env,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=120,
     )
+
+
+def run_healthcheck(tmp_path: Path, **env_extra: str):
+    # Windows 上退回的状态目录在 %LOCALAPPDATA% 下（不使用 HOME）：同样放在临时目录中，不查找本机真实的目录。
+    env_extra.setdefault("LOCALAPPDATA", str(tmp_path / "home" / "AppData" / "Local"))
+    return run_cli(tmp_path, "healthcheck", **env_extra)
 
 
 def test_selftest_json_cpu_passes(tmp_path):
@@ -107,7 +124,7 @@ def test_selftest_without_torch_exits_1(tmp_path):
     ml = tmp_path / "empty"
     ml.mkdir()
     # 不依赖测试环境是否装了 torch：PYTHONPATH 上放一个导入即失败的同名模块
-    (ml / "torch.py").write_text("raise ImportError('No module named torch')\n")
+    (ml / "torch.py").write_text("raise ImportError('No module named torch')\n", encoding="utf-8")
     proc = run_cli(tmp_path, "selftest", extra_path=ml)
     assert proc.returncode == 1
     assert "CUDA 环境：异常" in proc.stdout
@@ -205,28 +222,32 @@ def test_default_command_is_run(tmp_path):
 
 
 def test_healthcheck_cli(tmp_path):
-    proc = run_cli(tmp_path, "healthcheck")
+    proc = run_healthcheck(tmp_path)
     assert proc.returncode == 1
     assert "没有心跳记录" in proc.stderr
 
     state = tmp_path / "state"
     state.mkdir()
     (state / "heartbeat").write_text(json.dumps({"unix": time.time(), "interval_seconds": 10}))
-    proc = run_cli(tmp_path, "healthcheck")
+    proc = run_healthcheck(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert "秒前" in proc.stdout
 
     (state / "heartbeat").write_text(
         json.dumps({"unix": time.time() - 3600, "interval_seconds": 10})
     )
-    assert run_cli(tmp_path, "healthcheck").returncode == 1
+    assert run_healthcheck(tmp_path).returncode == 1
 
 
 def test_healthcheck_finds_fallback_state_dir(tmp_path):
-    fallback = tmp_path / "home" / ".local" / "state" / "trainmaster"
+    # 状态目录不可写时退回的目录：Linux 为 ~/.local/state/trainmaster，Windows 为 %LOCALAPPDATA%\trainMaster\state
+    if WINDOWS:
+        fallback = tmp_path / "home" / "AppData" / "Local" / "trainMaster" / "state"
+    else:
+        fallback = tmp_path / "home" / ".local" / "state" / "trainmaster"
     fallback.mkdir(parents=True)
     (fallback / "heartbeat").write_text(json.dumps({"unix": time.time(), "interval_seconds": 10}))
-    proc = run_cli(tmp_path, "healthcheck", TM_STATE_DIR=str(tmp_path / "unwritable"))
+    proc = run_healthcheck(tmp_path, TM_STATE_DIR=str(tmp_path / "unwritable"))
     assert proc.returncode == 0, proc.stderr
 
 
@@ -236,9 +257,9 @@ def test_healthcheck_finds_temp_state_dir_of_puid(tmp_path):
     fallback = tmp / "trainmaster-4321"
     fallback.mkdir(parents=True)
     (fallback / "heartbeat").write_text(json.dumps({"unix": time.time(), "interval_seconds": 10}))
-    proc = run_cli(tmp_path, "healthcheck", TMPDIR=str(tmp))
+    proc = run_healthcheck(tmp_path, TMPDIR=str(tmp))
     assert proc.returncode == 1
-    proc = run_cli(tmp_path, "healthcheck", TMPDIR=str(tmp), PUID="4321")
+    proc = run_healthcheck(tmp_path, TMPDIR=str(tmp), PUID="4321")
     assert proc.returncode == 0, proc.stderr
 
 
@@ -371,8 +392,10 @@ def test_apply_env_file_sets_tm_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / "trainer.env"
     env_file.write_text("TM_NODE_NAME='节点 1'\nCUDA_VISIBLE_DEVICES=1\n", encoding="utf-8")
     monkeypatch.setenv("TM_NODE_NAME", "old")
-    monkeypatch.delenv("TM_ENV_FILE", raising=False)
-    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    # 先 setenv 再 delenv：monkeypatch 记录原来的值，测试结束时还原（apply_env_file 写入的值不留给其它测试）
+    for key in ("TM_ENV_FILE", "CUDA_VISIBLE_DEVICES"):
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
     assert cli.apply_env_file(str(env_file))
     assert os.environ["TM_NODE_NAME"] == "节点 1"
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "1"
@@ -553,3 +576,37 @@ def test_log_file_keeps_writing_when_rotation_fails(tmp_path, monkeypatch):
     text = (tmp_path / "t.log").read_text(encoding="utf-8")
     assert all(f"line {i} " in text for i in range(10))
     assert "after retry" in text
+
+
+def test_recommend_runs_without_psutil_and_nvml(tmp_path):
+    # 安装脚本在创建虚拟环境之前用系统的 Python 运行 recommend：只有标准库可用。
+    code = (
+        "import sys\n"
+        "sys.modules['psutil'] = None\n"
+        "sys.modules['pynvml'] = None\n"
+        "from trainmaster_trainer.__main__ import main\n"
+        "sys.exit(main(['recommend', '--json']))\n"
+    )
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TM_")}
+    env.update(PYTHONPATH=str(TRAINER_DIR), TM_NVIDIA_SMI=str(tmp_path / "missing"))
+    proc = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.isascii()
+    report = json.loads(proc.stdout)
+    assert report["recommended"]["variant"] == "cpu"
+    assert "nvidia-ml-py is not installed" in (report["detection"]["error"] or "")
+
+
+def test_tolerate_unencodable_output(monkeypatch):
+    # Windows 上输出重定向时按代码页编码：英文系统的 cp1252 没有中文，不能因此抛出 UnicodeEncodeError
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+    cli.tolerate_unencodable_output(windows=False)
+    with pytest.raises(UnicodeEncodeError):
+        print("推荐的变体")
+    cli.tolerate_unencodable_output(windows=True)
+    print("推荐的变体 cu130")
+    out.flush()
+    assert out.buffer.getvalue() == b"\\u63a8\\u8350\\u7684\\u53d8\\u4f53 cu130\n"

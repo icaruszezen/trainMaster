@@ -265,22 +265,23 @@ def cmd_selftest(as_json: bool) -> int:
 def recommend_report(variant: str | None = None) -> dict[str, Any]:
     """recommend 的结果：本机显卡与驱动、推荐的变体，以及要安装的变体（variant，默认为推荐的）。
 
-    只检测显卡（NVML，失败时用 nvidia-smi），不导入 torch，安装 PyTorch 之前就能运行。Windows 上没有
-    检测到显卡时统计 PCI 总线上的 NVIDIA 显卡（提示“有显卡但没有驱动”）。
-    variant 不在变体表中时抛出 ValueError（中文说明）。
+    只检测显卡（NVML，失败或没有安装 nvidia-ml-py 时用 nvidia-smi），不导入 torch 与 psutil：安装脚本在
+    创建虚拟环境之前，用系统的 Python 加上 PYTHONPATH 就能运行。Windows 上没有检测到显卡时统计 PCI 总线
+    上的 NVIDIA 显卡（提示“有显卡但没有驱动”）。variant 不在变体表中时抛出 ValueError（中文说明）。
     """
     import platform as platform_mod
 
     from . import gpu as gpu_mod
-    from . import hardware, issues, winsys
+    from . import issues, winsys
     from . import variants as variants_mod
 
     table = variants_mod.load_variants()
     names = [v.name for v in table]
     if variant and variants_mod.get_variant(variant, table) is None:
         raise ValueError(f"未知的变体 {variant}（可选：{' '.join(names)}）")
-    windows = hardware.WINDOWS
-    system = hardware.platform_name(windows)
+    windows = sys.platform == "win32"
+    # 与 hardware.platform_name 相同（hardware 依赖 psutil，这里不导入）
+    system = "windows" if windows else (platform_mod.system().lower() or None)
     gp = gpu_mod.probe(windows=windows)
     gp.sampler.close()
     pci_gpu_count = winsys.pci_gpu_count() if windows and not gp.gpus else None
@@ -370,7 +371,8 @@ def cmd_recommend(as_json: bool, variant: str | None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     if as_json:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        # 只输出 ASCII：Windows PowerShell 按控制台代码页解码子进程的输出，中文会变成乱码
+        print(json.dumps(report, ensure_ascii=True, indent=2))
     else:
         print(format_recommend(report))
     return 0
@@ -735,7 +737,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def tolerate_unencodable_output(windows: bool = sys.platform == "win32") -> None:
+    """Windows 上输出重定向到管道或文件时按系统的代码页编码（英文系统为 cp1252，没有中文），打印中文会抛出
+    UnicodeEncodeError，命令在做完事情之后失败。改为把无法编码的字符写成 \\uXXXX。控制台、
+    PYTHONIOENCODING=utf-8（install.ps1 这样运行）与中文系统的代码页都能编码中文，不受影响。"""
+    if not windows:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if getattr(stream, "errors", None) == "strict" and hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    tolerate_unencodable_output()
     args = build_parser().parse_args(argv)
     if not apply_env_file(args.env_file):
         return 2

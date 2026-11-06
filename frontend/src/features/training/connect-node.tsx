@@ -395,9 +395,9 @@ function ConnectNodeContent() {
               : "运行仓库中的安装脚本："}
             自动选择 CUDA 版本，安装到{" "}
             <Code>C:\ProgramData\trainMaster\trainer</Code> 的虚拟环境中；
-            <Code>-InstallPython</Code> 在没有 Python 3.10–3.13 时用 winget 安装
-            Python 3.12，<Code>-Service</Code> 注册为开机自启的计划任务{" "}
-            <Code>trainmaster-trainer</Code>
+            <Code>-InstallPython</Code> 在没有 Python 3.10–3.13 时安装 Python
+            3.12（缺少 VC++ 运行库时一并安装），<Code>-Service</Code>
+            注册为开机自启的计划任务 <Code>trainmaster-trainer</Code>
             （以 SYSTEM
             运行，不需要登录）。平台地址按其它机器实际能访问的地址与端口填写。
           </p>
