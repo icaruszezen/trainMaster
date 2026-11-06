@@ -601,7 +601,7 @@ def test_recommend_runs_without_psutil_and_nvml(tmp_path):
 
 def test_tolerate_unencodable_output(monkeypatch):
     # Windows 上输出重定向时按代码页编码：英文系统的 cp1252 没有中文，不能因此抛出 UnicodeEncodeError
-    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", newline="\n")
     monkeypatch.setattr(sys, "stdout", out)
     cli.tolerate_unencodable_output(windows=False)
     with pytest.raises(UnicodeEncodeError):
