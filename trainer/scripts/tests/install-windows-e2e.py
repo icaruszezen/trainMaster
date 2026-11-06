@@ -65,12 +65,15 @@ def install(*args: str) -> str:
 
 
 def powershell(code: str) -> str:
+    # 从 PowerShell 7 中启动时（CI）继承的 PSModulePath 会让 Windows PowerShell 5.1 加载不了 Get-Acl 等命令所在的模块
+    env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
     proc = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", code],
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
         timeout=120,
         check=False,
     )
