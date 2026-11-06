@@ -114,6 +114,7 @@ import {
   ModelReviewsLink,
   ReviewWithModelButton,
 } from "@/features/reviews/model-review-entry"
+import { RECYCLE_BIN_PATH } from "@/features/recycle-bin/recycle-format"
 import { CopyButton } from "@/features/training/command-block"
 import { useMediaQuery } from "@/hooks/use-media-query"
 import { usePageTitle } from "@/hooks/use-page-title"
@@ -159,15 +160,26 @@ function ModelNotFound() {
           <FileWarning />
         </EmptyMedia>
         <EmptyTitle>模型不存在</EmptyTitle>
-        <EmptyDescription>该模型可能已被删除，或者链接有误。</EmptyDescription>
+        <EmptyDescription>
+          该模型可能已被删除，或者链接有误。删除的模型在回收站中保留 7
+          天，期间可以恢复。
+        </EmptyDescription>
       </EmptyHeader>
       <EmptyContent>
-        <Button asChild>
-          <Link to="/models">
-            <ArrowLeft />
-            返回模型仓库
-          </Link>
-        </Button>
+        <div className="flex flex-wrap justify-center gap-2">
+          <Button asChild>
+            <Link to="/models">
+              <ArrowLeft />
+              返回模型仓库
+            </Link>
+          </Button>
+          <Button variant="outline" asChild>
+            <Link to={RECYCLE_BIN_PATH}>
+              <Trash2 />
+              查看回收站
+            </Link>
+          </Button>
+        </div>
       </EmptyContent>
     </Empty>
   )

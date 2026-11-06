@@ -365,6 +365,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 模型审图位于 `src/features/reviews/`：列表页（`/datasets/reviews`，项目与模型的筛选记在 URL 的 `?project=`、`?model=`）、详情页（`/datasets/reviews/:reviewId`：进度、各数据集、本地审图的步骤、上传与合并记录）、审图编辑器（`/datasets/reviews/:reviewId/workspace?image=`，`handle.fullBleed`，筛选记在 URL 中），以及新建、下载审图包、上传审图结果、合并到数据集的对话框；模型详情页的“用这个模型审图”与数据集详情页的“审核记录”（`?tab=reviews`）也在这里。审图编辑器与标注工作台共用画布、框编辑（`features/annotation/box-editing.tsx`）、工具栏部件（`toolbar-parts.tsx`）、保存守护（`save-guard.tsx`）、快捷键（`use-editor-keys.ts`、`shortcuts.ts` 的 `review` 模式）与跨图片的视图设置（`editor-common.ts`），只通过 `ReviewSource`（接口前缀与查询键）读写，所以本地审图程序直接复用它。`review-status.ts`、`review-format.ts`、`params.ts` 是与界面无关的纯函数，有单元测试。
 - 本地审图程序的页面位于 `src/reviewer/`（入口 `frontend/reviewer.html`，用 `vite.reviewer.config.ts` 单独构建到 `backend/cmd/trainmaster-reviewer/web/dist`）：开始页（打开审图包、最近打开的包、打开进度）、审图页（复用 `ReviewEditor`，接口为本机的 `/api/review`）与导出对话框。
 - 模型仓库位于 `src/features/models/`：列表页（`/models`，桌面为表格、窄屏为卡片）、模型详情页（`/models/:modelId`）、上传对话框与下载对话框（PT / ONNX，ONNX 转换的进度与失败原因）。`yolo-versions.ts`（版本表、各模型允许的与默认的后处理方式、转换选项的范围、输出形状说明、下载文件名）与 `naming.ts`（上传文件名与说明的规则）是与后端 `internal/model` 规则一致的纯函数，有单元测试。模型上传由 `features/models/upload-manager.ts` 执行（做法同数据集，复用 `upload-plan.ts` 的分块与重试，进度显示在同一个上传面板中）。
+- 回收站位于 `src/features/recycle-bin/`：回收站页（`/system/recycle-bin`，系统管理分组；桌面为表格、窄屏为卡片，按类型与关键字筛选，显示到期倒计时）、恢复操作（`restore-actions.tsx`：一键恢复，名称被占用（409 `name_taken`）时打开换名对话框）、删除之后带“撤销”的提示（`recycle-toast.ts`，数据集、模型、审图版本的删除对话框共用）。三类内容合成一个列表、搜索、倒计时与建议的新名称是 `recycle-format.ts` 中的纯函数，有单元测试；删除与恢复后要刷新的查询集中在 `api.ts`（`refreshAfterDatasetMove` 等）。
 
 开发时由 Vite（:5173）托管前端并把 `/api` 代理到 Go 服务（:8080）；生产环境由 Go 服务托管 `frontend/dist`。
 
@@ -840,7 +841,7 @@ zip 中只有一个顶层文件夹 `审图-<任务ID>-<任务名>/`（`SafeSegme
 
 ## 12. 回收站
 
-删除数据集、数据集的审图版本与模型都不会立即删除它们，而是移入回收站：**保留 7 天**（`internal/recycle` 的 `Retention`），期间可以在“系统设置 · 回收站”（`/system/recycle-bin`）中查看与恢复，到期后由后台任务自动永久删除。删除项目时勾选“同时删除模型”的模型同样进入回收站。回收站**不提供提前永久删除**（也没有“清空回收站”）：保留期是强制的，误删的东西总有 7 天可以找回。接口见第 3 节“回收站接口”。
+删除数据集、数据集的审图版本与模型都不会立即删除它们，而是移入回收站：**保留 7 天**（`internal/recycle` 的 `Retention`），期间可以在“系统管理 · 回收站”（`/system/recycle-bin`）中查看与恢复，到期后由后台任务自动永久删除。删除项目时勾选“同时删除模型”的模型同样进入回收站。回收站**不提供提前永久删除**（也没有“清空回收站”）：保留期是强制的，误删的东西总有 7 天可以找回。接口见第 3 节“回收站接口”。
 
 ### 软删除
 

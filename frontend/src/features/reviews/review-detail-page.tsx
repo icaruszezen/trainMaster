@@ -337,7 +337,7 @@ function ReviewMeta({ review }: { review: Review }) {
       ) : (
         <span
           className="inline-flex min-w-0 items-center gap-1"
-          title="模型已被删除，审图任务保留了创建时的模型信息"
+          title="模型已被删除，审图任务保留了创建时的模型信息；模型还在回收站中时，恢复后可以继续使用"
         >
           {model}
           <span>（已删除）</span>
@@ -398,7 +398,7 @@ function InferenceStatus({
               : ""}
             {review.model_exists
               ? `重新识别时只识别剩下的 ${formatNumber(left)} 张。`
-              : "模型已被删除，无法重新识别。"}
+              : "模型已被删除，无法重新识别；模型还在回收站中时，恢复后可以重试。"}
           </p>
           <div className="mt-2 flex flex-wrap items-center gap-2">
             {review.model_exists && (

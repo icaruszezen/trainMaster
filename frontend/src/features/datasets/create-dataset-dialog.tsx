@@ -293,10 +293,11 @@ export function CreateDatasetDialog({
         startFolderUpload({ dataset, job, files: uploads })
       }
     } catch (error) {
-      // 导入任务没建起来（如磁盘空间不足）：撤销刚创建的空数据集，
-      // 用户修正后可以用同一个名称重试。
+      // 导入任务没建起来（如磁盘空间不足）：撤销刚创建的空数据集（连同空
+      // 文件夹移入回收站，名称与文件夹名随即可以再用），用户修正后可以用
+      // 同一个名称重试。
       const rollbackProblem = await deleteDataset(dataset.id, true).then(
-        (result) => (result?.files_removed === false ? result.message : null),
+        () => null,
         () =>
           `已创建的空数据集“${dataset.name}”未能自动删除，可在列表中手动删除`
       )

@@ -20,6 +20,7 @@ import { ReviewDetailPage } from "@/features/reviews/review-detail-page"
 import { ReviewWorkspacePage } from "@/features/reviews/review-workspace-page"
 import { ReviewsPage } from "@/features/reviews/reviews-page"
 import { ProjectsPage } from "@/features/projects/projects-page"
+import { RecycleBinPage } from "@/features/recycle-bin/recycle-bin-page"
 import { MembersPage } from "@/features/system/members-page"
 import { SettingsPage } from "@/features/system/settings-page"
 import { StoragePage } from "@/features/system/storage-page"
@@ -53,6 +54,7 @@ export const pages: Record<ModuleId, ComponentType> = {
   inference: InferencePage,
   members: MembersPage,
   storage: StoragePage,
+  "recycle-bin": RecycleBinPage,
   settings: SettingsPage,
 }
 

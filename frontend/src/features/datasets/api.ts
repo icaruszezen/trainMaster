@@ -216,6 +216,11 @@ export type DatasetDirectory = {
   path: string
   registered: boolean
   dataset_id: number | null
+  /**
+   * 使用它的数据集在回收站中（删除时保留了文件夹）：不能再次添加，只能在
+   * 回收站中恢复那个数据集；它永久删除后文件夹可以重新添加。
+   */
+  in_recycle_bin: boolean
   image_count: number
   /** `.xml` 文件数。 */
   annotation_count: number
@@ -529,13 +534,11 @@ export function updateDataset(
 }
 
 /**
- * `?delete_files=true` 时记录已删除、但文件夹没能完全删除的结果（200）；
- * 全部删除时为 204，`deleteDataset` 返回 undefined。
+ * 把数据集移入回收站（7 天内可以恢复，见 features/recycle-bin）。`deleteFiles`：
+ * 到期永久删除时一并删除磁盘上的文件夹；否则文件夹留在原处。
  */
-export type DeleteDatasetResult = { files_removed: boolean; message: string }
-
 export function deleteDataset(id: number, deleteFiles: boolean) {
-  return apiSend<DeleteDatasetResult | undefined>(
+  return apiSend<void>(
     "DELETE",
     deleteFiles ? `${datasetPath(id)}?delete_files=true` : datasetPath(id)
   )
@@ -719,6 +722,7 @@ export function updateDatasetVersion(
   )
 }
 
+/** 把审图版本移入回收站（7 天内可以恢复，见 features/recycle-bin）。 */
 export function deleteDatasetVersion(datasetId: number, versionId: number) {
   return apiSend<void>(
     "DELETE",

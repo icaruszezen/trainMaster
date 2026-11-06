@@ -216,9 +216,6 @@ export type ModelExport = {
   finished_at: string | null
 }
 
-/** 删除时记录已删除、但文件夹没能完全删除的结果（200）；全部删除时为 204。 */
-export type DeleteModelResult = { files_removed: boolean; message: string }
-
 /** 模型列表的筛选条件；`null` / `""` 表示不限。 */
 export type ModelFilters = {
   projectId: number | null
@@ -380,8 +377,9 @@ export function updateModel(id: number, input: { description: string }) {
 }
 
 /** 删除模型记录、转换结果与模型文件夹。 */
+/** 把模型移入回收站（7 天内可以恢复，见 features/recycle-bin）。 */
 export function deleteModel(id: number) {
-  return apiSend<DeleteModelResult | undefined>("DELETE", modelPath(id))
+  return apiSend<void>("DELETE", modelPath(id))
 }
 
 export type CreateModelUploadInput = {

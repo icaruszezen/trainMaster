@@ -15,6 +15,7 @@ import {
   RefreshCw,
   SquareDashed,
   Tags,
+  Trash2,
 } from "lucide-react"
 import { Link, useNavigate, useParams, useSearchParams } from "react-router"
 import { toast } from "sonner"
@@ -76,6 +77,7 @@ import { BASE_ONLY } from "@/features/datasets/versions"
 import { workspacePath } from "@/features/annotation/workspace-params"
 import { DatasetProjectBadges } from "@/features/projects/dataset-project-badges"
 import { DatasetProjectsDialog } from "@/features/projects/dataset-projects-dialog"
+import { RECYCLE_BIN_PATH } from "@/features/recycle-bin/recycle-format"
 import { usePageTitle } from "@/hooks/use-page-title"
 import { ApiError } from "@/lib/api"
 import { copyText } from "@/lib/clipboard"
@@ -119,16 +121,25 @@ function DatasetNotFound() {
         </EmptyMedia>
         <EmptyTitle>数据集不存在</EmptyTitle>
         <EmptyDescription>
-          该数据集可能已被删除，或者链接有误。
+          该数据集可能已被删除，或者链接有误。删除的数据集在回收站中保留 7
+          天，期间可以恢复。
         </EmptyDescription>
       </EmptyHeader>
       <EmptyContent>
-        <Button asChild>
-          <Link to="/datasets">
-            <ArrowLeft />
-            返回数据集列表
-          </Link>
-        </Button>
+        <div className="flex flex-wrap justify-center gap-2">
+          <Button asChild>
+            <Link to="/datasets">
+              <ArrowLeft />
+              返回数据集列表
+            </Link>
+          </Button>
+          <Button variant="outline" asChild>
+            <Link to={RECYCLE_BIN_PATH}>
+              <Trash2 />
+              查看回收站
+            </Link>
+          </Button>
+        </div>
       </EmptyContent>
     </Empty>
   )

@@ -43,11 +43,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { datasetsQuery } from "@/features/datasets/api"
 import { DescriptionCounter } from "@/features/datasets/dataset-actions"
 import { isNameTaken, validateDescription } from "@/features/datasets/naming"
-import {
-  modelKeys,
-  projectModelsQuery,
-  refreshModels,
-} from "@/features/models/api"
+import { modelKeys, projectModelsQuery } from "@/features/models/api"
 import {
   cacheNewProject,
   createProject,
@@ -60,6 +56,8 @@ import {
 } from "@/features/projects/api"
 import { DatasetPicker } from "@/features/projects/dataset-picker"
 import { validateProjectName } from "@/features/projects/naming"
+import { refreshAfterModelMove } from "@/features/recycle-bin/api"
+import { RECYCLE_RETENTION_DAYS } from "@/features/recycle-bin/recycle-format"
 import { ApiError } from "@/lib/api"
 import { formatBytes, formatNumber } from "@/lib/format"
 import { queryClient } from "@/lib/query-client"
@@ -385,7 +383,10 @@ type DeleteProjectDialogProps = {
   onDeleted?: (project: Project) => void
 }
 
-/** 删除项目：其中的数据集保留；项目中有模型时需要勾选同时删除模型。 */
+/**
+ * 删除项目：其中的数据集保留；项目中有模型时需要勾选同时删除模型（移入回收站，
+ * 恢复其中一个模型时项目随之恢复）。
+ */
 export function DeleteProjectDialog({
   project,
   onOpenChange,
@@ -431,27 +432,18 @@ function DeleteProjectForm({
   const mutation = useMutation({
     mutationFn: () =>
       deleteProject(project.id, { deleteModels: hasModels && deleteModels }),
-    onSuccess: (result) => {
+    onSuccess: () => {
       queryClient.removeQueries({ queryKey: projectKeys.detail(project.id) })
       queryClient.removeQueries({ queryKey: modelKeys.project(project.id) })
-      // 数据集上的项目标记与按项目筛选的结果都会变化；模型随项目一起删除。
-      refreshMembership()
-      if (hasModels) {
-        refreshModels()
-      }
-      if (result?.files_removed === false) {
-        // 记录已删除，但有模型文件夹没能完全删除（如权限不足）：说明留在了哪里。
-        toast.warning(`已删除项目“${project.name}”`, {
-          description: result.message,
-          duration: 15_000,
-        })
-      } else {
-        toast.success(`已删除项目“${project.name}”`, {
-          description: hasModels
-            ? `同时删除了 ${formatNumber(modelCount)} 个模型。`
-            : undefined,
-        })
-      }
+      // 数据集上的项目标记与按项目筛选的结果都会变化；模型随项目移入回收站
+      // （回收站中已有这个项目的模型时，项目也随它们留在回收站中）。
+      refreshAfterModelMove()
+      toast.success(`已删除项目“${project.name}”`, {
+        description: hasModels
+          ? `${formatNumber(modelCount)} 个模型已移入回收站，${RECYCLE_RETENTION_DAYS} 天内可以在“系统管理 · 回收站”中恢复，项目随之恢复。`
+          : undefined,
+        duration: hasModels ? 10_000 : undefined,
+      })
       onDeleted()
     },
     onError: (error) => {
@@ -502,10 +494,11 @@ function DeleteProjectForm({
               {modelBytes !== undefined && `（${formatBytes(modelBytes)}）`}
             </span>
             <span className="text-xs text-muted-foreground">
-              模型文件
+              模型移入回收站，保留 {RECYCLE_RETENTION_DAYS}{" "}
+              天，期间可以恢复（项目随之恢复）；到期后模型文件
               {exportCount > 0 &&
                 `与 ${formatNumber(exportCount)} 个 ONNX 转换结果`}
-              会被永久删除，无法恢复。
+              被永久删除。
             </span>
           </span>
         </label>

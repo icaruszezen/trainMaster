@@ -22,6 +22,7 @@ import {
   Settings,
   Sparkles,
   Tags,
+  Trash2,
   Users,
   type LucideIcon,
 } from "lucide-react"
@@ -43,6 +44,7 @@ export type ModuleId =
   | "inference"
   | "members"
   | "storage"
+  | "recycle-bin"
   | "settings"
 
 export type NavItem = {
@@ -346,6 +348,22 @@ export const navGroups: NavGroup[] = [
           "存储目录与容量监控",
           "数据备份与清理",
           "按数据集统计空间占用",
+        ],
+      },
+      {
+        id: "recycle-bin",
+        title: "回收站",
+        path: "/system/recycle-bin",
+        icon: Trash2,
+        description:
+          "删除的数据集、审图版本与模型保留 7 天，期间可以恢复，到期后自动永久删除。",
+        status: "ready",
+        apiPath: "/api/v1/recycle-bin",
+        features: [
+          "删除的数据集、审图版本与模型（含随项目删除的模型）强制保留 7 天",
+          "7 天内一键恢复：数据集回到原来的项目与审图任务，模型连同项目一起恢复",
+          "名称已被占用时换名恢复",
+          "到期自动永久删除，不能提前删除",
         ],
       },
       {

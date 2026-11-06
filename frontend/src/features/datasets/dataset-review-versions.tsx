@@ -77,6 +77,13 @@ import {
   versionSelection,
   versionSourceText,
 } from "@/features/datasets/versions"
+import {
+  refreshAfterVersionMove,
+  refreshRecycleBin,
+  restoreVersion,
+} from "@/features/recycle-bin/api"
+import { RECYCLE_RETENTION_DAYS } from "@/features/recycle-bin/recycle-format"
+import { toastMovedToBin } from "@/features/recycle-bin/recycle-toast"
 import { reviewKeys } from "@/features/reviews/api"
 import { reviewDetailPath } from "@/features/reviews/params"
 import {
@@ -548,7 +555,15 @@ function DeleteVersionForm({
           }
       )
       refreshVersions(datasetId)
-      toast.success(`已删除${name}`)
+      refreshRecycleBin()
+      toastMovedToBin({
+        title: `已将${name}移入回收站`,
+        undo: () =>
+          restoreVersion(version.id).then(() =>
+            refreshAfterVersionMove(datasetId)
+          ),
+        undoneTitle: `已恢复${name}`,
+      })
       onDone()
     },
   })
@@ -558,9 +573,10 @@ function DeleteVersionForm({
       <AlertDialogHeader>
         <AlertDialogTitle>删除{name}？</AlertDialogTitle>
         <AlertDialogDescription>
-          删除后不能再下载这个版本的审图标注（
-          {formatNumber(version.image_count)} 张图片），编号“{name}
-          ”也不会再使用。
+          版本会移入回收站，保留 {RECYCLE_RETENTION_DAYS}{" "}
+          天，期间可以恢复（编号不变）；到期后自动永久删除这个版本的审图标注（
+          {formatNumber(version.image_count)} 张图片）。编号“{name}
+          ”不会再分配给别的版本。
         </AlertDialogDescription>
       </AlertDialogHeader>
       <p className="text-sm text-pretty text-muted-foreground">
@@ -581,7 +597,7 @@ function DeleteVersionForm({
           disabled={mutation.isPending}
         >
           {mutation.isPending && <Spinner aria-hidden />}
-          删除版本
+          移入回收站
         </Button>
       </AlertDialogFooter>
     </>

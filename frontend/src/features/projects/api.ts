@@ -230,17 +230,11 @@ export function updateProject(
 }
 
 /**
- * `?delete_models=true` 时记录已删除、但有模型文件夹没能完全删除的结果（200）；
- * 全部删除时为 204，`deleteProject` 返回 undefined。
- */
-export type DeleteProjectResult = { files_removed: boolean; message: string }
-
-/**
  * 删除项目；其中的数据集保留，只是不再属于该项目。项目中有模型时必须同时删除
- * 模型（`deleteModels`），否则 409 `conflict`。
+ * 模型（`deleteModels`，模型移入回收站），否则 409 `conflict`。
  */
 export function deleteProject(id: number, { deleteModels = false } = {}) {
-  return apiSend<DeleteProjectResult | undefined>(
+  return apiSend<void>(
     "DELETE",
     deleteModels ? `${projectPath(id)}?delete_models=true` : projectPath(id)
   )

@@ -44,7 +44,6 @@ import { DescriptionCounter } from "@/features/datasets/dataset-actions"
 import {
   deleteModel,
   modelKeys,
-  refreshModels,
   updateModel,
   type Model,
   type ModelExport,
@@ -56,6 +55,9 @@ import {
 import { modelTitle } from "@/features/models/model-info"
 import { validateModelDescription } from "@/features/models/naming"
 import { modelFileName } from "@/features/models/yolo-versions"
+import { refreshAfterModelMove, restoreModel } from "@/features/recycle-bin/api"
+import { RECYCLE_RETENTION_DAYS } from "@/features/recycle-bin/recycle-format"
+import { toastMovedToBin } from "@/features/recycle-bin/recycle-toast"
 import { startDownload } from "@/lib/download"
 import { formatBytes, formatNumber } from "@/lib/format"
 import { queryClient } from "@/lib/query-client"
@@ -314,7 +316,7 @@ function EditModelForm({
   )
 }
 
-/** 删除模型：记录、模型文件与 ONNX 转换结果一起删除。 */
+/** 删除模型：移入回收站，到期后记录、模型文件与 ONNX 转换结果一起永久删除。 */
 export function DeleteModelDialog({
   model,
   onOpenChange,
@@ -351,18 +353,15 @@ function DeleteModelForm({
   const title = modelTitle(model)
   const mutation = useMutation({
     mutationFn: () => deleteModel(model.id),
-    onSuccess: (result) => {
+    onSuccess: () => {
       queryClient.removeQueries({ queryKey: modelKeys.detail(model.id) })
-      refreshModels()
-      if (result?.files_removed === false) {
-        // 记录已删除，但模型文件夹没能完全删除（如权限不足）：说明留在了哪里。
-        toast.warning(`已删除模型“${title}”`, {
-          description: result.message,
-          duration: 15_000,
-        })
-      } else {
-        toast.success(`已删除模型“${title}”`)
-      }
+      // 使用它的审图任务等它恢复，也要刷新。
+      refreshAfterModelMove()
+      toastMovedToBin({
+        title: `已将模型“${title}”移入回收站`,
+        undo: () => restoreModel(model.id).then(refreshAfterModelMove),
+        undoneTitle: `已恢复模型“${title}”`,
+      })
       onDeleted()
     },
   })
@@ -374,15 +373,17 @@ function DeleteModelForm({
           删除模型“{title}”？
         </AlertDialogTitle>
         <AlertDialogDescription>
-          将删除模型文件 {model.file_name}（{formatBytes(model.size_bytes)}）
+          模型会移入回收站，保留 {RECYCLE_RETENTION_DAYS}{" "}
+          天，期间可以恢复；到期后自动永久删除模型文件 {model.file_name}（
+          {formatBytes(model.size_bytes)}）
           {model.export_count > 0 &&
             `、${formatNumber(model.export_count)} 个 ONNX 转换结果`}
-          与模型记录，无法恢复。
+          与模型记录。
         </AlertDialogDescription>
       </AlertDialogHeader>
       <p className="text-sm text-muted-foreground">
-        版本号 v{model.version}{" "}
-        不会再分配给之后上传的模型；正在进行的转换也会停止。
+        正在进行的转换会停止；使用它的审图任务等它恢复后再识别。版本号 v
+        {model.version} 不会再分配给之后上传的模型。
       </p>
       {mutation.error && (
         <p role="alert" className="text-sm text-destructive">
@@ -399,7 +400,7 @@ function DeleteModelForm({
           disabled={mutation.isPending}
         >
           {mutation.isPending && <Spinner aria-hidden />}
-          删除模型
+          移入回收站
         </Button>
       </AlertDialogFooter>
     </>
