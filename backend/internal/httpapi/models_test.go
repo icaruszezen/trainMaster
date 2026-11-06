@@ -371,8 +371,8 @@ func TestModelAPIModels(t *testing.T) {
 	}
 	wantError(t, e.do("GET", base, nil), 404, codeNotFound, "模型不存在")
 	wantError(t, e.do("DELETE", base, nil), 404, codeNotFound, "模型不存在")
-	if exists := dirExists(filepath.Join(e.st.Dir(storage.Models), fmt.Sprintf("project-%d", p.ID), "v1")); exists {
-		t.Error("the model folder should be removed")
+	if !dirExists(filepath.Join(e.st.Dir(storage.Models), fmt.Sprintf("project-%d", p.ID), "v1")) {
+		t.Error("the model folder must stay while the model is in the recycle bin")
 	}
 	// Versions are not reused.
 	if v3 := e.uploadModel(t, p.ID, "yolo11", fakeWeights(t, "yolo11", "detect", "4")); v3.Version != 3 {
@@ -428,8 +428,8 @@ func TestModelAPIProjectDelete(t *testing.T) {
 		t.Fatalf("delete with models = %d %s", rec.Code, rec.Body)
 	}
 	wantError(t, e.do("GET", base, nil), 404, codeNotFound, "项目不存在")
-	if dirExists(projectDir) {
-		t.Error("the project's model folder should be removed")
+	if !dirExists(projectDir) {
+		t.Error("the project's model folder must stay while its models are in the recycle bin")
 	}
 	if l := want[List[model.Model]](t, e.do("GET", "/api/v1/models", nil), 200); l.Total != 0 {
 		t.Errorf("models left = %+v", l)

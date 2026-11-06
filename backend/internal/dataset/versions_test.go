@@ -191,21 +191,25 @@ func TestIntegrationVersions(t *testing.T) {
 	if v2 := e.addVersion(t, d.ID, "第三轮", testVersionImage{"a.png", "approved", nil}); v2.Name != "审图1.2" {
 		t.Errorf("version after a delete = %s", v2.Name)
 	}
-	// A version of a deleted dataset cannot be built; deleting a dataset
-	// deletes its versions.
+	// A version of a dataset in the recycle bin cannot be built; purging a
+	// dataset purges its versions.
 	mergeID, reviewID = e.addMerge(t, other.ID)
-	if _, err := e.svc.DeleteDataset(ctx, other.ID, true); err != nil {
+	if err := e.svc.DeleteDataset(ctx, other.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	_, err = e.svc.CreateReviewVersion(ctx, ReviewVersionDraft{DatasetID: other.ID, ReviewID: reviewID, MergeID: mergeID, Note: "x"})
 	wantKind(t, err, ErrNotFound, "数据集已被删除")
-	if _, err := e.svc.DeleteDataset(ctx, d.ID, true); err != nil {
+	if err := e.svc.DeleteDataset(ctx, d.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	e.expire(t, "datasets", d.ID, other.ID)
+	if err := e.svc.purgeExpired(ctx); err != nil {
 		t.Fatal(err)
 	}
 	var n int
 	if err := e.db.QueryRow(ctx, "SELECT (SELECT count(*) FROM dataset_versions) + (SELECT count(*) FROM dataset_version_images)").
 		Scan(&n); err != nil || n != 0 {
-		t.Errorf("versions left after deleting the dataset: %d, %v", n, err)
+		t.Errorf("versions left after purging the dataset: %d, %v", n, err)
 	}
 }
 

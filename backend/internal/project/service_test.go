@@ -402,7 +402,7 @@ func TestIntegrationProjectDatasets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.datasets.DeleteDataset(ctx, b, false); err != nil {
+	if err := e.datasets.DeleteDataset(ctx, b, false); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := e.svc.GetProject(ctx, p.ID); got.DatasetCount != 1 || got.ImageCount != 3 ||

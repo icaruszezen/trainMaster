@@ -151,6 +151,9 @@ func NewHandler(o Options) http.Handler {
 			if s.reviews != nil {
 				r.Route("/reviews", s.reviewRoutes)
 			}
+			if s.datasets != nil {
+				r.Route("/recycle-bin", s.recycleBinRoutes)
+			}
 
 			for _, p := range plannedModules {
 				r.HandleFunc(p, notImplemented)

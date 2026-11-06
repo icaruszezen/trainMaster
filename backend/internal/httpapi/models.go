@@ -211,13 +211,8 @@ func (s *server) deleteModel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, err := s.models.DeleteModel(r.Context(), id)
-	if err != nil {
+	if err := s.models.DeleteModel(r.Context(), id); err != nil { // to the recycle bin
 		s.modelError(w, r, err)
-		return
-	}
-	if res != nil { // deleted, but part of the folder is left on disk
-		writeJSON(w, http.StatusOK, res)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

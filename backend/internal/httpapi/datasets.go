@@ -95,6 +95,8 @@ func datasetErrorStatus(kind error) (int, string) {
 		return http.StatusBadRequest, codeBadRequest
 	case dataset.ErrConflict:
 		return http.StatusConflict, codeConflict
+	case dataset.ErrNameTaken:
+		return http.StatusConflict, codeNameTaken
 	case dataset.ErrOffsetMismatch:
 		return http.StatusConflict, codeUploadOffsetMismatch
 	case dataset.ErrTooLarge:
@@ -332,13 +334,10 @@ func (s *server) deleteDataset(w http.ResponseWriter, r *http.Request) {
 		}
 		deleteFiles = b
 	}
-	res, err := s.datasets.DeleteDataset(r.Context(), id, deleteFiles)
-	if err != nil {
+	// To the recycle bin; with delete_files its folder is removed when it
+	// is purged.
+	if err := s.datasets.DeleteDataset(r.Context(), id, deleteFiles); err != nil {
 		s.datasetError(w, r, err)
-		return
-	}
-	if res != nil { // deleted, but part of the folder is left on disk
-		writeJSON(w, http.StatusOK, res)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

@@ -118,8 +118,10 @@ func (s *Service) addModel(ctx context.Context, n newModel) (Model, error) {
 			// The update locks the project row until the transaction ends:
 			// concurrent additions to the project wait here, and deleting the
 			// project waits for the model.
+			// A project in the recycle bin (deleted with its models) takes
+			// no new ones.
 			err := tx.QueryRow(ctx, `UPDATE projects SET model_version_seq = model_version_seq + 1
-				WHERE id = $1 RETURNING model_version_seq, name`, n.ProjectID).Scan(&version, &projectName)
+				WHERE id = $1 AND deleted_at IS NULL RETURNING model_version_seq, name`, n.ProjectID).Scan(&version, &projectName)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return errProjectGone
 			}
@@ -579,7 +581,7 @@ type ModelQuery struct {
 // ListModels returns the models selected by q, newest first.
 func (s *Service) ListModels(ctx context.Context, q ModelQuery) ([]Model, error) {
 	rows, err := collectModels(s.db.Query(ctx, modelSelect+`
-		WHERE ($1::bigint = 0 OR m.project_id = $1::bigint) AND ($2 = '' OR m.yolo_version = $2) AND ($3 = '' OR m.source = $3)
+		WHERE `+modelLive+` AND ($1::bigint = 0 OR m.project_id = $1::bigint) AND ($2 = '' OR m.yolo_version = $2) AND ($3 = '' OR m.source = $3)
 			AND ($4 = '' OR strpos(lower(m.description), lower($4)) > 0 OR strpos(lower(m.file_name), lower($4)) > 0
 				OR strpos(lower(p.name), lower($4)) > 0)
 		ORDER BY m.created_at DESC, m.id DESC`, q.ProjectID, q.YOLOVersion, q.Source, strings.TrimSpace(q.Search)))
@@ -593,13 +595,15 @@ func (s *Service) ListModels(ctx context.Context, q ModelQuery) ([]Model, error)
 // first.
 func (s *Service) ListProjectModels(ctx context.Context, projectID int64) ([]Model, error) {
 	var found bool
-	if err := s.db.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1)", projectID).Scan(&found); err != nil {
+	if err := s.db.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL)",
+		projectID).Scan(&found); err != nil {
 		return nil, err
 	}
 	if !found {
 		return nil, errProjectNotFound
 	}
-	rows, err := collectModels(s.db.Query(ctx, modelSelect+" WHERE m.project_id = $1 ORDER BY m.version DESC", projectID))
+	rows, err := collectModels(s.db.Query(ctx, modelSelect+" WHERE m.project_id = $1 AND "+modelLive+
+		" ORDER BY m.version DESC", projectID))
 	if err != nil {
 		return nil, err
 	}
@@ -653,7 +657,8 @@ func (s *Service) UpdateModel(ctx context.Context, id int64, in UpdateModelInput
 		if err != nil {
 			return Model{}, err
 		}
-		tag, err := s.db.Exec(ctx, "UPDATE models SET description = $2, updated_at = now() WHERE id = $1", id, desc)
+		tag, err := s.db.Exec(ctx, `UPDATE models SET description = $2, updated_at = now()
+			WHERE id = $1 AND deleted_at IS NULL`, id, desc)
 		if err != nil {
 			return Model{}, err
 		}
@@ -722,162 +727,4 @@ func (s *Service) openInModel(dirName, rel string, missing error) (*File, error)
 func isEscape(err error) bool {
 	var pe *fs.PathError
 	return errors.As(err, &pe) && strings.Contains(pe.Err.Error(), "escapes")
-}
-
-// ---- deleting ----
-
-// DeleteModel deletes a model with its conversions and its folder (the
-// weights, model.json and the cached conversions). Nodes still working on
-// one of its conversions get "not found" from then on and stop. The result
-// is nil unless the model was deleted but its folder could not be removed
-// completely.
-func (s *Service) DeleteModel(ctx context.Context, id int64) (*DeleteResult, error) {
-	ctx, cancel := s.detach(ctx)
-	defer cancel()
-	var dirName, trash string
-	var exportIDs []int64
-	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		err := tx.QueryRow(ctx, "SELECT dir_name FROM models WHERE id = $1 FOR UPDATE", id).Scan(&dirName)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return errModelNotFound
-		}
-		if err != nil {
-			return err
-		}
-		rows, err := tx.Query(ctx, "DELETE FROM model_exports WHERE model_id = $1 RETURNING id", id)
-		if err != nil {
-			return err
-		}
-		if exportIDs, err = pgx.CollectRows(rows, pgx.RowTo[int64]); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, "DELETE FROM models WHERE id = $1", id); err != nil {
-			return err
-		}
-		// Move the folder out of the way first: this is atomic and quick, so
-		// the transaction can still roll back, and the slow removal below
-		// cannot leave a half-deleted model folder behind.
-		trash, err = s.moveToTrash(dirName, id)
-		return err
-	})
-	if err != nil {
-		if trash != "" {
-			s.restoreFromTrash(trash, dirName)
-		}
-		return nil, err
-	}
-	for _, eid := range exportIDs {
-		s.removeExportTemp(eid)
-	}
-	s.log.Info("model deleted", "model_id", id, "dir", dirName, "exports", len(exportIDs))
-	if trash == "" {
-		return nil, nil
-	}
-	defer s.busy.remove(trash)
-	if err := s.removeAll(trash); err != nil {
-		return s.restoreLeftover(id, dirName, trash, err), nil
-	}
-	return nil, nil
-}
-
-// moveToTrash renames the folder of a model to a hidden name in models/
-// and marks it as in use (the caller removes the mark). A missing folder
-// is not an error (nothing to delete). Symbolic links are moved, not
-// followed.
-func (s *Service) moveToTrash(dirName string, modelID int64) (string, error) {
-	dir, err := s.modelDir(dirName)
-	if err != nil {
-		return "", err
-	}
-	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
-		return "", nil
-	} else if err != nil {
-		return "", fmt.Errorf("stat model folder: %w", err)
-	}
-	trash := filepath.Join(s.modelsDir(), fmt.Sprintf("%s%d", deletingPrefix, modelID))
-	s.busy.add(trash)
-	if err := os.Rename(dir, trash); err != nil {
-		s.busy.remove(trash)
-		return "", fmt.Errorf("move model folder aside: %w", err)
-	}
-	return trash, nil
-}
-
-// restoreFromTrash undoes moveToTrash after the delete failed.
-func (s *Service) restoreFromTrash(trash, dirName string) {
-	defer s.busy.remove(trash)
-	dir, err := s.modelDir(dirName)
-	if err == nil {
-		err = os.Rename(trash, dir)
-	}
-	if err != nil {
-		s.log.Error("restore model folder after failed delete", "path", trash, "err", err)
-	}
-}
-
-// restoreLeftover handles a model folder that could not be removed
-// completely (e.g. files added by another user): what is left gets its
-// name back, so it can be cleaned up by hand. Versions are never reused,
-// so no new model takes that name.
-func (s *Service) restoreLeftover(modelID int64, dirName, trash string, removeErr error) *DeleteResult {
-	reason := "部分文件无法删除"
-	if errors.Is(removeErr, fs.ErrPermission) {
-		reason = "权限不足"
-	}
-	if dir, err := s.modelDir(dirName); err == nil {
-		if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) && os.MkdirAll(filepath.Dir(dir), 0o755) == nil &&
-			os.Rename(trash, dir) == nil {
-			s.log.Error("model folder only partly deleted; kept the rest under its name",
-				"model_id", modelID, "path", dir, "err", removeErr)
-			return &DeleteResult{Message: fmt.Sprintf("模型已删除，但文件夹未能完全删除（%s）：%s。请在服务器上手动删除剩余的文件。",
-				reason, dir)}
-		}
-	}
-	s.log.Error("model folder only partly deleted", "model_id", modelID, "path", trash, "err", removeErr)
-	return &DeleteResult{Message: fmt.Sprintf("模型已删除，但文件夹未能完全删除（%s）：剩余的文件在 %s，请在服务器上手动删除。",
-		reason, trash)}
-}
-
-// DeleteProjectModels deletes all models of a project (as DeleteModel
-// does), before the project itself is deleted. The result is nil unless
-// some folders could not be removed completely.
-func (s *Service) DeleteProjectModels(ctx context.Context, projectID int64) (*DeleteResult, error) {
-	rows, err := s.db.Query(ctx, "SELECT id FROM models WHERE project_id = $1 ORDER BY id", projectID)
-	if err != nil {
-		return nil, err
-	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
-	if err != nil {
-		return nil, err
-	}
-	var leftovers []string
-	for _, id := range ids {
-		res, err := s.DeleteModel(ctx, id)
-		if errors.Is(err, ErrNotFound) {
-			continue // deleted meanwhile
-		}
-		if err != nil {
-			return nil, err
-		}
-		if res != nil {
-			leftovers = append(leftovers, res.Message)
-		}
-	}
-	// The project's folder is empty now unless something was left behind
-	// (a crash leftover is moved aside first).
-	projectDir := fmt.Sprintf("project-%d", projectID)
-	s.recoverPendingIn(ctx, projectDir)
-	if dir, err := s.modelDir(projectDir); err == nil {
-		_ = os.Remove(dir)
-	}
-	if len(ids) > 0 {
-		s.log.Info("project models deleted", "project_id", projectID, "models", len(ids))
-	}
-	switch len(leftovers) {
-	case 0:
-		return nil, nil
-	case 1:
-		return &DeleteResult{Message: leftovers[0]}, nil
-	}
-	return &DeleteResult{Message: fmt.Sprintf("%s（另有 %d 个模型的文件夹也未能完全删除）", leftovers[0], len(leftovers)-1)}, nil
 }

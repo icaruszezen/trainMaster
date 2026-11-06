@@ -208,6 +208,7 @@ type Directory struct {
 	Path            string    `json:"path"`
 	Registered      bool      `json:"registered"`
 	DatasetID       *int64    `json:"dataset_id"`
+	InRecycleBin    bool      `json:"in_recycle_bin"` // its dataset is in the recycle bin (deleted without its files): restore it instead
 	ImageCount      int       `json:"image_count"`
 	AnnotationCount int       `json:"annotation_count"` // .xml files
 	TotalBytes      int64     `json:"total_bytes"`      // bytes of the images counted

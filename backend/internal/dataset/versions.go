@@ -149,16 +149,26 @@ const versionColumns = `v.id, v.dataset_id, v.kind, v.major, v.minor, v.note, v.
 	v.needs_sample_count, v.approved_count, v.object_count, v.review_id, r.name, v.merge_id, v.source,
 	v.created_at, v.updated_at, v.finished_at`
 
-// versionFrom is the FROM clause of versionColumns.
-const versionFrom = ` FROM dataset_versions v LEFT JOIN reviews r ON r.id = v.review_id`
+// versionFrom is the FROM clause of versionColumns for the versions in use:
+// neither the version nor its dataset is in the recycle bin.
+const versionFrom = ` FROM dataset_versions v
+	JOIN datasets vd ON vd.id = v.dataset_id AND vd.deleted_at IS NULL
+	LEFT JOIN reviews r ON r.id = v.review_id`
 
-func scanVersion(row pgx.Row) (Version, error) {
+// versionLive is the condition (on dataset_versions v) of a version that is
+// not in the recycle bin.
+const versionLive = ` AND v.deleted_at IS NULL`
+
+func scanVersion(row pgx.Row) (Version, error) { return scanVersionWith(row) }
+
+// scanVersionWith scans versionColumns followed by the extra columns.
+func scanVersionWith(row pgx.Row, extra ...any) (Version, error) {
 	var v Version
 	var reviewID *int64
 	var reviewName *string
-	err := row.Scan(&v.ID, &v.DatasetID, &v.Kind, &v.Major, &v.Minor, &v.Note, &v.Status, &v.ImageCount,
-		&v.NeedsSampleCount, &v.ApprovedCount, &v.ObjectCount, &reviewID, &reviewName, &v.MergeID, &v.Source,
-		&v.CreatedAt, &v.UpdatedAt, &v.FinishedAt)
+	err := row.Scan(append([]any{&v.ID, &v.DatasetID, &v.Kind, &v.Major, &v.Minor, &v.Note, &v.Status,
+		&v.ImageCount, &v.NeedsSampleCount, &v.ApprovedCount, &v.ObjectCount, &reviewID, &reviewName, &v.MergeID,
+		&v.Source, &v.CreatedAt, &v.UpdatedAt, &v.FinishedAt}, extra...)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return v, errVersionNotFound
 	}
@@ -196,7 +206,7 @@ func (s *Service) ListVersions(ctx context.Context, datasetID int64) ([]Version,
 		return nil, err
 	}
 	versions, err := collectVersions(s.db.Query(ctx, "SELECT "+versionColumns+versionFrom+
-		" WHERE v.dataset_id = $1"+newestFirst, datasetID))
+		" WHERE v.dataset_id = $1"+versionLive+newestFirst, datasetID))
 	if versions == nil && err == nil {
 		versions = []Version{}
 	}
@@ -206,7 +216,7 @@ func (s *Service) ListVersions(ctx context.Context, datasetID int64) ([]Version,
 // GetVersion returns one version of a dataset.
 func (s *Service) GetVersion(ctx context.Context, datasetID, versionID int64) (Version, error) {
 	v, err := scanVersion(s.db.QueryRow(ctx, "SELECT "+versionColumns+versionFrom+
-		" WHERE v.id = $1 AND v.dataset_id = $2", versionID, datasetID))
+		" WHERE v.id = $1 AND v.dataset_id = $2"+versionLive, versionID, datasetID))
 	if errors.Is(err, ErrNotFound) {
 		if derr := datasetExists(ctx, s.db, datasetID); derr != nil {
 			return v, derr
@@ -230,7 +240,9 @@ func (s *Service) UpdateVersion(ctx context.Context, datasetID, versionID int64,
 		var status string
 		err = s.db.QueryRow(ctx, `UPDATE dataset_versions SET note = CASE WHEN status = 'ready' THEN $3 ELSE note END,
 				updated_at = CASE WHEN status = 'ready' THEN now() ELSE updated_at END
-			WHERE id = $1 AND dataset_id = $2 RETURNING status`, versionID, datasetID, note).Scan(&status)
+			WHERE id = $1 AND dataset_id = $2 AND deleted_at IS NULL
+				AND EXISTS (SELECT 1 FROM datasets WHERE id = $2 AND deleted_at IS NULL)
+			RETURNING status`, versionID, datasetID, note).Scan(&status)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return s.GetVersion(ctx, datasetID, versionID) // the right not-found error
 		}
@@ -244,12 +256,15 @@ func (s *Service) UpdateVersion(ctx context.Context, datasetID, versionID int64,
 	return s.GetVersion(ctx, datasetID, versionID)
 }
 
-// DeleteVersion deletes a ready version with its images. The dataset and
-// the other versions do not change; the number is not given again.
+// DeleteVersion moves a ready version to the recycle bin (recycle.go):
+// it is left out of the dataset's versions and downloads until it is
+// restored, or purged with its images after recycle.Retention. The dataset
+// and the other versions do not change; the number is not given again.
 func (s *Service) DeleteVersion(ctx context.Context, datasetID, versionID int64) error {
 	var status string
-	err := s.db.QueryRow(ctx, `DELETE FROM dataset_versions v WHERE v.id = $1 AND v.dataset_id = $2
-			AND v.status = 'ready'
+	err := s.db.QueryRow(ctx, `UPDATE dataset_versions v SET deleted_at = now()
+		WHERE v.id = $1 AND v.dataset_id = $2 AND v.status = 'ready' AND v.deleted_at IS NULL
+			AND EXISTS (SELECT 1 FROM datasets WHERE id = $2 AND deleted_at IS NULL)
 		RETURNING v.status`, versionID, datasetID).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		v, gerr := s.GetVersion(ctx, datasetID, versionID)
@@ -264,14 +279,16 @@ func (s *Service) DeleteVersion(ctx context.Context, datasetID, versionID int64)
 	if err != nil {
 		return err
 	}
-	s.log.Info("dataset version deleted", "dataset_id", datasetID, "version_id", versionID)
+	s.log.Info("dataset version moved to the recycle bin", "dataset_id", datasetID, "version_id", versionID)
 	return nil
 }
 
-// datasetExists returns errDatasetNotFound unless the dataset exists.
+// datasetExists returns errDatasetNotFound unless the dataset exists and
+// is not in the recycle bin.
 func datasetExists(ctx context.Context, q querier, id int64) error {
 	var exists bool
-	if err := q.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM datasets WHERE id = $1)", id).Scan(&exists); err != nil {
+	if err := q.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM datasets WHERE id = $1 AND deleted_at IS NULL)", id).
+		Scan(&exists); err != nil {
 		return err
 	}
 	if !exists {
@@ -280,10 +297,11 @@ func datasetExists(ctx context.Context, q querier, id int64) error {
 	return nil
 }
 
-// queryVersionCounts counts the ready versions of datasets.
+// queryVersionCounts counts the ready versions of datasets (not those in
+// the recycle bin).
 func queryVersionCounts(ctx context.Context, q querier, ids []int64) (map[int64]int, error) {
 	rows, err := q.Query(ctx, `SELECT dataset_id, count(*) FROM dataset_versions
-		WHERE dataset_id = ANY($1) AND status = 'ready' GROUP BY dataset_id`, ids)
+		WHERE dataset_id = ANY($1) AND status = 'ready' AND deleted_at IS NULL GROUP BY dataset_id`, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -319,13 +337,17 @@ type VersionImage struct {
 
 // CreateReviewVersion starts building a review version of a dataset. It
 // fails with an *Error of kind ErrNotFound when the dataset no longer
-// exists.
+// exists or is in the recycle bin. The dataset row is locked FOR KEY SHARE
+// while the version is added: moving the dataset to the recycle bin locks
+// it FOR UPDATE and refuses while it has a version being built, so a
+// version is never built for a dataset in the bin.
 func (s *Service) CreateReviewVersion(ctx context.Context, d ReviewVersionDraft) (int64, error) {
 	var id int64
-	err := s.db.QueryRow(ctx, `INSERT INTO dataset_versions (dataset_id, kind, note, status, review_id, merge_id, source)
-		VALUES ($1, 'review', $2, 'building', $3, $4, $5) RETURNING id`,
+	err := s.db.QueryRow(ctx, `WITH d AS (SELECT id FROM datasets WHERE id = $1 AND deleted_at IS NULL FOR KEY SHARE)
+		INSERT INTO dataset_versions (dataset_id, kind, note, status, review_id, merge_id, source)
+		SELECT d.id, 'review', $2, 'building', $3, $4, $5 FROM d RETURNING id`,
 		d.DatasetID, d.Note, d.ReviewID, d.MergeID, d.Source).Scan(&id)
-	if foreignKeyViolation(err) {
+	if foreignKeyViolation(err) || errors.Is(err, pgx.ErrNoRows) {
 		return 0, errVersionDatasetGone
 	}
 	return id, err
@@ -449,7 +471,8 @@ func (s *Service) MergeVersions(ctx context.Context, mergeIDs []int64) (map[int6
 		return out, nil
 	}
 	rows, err := s.db.Query(ctx, `SELECT merge_id, id, dataset_id, major, minor, status, image_count
-		FROM dataset_versions WHERE merge_id = ANY($1) ORDER BY merge_id, dataset_id, id`, mergeIDs)
+		FROM dataset_versions WHERE merge_id = ANY($1) AND deleted_at IS NULL
+		ORDER BY merge_id, dataset_id, id`, mergeIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -557,7 +580,7 @@ func resolveSelection(ctx context.Context, q querier, datasetID int64, sel Versi
 		return out, nil
 	}
 	versions, err := collectVersions(q.Query(ctx, "SELECT "+versionColumns+versionFrom+
-		" WHERE v.id = ANY($1) AND v.dataset_id = $2"+newestFirst, ids, datasetID))
+		" WHERE v.id = ANY($1) AND v.dataset_id = $2"+versionLive+newestFirst, ids, datasetID))
 	if err != nil {
 		return out, err
 	}

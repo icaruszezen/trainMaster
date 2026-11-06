@@ -19,16 +19,24 @@ type querier interface {
 }
 
 // projectSelect reads projects with the totals over their datasets; append
-// a WHERE clause, then projectGroupBy.
+// a WHERE clause that includes projectLive, then projectGroupBy.
+// project_datasets only links projects and datasets in use (the links of
+// one in the recycle bin are kept in recycled_project_datasets).
 const projectSelect = `SELECT p.id, p.name, p.description, p.created_at, p.updated_at,
 		count(d.id), coalesce(sum(d.image_count), 0), coalesce(sum(d.annotated_count), 0),
 		coalesce(sum(d.empty_count), 0), coalesce(sum(d.invalid_count), 0), coalesce(sum(d.object_count), 0),
 		coalesce(sum(d.total_bytes), 0)::bigint
 	FROM projects p
 	LEFT JOIN project_datasets pd ON pd.project_id = p.id
-	LEFT JOIN datasets d ON d.id = pd.dataset_id`
+	LEFT JOIN datasets d ON d.id = pd.dataset_id AND d.deleted_at IS NULL`
 
 const projectGroupBy = ` GROUP BY p.id`
+
+// projectLive is the condition (on projects p) of a project that is not
+// in the recycle bin. A project goes there only when it is deleted while
+// models of it are in the bin (recycle.go); every query but those of
+// recycle.go treats it as gone.
+const projectLive = "p.deleted_at IS NULL"
 
 func scanProject(row pgx.Row) (Project, error) {
 	var p Project
@@ -43,12 +51,12 @@ func scanProject(row pgx.Row) (Project, error) {
 }
 
 func queryProject(ctx context.Context, q querier, id int64) (Project, error) {
-	return scanProject(q.QueryRow(ctx, projectSelect+" WHERE p.id = $1"+projectGroupBy, id))
+	return scanProject(q.QueryRow(ctx, projectSelect+" WHERE p.id = $1 AND "+projectLive+projectGroupBy, id))
 }
 
 func queryProjects(ctx context.Context, q querier, search string) ([]Project, error) {
 	rows, err := q.Query(ctx, projectSelect+`
-		WHERE $1 = '' OR strpos(lower(p.name), lower($1)) > 0 OR strpos(lower(p.description), lower($1)) > 0`+
+		WHERE `+projectLive+` AND ($1 = '' OR strpos(lower(p.name), lower($1)) > 0 OR strpos(lower(p.description), lower($1)) > 0)`+
 		projectGroupBy+` ORDER BY p.updated_at DESC, p.id DESC`, search)
 	if err != nil {
 		return nil, err
@@ -64,19 +72,32 @@ func queryProjects(ctx context.Context, q querier, search string) ([]Project, er
 // deadlock with each other.
 
 // lockRows locks the rows of table (datasets or projects) with the given
-// IDs, which must be sorted, and returns the IDs that exist.
+// IDs, which must be sorted, and returns the IDs that exist and are not in
+// the recycle bin (rows in it are locked too).
 func lockRows(ctx context.Context, q querier, table string, ids []int64) ([]int64, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	rows, err := q.Query(ctx, "SELECT id FROM "+table+" WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE", ids)
+	// Locking those in the bin too makes a row moved out of it meanwhile
+	// count: after the wait the row is read again.
+	rows, err := q.Query(ctx, "SELECT id, deleted_at IS NULL FROM "+table+" WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE", ids)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[int64])
+	var live []int64
+	var id int64
+	var inUse bool
+	_, err = pgx.ForEachRow(rows, []any{&id, &inUse}, func() error {
+		if inUse {
+			live = append(live, id)
+		}
+		return nil
+	})
+	return live, err
 }
 
-// lockOne locks one row of table and reports whether it exists.
+// lockOne locks one row of table and reports whether it exists (and is
+// not in the recycle bin).
 func lockOne(ctx context.Context, q querier, table string, id int64) (bool, error) {
 	found, err := lockRows(ctx, q, table, []int64{id})
 	return len(found) == 1, err
@@ -95,10 +116,12 @@ func touchProjects(ctx context.Context, q querier, ids []int64) error {
 const projectsNameKey = "projects_name_key"
 
 // checkNameFree fails with errNameTaken if another project (not exceptID)
-// already uses name, ignoring case.
+// already uses name, ignoring case. Projects in the recycle bin do not
+// hold their names.
 func checkNameFree(ctx context.Context, q querier, name string, exceptID int64) error {
 	var exists bool
-	err := q.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM projects WHERE lower(name) = lower($1) AND id <> $2)",
+	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM projects
+		WHERE lower(name) = lower($1) AND id <> $2 AND deleted_at IS NULL)`,
 		name, exceptID).Scan(&exists)
 	if err != nil {
 		return err
@@ -127,7 +150,7 @@ func queryCovers(ctx context.Context, q querier, ids []int64) (map[int64][]Cover
 	rows, err := q.Query(ctx, `SELECT ps.id, c.dataset_id, c.id, c.size_bytes, c.mod_time
 		FROM unnest($1::bigint[]) AS ps (id)
 		CROSS JOIN LATERAL (SELECT pd.dataset_id, pd.created_at FROM project_datasets pd
-			JOIN datasets d ON d.id = pd.dataset_id
+			JOIN datasets d ON d.id = pd.dataset_id AND d.deleted_at IS NULL
 			WHERE pd.project_id = ps.id AND d.image_count > 0
 			ORDER BY pd.created_at, pd.dataset_id LIMIT 4) ds
 		CROSS JOIN LATERAL (SELECT dataset_id, id, size_bytes, mod_time, sort_key FROM dataset_images
@@ -187,12 +210,13 @@ type modelStats struct {
 
 // queryModelStats returns the models of the given projects: how many, and
 // the one with the highest version. Projects without models are missing.
+// Models in the recycle bin do not count.
 func queryModelStats(ctx context.Context, q querier, ids []int64) (map[int64]modelStats, error) {
 	// The window function runs before DISTINCT ON keeps the first row (the
 	// highest version) of each project.
 	rows, err := q.Query(ctx, `SELECT DISTINCT ON (project_id) project_id, count(*) OVER (PARTITION BY project_id),
 			id, version, yolo_version, created_at
-		FROM models WHERE project_id = ANY($1)
+		FROM models WHERE project_id = ANY($1) AND deleted_at IS NULL
 		ORDER BY project_id, version DESC`, ids)
 	if err != nil {
 		return nil, err
@@ -209,16 +233,18 @@ func queryModelStats(ctx context.Context, q querier, ids []int64) (map[int64]mod
 	return out, err
 }
 
-// countModels returns the number of models of a project.
-func countModels(ctx context.Context, q querier, projectID int64) (int, error) {
-	var n int
-	err := q.QueryRow(ctx, "SELECT count(*) FROM models WHERE project_id = $1", projectID).Scan(&n)
-	return n, err
+// countModels returns the number of models of a project in use and in
+// the recycle bin.
+func countModels(ctx context.Context, q querier, projectID int64) (live, trashed int, err error) {
+	err = q.QueryRow(ctx, `SELECT count(*) FILTER (WHERE deleted_at IS NULL), count(*) FILTER (WHERE deleted_at IS NOT NULL)
+		FROM models WHERE project_id = $1`, projectID).Scan(&live, &trashed)
+	return live, trashed, err
 }
 
 func queryLabels(ctx context.Context, q querier, projectID int64) ([]Label, error) {
 	rows, err := q.Query(ctx, `SELECT l.key, sum(l.value::bigint)::bigint, count(*), count(DISTINCT i.dataset_id)
 		FROM project_datasets pd
+		JOIN datasets d ON d.id = pd.dataset_id AND d.deleted_at IS NULL
 		JOIN dataset_images i ON i.dataset_id = pd.dataset_id
 		CROSS JOIN LATERAL jsonb_each_text(i.label_counts) AS l
 		WHERE pd.project_id = $1

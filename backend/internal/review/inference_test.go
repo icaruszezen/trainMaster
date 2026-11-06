@@ -426,7 +426,7 @@ func TestIntegrationClaimSkipsUnusableModels(t *testing.T) {
 	r1 := e.create(t, CreateInput{ModelID: deleted.ID, DatasetIDs: []int64{ds}})
 	r2 := e.create(t, CreateInput{ModelID: lost.ID, DatasetIDs: []int64{ds}})
 	r3 := e.create(t, CreateInput{ModelID: good.ID, DatasetIDs: []int64{ds}})
-	if _, err := e.models.DeleteModel(ctx, deleted.ID); err != nil {
+	if err := e.models.DeleteModel(ctx, deleted.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(e.modelPath(lost)); err != nil {
@@ -436,15 +436,14 @@ func TestIntegrationClaimSkipsUnusableModels(t *testing.T) {
 	if task := e.claim(t, node); task == nil || task.ID != r3.ID {
 		t.Fatalf("claimed %+v, want review %d", task, r3.ID)
 	}
-	if got := e.review(t, r1.ID); got.Status != StatusFailed || got.Error != msgModelDeleted || got.ModelExists {
-		t.Errorf("review of a deleted model = %+v", got)
+	// The review of a model in the recycle bin waits for it.
+	if got := e.review(t, r1.ID); got.Status != StatusQueued || got.ModelExists {
+		t.Errorf("review of a model in the bin = %+v", got)
 	}
 	if got := e.review(t, r2.ID); got.Status != StatusFailed || got.Error != msgModelFileMissing || !got.ModelExists {
 		t.Errorf("review of a lost model file = %+v", got)
 	}
-	_, err := e.svc.RetryReview(ctx, r1.ID)
-	wantKind(t, err, ErrConflict, "模型已被删除")
-	_, err = e.svc.RetryReview(ctx, r2.ID)
+	_, err := e.svc.RetryReview(ctx, r2.ID)
 	wantKind(t, err, ErrConflict, "模型文件不存在")
 
 	// The weights disappearing while the node holds the review fail it.

@@ -315,7 +315,7 @@ func TestIntegrationMergeWhileRunning(t *testing.T) {
 	wantDatasetKind(t, err, dataset.ErrConflict, "正在生成")
 	wantDatasetKind(t, e.datasets.DeleteVersion(ctx, ds[0], building), dataset.ErrConflict, "正在生成")
 	e.mark(t, r.ID, reviewfile.StatusApproved, c)
-	if _, err := e.datasets.DeleteDataset(ctx, ds[1], false); err != nil {
+	if err := e.datasets.DeleteDataset(ctx, ds[1], false); err != nil {
 		t.Fatal(err)
 	}
 	close(release)

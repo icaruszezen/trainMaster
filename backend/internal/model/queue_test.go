@@ -469,7 +469,7 @@ func TestIntegrationTaskOwnership(t *testing.T) {
 		t.Fatalf("claim = %+v", task)
 	}
 	e.putOutput(t, exp2.ID, node, data)
-	if _, err := e.svc.DeleteModel(ctx, m.ID); err != nil {
+	if err := e.svc.DeleteModel(ctx, m.ID); err != nil {
 		t.Fatal(err)
 	}
 	if exists(e.svc.exportTempDir(exp2.ID)) {

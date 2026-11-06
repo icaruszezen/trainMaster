@@ -21,11 +21,19 @@ type querier interface {
 // ---- models ----
 
 // modelSelect reads models with their project's name and the number of
-// succeeded conversions; append WHERE and ORDER BY.
-const modelSelect = `SELECT m.id, m.project_id, p.name, m.version, m.description, m.source, m.training_job_id,
+// succeeded conversions; append WHERE and ORDER BY. Every query but the
+// recycle bin's (recycle.go) includes modelLive.
+const modelSelect = "SELECT " + modelColumns + modelFrom
+
+const modelColumns = `m.id, m.project_id, p.name, m.version, m.description, m.source, m.training_job_id,
 		m.yolo_version, m.task, m.file_name, m.dir_name, m.size_bytes, m.sha256, m.info, m.created_at, m.updated_at,
-		(SELECT count(*) FROM model_exports e WHERE e.model_id = m.id AND e.status = 'succeeded')
-	FROM models m JOIN projects p ON p.id = m.project_id`
+		(SELECT count(*) FROM model_exports e WHERE e.model_id = m.id AND e.status = 'succeeded')`
+
+const modelFrom = ` FROM models m JOIN projects p ON p.id = m.project_id`
+
+// modelLive is the condition (on models m) of a model that is not in the
+// recycle bin.
+const modelLive = "m.deleted_at IS NULL"
 
 // modelRow is a model as stored, with the folder the API does not show.
 type modelRow struct {
@@ -33,12 +41,15 @@ type modelRow struct {
 	dirName string
 }
 
-func scanModel(row pgx.Row) (modelRow, error) {
+func scanModel(row pgx.Row) (modelRow, error) { return scanModelWith(row) }
+
+// scanModelWith scans modelColumns followed by extra columns into extra.
+func scanModelWith(row pgx.Row, extra ...any) (modelRow, error) {
 	var r modelRow
 	var info []byte
-	err := row.Scan(&r.ID, &r.Project.ID, &r.Project.Name, &r.Version, &r.Description, &r.Source, &r.TrainingJobID,
-		&r.YOLOVersion, &r.Task, &r.FileName, &r.dirName, &r.SizeBytes, &r.SHA256, &info, &r.CreatedAt, &r.UpdatedAt,
-		&r.ExportCount)
+	err := row.Scan(append([]any{&r.ID, &r.Project.ID, &r.Project.Name, &r.Version, &r.Description, &r.Source,
+		&r.TrainingJobID, &r.YOLOVersion, &r.Task, &r.FileName, &r.dirName, &r.SizeBytes, &r.SHA256, &info,
+		&r.CreatedAt, &r.UpdatedAt, &r.ExportCount}, extra...)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return r, errModelNotFound
 	}
@@ -54,7 +65,7 @@ func scanModel(row pgx.Row) (modelRow, error) {
 }
 
 func queryModel(ctx context.Context, q querier, id int64) (modelRow, error) {
-	return scanModel(q.QueryRow(ctx, modelSelect+" WHERE m.id = $1", id))
+	return scanModel(q.QueryRow(ctx, modelSelect+" WHERE m.id = $1 AND "+modelLive, id))
 }
 
 func collectModels(rows pgx.Rows, err error) ([]modelRow, error) {
@@ -87,9 +98,10 @@ func queryUpload(ctx context.Context, q querier, id int64) (Upload, error) {
 // ---- exports ----
 
 // exportSelect reads conversions with what their API form needs from the
-// model, its project and the node; append WHERE and ORDER BY. A queued
-// conversion's position counts the queued ones claimed before it (claims
-// go by ID).
+// model, its project and the node; append WHERE and ORDER BY. Every query
+// includes modelLive: the conversions of a model in the recycle bin are
+// gone with it until it is restored. A queued conversion's position counts
+// the queued ones claimed before it (claims go by ID).
 const exportSelect = `SELECT e.id, e.model_id, e.format, e.options, e.status, e.stage, e.attempts, e.node_id, n.name,
 		CASE WHEN e.status = 'queued' THEN
 			(SELECT count(*) FROM model_exports q WHERE q.status = 'queued' AND q.id <= e.id) END,
@@ -161,7 +173,8 @@ func utcPtr(t *time.Time) *time.Time {
 }
 
 func queryExport(ctx context.Context, q querier, modelID, exportID int64) (exportRow, error) {
-	return scanExport(q.QueryRow(ctx, exportSelect+" WHERE e.id = $1 AND e.model_id = $2", exportID, modelID))
+	return scanExport(q.QueryRow(ctx, exportSelect+" WHERE e.id = $1 AND e.model_id = $2 AND "+modelLive,
+		exportID, modelID))
 }
 
 func collectExports(rows pgx.Rows, err error) ([]exportRow, error) {
@@ -182,10 +195,12 @@ type exportState struct {
 }
 
 // lockExportState reads (and with forUpdate, locks) the state of a
-// conversion; errTaskGone if it does not exist.
+// conversion; errTaskGone if it does not exist or its model is in the
+// recycle bin (moving it there removes the conversions in progress, this
+// is the safety net).
 func lockExportState(ctx context.Context, q querier, id int64, forUpdate bool) (exportState, error) {
 	sql := `SELECT e.status, e.node_id, e.attempts, e.size_bytes, e.sha256, m.dir_name
-		FROM model_exports e JOIN models m ON m.id = e.model_id WHERE e.id = $1`
+		FROM model_exports e JOIN models m ON m.id = e.model_id WHERE e.id = $1 AND ` + modelLive
 	if forUpdate {
 		sql += " FOR UPDATE OF e"
 	}

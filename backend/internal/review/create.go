@@ -116,6 +116,11 @@ func (s *Service) reviewModel(ctx context.Context, id int64, retry bool) (model.
 	m, err := s.models.GetModel(ctx, id)
 	if errors.Is(err, model.ErrNotFound) {
 		if retry {
+			if in, err := modelInBin(ctx, s.db, id); err != nil {
+				return m, err
+			} else if in {
+				return m, &Error{Kind: ErrConflict, Message: "模型已在回收站中，请先在回收站中恢复模型，再重新识别"}
+			}
 			return m, &Error{Kind: ErrConflict, Message: "模型已被删除，无法重新识别"}
 		}
 		return m, &Error{Kind: ErrInvalid, Message: "所选模型不存在或已被删除，请刷新后重试"}
@@ -238,9 +243,10 @@ func (s *Service) insertReview(ctx context.Context, name, desc string, m model.M
 		if err != nil {
 			return err
 		}
-		// The model must still exist (a delete waits for this transaction).
+		// The model must still be in use (moving it to the recycle bin waits
+		// for this transaction).
 		var exists bool
-		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM models WHERE id = $1 FOR KEY SHARE)", m.ID).
+		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM models WHERE id = $1 AND deleted_at IS NULL FOR KEY SHARE)", m.ID).
 			Scan(&exists); err != nil {
 			return err
 		}
@@ -316,7 +322,8 @@ func (s *Service) insertReview(ctx context.Context, name, desc string, m model.M
 // lockDatasets locks the datasets of a new review (so none is deleted
 // before the review commits) and returns them in the given order.
 func lockDatasets(ctx context.Context, tx pgx.Tx, ids []int64) ([]*datasetRow, error) {
-	rows, err := tx.Query(ctx, "SELECT id, name, dir_name FROM datasets WHERE id = ANY($1) FOR KEY SHARE", ids)
+	rows, err := tx.Query(ctx, "SELECT id, name, dir_name FROM datasets WHERE id = ANY($1) AND deleted_at IS NULL FOR KEY SHARE",
+		ids)
 	if err != nil {
 		return nil, err
 	}

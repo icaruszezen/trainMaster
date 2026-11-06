@@ -247,7 +247,8 @@ var errDatasetNotFound = &Error{Kind: ErrNotFound, Message: "数据集不存在"
 // first.
 func (s *Service) ListDatasetReviews(ctx context.Context, datasetID int64) ([]DatasetReview, error) {
 	var exists bool
-	if err := s.db.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM datasets WHERE id = $1)", datasetID).Scan(&exists); err != nil {
+	if err := s.db.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM datasets WHERE id = $1 AND deleted_at IS NULL)",
+		datasetID).Scan(&exists); err != nil {
 		return nil, err
 	}
 	if !exists {

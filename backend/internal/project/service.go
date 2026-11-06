@@ -150,7 +150,8 @@ type UpdateProjectInput struct {
 func (s *Service) UpdateProject(ctx context.Context, id int64, in UpdateProjectInput) (Project, error) {
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		var name, desc string
-		err := tx.QueryRow(ctx, "SELECT name, description FROM projects WHERE id = $1 FOR NO KEY UPDATE", id).Scan(&name, &desc)
+		err := tx.QueryRow(ctx, "SELECT name, description FROM projects WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE",
+			id).Scan(&name, &desc)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return errProjectNotFound
 		}
@@ -178,37 +179,6 @@ func (s *Service) UpdateProject(ctx context.Context, id int64, in UpdateProjectI
 		return Project{}, err
 	}
 	return s.GetProject(ctx, id)
-}
-
-// DeleteProject deletes a project. Its datasets are kept; they only leave
-// the project. A project with models cannot be deleted (ErrHasModels):
-// package model deletes them first, with their files. Uploads of models
-// into the project that are still in progress go with it.
-func (s *Service) DeleteProject(ctx context.Context, id int64) error {
-	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		// The lock waits for models being added to the project (they lock
-		// its row to allocate their version) and keeps new ones out.
-		var found bool
-		if err := tx.QueryRow(ctx, "SELECT true FROM projects WHERE id = $1 FOR UPDATE", id).Scan(&found); errors.Is(err, pgx.ErrNoRows) {
-			return errProjectNotFound
-		} else if err != nil {
-			return err
-		}
-		n, err := countModels(ctx, tx, id)
-		if err != nil {
-			return err
-		}
-		if n > 0 {
-			return &Error{Kind: ErrHasModels, Message: fmt.Sprintf("项目中有 %d 个模型，请先删除模型，或选择同时删除模型", n)}
-		}
-		_, err = tx.Exec(ctx, "DELETE FROM projects WHERE id = $1", id)
-		return err
-	})
-	if err != nil {
-		return err
-	}
-	s.log.Info("project deleted", "project_id", id)
-	return nil
 }
 
 // AddDatasets includes datasets in a project. Datasets already in it are
@@ -350,7 +320,8 @@ func (s *Service) ListLabels(ctx context.Context, projectID int64) ([]Label, err
 // Exists fails with a not-found error unless the project exists.
 func (s *Service) Exists(ctx context.Context, projectID int64) error {
 	var found bool
-	if err := s.db.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1)", projectID).Scan(&found); err != nil {
+	if err := s.db.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL)",
+		projectID).Scan(&found); err != nil {
 		return err
 	}
 	if !found {

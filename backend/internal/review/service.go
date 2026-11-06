@@ -118,6 +118,9 @@ func NewService(o Options) *Service {
 	if s.models != nil {
 		s.models.AddTaskSource(s)
 	}
+	if s.datasets != nil {
+		s.datasets.SetRecycleHook(s)
+	}
 	return s
 }
 

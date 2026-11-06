@@ -85,8 +85,10 @@ func (s *Service) claimOne(ctx context.Context, nodeID int64) (task *Task, skipp
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		var id int64
 		var modelID *int64
-		err := tx.QueryRow(ctx, `SELECT id, model_id FROM reviews WHERE status = 'queued'
-			ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&id, &modelID)
+		// Reviews whose model is in the recycle bin wait for it.
+		err := tx.QueryRow(ctx, `SELECT id, model_id FROM reviews r WHERE status = 'queued'
+				AND NOT EXISTS (SELECT 1 FROM models m WHERE m.id = r.model_id AND m.deleted_at IS NOT NULL)
+			ORDER BY id FOR UPDATE OF r SKIP LOCKED LIMIT 1`).Scan(&id, &modelID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -239,6 +241,11 @@ func (s *Service) OpenTaskModel(ctx context.Context, reviewID, nodeID int64) (*m
 	f, err := s.models.OpenModelFile(ctx, *modelID)
 	if errors.Is(err, model.ErrNotFound) {
 		if _, gerr := s.models.GetModel(ctx, *modelID); errors.Is(gerr, model.ErrNotFound) {
+			if in, err := modelInBin(ctx, s.db, *modelID); err != nil {
+				return nil, err
+			} else if in {
+				return gone(msgModelInBin)
+			}
 			return gone(msgModelDeleted)
 		}
 		return gone(msgModelFileMissing)
