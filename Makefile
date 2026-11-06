@@ -62,6 +62,8 @@ dev-backend: export TM_DB_USER     ?= $(call dotenv,TM_DB_USER)
 dev-backend: export TM_DB_PASSWORD ?= $(call dotenv,TM_DB_PASSWORD)
 dev-backend: export TM_DB_NAME     ?= $(call dotenv,TM_DB_NAME)
 dev-backend: export TM_LOG_LEVEL   ?= $(call dotenv,TM_LOG_LEVEL)
+# Windows 训练节点的安装脚本与安装包直接取自仓库的 trainer/（环境变量已设置时不覆盖）。
+dev-backend: export TM_TRAINER_PACKAGE_DIR ?= $(CURDIR)/trainer
 dev-backend: ## 本地运行后端 http://localhost:8080（需先 make dev-db）
 	cd backend && TM_DB_PORT=$(TM_DEV_DB_PORT) TM_DATA_DIR="$(CURDIR)/data/storage" go run ./cmd/trainmaster
 

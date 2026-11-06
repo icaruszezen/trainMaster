@@ -1,6 +1,7 @@
 # trainMaster 镜像：前端（Vite 构建产物）+ 后端（Go 单二进制），运行于 Alpine。
 # 镜像中还附带 Windows 版本地审图程序（/app/tools/trainmaster-reviewer.exe，
-# 平台的审图任务页面提供下载）。
+# 平台的审图任务页面提供下载），以及在 Windows 电脑上安装训练节点所用的安装脚本与
+# 安装包的源文件（/app/tools/trainer，平台的计算资源页面给出的接入命令从平台下载）。
 #
 #   docker build -t trainmaster:latest .
 #
@@ -63,11 +64,19 @@ RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod 0755 /usr/local/bin/e
 COPY --from=backend /out/trainmaster /app/trainmaster
 COPY --from=frontend /src/frontend/dist /app/web
 COPY --from=backend /out/trainmaster-reviewer.exe /app/tools/trainmaster-reviewer.exe
+# Windows 训练节点（TM_TRAINER_PACKAGE_DIR）：平台提供 scripts/install.ps1 的下载，并把这些文件
+# 打包为安装包（trainer.zip）。确保所有用户可读：宿主机上检出的文件可能只有属主可读（如 umask 077），
+# 而平台以 PUID 运行。
+COPY trainer/pyproject.toml trainer/requirements.txt /app/tools/trainer/
+COPY trainer/trainmaster_trainer/ /app/tools/trainer/trainmaster_trainer/
+COPY trainer/scripts/install.ps1 /app/tools/trainer/scripts/install.ps1
+RUN chmod -R a+rX /app/tools/trainer
 
 ENV TM_HTTP_ADDR=:8080 \
     TM_DATA_DIR=/data \
     TM_WEB_DIR=/app/web \
     TM_REVIEWER_TOOL=/app/tools/trainmaster-reviewer.exe \
+    TM_TRAINER_PACKAGE_DIR=/app/tools/trainer \
     TM_LOG_FORMAT=json
 WORKDIR /app
 EXPOSE 8080

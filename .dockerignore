@@ -4,9 +4,16 @@
 !backend/
 !frontend/
 !deploy/docker/entrypoint.sh
+# Windows 训练节点的安装脚本与安装包的源文件（平台提供下载）
+!trainer/pyproject.toml
+!trainer/requirements.txt
+!trainer/trainmaster_trainer/
+!trainer/scripts/install.ps1
 
 # 白名单目录中仍需排除的内容
 **/node_modules
+**/__pycache__
+**/*.pyc
 frontend/dist
 backend/cmd/trainmaster-reviewer/web/dist
 **/coverage

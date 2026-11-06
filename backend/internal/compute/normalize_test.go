@@ -138,6 +138,7 @@ func messyHardware() Hardware {
 		OS:          Value("  Ubuntu 22.04.4 LTS \n"),
 		Kernel:      Value(""),
 		Arch:        Value("x86_64"),
+		Platform:    Value(" Linux\n"),
 		InContainer: true,
 		CPU: HardwareCPU{
 			Model:         Value("Intel(R) Xeon(R) Gold 6330"),
@@ -163,8 +164,8 @@ func messyHardware() Hardware {
 
 func TestNormalizeHardware(t *testing.T) {
 	h := normalizeHardware(messyHardware())
-	if h.OS != Value("Ubuntu 22.04.4 LTS") || h.Kernel.Valid || h.Arch != Value("x86_64") || !h.InContainer {
-		t.Errorf("os/kernel/arch = %+v %+v %+v", h.OS, h.Kernel, h.Arch)
+	if h.OS != Value("Ubuntu 22.04.4 LTS") || h.Kernel.Valid || h.Arch != Value("x86_64") || h.Platform != Value("linux") || !h.InContainer {
+		t.Errorf("os/kernel/arch/platform = %+v %+v %+v %+v", h.OS, h.Kernel, h.Arch, h.Platform)
 	}
 	if c := h.CPU; c.PhysicalCores.Valid || c.LogicalCores != Value[int64](56) || c.MaxMHz.Valid || c.LimitCores.Valid {
 		t.Errorf("cpu = %+v", c)
@@ -202,6 +203,40 @@ func TestNormalizeHardware(t *testing.T) {
 	}
 }
 
+func TestNormalizePlatform(t *testing.T) {
+	for _, tt := range []struct {
+		in   Null[string]
+		want Null[string]
+	}{
+		{Value("windows"), Value("windows")},
+		{Value("linux"), Value("linux")},
+		{Value(" Windows "), Value("windows")}, // platform.system() is "Windows"
+		{Value("LINUX\n"), Value("linux")},
+		{Value("darwin"), Value("darwin")},
+		{Value("freebsd"), Value("freebsd")},
+		{Value("cygwin_nt-10"), Value("cygwin_nt-10")},
+		{Value("a" + strings.Repeat("b", 31)), Value("a" + strings.Repeat("b", 31))},
+		// Older agents send none: they run on Linux, which the frontend
+		// assumes for null.
+		{Null[string]{}, Null[string]{}},
+		{Value(""), Null[string]{}},
+		{Value("   "), Null[string]{}},
+		{Value("a" + strings.Repeat("b", 32)), Null[string]{}}, // too long
+		{Value("cygwin_nt-10.0"), Null[string]{}},
+		{Value("9front"), Null[string]{}},
+		{Value("_linux"), Null[string]{}},
+		{Value("win dows"), Null[string]{}},
+		{Value("windows\x00"), Null[string]{}},
+		{Value("linux\nwindows"), Null[string]{}},
+		{Value("视窗"), Null[string]{}},
+		{Value("ｗindows"), Null[string]{}}, // full-width w
+	} {
+		if got := normalizePlatform(tt.in); got != tt.want {
+			t.Errorf("normalizePlatform(%+v) = %+v, want %+v", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestNormalizeHardwareLimitsGPUs(t *testing.T) {
 	var h Hardware
 	for i := range 100 {
@@ -218,7 +253,7 @@ func TestNormalizeEmptyArraysAreArrays(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"os":null,"kernel":null,"arch":null,"in_container":false,` +
+	want := `{"os":null,"kernel":null,"arch":null,"platform":null,"in_container":false,` +
 		`"cpu":{"model":null,"physical_cores":null,"logical_cores":null,"max_mhz":null,"limit_cores":null},` +
 		`"memory":{"total_bytes":null,"limit_bytes":null},"shm_bytes":null,"gpu_driver":null,"gpus":[],` +
 		`"gpu_detection":{"method":"none","error":null,"host_gpu_count":null}}`

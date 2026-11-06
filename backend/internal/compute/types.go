@@ -48,13 +48,20 @@ type Node struct {
 // Hardware is the static description of a node, reported when it starts
 // and after a probe.
 type Hardware struct {
-	OS          Null[string]   `json:"os"` // PRETTY_NAME of /etc/os-release (inside a container: the image's)
-	Kernel      Null[string]   `json:"kernel"`
-	Arch        Null[string]   `json:"arch"` // platform.machine(), e.g. x86_64
+	// OS is PRETTY_NAME of /etc/os-release (inside a container: the
+	// image's); on Windows the edition and version from the registry, e.g.
+	// "Windows 11 Pro 23H2".
+	OS     Null[string] `json:"os"`
+	Kernel Null[string] `json:"kernel"` // on Windows the build, e.g. 10.0.22631.4317
+	Arch   Null[string] `json:"arch"`   // platform.machine(), e.g. x86_64 (AMD64 on Windows)
+	// Platform is the operating system as platform.system() names it, in
+	// lower case: "linux" or "windows" (see normalizePlatform). Null from
+	// agents before 0.4.0, which all run on Linux.
+	Platform    Null[string]   `json:"platform"`
 	InContainer bool           `json:"in_container"`
 	CPU         HardwareCPU    `json:"cpu"`
 	Memory      HardwareMemory `json:"memory"`
-	ShmBytes    Null[int64]    `json:"shm_bytes"` // size of /dev/shm
+	ShmBytes    Null[int64]    `json:"shm_bytes"` // size of /dev/shm; null on Windows, which has none
 	// GPUDriver is nil when there is no NVIDIA driver or it cannot be
 	// probed.
 	GPUDriver    *GPUDriver   `json:"gpu_driver"`

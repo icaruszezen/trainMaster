@@ -31,6 +31,7 @@ func TestLoadDefaults(t *testing.T) {
 		NodeHeartbeatInterval: 10 * time.Second,
 		TrainerMode:           "",
 		ReviewerTool:          "",
+		TrainerPackageDir:     "",
 	}
 	if !reflect.DeepEqual(*cfg, want) {
 		t.Errorf("Load defaults\n got %+v\nwant %+v", *cfg, want)
@@ -39,22 +40,23 @@ func TestLoadDefaults(t *testing.T) {
 
 func TestLoadOverrides(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
-		"TM_HTTP_ADDR":       "127.0.0.1:9000",
-		"TM_DATA_DIR":        "/data",
-		"TM_WEB_DIR":         "/app/web",
-		"TM_REVIEWER_TOOL":   " /app/tools/trainmaster-reviewer.exe ",
-		"TM_DB_HOST":         "postgres",
-		"TM_DB_PORT":         "6543",
-		"TM_DB_SSLMODE":      "require",
-		"TM_DB_AUTO_MIGRATE": "false",
-		"TM_LOG_LEVEL":       "DEBUG",
-		"TM_LOG_FORMAT":      "json",
+		"TM_HTTP_ADDR":           "127.0.0.1:9000",
+		"TM_DATA_DIR":            "/data",
+		"TM_WEB_DIR":             "/app/web",
+		"TM_REVIEWER_TOOL":       " /app/tools/trainmaster-reviewer.exe ",
+		"TM_TRAINER_PACKAGE_DIR": " /app/tools/trainer ",
+		"TM_DB_HOST":             "postgres",
+		"TM_DB_PORT":             "6543",
+		"TM_DB_SSLMODE":          "require",
+		"TM_DB_AUTO_MIGRATE":     "false",
+		"TM_LOG_LEVEL":           "DEBUG",
+		"TM_LOG_FORMAT":          "json",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.HTTPAddr != "127.0.0.1:9000" || cfg.DataDir != "/data" || cfg.WebDir != "/app/web" ||
-		cfg.ReviewerTool != "/app/tools/trainmaster-reviewer.exe" {
+		cfg.ReviewerTool != "/app/tools/trainmaster-reviewer.exe" || cfg.TrainerPackageDir != "/app/tools/trainer" {
 		t.Errorf("unexpected paths/addr: %+v", cfg)
 	}
 	if cfg.AutoMigrate || cfg.LogLevel != slog.LevelDebug || cfg.LogFormat != "json" {

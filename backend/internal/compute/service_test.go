@@ -199,6 +199,9 @@ func TestServiceStoresNormalizedReports(t *testing.T) {
 	if got, _ := json.Marshal(n.Hardware); string(got) != string(wantHW) {
 		t.Errorf("hardware\n got %s\nwant %s", got, wantHW)
 	}
+	if n.Hardware.Platform != Value("linux") {
+		t.Errorf("platform = %+v", n.Hardware.Platform)
+	}
 	if got, _ := json.Marshal(n.Environment); string(got) != string(wantEnv) {
 		t.Errorf("environment\n got %s\nwant %s", got, wantEnv)
 	}
