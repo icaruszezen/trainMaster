@@ -1,8 +1,9 @@
 // Package project implements project management: a project groups the
 // datasets of one inspection task, its models (package model keeps them;
-// a project only reports their number and latest version) and, later, its
-// training jobs. Projects are metadata in PostgreSQL only; a dataset can
-// belong to any number of projects, a model to exactly one.
+// a project only reports their number and latest version), its data
+// versions (package dataversion, likewise) and, later, its training jobs.
+// Projects are metadata in PostgreSQL only; a dataset can belong to any
+// number of projects, a model or a data version to exactly one.
 package project
 
 import (
@@ -72,6 +73,10 @@ func (s *Service) decorate(ctx context.Context, ps []Project) error {
 	if err != nil {
 		return fmt.Errorf("load project models: %w", err)
 	}
+	dataVersions, err := queryDataVersionStats(ctx, s.db, ids)
+	if err != nil {
+		return fmt.Errorf("load project data versions: %w", err)
+	}
 	for i := range ps {
 		if c := covers[ps[i].ID]; c != nil {
 			ps[i].Covers = c
@@ -79,6 +84,10 @@ func (s *Service) decorate(ctx context.Context, ps []Project) error {
 		if m, ok := models[ps[i].ID]; ok {
 			latest := m.latest
 			ps[i].ModelCount, ps[i].LatestModel = m.count, &latest
+		}
+		if v, ok := dataVersions[ps[i].ID]; ok {
+			latest := v.latest
+			ps[i].DataVersionCount, ps[i].LatestDataVersion = v.count, &latest
 		}
 	}
 	return nil

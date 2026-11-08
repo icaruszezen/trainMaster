@@ -21,8 +21,14 @@ type Project struct {
 	Covers         []Cover   `json:"covers"`       // up to 4 images of its datasets for the card mosaic
 	ModelCount     int       `json:"model_count"`  // models in the project's model repository
 	LatestModel    *ModelRef `json:"latest_model"` // the model with the highest version; nil without models
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"` // also changes when datasets are added or removed
+	// DataVersionCount counts the project's data versions (数据版本, package
+	// dataversion) that are not in the recycle bin, in any state.
+	DataVersionCount int `json:"data_version_count"`
+	// LatestDataVersion is the data version with the highest version
+	// number that is not in the recycle bin; nil without one.
+	LatestDataVersion *DataVersionRef `json:"latest_data_version"`
+	CreatedAt         time.Time       `json:"created_at"`
+	UpdatedAt         time.Time       `json:"updated_at"` // also changes when datasets are added or removed
 }
 
 // ModelRef is the latest model of a project (internal/model has the
@@ -32,6 +38,15 @@ type ModelRef struct {
 	Version     int       `json:"version"`
 	YOLOVersion string    `json:"yolo_version"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+// DataVersionRef is the latest data version of a project
+// (internal/dataversion has the rest).
+type DataVersionRef struct {
+	ID        int64     `json:"id"`
+	Version   int       `json:"version"`
+	Status    string    `json:"status"` // queued, building, ready or failed
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Cover is an image of one of the project's datasets, with the version of

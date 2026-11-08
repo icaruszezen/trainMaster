@@ -12,7 +12,7 @@ func TestRecycleBinAPI(t *testing.T) {
 	e := newModelEnv(t, "")
 	const bin = "/api/v1/recycle-bin"
 	empty := want[map[string]any](t, e.do("GET", bin, nil), 200)
-	wantKeys(t, "recycle bin", empty, "retention_days", "datasets", "versions", "models")
+	wantKeys(t, "recycle bin", empty, "retention_days", "datasets", "versions", "models", "data_versions")
 	if empty["retention_days"] != float64(7) || len(empty["datasets"].([]any)) != 0 || len(empty["models"].([]any)) != 0 {
 		t.Errorf("empty recycle bin = %v", empty)
 	}
