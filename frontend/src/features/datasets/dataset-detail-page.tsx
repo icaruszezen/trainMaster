@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react"
+import { useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import {
   ArrowLeft,
@@ -21,6 +21,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router"
 import { toast } from "sonner"
 
 import { PageHeader } from "@/components/page-header"
+import { ScrollingTabsList } from "@/components/scrolling-tabs-list"
 import { StatCard } from "@/components/stat-card"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -35,7 +36,7 @@ import {
 } from "@/components/ui/empty"
 import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Tabs, TabsContent, TabsTrigger } from "@/components/ui/tabs"
 import {
   Tooltip,
   TooltipContent,
@@ -417,44 +418,6 @@ function DatasetDetail({ id }: { id: number }) {
         onOpenChange={(open) => !open && setExporting(null)}
       />
     </>
-  )
-}
-
-/**
- * 标签列表：手机宽度下放不下一行时横向滚动（不撑宽页面），并把选中的标签滚到
- * 可见处（如打开 ?tab=versions 的链接时）。
- */
-function ScrollingTabsList({
-  value,
-  children,
-}: {
-  value: string
-  children: ReactNode
-}) {
-  const ref = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    const scroller = ref.current
-    const tab = scroller?.querySelector<HTMLElement>(
-      '[role="tab"][data-state="active"]'
-    )
-    if (!scroller || !tab) {
-      return
-    }
-    // 只横向滚动标签列表；scrollIntoView 可能连页面一起滚动。
-    const box = scroller.getBoundingClientRect()
-    const rect = tab.getBoundingClientRect()
-    if (rect.left < box.left) {
-      scroller.scrollLeft -= box.left - rect.left
-    } else if (rect.right > box.right) {
-      scroller.scrollLeft += rect.right - box.right
-    }
-  }, [value])
-  return (
-    <div ref={ref} className="scrollbar-auto-hide overflow-x-auto">
-      <TabsList className="w-max min-w-full sm:w-fit sm:min-w-0">
-        {children}
-      </TabsList>
-    </div>
   )
 }
 

@@ -8,8 +8,10 @@ import { AnnotationWorkspacePage } from "@/features/annotation/annotation-worksp
 import { LabelsPage } from "@/features/annotation/labels-page"
 import { PrelabelPage } from "@/features/annotation/prelabel-page"
 import { DashboardPage } from "@/features/dashboard/dashboard-page"
+import { DataVersionDetailPage } from "@/features/data-versions/data-version-detail-page"
+import { DataVersionsPage } from "@/features/data-versions/data-versions-page"
+import { NewDataVersionPage } from "@/features/data-versions/new-data-version-page"
 import { DatasetDetailPage } from "@/features/datasets/dataset-detail-page"
-import { DatasetVersionsPage } from "@/features/datasets/dataset-versions-page"
 import { DatasetsPage } from "@/features/datasets/datasets-page"
 import { EvaluationsPage } from "@/features/evaluation/evaluations-page"
 import { InferencePage } from "@/features/models/inference-page"
@@ -41,7 +43,7 @@ export const pages: Record<ModuleId, ComponentType> = {
   dashboard: DashboardPage,
   projects: ProjectsPage,
   datasets: DatasetsPage,
-  "dataset-versions": DatasetVersionsPage,
+  "dataset-versions": DataVersionsPage,
   "annotation-tasks": AnnotationTasksPage,
   "annotation-workspace": AnnotationWorkspacePage,
   labels: LabelsPage,
@@ -75,10 +77,16 @@ export const routes: RouteObject[] = [
             Component: pages[item.id],
           })),
           // 模块的子页面。静态路径优先于动态参数，/datasets/versions 仍是数据版本页，
-          // /datasets/reviews 仍是模型审图，/models/inference 仍是推理测试页。
+          // /datasets/versions/new 仍是生成数据版本页，/datasets/reviews 仍是模型审图，
+          // /models/inference 仍是推理测试页。
           { path: "/projects/:projectId", Component: ProjectDetailPage },
           { path: "/datasets/:datasetId", Component: DatasetDetailPage },
           { path: "/models/:modelId", Component: ModelDetailPage },
+          { path: "/datasets/versions/new", Component: NewDataVersionPage },
+          {
+            path: "/datasets/versions/:versionId",
+            Component: DataVersionDetailPage,
+          },
           { path: "/datasets/reviews/:reviewId", Component: ReviewDetailPage },
           {
             path: "/datasets/reviews/:reviewId/workspace",

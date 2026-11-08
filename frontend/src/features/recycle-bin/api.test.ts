@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
+import { dataVersionKeys } from "@/features/data-versions/api"
 import { datasetKeys } from "@/features/datasets/api"
 import { modelKeys } from "@/features/models/api"
 import { projectKeys } from "@/features/projects/api"
@@ -7,9 +8,11 @@ import {
   recycleBinKeys,
   recycleBinQuery,
   refreshAfterDatasetMove,
+  refreshAfterDataVersionMove,
   refreshAfterModelMove,
   refreshAfterVersionMove,
   restoreDataset,
+  restoreDataVersion,
   restoreModel,
   restoreVersion,
 } from "@/features/recycle-bin/api"
@@ -42,7 +45,13 @@ function requestOf(fetchMock: ReturnType<typeof mockFetch>) {
 
 describe("recycle bin requests", () => {
   it("lists the recycle bin", async () => {
-    const bin = { retention_days: 7, datasets: [], versions: [], models: [] }
+    const bin = {
+      retention_days: 7,
+      datasets: [],
+      versions: [],
+      data_versions: [],
+      models: [],
+    }
     const fetchMock = mockFetch(() => Response.json(bin))
     const options = recycleBinQuery()
     expect(options.queryKey).toEqual(recycleBinKeys.all)
@@ -90,6 +99,20 @@ describe("recycle bin requests", () => {
 
     fetchMock.mockClear()
     await restoreModel(5, "A 线（恢复）")
+    expect(requestOf(fetchMock).body).toEqual({ project_name: "A 线（恢复）" })
+  })
+
+  it("restores a data version, renaming its project when asked", async () => {
+    const fetchMock = mockFetch(() => Response.json({ id: 12 }))
+    await restoreDataVersion(12)
+    expect(requestOf(fetchMock)).toEqual({
+      path: "/api/v1/recycle-bin/data-versions/12/restore",
+      method: "POST",
+      body: undefined,
+    })
+
+    fetchMock.mockClear()
+    await restoreDataVersion(12, "A 线（恢复）")
     expect(requestOf(fetchMock).body).toEqual({ project_name: "A 线（恢复）" })
   })
 
@@ -144,6 +167,21 @@ describe("refreshing", () => {
       recycleBinKeys.all,
     ]) {
       expect(invalidate).toHaveBeenCalledWith({ queryKey })
+    }
+  })
+
+  it("refreshes data versions, projects and the bin after a data version moves", () => {
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries")
+    refreshAfterDataVersionMove()
+    for (const queryKey of [
+      dataVersionKeys.all,
+      projectKeys.all,
+      datasetKeys.lists(),
+      recycleBinKeys.all,
+    ]) {
+      expect(invalidate).toHaveBeenCalledWith(
+        expect.objectContaining({ queryKey })
+      )
     }
   })
 })

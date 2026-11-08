@@ -114,6 +114,25 @@ describe("project writes", () => {
       method: "DELETE",
     })
   })
+
+  it("deletes a project together with its data versions", async () => {
+    let fetchMock = mockFetch(() => new Response(null, { status: 204 }))
+    await deleteProject(9, { deleteDataVersions: true })
+    expect(requestOf(fetchMock)).toMatchObject({
+      path: "/api/v1/projects/9?delete_data_versions=true",
+      method: "DELETE",
+    })
+
+    fetchMock = mockFetch(() => new Response(null, { status: 204 }))
+    await deleteProject(9, { deleteModels: true, deleteDataVersions: true })
+    expect(requestOf(fetchMock).path).toBe(
+      "/api/v1/projects/9?delete_models=true&delete_data_versions=true"
+    )
+
+    fetchMock = mockFetch(() => new Response(null, { status: 204 }))
+    await deleteProject(9, { deleteModels: false, deleteDataVersions: false })
+    expect(requestOf(fetchMock).path).toBe("/api/v1/projects/9")
+  })
 })
 
 function project(id: number, name: string): Project {
@@ -131,6 +150,8 @@ function project(id: number, name: string): Project {
     covers: [],
     model_count: 0,
     latest_model: null,
+    data_version_count: 0,
+    latest_data_version: null,
     created_at: "2026-10-30T08:00:00Z",
     updated_at: "2026-10-30T08:00:00Z",
   }
