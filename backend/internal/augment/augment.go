@@ -54,21 +54,19 @@ var ErrInvalidMethods = errors.New("invalid augmentation methods")
 // NormalizeMethods validates the methods of a configuration: at least one,
 // each known; the result is de-duplicated and in Methods order. Errors
 // wrap ErrInvalidMethods and have a Chinese message.
-func NormalizeMethods(raw []string) ([]Method, error) {
-	panic("augment: not implemented")
-}
+func NormalizeMethods(raw []string) ([]Method, error) { return normalizeMethods(raw) }
 
 // MaxCopies is how many distinct copies of one image methods can make:
 // with geometric methods only, the number of non-identity orientations
 // they generate (hflip or vflip: 1; both: 3; rotate90: 3; rotate90 with a
 // flip: 7); with any photometric method, CopiesLimit. methods must be
 // normalized.
-func MaxCopies(methods []Method) int {
-	panic("augment: not implemented")
-}
+func MaxCopies(methods []Method) int { return maxCopies(methods) }
 
 // Box is a bounding box in whole pixels of the image it belongs to
-// (0 <= Xmin < Xmax <= width, same for y).
+// (0 <= Xmin < Xmax <= width, same for y). The coordinates are pixel
+// edges, as in the platform's VOC files and YOLO labels: the box covers
+// the pixels Xmin..Xmax-1 and its width is Xmax-Xmin.
 type Box struct {
 	Label                  string
 	Xmin, Ymin, Xmax, Ymax int
@@ -111,17 +109,24 @@ func (p Plan) Methods() []string {
 // would otherwise equal the original. minBoxSide is the smallest side of
 // the image's boxes (0 when it has none): blur is left out below
 // MinBlurBoxSide. methods must be normalized.
+//
+// The plan has no steps when the copy cannot be made different from the
+// original and the other copies: copy is beyond the distinct orientations
+// and no photometric method is allowed (methods {blur} with boxes under
+// MinBlurBoxSide: every copy; {hflip, blur} with such boxes: copies 2 and
+// up), or copy < 1. The caller does not write such a copy.
 func NewPlan(seed int64, key string, copy int, methods []Method, minBoxSide int) Plan {
-	panic("augment: not implemented")
+	return newPlan(seed, key, copy, methods, minBoxSide)
 }
 
 // Apply transforms src and its boxes. The result is an 8-bit *image.Gray
 // for grayscale sources and an 8-bit opaque *image.NRGBA otherwise (alpha
 // dropped by copying the color values, never premultiplied). src is not
-// modified.
-func Apply(src image.Image, boxes []Box, p Plan) (image.Image, []Box) {
-	panic("augment: not implemented")
-}
+// modified. The geometric steps are applied first (they move pixels and
+// boxes exactly; 90° and 270° swap width and height), then the
+// photometric ones in plan order (the boxes stay). Boxes are clipped to
+// src, and dropped when nothing is left of them.
+func Apply(src image.Image, boxes []Box, p Plan) (image.Image, []Box) { return apply(src, boxes, p) }
 
 // OutputFormat is the format and file extension of the augmented copies of
 // an image decoded as srcFormat (as image.DecodeConfig names it): JPEG for
@@ -136,19 +141,15 @@ func OutputFormat(srcFormat string, losslessWebP bool) (format, ext string) {
 }
 
 // IsLosslessWebP reports whether r holds a lossless (VP8L) WebP image. It
-// reads the RIFF header only.
-func IsLosslessWebP(r io.ReaderAt) bool {
-	panic("augment: not implemented")
-}
+// reads the RIFF header only (for an extended file, VP8X, the chunk
+// headers within the first MiB).
+func IsLosslessWebP(r io.ReaderAt) bool { return isLosslessWebP(r) }
 
 // Encode writes img in format ("jpeg": quality 95; "png": best speed).
-func Encode(w io.Writer, img image.Image, format string) error {
-	panic("augment: not implemented")
-}
+func Encode(w io.Writer, img image.Image, format string) error { return encode(w, img, format) }
 
 // DecodedBytes estimates the memory of a decoded image of cfg (its pixel
 // buffer as decoded) for the caller's memory budget; a copy being made
-// needs about three times that (source, result, scratch).
-func DecodedBytes(cfg image.Config) int64 {
-	panic("augment: not implemented")
-}
+// needs about three times that (source, result, scratch). It is at most
+// math.MaxInt64/4, so that such a multiple does not overflow.
+func DecodedBytes(cfg image.Config) int64 { return decodedBytes(cfg) }
