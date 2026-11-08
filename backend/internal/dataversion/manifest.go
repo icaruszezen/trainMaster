@@ -99,7 +99,10 @@ func writeFileAtomic(name string, data []byte) error {
 		return fmt.Errorf("write %s: %w", filepath.Base(name), err)
 	}
 	tmp := f.Name()
-	_, err = f.Write(data)
+	err = f.Chmod(0o644) // CreateTemp makes it 0600, like copyFileFrom
+	if err == nil {
+		_, err = f.Write(data)
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}

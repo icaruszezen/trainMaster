@@ -217,7 +217,13 @@ func copyFileFrom(src *os.File, size int64, dst string, o *augment.Orientation) 
 		return 0, fmt.Errorf("copy image: %w", err)
 	}
 	name := tmp.Name()
-	n, err := io.Copy(tmp, io.NewSectionReader(src, 0, size))
+	// CreateTemp makes the file 0600; the version folder is read by other
+	// users too (training nodes over a shared mount, backups).
+	err = tmp.Chmod(0o644)
+	var n int64
+	if err == nil {
+		n, err = io.Copy(tmp, io.NewSectionReader(src, 0, size))
+	}
 	if err == nil && n != size {
 		err = errSourceChanged
 	}
