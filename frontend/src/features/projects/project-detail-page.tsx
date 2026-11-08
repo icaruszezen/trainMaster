@@ -14,6 +14,7 @@ import {
 import { Link, useNavigate, useParams, useSearchParams } from "react-router"
 
 import { PageHeader } from "@/components/page-header"
+import { ScrollingTabsList } from "@/components/scrolling-tabs-list"
 import { StatCard } from "@/components/stat-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -27,7 +28,8 @@ import {
 } from "@/components/ui/empty"
 import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Tabs, TabsContent, TabsTrigger } from "@/components/ui/tabs"
+import { ProjectDataVersions } from "@/features/data-versions/project-data-versions"
 import { watchImport } from "@/features/datasets/import-watch"
 import { LoadError } from "@/features/datasets/load-error"
 import { yoloVersionLabel } from "@/features/models/yolo-versions"
@@ -38,6 +40,7 @@ import {
   projectQuery,
   type Project,
 } from "@/features/projects/api"
+import { parseDetailTab, type DetailTab } from "@/features/projects/detail-tabs"
 import { AddDatasetsDialog } from "@/features/projects/add-datasets-dialog"
 import {
   DeleteProjectDialog,
@@ -102,19 +105,10 @@ function ProjectNotFound() {
   )
 }
 
-type DetailTab = "datasets" | "classes" | "models"
-
 /** 当前标签页保存在地址栏中，刷新、分享链接、前进后退都能保留。 */
 function useDetailTab() {
   const [params, setParams] = useSearchParams()
-  const value = params.get("tab")
-  // labels 是以前“标签分布”标签页的链接，标签分布现在显示在“类别”中。
-  const tab: DetailTab =
-    value === "classes" || value === "labels"
-      ? "classes"
-      : value === "models"
-        ? value
-        : "datasets"
+  const tab = parseDetailTab(params.get("tab"))
 
   const setTab = (next: DetailTab) => {
     setParams(
@@ -198,7 +192,7 @@ function ProjectDetail({ id }: { id: number }) {
         onValueChange={(value) => setTab(value as DetailTab)}
         className="gap-4"
       >
-        <TabsList className="w-full sm:w-fit">
+        <ScrollingTabsList value={tab}>
           <TabsTrigger value="datasets" className="px-3">
             数据集
             <span className="text-xs text-muted-foreground tabular-nums">
@@ -213,13 +207,19 @@ function ProjectDetail({ id }: { id: number }) {
               </span>
             )}
           </TabsTrigger>
+          <TabsTrigger value="data-versions" className="px-3">
+            数据版本
+            <span className="text-xs text-muted-foreground tabular-nums">
+              {formatNumber(project.data_version_count)}
+            </span>
+          </TabsTrigger>
           <TabsTrigger value="models" className="px-3">
             模型
             <span className="text-xs text-muted-foreground tabular-nums">
               {formatNumber(project.model_count)}
             </span>
           </TabsTrigger>
-        </TabsList>
+        </ScrollingTabsList>
         <TabsContent value="datasets">
           <ProjectDatasets
             project={project}
@@ -231,6 +231,12 @@ function ProjectDetail({ id }: { id: number }) {
             projectId={project.id}
             classes={classes}
             labels={labels}
+          />
+        </TabsContent>
+        <TabsContent value="data-versions">
+          <ProjectDataVersions
+            projectId={project.id}
+            projectName={project.name}
           />
         </TabsContent>
         <TabsContent value="models">

@@ -6,6 +6,7 @@
  */
 import { queryOptions } from "@tanstack/react-query"
 
+import type { DataVersionStatus } from "@/features/data-versions/api"
 import {
   activeImportRefetchInterval,
   datasetKeys,
@@ -28,8 +29,19 @@ export type ProjectLatestModel = {
 }
 
 /**
- * 项目：一组数据集与模型仓库中归属它的模型（以后还有训练任务）。图片、标注等
- * 统计数据是其数据集的合计。
+ * 项目中版本号最大的数据版本（不在回收站中的，任何状态；详见
+ * features/data-versions）。
+ */
+export type ProjectLatestDataVersion = {
+  id: number
+  version: number
+  status: DataVersionStatus
+  created_at: string
+}
+
+/**
+ * 项目：一组数据集、由它们生成的数据版本与模型仓库中归属它的模型（以后还有
+ * 训练任务）。图片、标注等统计数据是其数据集的合计。
  */
 export type Project = {
   id: number
@@ -52,6 +64,10 @@ export type Project = {
   model_count: number
   /** 没有模型时为 null。 */
   latest_model: ProjectLatestModel | null
+  /** 项目的数据版本数（不含回收站中的，任何状态）。 */
+  data_version_count: number
+  /** 没有数据版本时为 null。 */
+  latest_data_version: ProjectLatestDataVersion | null
   created_at: string
   /** 修改信息、增减数据集时更新。 */
   updated_at: string
@@ -231,12 +247,25 @@ export function updateProject(
 
 /**
  * 删除项目；其中的数据集保留，只是不再属于该项目。项目中有模型时必须同时删除
- * 模型（`deleteModels`，模型移入回收站），否则 409 `conflict`。
+ * 模型（`deleteModels`，模型移入回收站），有数据版本时必须同时删除数据版本
+ * （`deleteDataVersions`：已生成的移入回收站，其余直接删除），否则 409
+ * `conflict`。
  */
-export function deleteProject(id: number, { deleteModels = false } = {}) {
+export function deleteProject(
+  id: number,
+  { deleteModels = false, deleteDataVersions = false } = {}
+) {
+  const params = new URLSearchParams()
+  if (deleteModels) {
+    params.set("delete_models", "true")
+  }
+  if (deleteDataVersions) {
+    params.set("delete_data_versions", "true")
+  }
+  const query = params.toString()
   return apiSend<void>(
     "DELETE",
-    deleteModels ? `${projectPath(id)}?delete_models=true` : projectPath(id)
+    query ? `${projectPath(id)}?${query}` : projectPath(id)
   )
 }
 
