@@ -77,13 +77,13 @@ type Service struct {
 // NewService creates a Service. It does not touch the database yet.
 func NewService(o Options) *Service {
 	s := &Service{
-		db:        o.DB,
-		storage:   o.Storage,
-		log:       o.Logger,
-		datasets:  o.Datasets,
-		projects:  o.Projects,
-		usage:     o.DiskUsage,
-		base:      context.Background(),
+		db:          o.DB,
+		storage:     o.Storage,
+		log:         o.Logger,
+		datasets:    o.Datasets,
+		projects:    o.Projects,
+		usage:       o.DiskUsage,
+		base:        context.Background(),
 		removeAll:   os.RemoveAll,
 		link:        os.Link,
 		orientation: augment.FindOrientation,

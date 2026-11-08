@@ -17,10 +17,10 @@ import (
 
 // Limits of a create input.
 const (
-	maxSources          = 1000    // datasets per version
-	maxSourceVersions   = 100     // review versions per dataset (like a dataset download)
-	maxIgnoreLabels     = 1000    // ignored labels
-	maxIgnoreLabelRunes = 100     // characters of an ignored label
+	maxSources          = 1000 // datasets per version
+	maxSourceVersions   = 100  // review versions per dataset (like a dataset download)
+	maxIgnoreLabels     = 1000 // ignored labels
+	maxIgnoreLabelRunes = 100  // characters of an ignored label
 	maxSeed             = 1<<31 - 1
 	maxAugmented        = 100_000 // augmented copies per version
 )
