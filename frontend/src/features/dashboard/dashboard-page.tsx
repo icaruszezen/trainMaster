@@ -49,7 +49,7 @@ const workflow: { moduleId: ModuleId; title: string; description: string }[] = [
   {
     moduleId: "dataset-versions",
     title: "数据版本",
-    description: "划分训练 / 验证集并冻结快照",
+    description: "划分训练 / 验证 / 测试集，冻结训练数据",
   },
   {
     moduleId: "training-jobs",

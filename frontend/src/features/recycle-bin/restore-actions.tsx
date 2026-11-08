@@ -1,6 +1,7 @@
 /**
  * 从回收站恢复：一键恢复，名称已被占用（409 `name_taken`）时打开换名对话框，
- * 用新名称再恢复一次。数据集换的是数据集名称，模型换的是随它恢复的项目名称。
+ * 用新名称再恢复一次。数据集换的是数据集名称，数据版本与模型换的是随它恢复的
+ * 项目名称。
  */
 import { useId, useState, type FormEvent } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
@@ -24,16 +25,19 @@ import {
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
+import { dataVersionFullTitle } from "@/features/data-versions/format"
 import { datasetsQuery } from "@/features/datasets/api"
 import { validateDatasetName } from "@/features/datasets/naming"
 import { projectsQuery } from "@/features/projects/api"
 import { validateProjectName } from "@/features/projects/naming"
 import {
   refreshAfterDatasetMove,
+  refreshAfterDataVersionMove,
   refreshAfterModelMove,
   refreshAfterVersionMove,
   refreshRecycleBin,
   restoreDataset,
+  restoreDataVersion,
   restoreModel,
   restoreVersion,
 } from "@/features/recycle-bin/api"
@@ -45,12 +49,53 @@ import { ApiError } from "@/lib/api"
 
 /** 名称被占用、需要换名恢复的一项（审图版本没有名称冲突）。 */
 type RenameTarget = {
-  item: Extract<RecycleItem, { kind: "dataset" | "model" }>
+  item: Extract<RecycleItem, { kind: "dataset" | "data_version" | "model" }>
   message: string
 }
 
 function isNameTaken(error: unknown) {
   return error instanceof ApiError && error.code === "name_taken"
+}
+
+/** 名称被占用时可以换名恢复的一项。 */
+function isRenameable(item: RecycleItem): item is RenameTarget["item"] {
+  switch (item.kind) {
+    case "dataset":
+    case "data_version":
+    case "model":
+      return true
+    case "version":
+      return false
+  }
+}
+
+/**
+ * 换名恢复的是什么：数据集换数据集名称，数据版本与模型换随它恢复的项目名称。
+ */
+function renameSubject({ item }: RenameTarget) {
+  switch (item.kind) {
+    case "dataset":
+      return {
+        isDataset: true,
+        original: item.dataset.name,
+        hint: item.dataset.delete_files
+          ? "数据集以新名称恢复；文件夹名被占用时，文件夹也改用新名称。"
+          : "只改数据集的显示名称，磁盘上的文件夹不变。",
+      }
+    case "data_version":
+      return {
+        isDataset: false,
+        original: item.dataVersion.project_name,
+        // 标题已是“外观检测 · 数据版本 v4”。
+        hint: `“${item.title}”所属的项目随它恢复，项目以新名称恢复。`,
+      }
+    case "model":
+      return {
+        isDataset: false,
+        original: item.model.project.name,
+        hint: `模型“${item.title}”所属的项目随它恢复，项目以新名称恢复。`,
+      }
+  }
 }
 
 /** 恢复一项（可以带新名称），成功后刷新相关的查询并提示，带“查看”。 */
@@ -85,6 +130,20 @@ function useRestoreMutation(onRestored?: () => void) {
               label: "查看",
               onClick: () =>
                 navigate(`/datasets/${version.dataset_id}?tab=versions`),
+            },
+          })
+          return
+        }
+        case "data_version": {
+          const version = await restoreDataVersion(item.dataVersion.id, name)
+          refreshAfterDataVersionMove()
+          toast.success(`已恢复“${dataVersionFullTitle(version)}”`, {
+            description: item.dataVersion.project_deleted
+              ? `项目“${version.project_name}”随之恢复。`
+              : undefined,
+            action: {
+              label: "查看",
+              onClick: () => navigate(`/datasets/versions/${version.id}`),
             },
           })
           return
@@ -128,10 +187,7 @@ export function useRestoreActions() {
       { item },
       {
         onError: (error) => {
-          if (
-            isNameTaken(error) &&
-            (item.kind === "dataset" || item.kind === "model")
-          ) {
+          if (isNameTaken(error) && isRenameable(item)) {
             setRename({ item, message: error.message })
             return
           }
@@ -174,8 +230,7 @@ function RenameRestoreForm({
 }) {
   const inputId = useId()
   const { item } = target
-  const isDataset = item.kind === "dataset"
-  const original = isDataset ? item.dataset.name : item.model.project.name
+  const { isDataset, original, hint } = renameSubject(target)
   // 已有的名称（不区分大小写），用于建议一个没被占用的名称。
   const datasets = useQuery({ ...datasetsQuery(), enabled: isDataset })
   const projects = useQuery({ ...projectsQuery(), enabled: !isDataset })
@@ -234,13 +289,7 @@ function RenameRestoreForm({
         {fieldError ? (
           <FieldError>{fieldError}</FieldError>
         ) : (
-          <FieldDescription>
-            {isDataset
-              ? item.dataset.delete_files
-                ? "数据集以新名称恢复；文件夹名被占用时，文件夹也改用新名称。"
-                : "只改数据集的显示名称，磁盘上的文件夹不变。"
-              : `模型“${item.title}”所属的项目随它恢复，项目以新名称恢复。`}
-          </FieldDescription>
+          <FieldDescription>{hint}</FieldDescription>
         )}
       </Field>
       {otherError && (

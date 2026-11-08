@@ -1,10 +1,13 @@
 /**
- * 回收站页面的纯函数：把三类内容合成一个列表、搜索、到期时间的文字与恢复时
+ * 回收站页面的纯函数：把四类内容合成一个列表、搜索、到期时间的文字与恢复时
  * 建议的新名称。与界面无关，有单元测试。
  */
+import type { DataVersion } from "@/features/data-versions/api"
+import { dataVersionFullTitle } from "@/features/data-versions/format"
 import type {
   RecycleBin,
   TrashedDataset,
+  TrashedDataVersion,
   TrashedModel,
   TrashedVersion,
 } from "@/features/recycle-bin/api"
@@ -19,15 +22,17 @@ export const RECYCLE_RETENTION_DAYS = 7
 /** 回收站页面的路径（与 config/navigation 中的一致）。 */
 export const RECYCLE_BIN_PATH = "/system/recycle-bin"
 
-export type RecycleKind = "dataset" | "version" | "model"
+export type RecycleKind = "dataset" | "version" | "data_version" | "model"
 
+/** 各类内容的名称，也是类型筛选中的顺序。 */
 export const recycleKindLabels: Record<RecycleKind, string> = {
   dataset: "数据集",
   version: "审图版本",
+  data_version: "数据版本",
   model: "模型",
 }
 
-/** 回收站中的一项，三类内容共用的字段与原始数据。 */
+/** 回收站中的一项，各类内容共用的字段与原始数据。 */
 export type RecycleItem = {
   /** 列表中唯一，如 `dataset-12`。 */
   key: string
@@ -37,6 +42,7 @@ export type RecycleItem = {
 } & (
   | { kind: "dataset"; dataset: TrashedDataset }
   | { kind: "version"; version: TrashedVersion }
+  | { kind: "data_version"; dataVersion: TrashedDataVersion }
   | { kind: "model"; model: TrashedModel }
 )
 
@@ -45,12 +51,21 @@ export function versionTitle(version: TrashedVersion) {
   return version.name || `版本 #${version.id}`
 }
 
+/**
+ * 数据版本的新增占用：复制与增强生成的图片文件。其余的原图是指向数据集文件的
+ * 硬链接，与数据集共用磁盘空间。
+ */
+export function dataVersionAddedBytes(version: Pick<DataVersion, "stats">) {
+  const { storage } = version.stats
+  return storage.copied_bytes + storage.generated_bytes
+}
+
 /** 模型的名称，如“A 线外观 v3”。 */
 export function trashedModelTitle(model: TrashedModel) {
   return `${model.project.name} v${model.version}`
 }
 
-/** 三类内容合成一个列表，最近删除的在前。 */
+/** 各类内容合成一个列表，最近删除的在前。 */
 export function recycleItems(bin: RecycleBin): RecycleItem[] {
   const items: RecycleItem[] = [
     ...bin.datasets.map((dataset): RecycleItem => ({
@@ -68,6 +83,15 @@ export function recycleItems(bin: RecycleBin): RecycleItem[] {
       deletedAt: version.deleted_at,
       purgeAt: version.purge_at,
       version,
+    })),
+    ...bin.data_versions.map((dataVersion): RecycleItem => ({
+      kind: "data_version",
+      key: `data_version-${dataVersion.id}`,
+      // “外观检测 · 数据版本 v4”：只写“数据版本 v4”分不清是哪个项目的。
+      title: dataVersionFullTitle(dataVersion),
+      deletedAt: dataVersion.deleted_at,
+      purgeAt: dataVersion.purge_at,
+      dataVersion,
     })),
     ...bin.models.map((model): RecycleItem => ({
       kind: "model",
@@ -92,6 +116,13 @@ function searchText(item: RecycleItem) {
       return [item.title, item.dataset.description, item.dataset.dir_name]
     case "version":
       return [item.title, item.version.dataset_name, item.version.note]
+    case "data_version":
+      // 标题中已有项目名称；也可以按来源的数据集查找。
+      return [
+        item.title,
+        item.dataVersion.note,
+        ...item.dataVersion.sources.map((source) => source.dataset_name),
+      ]
     case "model":
       return [item.title, item.model.description, item.model.file_name]
   }
