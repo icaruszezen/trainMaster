@@ -89,7 +89,7 @@ export function DataVersionActivity({
     return null
   }
   return (
-    <div className={cn("grid gap-1", className)}>
+    <div className={cn("grid grid-cols-[minmax(0,1fr)] gap-1", className)}>
       <TaskProgress
         value={progressPercent(version.progress)}
         label="生成进度"

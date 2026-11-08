@@ -191,7 +191,7 @@ export function DataVersionCards({
               <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border bg-muted text-muted-foreground">
                 <Layers className="size-4" />
               </div>
-              <div className="grid min-w-0 flex-1 gap-0.5">
+              <div className="grid min-w-0 flex-1 grid-cols-[minmax(0,1fr)] gap-0.5">
                 <h3 className="truncate leading-snug font-medium">
                   {/* 伸展的链接覆盖整张卡片；菜单按钮通过 z-[1] 浮在它上面。 */}
                   <Link
