@@ -125,6 +125,13 @@ func (e *dataVersionEnv) insertDataVersion(t *testing.T, projectID int64, versio
 	if err := os.MkdirAll(v.dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if status != dataversion.StatusReady {
+		// Like a real build: only a finished version's folder has no
+		// .pending marker (a folder without it is never cleared).
+		if err := os.WriteFile(filepath.Join(v.dir, ".pending"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for i, img := range images {
 		data := img.data
 		if data == nil {

@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -19,18 +18,10 @@ import (
 // retry, PATCH, DELETE, DELETE /projects?delete_data_versions=true),
 // through the API with started services.
 
-// startedDataVersionEnv is newDataVersionEnvWith(t, true). It skips the
-// test while the builder is still the skeleton's stub.
-func startedDataVersionEnv(t *testing.T) (e *dataVersionEnv) {
+// startedDataVersionEnv is newDataVersionEnvWith(t, true): the services
+// are started (the builder runs).
+func startedDataVersionEnv(t *testing.T) *dataVersionEnv {
 	t.Helper()
-	defer func() {
-		if r := recover(); r != nil {
-			if msg := fmt.Sprint(r); strings.Contains(msg, "not implemented") {
-				t.Skipf("data version builds are not implemented in this tree: %s", msg)
-			}
-			panic(r)
-		}
-	}()
 	return newDataVersionEnvWith(t, true)
 }
 
