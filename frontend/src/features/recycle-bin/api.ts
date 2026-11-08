@@ -115,15 +115,10 @@ export function restoreModel(id: number, projectName?: string) {
 
 /**
  * 恢复数据版本（项目随它在回收站中时一并恢复）。项目的名称已被占用时 409
- * `name_taken`，带 `projectName` 用新名称恢复项目。
+ * `name_taken`，带 `projectName` 用新名称恢复项目。定义在数据版本的 API 中
+ * （数据版本页面的撤销也用它）。
  */
-export function restoreDataVersion(id: number, projectName?: string) {
-  return apiSend<DataVersion>(
-    "POST",
-    `${BASE}/data-versions/${id}/restore`,
-    projectName === undefined ? undefined : { project_name: projectName }
-  )
-}
+export { restoreDataVersion } from "@/features/data-versions/api"
 
 /** 删除或恢复之后刷新回收站。 */
 export function refreshRecycleBin() {

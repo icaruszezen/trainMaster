@@ -2,7 +2,6 @@
  * 回收站页面的纯函数：把四类内容合成一个列表、搜索、到期时间的文字与恢复时
  * 建议的新名称。与界面无关，有单元测试。
  */
-import type { DataVersion } from "@/features/data-versions/api"
 import { dataVersionFullTitle } from "@/features/data-versions/format"
 import type {
   RecycleBin,
@@ -51,14 +50,8 @@ export function versionTitle(version: TrashedVersion) {
   return version.name || `版本 #${version.id}`
 }
 
-/**
- * 数据版本的新增占用：复制与增强生成的图片文件。其余的原图是指向数据集文件的
- * 硬链接，与数据集共用磁盘空间。
- */
-export function dataVersionAddedBytes(version: Pick<DataVersion, "stats">) {
-  const { storage } = version.stats
-  return storage.copied_bytes + storage.generated_bytes
-}
+/** 数据版本的新增占用（见 data-versions/format.ts）。 */
+export { dataVersionAddedBytes } from "@/features/data-versions/format"
 
 /** 模型的名称，如“A 线外观 v3”。 */
 export function trashedModelTitle(model: TrashedModel) {
