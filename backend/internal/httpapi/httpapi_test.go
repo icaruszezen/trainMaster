@@ -133,6 +133,9 @@ func TestErrorEnvelopes(t *testing.T) {
 		// Without a model service the model routes are not mounted.
 		{"PATCH", "/api/v1/models", 404, "not_found"},
 		{"GET", "/api/v1/models/1", 404, "not_found"},
+		// Without a data version service the data version routes are not mounted.
+		{"GET", "/api/v1/data-versions", 404, "not_found"},
+		{"POST", "/api/v1/data-versions/preview", 404, "not_found"},
 		// Without a web directory, non-API paths are JSON 404s too.
 		{"GET", "/", 404, "not_found"},
 		{"GET", "/datasets/versions", 404, "not_found"},
