@@ -2,7 +2,7 @@
  * 数据版本生成的全局观察（与 datasets/import-watch.ts 相同的做法）：在模块级
  * 轮询告诉它的版本，直到生成完成或失败，然后刷新数据版本与项目的查询并弹出
  * 提示（带“查看”）。生成要排队、可能需要几分钟，切换页面也不会漏掉结果；
- * 同一个版本只轮询一次、只提示一次。
+ * 同一个版本同时只轮询一次，每次生成只提示一次（重新生成后再提示）。
  */
 import { QueryObserver } from "@tanstack/react-query"
 import { toast } from "sonner"
@@ -10,6 +10,7 @@ import { toast } from "sonner"
 import {
   dataVersionQuery,
   isActiveDataVersion,
+  refreshDataVersionImages,
   refreshDataVersions,
   type DataVersion,
 } from "@/features/data-versions/api"
@@ -26,7 +27,8 @@ import { queryClient } from "@/lib/query-client"
 export type Navigate = (path: string) => void
 
 const watchers = new Map<number, () => void>()
-const settled = new Set<number>()
+/** 已提示的生成：`<id>:<finished_at>`（重新生成的版本 id 不变）。 */
+const settled = new Set<string>()
 
 let navigateTo: Navigate | null = null
 
@@ -43,13 +45,15 @@ function open(path: string) {
   }
 }
 
-/** 生成结束：刷新查询并提示（每个版本只提示一次）。 */
+/** 生成结束：刷新查询并提示（每次生成只提示一次）。 */
 function settle(version: DataVersion) {
-  if (settled.has(version.id)) {
+  const key = `${version.id}:${version.finished_at ?? ""}`
+  if (settled.has(key)) {
     return
   }
-  settled.add(version.id)
+  settled.add(key)
   void refreshDataVersions()
+  void refreshDataVersionImages(version.id)
 
   const title = dataVersionFullTitle(version)
   const action = {

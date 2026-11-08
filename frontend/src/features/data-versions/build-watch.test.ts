@@ -105,6 +105,26 @@ describe("watchDataVersionBuild", () => {
     expect(options.description).toBe("数据集“A”的文件夹不存在")
   })
 
+  it("toasts again after a retry of the same version", async () => {
+    serve(
+      dataVersion({
+        status: "failed",
+        error: "磁盘空间不足",
+        finished_at: "2026-11-01T08:00:00Z",
+      })
+    )
+    watchDataVersionBuild(building)
+    await vi.advanceTimersByTimeAsync(1_600)
+    expect(toast.error).toHaveBeenCalledTimes(1)
+
+    // 重新生成：同一个 id 再次排队，这次生成成功。
+    serve(dataVersion({ status: "ready", finished_at: "2026-11-01T09:00:00Z" }))
+    watchDataVersionBuild(queued)
+    await vi.advanceTimersByTimeAsync(1_600)
+    expect(toast.success).toHaveBeenCalledTimes(1)
+    expect(watchedBuildCount()).toBe(0)
+  })
+
   it("stops quietly when the version is deleted", async () => {
     const fetchMock = serve(404)
     watchDataVersionBuild(building)

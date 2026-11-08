@@ -7,7 +7,7 @@
  * - 排队中 / 生成中：修改备注、停止并删除（需要确认）。
  */
 import { useId, useState, type FormEvent } from "react"
-import { useMutation } from "@tanstack/react-query"
+import { useMutation, useQuery } from "@tanstack/react-query"
 import {
   CopyPlus,
   Download,
@@ -52,7 +52,9 @@ import { Textarea } from "@/components/ui/textarea"
 import { DescriptionCounter } from "@/features/datasets/dataset-actions"
 import {
   dataVersionKeys,
+  dataVersionQuery,
   deleteDataVersion,
+  isActiveDataVersion,
   refreshAfterDataVersionMove,
   refreshDataVersions,
   restoreDataVersion,
@@ -458,32 +460,36 @@ export function DeleteDataVersionDialog({
 }
 
 function DeleteForm({
-  version,
+  version: opened,
   onDeleted,
 }: {
   version: DataVersion
   onDeleted: () => void
 }) {
-  const title = dataVersionFullTitle(version)
-  const status = version.status
   const mutation = useMutation({
-    mutationFn: () => deleteDataVersion(version.id),
-    onSuccess: () => {
+    // 带着确认时的状态：服务器按删除时的实际状态处理，进行中的版本可能刚刚
+    // 生成完成。
+    mutationFn: (status: DataVersionStatus) =>
+      deleteDataVersion(opened.id).then(() => status),
+    onSuccess: (status) => {
       queryClient.removeQueries({
-        queryKey: dataVersionKeys.detail(version.id),
+        queryKey: dataVersionKeys.detail(opened.id),
       })
       if (status === "ready") {
         void refreshAfterDataVersionMove()
         toastMovedToBin({
           title: `已将“${title}”移入回收站`,
           undo: () =>
-            restoreDataVersion(version.id).then(
+            restoreDataVersion(opened.id).then(
               () => void refreshAfterDataVersionMove()
             ),
           undoneTitle: `已恢复“${title}”`,
         })
       } else {
-        void refreshDataVersions()
+        // 进行中的版本在最后一次刷新之后生成完成时，服务器把它移入了回收站。
+        void (status === "failed"
+          ? refreshDataVersions()
+          : refreshAfterDataVersionMove())
         toast.success(
           status === "failed" ? `已删除“${title}”` : `已停止并删除“${title}”`
         )
@@ -496,6 +502,13 @@ function DeleteForm({
     },
   })
 
+  // 进行中的版本在对话框打开期间继续刷新：按最新的状态说明与删除。
+  const { data: version = opened } = useQuery({
+    ...dataVersionQuery(opened.id),
+    enabled: isActiveDataVersion(opened) && mutation.isIdle,
+  })
+  const title = dataVersionFullTitle(version)
+  const status = version.status
   const number = `版本号 v${version.version} 不会再分配给之后的数据版本。`
   return (
     <>
@@ -527,7 +540,7 @@ function DeleteForm({
         </AlertDialogCancel>
         <Button
           variant="destructive"
-          onClick={() => mutation.mutate()}
+          onClick={() => mutation.mutate(status)}
           disabled={mutation.isPending}
         >
           {mutation.isPending && <Spinner aria-hidden />}

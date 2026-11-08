@@ -144,8 +144,11 @@ function PreviewContent({
   testPercent: number
   warnings: readonly PreviewWarning[]
 }) {
-  // 手机宽度只显示各划分的目标数，放不下图片数。
-  const wide = useMediaQuery("(min-width: 40rem)")
+  // 手机宽度只显示各划分的目标数，放不下图片数；xl 起预览在 22rem 的侧栏中，
+  // 同样放不下。
+  const sm = useMediaQuery("(min-width: 40rem)")
+  const xl = useMediaQuery("(min-width: 80rem)")
+  const wide = sm && !xl
   const showTest = testPercent > 0 || preview.splits.test.images > 0
   const splits: Split[] = showTest ? [...SPLITS] : ["train", "val"]
   const skipped = skippedEntries(preview.skipped)
@@ -342,17 +345,21 @@ function PreviewSkeleton() {
 
 /**
  * 手机与平板宽度：吸在页面底部的概况栏，显示划分后的图片数、警告数与
- * “生成”按钮（提交 `form`）。
+ * “生成”按钮（提交 `form`）。设置无效、出错或正在更新时显示原因，或把
+ * 上一次的数字标为过期。
  */
 export function PreviewBar({
-  preview,
+  state,
+  last,
   warnings,
   pending,
   formId,
   onShowPreview,
   className,
 }: {
-  preview: DataVersionPreview | undefined
+  state: PreviewState
+  /** 上一次成功的预览。 */
+  last: DataVersionPreview | undefined
   warnings: readonly PreviewWarning[]
   pending: boolean
   formId: string
@@ -360,6 +367,31 @@ export function PreviewBar({
   className?: string
 }) {
   const errors = warnings.filter((w) => w.tone === "error").length
+  const preview =
+    state.kind === "ready"
+      ? state.preview
+      : state.kind === "loading"
+        ? last
+        : undefined
+  const stale = state.kind !== "ready" || state.stale
+  let detail: { text: string; tone: "muted" | "warning" | "error" }
+  if (state.kind === "invalid") {
+    detail = {
+      text: state.reasons[0] ?? "完善设置后显示预览",
+      tone: "muted",
+    }
+  } else if (state.kind === "error") {
+    detail = { text: "无法计算预览 · 查看原因", tone: "error" }
+  } else if (state.kind === "loading" || state.stale) {
+    detail = { text: "正在更新预览…", tone: "muted" }
+  } else if (warnings.length > 0) {
+    detail = {
+      text: `${formatNumber(warnings.length)} 个警告 · 查看预览`,
+      tone: errors > 0 ? "error" : "warning",
+    }
+  } else {
+    detail = { text: "没有警告 · 查看预览", tone: "muted" }
+  }
   return (
     <div
       className={cn(
@@ -374,28 +406,33 @@ export function PreviewBar({
           className="grid min-w-0 flex-1 gap-0.5 rounded-md text-left outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
           aria-label="查看预览"
         >
-          <span className="truncate text-sm font-medium tabular-nums">
+          <span
+            className={cn(
+              "truncate text-sm font-medium tabular-nums",
+              preview && stale && "text-muted-foreground"
+            )}
+          >
             {preview
               ? splitSummary({
                   train: preview.splits.train.images,
                   val: preview.splits.val.images,
                   test: preview.splits.test.images,
                 })
-              : "完善设置后显示预览"}
+              : state.kind === "error"
+                ? "预览不可用"
+                : "完善设置后显示预览"}
           </span>
           <span
             className={cn(
               "truncate text-xs tabular-nums",
-              errors > 0
+              detail.tone === "error"
                 ? "text-destructive"
-                : warnings.length > 0
+                : detail.tone === "warning"
                   ? "text-amber-700 dark:text-amber-500"
                   : "text-muted-foreground"
             )}
           >
-            {warnings.length > 0
-              ? `${formatNumber(warnings.length)} 个警告 · 查看预览`
-              : "没有警告 · 查看预览"}
+            {detail.text}
           </span>
         </button>
         <Button type="submit" form={formId} disabled={pending}>

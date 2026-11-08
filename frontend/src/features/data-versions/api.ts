@@ -520,9 +520,27 @@ export function createDataVersionExport(
 /** 刷新数据版本列表与详情，以及显示数据版本数的项目。 */
 export function refreshDataVersions() {
   return Promise.all([
-    queryClient.invalidateQueries({ queryKey: dataVersionKeys.all }),
+    queryClient.invalidateQueries({
+      queryKey: dataVersionKeys.all,
+      // 图片列表与单张图片在版本生成后不再变化：不重新加载已经翻过的页
+      // （生成结束时 build-watch 刷新那个版本的全部查询）。
+      predicate: (query) => !isDataVersionImageKey(query.queryKey),
+    }),
     queryClient.invalidateQueries({ queryKey: projectKeys.all }),
   ])
+}
+
+/** 一个版本的图片列表与单张图片（重新生成之后）。 */
+export function refreshDataVersionImages(id: number) {
+  return queryClient.invalidateQueries({
+    queryKey: dataVersionKeys.detail(id),
+    predicate: (query) => isDataVersionImageKey(query.queryKey),
+  })
+}
+
+/** dataVersionKeys.images 与 dataVersionKeys.image 的查询键。 */
+function isDataVersionImageKey(key: readonly unknown[]) {
+  return key[1] === "detail" && (key[3] === "images" || key[3] === "image")
 }
 
 /**

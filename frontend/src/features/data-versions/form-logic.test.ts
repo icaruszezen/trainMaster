@@ -14,6 +14,7 @@ import {
   isClassListConflict,
   isNewReviewVersion,
   mergeKnownUnlisted,
+  missingTemplateReviewVersions,
   missingTemplateSources,
   notInTemplate,
   parseAugmentation,
@@ -175,6 +176,15 @@ describe("template highlights", () => {
       ])
     ).toEqual(["产线A-外观"])
     expect(missingTemplateSources(template, [dataset({ id: 1 })])).toEqual([])
+  })
+
+  it("lists template review versions that cannot be selected any more", () => {
+    expect(missingTemplateReviewVersions(template, 1, [v6])).toEqual([
+      "审图1.2",
+    ])
+    expect(missingTemplateReviewVersions(template, 1, [v5, v6])).toEqual([])
+    expect(missingTemplateReviewVersions(template, 2, [])).toEqual([])
+    expect(missingTemplateReviewVersions(null, 1, [])).toEqual([])
   })
 })
 
@@ -431,6 +441,12 @@ describe("server errors", () => {
     )
     expect(fieldOfServerError("忽略的标签“scratch”在类别列表中")).toBe("labels")
     expect(fieldOfServerError("数据集“A”不在项目中")).toBe("sources")
+    // 名称中的字词不影响判断。
+    expect(fieldOfServerError("数据集“产线A 副本”不在项目中")).toBe("sources")
+    expect(fieldOfServerError("审图版本“划分备注”还没有生成完成")).toBe(
+      "sources"
+    )
+    expect(fieldOfServerError("忽略的标签“增强”在类别列表中")).toBe("labels")
     expect(fieldOfServerError("项目不存在（可能已被删除）")).toBe(null)
   })
 })

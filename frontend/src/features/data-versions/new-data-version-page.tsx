@@ -127,6 +127,7 @@ import {
   isNewReviewVersion,
   isSelected,
   mergeKnownUnlisted,
+  missingTemplateReviewVersions,
   missingTemplateSources,
   NO_SOURCE,
   noteError,
@@ -601,9 +602,10 @@ function NewDataVersionForm({
   )
 
   const classes = lastPreview?.classes ?? classList.items
+  // 忽略的标签不能是类别：两份列表都算（项目的类别列表可能比上次的预览新）。
   const classNames = useMemo(
-    () => new Set(classes.map((cls) => cls.name)),
-    [classes]
+    () => new Set([...classes, ...classList.items].map((cls) => cls.name)),
+    [classes, classList.items]
   )
   const templateIgnore = template?.config.ignore_labels ?? null
   const ignore = ignoreLabels({
@@ -633,7 +635,8 @@ function NewDataVersionForm({
   )
   const preview = useQuery({
     ...dataVersionPreviewQuery(previewInput ?? PLACEHOLDER_INPUT),
-    enabled: previewInput !== null && inputKey !== null,
+    // 输入暂时无效时保持上一次的查询（不显示它），恢复有效时不重新请求旧的输入。
+    enabled: previewInput !== null,
   })
 
   // 记住每次预览中不在类别列表中的标签（之后的预览中可能不再出现）。
@@ -656,7 +659,9 @@ function NewDataVersionForm({
     if (
       (classVersion !== undefined && classVersion !== classList.version) ||
       (previewError instanceof ApiError &&
-        isClassListConflict(previewError.message))
+        (isClassListConflict(previewError.message) ||
+          (previewError.message.startsWith("忽略的标签“") &&
+            previewError.message.endsWith("在类别列表中"))))
     ) {
       void queryClient.invalidateQueries({
         queryKey: projectKeys.classes(projectId),
@@ -782,7 +787,13 @@ function NewDataVersionForm({
       return
     }
     if (!lastPreview) {
-      toast.info("正在计算预览，请稍候再生成")
+      if (previewState.kind === "error") {
+        toast.error("无法计算预览，暂时不能生成", {
+          description: previewState.error.message,
+        })
+      } else {
+        toast.info("正在计算预览，请稍候再生成")
+      }
       return
     }
     if (previewState.kind === "ready" && !previewState.stale) {
@@ -804,8 +815,12 @@ function NewDataVersionForm({
       .getElementById(previewId)
       ?.scrollIntoView({ behavior: "smooth", block: "start" })
 
+  // 没有对应位置的错误显示在表单底部（增强关闭时增强设置不显示）。
   const generalError =
-    serverError && (serverError.field === null || serverError.field === "ratio")
+    serverError &&
+    (serverError.field === null ||
+      serverError.field === "ratio" ||
+      (serverError.field === "augment" && !draft.augment.enabled))
       ? serverError.message
       : null
 
@@ -936,7 +951,8 @@ function NewDataVersionForm({
       </div>
       <PreviewBar
         className="xl:hidden"
-        preview={shown ?? lastPreview}
+        state={previewState}
+        last={lastPreview}
         warnings={warnings}
         pending={create.isPending}
         formId={formId}
@@ -1086,6 +1102,15 @@ function SourcesSection({
     template,
     rows.map((row) => row.dataset)
   )
+  const missingVersions = rows.flatMap((row) =>
+    row.disabled || !row.query.isSuccess
+      ? []
+      : missingTemplateReviewVersions(
+          template,
+          row.dataset.id,
+          row.versions
+        ).map((name) => ({ dataset: row.dataset.name, name }))
+  )
 
   const selectNew = () => {
     for (const row of rows) {
@@ -1110,37 +1135,52 @@ function SourcesSection({
       title="数据集与标注来源"
       description="每个数据集可以选择基础标注（数据集自己的标注文件）与审图版本。同一张图片在多个来源中时，新的审图版本优先；不选基础标注时只纳入审图版本中标为需加样的图片。"
     >
-      {template && (newVersions.length > 0 || missing.length > 0) && (
-        <div className="grid gap-2">
-          {newVersions.length > 0 && (
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm">
-              <Sparkles className="size-4 shrink-0 text-amber-600 dark:text-amber-500" />
-              <span className="min-w-0 flex-1">
-                {dataVersionTitle(template)} 之后有{" "}
-                {formatNumber(newVersions.length)}{" "}
-                个新的审图版本（已标为“新”），默认没有选中。
-              </span>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={selectNew}
-              >
-                全部选中
-              </Button>
-            </div>
-          )}
-          {missing.length > 0 && (
-            <p className="flex items-start gap-1.5 text-xs text-pretty text-muted-foreground">
-              <Info className="mt-px size-3.5 shrink-0" />
-              <span className="min-w-0 break-words">
-                {dataVersionTitle(template)} 的数据集“{missing.join("”“")}
-                ”已不在项目中或不能使用，没有选择。
-              </span>
-            </p>
-          )}
-        </div>
-      )}
+      {template &&
+        (newVersions.length > 0 ||
+          missing.length > 0 ||
+          missingVersions.length > 0) && (
+          <div className="grid gap-2">
+            {newVersions.length > 0 && (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm">
+                <Sparkles className="size-4 shrink-0 text-amber-600 dark:text-amber-500" />
+                <span className="min-w-0 flex-1">
+                  {dataVersionTitle(template)} 之后有{" "}
+                  {formatNumber(newVersions.length)}{" "}
+                  个新的审图版本（已标为“新”），默认没有选中。
+                </span>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={selectNew}
+                >
+                  全部选中
+                </Button>
+              </div>
+            )}
+            {missing.length > 0 && (
+              <p className="flex items-start gap-1.5 text-xs text-pretty text-muted-foreground">
+                <Info className="mt-px size-3.5 shrink-0" />
+                <span className="min-w-0 break-words">
+                  {dataVersionTitle(template)} 的数据集“{missing.join("”“")}
+                  ”已不在项目中或不能使用，没有选择。
+                </span>
+              </p>
+            )}
+            {missingVersions.length > 0 && (
+              <p className="flex items-start gap-1.5 text-xs text-pretty text-amber-700 dark:text-amber-500">
+                <TriangleAlert className="mt-px size-3.5 shrink-0" />
+                <span className="min-w-0 break-words">
+                  {dataVersionTitle(template)} 用到的审图版本
+                  {missingVersions
+                    .map((item) => `“${item.dataset} · ${item.name}”`)
+                    .join("、")}
+                  已在回收站中或已被删除，没有选择：这些图片的标注会与模板不同。
+                </span>
+              </p>
+            )}
+          </div>
+        )}
       {rows.length === 0 ? (
         <Empty className="border">
           <EmptyHeader>

@@ -222,6 +222,25 @@ export function missingTemplateSources(
     .map((source) => source.dataset_name)
 }
 
+/**
+ * 模板为这个数据集选择、现在已不能选择的审图版本（在回收站中或已永久删除）
+ * 的名称。`versions` 是这个数据集现在已生成的审图版本。
+ */
+export function missingTemplateReviewVersions(
+  template: Pick<DataVersion, "sources"> | null,
+  datasetId: number,
+  versions: readonly Pick<DatasetVersion, "id">[]
+) {
+  const source = template?.sources.find((s) => s.dataset_id === datasetId)
+  if (!source) {
+    return []
+  }
+  const available = new Set(versions.map((version) => version.id))
+  return source.versions
+    .filter((version) => !available.has(version.id))
+    .map((version) => version.name)
+}
+
 // ---- 不在类别列表中的标签 ----
 
 /** 忽略这些框（保留图片），或跳过含有它的图片。 */
@@ -543,10 +562,14 @@ export function isClassListConflict(message: string) {
   return message.includes("类别列表已经修改") || message.includes("还没有类别")
 }
 
-/** 422 的错误属于哪个字段（按消息内容），用于显示在字段旁边。 */
+/**
+ * 422 的错误属于哪个字段（按消息内容），用于显示在字段旁边。引号中的名称
+ * （数据集、审图版本、标签）是用户起的，不参与判断：“产线A 副本”不是增强。
+ */
 export function fieldOfServerError(
-  message: string
+  raw: string
 ): "note" | "sources" | "ratio" | "seed" | "augment" | "labels" | null {
+  const message = raw.replace(/“[^”]*”/g, "“”")
   if (message.includes("备注")) {
     return "note"
   }
