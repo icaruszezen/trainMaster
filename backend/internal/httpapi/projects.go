@@ -54,7 +54,7 @@ func projectErrorStatus(kind error) (int, string) {
 		return http.StatusNotFound, codeNotFound
 	case project.ErrInvalid:
 		return http.StatusUnprocessableEntity, codeValidationFailed
-	case project.ErrConflict, project.ErrHasModels:
+	case project.ErrConflict, project.ErrHasModels, project.ErrHasDataVersions:
 		return http.StatusConflict, codeConflict
 	case project.ErrNameTaken:
 		return http.StatusConflict, codeNameTaken
@@ -143,38 +143,72 @@ func (s *server) updateProject(w http.ResponseWriter, r *http.Request) {
 }
 
 // deleteProject deletes a project; one with models only with
-// ?delete_models=true, which moves the models to the recycle bin first
-// (the project stays with them there, out of use, see package project).
+// ?delete_models=true, which moves the models to the recycle bin first, and
+// one with data versions only with ?delete_data_versions=true, which moves
+// the ready ones to the bin and removes the others (stopping a build). The
+// project stays in the bin with what went there (see package project). A
+// delete that would be refused changes nothing: it is checked first.
 func (s *server) deleteProject(w http.ResponseWriter, r *http.Request) {
 	id, ok := projectID(w, r)
 	if !ok {
 		return
 	}
-	deleteModels := false
-	if v := r.URL.Query().Get("delete_models"); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			badRequest(w, "参数 delete_models 无效，应为 true 或 false")
+	deleteModels, ok := boolQuery(w, r, "delete_models")
+	if !ok {
+		return
+	}
+	deleteDataVersions, ok := boolQuery(w, r, "delete_data_versions")
+	if !ok {
+		return
+	}
+	deleteModels = deleteModels && s.models != nil
+	deleteDataVersions = deleteDataVersions && s.dataVersions != nil
+	if err := s.projects.CheckDelete(r.Context(), id, deleteModels, deleteDataVersions); err != nil {
+		s.projectError(w, r, err)
+		return
+	}
+	if deleteDataVersions {
+		if err := s.dataVersions.DeleteProjectVersions(r.Context(), id); err != nil {
+			s.dataVersionError(w, r, err)
 			return
 		}
-		deleteModels = b
 	}
-	if deleteModels && s.models != nil {
+	if deleteModels {
 		if err := s.models.DeleteProjectModels(r.Context(), id); err != nil {
 			s.modelError(w, r, err)
 			return
 		}
 	}
-	// A model added after the models were moved makes this fail with 409;
-	// deleting again moves it too.
+	// A model or data version added after they were moved makes this fail
+	// with 409; deleting again moves it too.
 	if err := s.projects.DeleteProject(r.Context(), id); err != nil {
 		s.projectError(w, r, err)
 		return
 	}
+	// Deleted for good, the project's folders are empty; in the bin, they
+	// hold what is there and stay.
 	if s.models != nil {
-		s.models.RemoveProjectFolder(r.Context(), id) // deleted for good: its folder is empty
+		s.models.RemoveProjectFolder(r.Context(), id)
+	}
+	if s.dataVersions != nil {
+		s.dataVersions.RemoveProjectFolder(id)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// boolQuery parses an optional true / false query parameter (default
+// false).
+func boolQuery(w http.ResponseWriter, r *http.Request, name string) (value, ok bool) {
+	v := r.URL.Query().Get(name)
+	if v == "" {
+		return false, true
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		badRequest(w, "参数 "+name+" 无效，应为 true 或 false")
+		return false, false
+	}
+	return b, true
 }
 
 func (s *server) listProjectLabels(w http.ResponseWriter, r *http.Request) {

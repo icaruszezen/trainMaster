@@ -75,9 +75,18 @@ func newClassList(classes []Class) ClassList {
 	if classes == nil {
 		classes = []Class{}
 	}
+	return ClassList{Classes: classes, Version: ClassListVersion(classes)}
+}
+
+// ClassListVersion is the version of a class list (ClassList.Version).
+// Data versions freeze a class list with it.
+func ClassListVersion(classes []Class) string {
+	if classes == nil {
+		classes = []Class{}
+	}
 	data, _ := json.Marshal(classes) // cannot fail for a []Class
 	sum := sha256.Sum256(data)
-	return ClassList{Classes: classes, Version: hex.EncodeToString(sum[:16])}
+	return hex.EncodeToString(sum[:16])
 }
 
 // errClassesChanged is returned when the class list changed since the

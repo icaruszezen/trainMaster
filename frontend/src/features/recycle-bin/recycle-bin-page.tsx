@@ -1,7 +1,7 @@
 /**
- * 回收站（`/system/recycle-bin`）：删除的数据集、审图版本与模型保留 7 天，期间
- * 可以恢复，到期后由后台任务自动永久删除。保留期是强制的，这里没有“永久删除”
- * 与“清空回收站”。桌面宽度为表格，手机宽度为卡片。
+ * 回收站（`/system/recycle-bin`）：删除的数据集、审图版本、数据版本与模型保留
+ * 7 天，期间可以恢复，到期后由后台任务自动永久删除。保留期是强制的，这里没有
+ * “永久删除”与“清空回收站”。桌面宽度为表格，手机宽度为卡片。
  */
 import { useMemo, useState, type ReactNode } from "react"
 import { useQuery } from "@tanstack/react-query"
@@ -12,6 +12,7 @@ import {
   GitBranch,
   Hourglass,
   Layers,
+  ListFilter,
   RotateCcw,
   Search,
   SearchX,
@@ -69,6 +70,7 @@ import { modelTaskText } from "@/features/models/model-list"
 import { modelArchLabel } from "@/features/models/yolo-versions"
 import { recycleBinQuery, type RecycleBin } from "@/features/recycle-bin/api"
 import {
+  dataVersionAddedBytes,
   filterRecycleItems,
   purgeCountdown,
   RECYCLE_RETENTION_DAYS,
@@ -93,6 +95,7 @@ import { cn } from "@/lib/utils"
 const kindIcons: Record<RecycleKind, LucideIcon> = {
   dataset: Database,
   version: GitBranch,
+  data_version: Layers,
   model: Boxes,
 }
 
@@ -118,7 +121,7 @@ export function RecycleBinPage() {
     <>
       <PageHeader
         title="回收站"
-        description={`删除的数据集、审图版本与模型（包括删除项目时一并删除的模型）在这里保留 ${retentionDays} 天，期间可以随时恢复；到期后自动永久删除。`}
+        description={`删除的数据集、审图版本、数据版本与模型（包括删除项目时一并删除的数据版本与模型）在这里保留 ${retentionDays} 天，期间可以随时恢复；到期后自动永久删除。`}
       />
 
       <Alert role="note">
@@ -147,7 +150,7 @@ export function RecycleBinPage() {
             </EmptyMedia>
             <EmptyTitle>回收站是空的</EmptyTitle>
             <EmptyDescription>
-              删除的数据集、审图版本与模型会在这里保留 {retentionDays}{" "}
+              删除的数据集、审图版本、数据版本与模型会在这里保留 {retentionDays}{" "}
               天，期间可以恢复。
             </EmptyDescription>
           </EmptyHeader>
@@ -186,7 +189,7 @@ export function RecycleBinPage() {
               }
             >
               <SelectTrigger className="w-36" aria-label="按类型筛选">
-                <Layers className="text-muted-foreground" />
+                <ListFilter className="text-muted-foreground" />
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -274,9 +277,14 @@ function RecycleSummary({
     (sum, model) => sum + model.size_bytes,
     0
   )
+  const dataVersionBytes = bin.data_versions.reduce(
+    (sum, version) => sum + dataVersionAddedBytes(version),
+    0
+  )
 
   return (
-    <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+    // 五张卡片：手机两列（最后一张占满一行），中等宽度三列，宽屏一行。
+    <div className="grid grid-cols-2 gap-4 lg:grid-cols-3 xl:grid-cols-5">
       <StatCard
         title="数据集"
         value={formatNumber(bin.datasets.length)}
@@ -298,6 +306,17 @@ function RecycleSummary({
         </span>
       </StatCard>
       <StatCard
+        title="数据版本"
+        value={formatNumber(bin.data_versions.length)}
+        icon={Layers}
+      >
+        <span className="tabular-nums">
+          {bin.data_versions.length > 0
+            ? `新增占用 ${formatBytes(dataVersionBytes)}`
+            : "没有删除的数据版本"}
+        </span>
+      </StatCard>
+      <StatCard
         title="模型"
         value={formatNumber(bin.models.length)}
         icon={Boxes}
@@ -308,25 +327,28 @@ function RecycleSummary({
             : "没有删除的模型"}
         </span>
       </StatCard>
-      <StatCard
-        title="最早到期"
-        value={
-          soonest ? (
-            <span title={formatDateTime(soonest.purgeAt)}>
-              {countdown?.text.replace("后永久删除", "后") ?? "—"}
-            </span>
-          ) : (
-            "—"
-          )
-        }
-        icon={Hourglass}
-      >
-        <span className="truncate" title={soonest?.title}>
-          {soonest
-            ? `${recycleKindLabels[soonest.kind]}“${soonest.title}”`
-            : "—"}
-        </span>
-      </StatCard>
+      {/* 列宽用 minmax(0,1fr)：很长的名称在卡片中截断，不撑宽这一行。 */}
+      <div className="col-span-2 grid grid-cols-[minmax(0,1fr)] lg:col-span-1">
+        <StatCard
+          title="最早到期"
+          value={
+            soonest ? (
+              <span title={formatDateTime(soonest.purgeAt)}>
+                {countdown?.text.replace("后永久删除", "后") ?? "—"}
+              </span>
+            ) : (
+              "—"
+            )
+          }
+          icon={Hourglass}
+        >
+          <span className="truncate" title={soonest?.title}>
+            {soonest
+              ? `${recycleKindLabels[soonest.kind]}“${soonest.title}”`
+              : "—"}
+          </span>
+        </StatCard>
+      </div>
     </div>
   )
 }
@@ -459,7 +481,10 @@ function KindIcon({ kind }: { kind: RecycleKind }) {
   )
 }
 
-/** 说明行：数据集的大小与恢复后回到哪里、版本的数据集、模型的结构与大小。 */
+/**
+ * 说明行：数据集的大小与恢复后回到哪里、审图版本的数据集、数据版本的图片数与
+ * 备注、模型的结构与大小。
+ */
 function ItemDetails({
   item,
   className,
@@ -488,6 +513,18 @@ function ItemDetails({
         `数据集“${version.dataset_name}”`,
         `${formatNumber(version.image_count)} 张图片`,
         version.note || null,
+      ]
+      break
+    }
+    case "data_version": {
+      const { dataVersion } = item
+      parts = [
+        `${formatNumber(dataVersion.image_count)} 张图片`,
+        dataVersion.augmented_count > 0
+          ? `含 ${formatNumber(dataVersion.augmented_count)} 张增强图片`
+          : null,
+        `新增占用 ${formatBytes(dataVersionAddedBytes(dataVersion))}`,
+        dataVersion.note || null,
       ]
       break
     }
@@ -536,6 +573,13 @@ function ItemBadges({ item }: { item: RecycleItem }) {
     badges.push(
       <Badge key="dataset" variant="outline" className="font-normal">
         数据集也在回收站中
+      </Badge>
+    )
+  }
+  if (item.kind === "data_version" && item.dataVersion.project_deleted) {
+    badges.push(
+      <Badge key="project" variant="outline" className="font-normal">
+        项目也在回收站中
       </Badge>
     )
   }
@@ -624,9 +668,12 @@ function RestoreButton({
 function RecycleBinSkeleton() {
   return (
     <div className="grid gap-6" aria-busy="true" aria-label="正在加载">
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        {[0, 1, 2, 3].map((index) => (
-          <Skeleton key={index} className="h-[118px] rounded-xl" />
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-3 xl:grid-cols-5">
+        {[0, 1, 2, 3, 4].map((index) => (
+          <Skeleton
+            key={index}
+            className="h-[118px] rounded-xl last:col-span-2 lg:last:col-span-1"
+          />
         ))}
       </div>
       <Skeleton className="h-9 w-full max-w-md" />

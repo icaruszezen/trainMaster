@@ -11,6 +11,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { dataVersionTitle } from "@/features/data-versions/format"
 import { DatasetThumbnail } from "@/features/datasets/dataset-thumbnail"
 import type { Project } from "@/features/projects/api"
 import { projectAnnotatedPercent } from "@/features/projects/project-card"
@@ -59,6 +60,9 @@ export function ProjectTable({
               图片
             </TableHead>
             <TableHead className="hidden w-44 md:table-cell">已标注</TableHead>
+            <TableHead className="hidden text-right xl:table-cell">
+              数据版本
+            </TableHead>
             <TableHead className="hidden text-right lg:table-cell">
               模型
             </TableHead>
@@ -126,6 +130,16 @@ export function ProjectTable({
                       {formatPercent(percent)}
                     </span>
                   </div>
+                </TableCell>
+                <TableCell
+                  className="hidden text-right tabular-nums xl:table-cell"
+                  title={
+                    project.latest_data_version
+                      ? `最新 ${dataVersionTitle(project.latest_data_version)}`
+                      : undefined
+                  }
+                >
+                  {formatNumber(project.data_version_count)}
                 </TableCell>
                 <TableCell
                   className="hidden text-right tabular-nums lg:table-cell"

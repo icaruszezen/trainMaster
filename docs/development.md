@@ -127,7 +127,7 @@ for t in trainer/scripts/tests/test-*.sh deploy/scripts/tests/test-*.sh; do bash
 shellcheck -x $(git ls-files '*.sh')
 ```
 
-后端单元测试不依赖数据库（数据集模块的压缩包、VOC、缩略图等测试使用 `backend/internal/dataset/testdata/` 中的小样本，来源见其中的 README）。数据库集成测试（迁移、并发加锁、`app_settings` 读写、数据集导入 / 扫描 / 接口、审图版本与按版本组合的下载，模型仓库的上传、版本分配、转换队列与租约，模型审图的各个流程）通过 `TM_TEST_DATABASE_URL` 启用，未设置时自动跳过。数据集相关的测试会为每个测试新建并删除一个独立的数据库，所以该账号需要 `CREATEDB` 权限（postgres 超级用户即可）。请使用一次性的数据库：
+后端单元测试不依赖数据库（数据集模块的压缩包、VOC、缩略图等测试使用 `backend/internal/dataset/testdata/` 中的小样本，来源见其中的 README）。数据库集成测试（迁移、并发加锁、`app_settings` 读写、数据集导入 / 扫描 / 接口、审图版本与按版本组合的下载，模型仓库的上传、版本分配、转换队列与租约，模型审图的各个流程，数据版本的创建、生成、下载与回收站）通过 `TM_TEST_DATABASE_URL` 启用，未设置时自动跳过。数据集相关的测试会为每个测试新建并删除一个独立的数据库，所以该账号需要 `CREATEDB` 权限（postgres 超级用户即可）。请使用一次性的数据库：
 
 ```bash
 docker run -d --rm --name tm-test-pg -e POSTGRES_PASSWORD=x -p 55432:5432 postgres:17-alpine
@@ -160,6 +160,17 @@ docker rm -f tm-test-pg
 
   真实的识别（torch 与 Ultralytics）没有自动化测试，需要时在装好 CPU 版 PyTorch 的环境中用 `infer` 子命令或本地后端验证（见第 2 节“训练节点”）。
 - **前端**：`npm test` 包括 `src/features/reviews/` 中的纯函数（地址栏参数、审核状态与计数的更新、格式化、编辑器的缓存更新）、`src/reviewer/format.test.ts`，以及 `features/annotation/shortcuts.test.ts` 中审图模式的快捷键。
+
+### 数据版本的测试
+
+- **后端**：`internal/augment`（增强方法的规范化与 `MaxCopies`、增强计划的确定性与各份互不相同、框的变换、输出的像素格式与编码、EXIF / TIFF 方向标记的识别与重置）与 `internal/dataversion` 的划分（`split.go`：沿用文件夹、分组与文件名的规范化、稳定的哈希、小数据集的修正）是不需要数据库的单元测试；`internal/dataversion` 的其余部分（校验与预览、编号、后台生成与重启后的恢复、删除与停止、重新生成、清理、图片、YOLO / VOC / COCO 下载、回收站）与 `internal/httpapi` 中数据版本的接口是数据库集成测试，按上面的方法用 `TM_TEST_DATABASE_URL` 启用。硬链接失败与磁盘空间不足不需要特殊的文件系统：服务中的 `link`（模拟 `EXDEV`、`EPERM` 或链接到别的文件）、`removeAll` 与 `Options.DiskUsage` 可以在测试中替换。只运行这部分：
+
+  ```bash
+  cd backend
+  TM_TEST_DATABASE_URL='postgres://postgres:x@localhost:55432/postgres?sslmode=disable' go test ./internal/augment ./internal/dataversion
+  ```
+
+- **前端**：`npm test` 包括 `src/features/data-versions/format.test.ts`（标题“数据版本 v4”、状态、划分摘要、比例预设与校验、跳过原因、新增占用）。
 
 ### 训练节点与脚本的测试
 

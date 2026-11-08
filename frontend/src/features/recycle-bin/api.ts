@@ -2,12 +2,16 @@
  * 回收站的 API 类型、查询与写操作。
  *
  * 这里的类型就是与后端 `internal/httpapi/recycle.go` 的契约，修改时两边同步，并
- * 更新 docs/architecture.md 的“回收站接口”与第 12 节。删除数据集、审图版本与
- * 模型（各自的 DELETE 接口）都把它们移入回收站，保留 `retention_days` 天后自动
- * 永久删除；回收站只能恢复，不能提前永久删除。
+ * 更新 docs/architecture.md 的“回收站接口”与第 12 节。删除数据集、审图版本、
+ * 已生成的数据版本与模型（各自的 DELETE 接口）都把它们移入回收站，保留
+ * `retention_days` 天后自动永久删除；回收站只能恢复，不能提前永久删除。
  */
 import { queryOptions } from "@tanstack/react-query"
 
+import {
+  refreshDataVersions,
+  type DataVersion,
+} from "@/features/data-versions/api"
 import {
   datasetKeys,
   type Dataset,
@@ -52,10 +56,18 @@ export type TrashedModel = Model &
     project_deleted: boolean
   }
 
+export type TrashedDataVersion = DataVersion &
+  Trashed & {
+    /** 所属项目随它在回收站中，恢复数据版本时一并恢复。 */
+    project_deleted: boolean
+  }
+
 export type RecycleBin = {
   retention_days: number
   datasets: TrashedDataset[]
   versions: TrashedVersion[]
+  /** 数据版本（只有已生成的会移入回收站），最近删除的在前。 */
+  data_versions: TrashedDataVersion[]
   models: TrashedModel[]
 }
 
@@ -101,6 +113,13 @@ export function restoreModel(id: number, projectName?: string) {
   )
 }
 
+/**
+ * 恢复数据版本（项目随它在回收站中时一并恢复）。项目的名称已被占用时 409
+ * `name_taken`，带 `projectName` 用新名称恢复项目。定义在数据版本的 API 中
+ * （数据版本页面的撤销也用它）。
+ */
+export { restoreDataVersion } from "@/features/data-versions/api"
+
 /** 删除或恢复之后刷新回收站。 */
 export function refreshRecycleBin() {
   void queryClient.invalidateQueries({ queryKey: recycleBinKeys.all })
@@ -140,5 +159,15 @@ export function refreshAfterModelMove() {
   refreshModels()
   refreshMembership()
   refreshReviews()
+  refreshRecycleBin()
+}
+
+/**
+ * 数据版本移入或移出回收站之后：数据版本与项目（数据版本数、最新版本；随它
+ * 恢复的项目，也带回它的数据集）与回收站。
+ */
+export function refreshAfterDataVersionMove() {
+  void refreshDataVersions()
+  refreshMembership()
   refreshRecycleBin()
 }

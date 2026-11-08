@@ -1,4 +1,4 @@
-import { useId, useMemo, useState, type FormEvent } from "react"
+import { useId, useMemo, useState, type FormEvent, type ReactNode } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { Ellipsis, Pencil, Trash2 } from "lucide-react"
 import { toast } from "sonner"
@@ -40,6 +40,10 @@ import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { Textarea } from "@/components/ui/textarea"
+import {
+  dataVersionKeys,
+  dataVersionsQuery,
+} from "@/features/data-versions/api"
 import { datasetsQuery } from "@/features/datasets/api"
 import { DescriptionCounter } from "@/features/datasets/dataset-actions"
 import { isNameTaken, validateDescription } from "@/features/datasets/naming"
@@ -55,6 +59,13 @@ import {
   type Project,
 } from "@/features/projects/api"
 import { DatasetPicker } from "@/features/projects/dataset-picker"
+import {
+  dataVersionsCheckboxText,
+  deletedProjectDescription,
+  deleteProjectLabel,
+  dependantsNotice,
+  type ProjectDependants,
+} from "@/features/projects/delete-project"
 import { validateProjectName } from "@/features/projects/naming"
 import { refreshAfterModelMove } from "@/features/recycle-bin/api"
 import { RECYCLE_RETENTION_DAYS } from "@/features/recycle-bin/recycle-format"
@@ -212,9 +223,11 @@ function ProjectForm({
       if (isEdit) {
         queryClient.setQueryData(projectKeys.detail(saved.id), saved)
         if (saved.name !== project.name) {
-          // 数据集上的项目标记与模型（标题为“项目名 v3”）显示项目名称。
+          // 数据集上的项目标记、模型（标题为“项目名 v3”）与数据版本（“项目名 ·
+          // 数据版本 v3”）显示项目名称。
           refreshMembership()
           void queryClient.invalidateQueries({ queryKey: modelKeys.all })
+          void queryClient.invalidateQueries({ queryKey: dataVersionKeys.all })
         } else {
           void queryClient.invalidateQueries({ queryKey: projectKeys.lists() })
         }
@@ -384,8 +397,9 @@ type DeleteProjectDialogProps = {
 }
 
 /**
- * 删除项目：其中的数据集保留；项目中有模型时需要勾选同时删除模型（移入回收站，
- * 恢复其中一个模型时项目随之恢复）。
+ * 删除项目：其中的数据集保留；项目中有模型或数据版本时需要勾选同时删除它们
+ * （模型与已生成的数据版本移入回收站，恢复其中一个时项目随之恢复；其余的数据
+ * 版本直接删除）。
  */
 export function DeleteProjectDialog({
   project,
@@ -416,8 +430,9 @@ function DeleteProjectForm({
   project: Project
   onDeleted: () => void
 }) {
-  const checkboxId = useId()
-  // 以项目的模型列表为准（项目卡片上的数量可能是一会儿之前的）。
+  const modelsCheckboxId = useId()
+  const dataVersionsCheckboxId = useId()
+  // 以项目的模型与数据版本列表为准（项目卡片上的数量可能是一会儿之前的）。
   const models = useQuery(projectModelsQuery(project.id))
   const modelCount = models.data?.items.length ?? project.model_count
   const modelBytes = models.data?.items.reduce(
@@ -426,31 +441,59 @@ function DeleteProjectForm({
   )
   const exportCount =
     models.data?.items.reduce((sum, model) => sum + model.export_count, 0) ?? 0
-  const hasModels = modelCount > 0
+  const dataVersions = useQuery(dataVersionsQuery(project.id))
+  const dependants: ProjectDependants = {
+    models: modelCount,
+    dataVersions: dataVersions.data?.items.length ?? project.data_version_count,
+    readyDataVersions:
+      dataVersions.data?.items.filter((version) => version.status === "ready")
+        .length ?? null,
+  }
+  const hasModels = dependants.models > 0
+  const hasDataVersions = dependants.dataVersions > 0
   const [deleteModels, setDeleteModels] = useState(false)
+  const [deleteDataVersions, setDeleteDataVersions] = useState(false)
+  const dataVersionsText = dataVersionsCheckboxText(
+    dependants,
+    RECYCLE_RETENTION_DAYS
+  )
 
   const mutation = useMutation({
     mutationFn: () =>
-      deleteProject(project.id, { deleteModels: hasModels && deleteModels }),
+      deleteProject(project.id, {
+        deleteModels: hasModels && deleteModels,
+        deleteDataVersions: hasDataVersions && deleteDataVersions,
+      }),
     onSuccess: () => {
       queryClient.removeQueries({ queryKey: projectKeys.detail(project.id) })
       queryClient.removeQueries({ queryKey: modelKeys.project(project.id) })
-      // 数据集上的项目标记与按项目筛选的结果都会变化；模型随项目移入回收站
-      // （回收站中已有这个项目的模型时，项目也随它们留在回收站中）。
+      queryClient.removeQueries({
+        queryKey: dataVersionKeys.list(project.id),
+      })
+      // 数据集上的项目标记与按项目筛选的结果都会变化；模型与已生成的数据版本
+      // 随项目移入回收站（回收站中已有这个项目的模型或数据版本时，项目也随它们
+      // 留在回收站中）；全部数据版本的列表中不再有这个项目的版本。
       refreshAfterModelMove()
+      void queryClient.invalidateQueries({ queryKey: dataVersionKeys.all })
+      const description = deletedProjectDescription(
+        dependants,
+        RECYCLE_RETENTION_DAYS
+      )
       toast.success(`已删除项目“${project.name}”`, {
-        description: hasModels
-          ? `${formatNumber(modelCount)} 个模型已移入回收站，${RECYCLE_RETENTION_DAYS} 天内可以在“系统管理 · 回收站”中恢复，项目随之恢复。`
-          : undefined,
-        duration: hasModels ? 10_000 : undefined,
+        description,
+        duration: description ? 10_000 : undefined,
       })
       onDeleted()
     },
     onError: (error) => {
       if (error instanceof ApiError && error.status === 409) {
-        // 删除期间有新的模型上传到了项目：刷新后显示最新的模型数。
+        // 删除期间有新的模型上传到了项目、或生成了新的数据版本：刷新后显示
+        // 最新的数量。
         void queryClient.invalidateQueries({
           queryKey: modelKeys.project(project.id),
+        })
+        void queryClient.invalidateQueries({
+          queryKey: dataVersionKeys.list(project.id),
         })
         void queryClient.invalidateQueries({
           queryKey: projectKeys.detail(project.id),
@@ -460,7 +503,9 @@ function DeleteProjectForm({
     },
   })
 
-  const blocked = hasModels && !deleteModels
+  const blocked =
+    (hasModels && !deleteModels) || (hasDataVersions && !deleteDataVersions)
+  const notice = dependantsNotice(dependants)
 
   return (
     <>
@@ -472,36 +517,41 @@ function DeleteProjectForm({
           {project.dataset_count > 0
             ? `项目中的 ${formatNumber(project.dataset_count)} 个数据集不会被删除，只是不再属于该项目。`
             : "该项目中还没有数据集。"}
-          {hasModels &&
-            `项目中有 ${formatNumber(modelCount)} 个模型；模型只属于这个项目，需要一起删除。`}
+          {notice}
         </AlertDialogDescription>
       </AlertDialogHeader>
       {hasModels && (
-        <label
-          htmlFor={checkboxId}
-          className="flex cursor-pointer items-start gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50"
-        >
-          <Checkbox
-            id={checkboxId}
-            checked={deleteModels}
-            onCheckedChange={(value) => setDeleteModels(value === true)}
-            disabled={mutation.isPending}
-            className="mt-0.5"
-          />
-          <span className="grid gap-1">
-            <span className="font-medium">
-              同时删除 {formatNumber(modelCount)} 个模型
+        <DependantsCheckbox
+          id={modelsCheckboxId}
+          checked={deleteModels}
+          onCheckedChange={setDeleteModels}
+          disabled={mutation.isPending}
+          label={
+            <>
+              同时删除 {formatNumber(dependants.models)} 个模型
               {modelBytes !== undefined && `（${formatBytes(modelBytes)}）`}
-            </span>
-            <span className="text-xs text-muted-foreground">
+            </>
+          }
+          detail={
+            <>
               模型移入回收站，保留 {RECYCLE_RETENTION_DAYS}{" "}
               天，期间可以恢复（项目随之恢复）；到期后模型文件
               {exportCount > 0 &&
                 `与 ${formatNumber(exportCount)} 个 ONNX 转换结果`}
               被永久删除。
-            </span>
-          </span>
-        </label>
+            </>
+          }
+        />
+      )}
+      {hasDataVersions && (
+        <DependantsCheckbox
+          id={dataVersionsCheckboxId}
+          checked={deleteDataVersions}
+          onCheckedChange={setDeleteDataVersions}
+          disabled={mutation.isPending}
+          label={dataVersionsText.label}
+          detail={dataVersionsText.detail}
+        />
       )}
       {mutation.error && (
         <p role="alert" className="text-sm text-destructive">
@@ -518,9 +568,45 @@ function DeleteProjectForm({
           disabled={mutation.isPending || blocked}
         >
           {mutation.isPending && <Spinner aria-hidden />}
-          {hasModels ? "删除项目与模型" : "删除项目"}
+          {deleteProjectLabel(dependants)}
         </Button>
       </AlertDialogFooter>
     </>
+  )
+}
+
+/** 删除项目时必须勾选的“同时删除……”。 */
+function DependantsCheckbox({
+  id,
+  checked,
+  onCheckedChange,
+  disabled,
+  label,
+  detail,
+}: {
+  id: string
+  checked: boolean
+  onCheckedChange: (checked: boolean) => void
+  disabled: boolean
+  label: ReactNode
+  detail: ReactNode
+}) {
+  return (
+    <label
+      htmlFor={id}
+      className="flex cursor-pointer items-start gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50"
+    >
+      <Checkbox
+        id={id}
+        checked={checked}
+        onCheckedChange={(value) => onCheckedChange(value === true)}
+        disabled={disabled}
+        className="mt-0.5"
+      />
+      <span className="grid min-w-0 gap-1">
+        <span className="font-medium break-words">{label}</span>
+        <span className="text-xs text-muted-foreground">{detail}</span>
+      </span>
+    </label>
   )
 }

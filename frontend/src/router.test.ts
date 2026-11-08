@@ -2,8 +2,10 @@ import { matchRoutes } from "react-router"
 import { describe, expect, it } from "vitest"
 
 import { navItems } from "@/config/navigation"
+import { DataVersionDetailPage } from "@/features/data-versions/data-version-detail-page"
+import { DataVersionsPage } from "@/features/data-versions/data-versions-page"
+import { NewDataVersionPage } from "@/features/data-versions/new-data-version-page"
 import { DatasetDetailPage } from "@/features/datasets/dataset-detail-page"
-import { DatasetVersionsPage } from "@/features/datasets/dataset-versions-page"
 import { InferencePage } from "@/features/models/inference-page"
 import { ModelDetailPage } from "@/features/models/model-detail-page"
 import { ModelsPage } from "@/features/models/models-page"
@@ -42,8 +44,24 @@ describe("routes", () => {
 
   it("routes dataset ids to the detail page without shadowing versions", () => {
     expect(leafComponent("/datasets/123")).toBe(DatasetDetailPage)
-    expect(leafComponent("/datasets/versions")).toBe(DatasetVersionsPage)
+    expect(leafComponent("/datasets/versions")).toBe(DataVersionsPage)
     expect(leaf("/datasets/123")?.handle).toBeUndefined()
+  })
+
+  it("routes data versions under the datasets", () => {
+    expect(leafComponent("/datasets/versions")).toBe(DataVersionsPage)
+    expect(leafComponent("/datasets/versions/new")).toBe(NewDataVersionPage)
+    expect(leafComponent("/datasets/versions/12")).toBe(DataVersionDetailPage)
+    // 不是数字的 id 由详情页显示“不存在”，与其它详情页一样。
+    expect(leafComponent("/datasets/versions/abc")).toBe(DataVersionDetailPage)
+    expect(leafComponent("/datasets/versions/12/extra")).toBe(NotFoundPage)
+    expect(leafComponent("/datasets/versions/new/extra")).toBe(NotFoundPage)
+    for (const path of ["/datasets/versions/new", "/datasets/versions/12"]) {
+      expect(leaf(path)?.handle, path).toBeUndefined()
+    }
+    // 数据集详情与模型审图不受影响。
+    expect(leafComponent("/datasets/12")).toBe(DatasetDetailPage)
+    expect(leafComponent("/datasets/reviews")).toBe(ReviewsPage)
   })
 
   it("routes project ids to the project detail page", () => {

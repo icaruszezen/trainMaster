@@ -3,16 +3,19 @@ import { describe, expect, it } from "vitest"
 import type {
   RecycleBin,
   TrashedDataset,
+  TrashedDataVersion,
   TrashedModel,
   TrashedVersion,
 } from "@/features/recycle-bin/api"
 import {
+  dataVersionAddedBytes,
   filterRecycleItems,
   purgeCountdown,
   recycleItems,
   remainingFraction,
   restoreBlockedReason,
   suggestRestoreName,
+  type RecycleKind,
 } from "@/features/recycle-bin/recycle-format"
 
 const HOUR = 3_600_000
@@ -60,22 +63,61 @@ function model(id: number, deletedAgo: number): TrashedModel {
   } as TrashedModel
 }
 
+function dataVersion(
+  id: number,
+  deletedAgo: number,
+  projectDeleted = false
+): TrashedDataVersion {
+  return {
+    id,
+    project_id: 1,
+    project_name: "A 线外观",
+    version: 4,
+    note: "加入 3 号线的样本",
+    sources: [{ dataset_id: 3, dataset_name: "Line3-NG" }],
+    stats: {
+      storage: { copied_bytes: 1_000, generated_bytes: 500 },
+    },
+    project_deleted: projectDeleted,
+    deleted_at: at(-deletedAgo),
+    purge_at: at(7 * DAY - deletedAgo),
+  } as TrashedDataVersion
+}
+
 const bin: RecycleBin = {
   retention_days: 7,
   datasets: [dataset(1, "划痕", 2 * DAY), dataset(2, "Dent", HOUR)],
   versions: [version(9, "审图1.3", 3 * HOUR, true)],
+  data_versions: [dataVersion(12, 3 * DAY, true)],
   models: [model(5, 5 * DAY)],
 }
 
 describe("recycleItems", () => {
-  it("merges the three lists, most recently deleted first", () => {
+  it("merges the lists, most recently deleted first", () => {
     const items = recycleItems(bin)
     expect(items.map((item) => [item.key, item.title])).toEqual([
       ["dataset-2", "Dent"],
       ["version-9", "审图1.3"],
       ["dataset-1", "划痕"],
+      ["data_version-12", "A 线外观 · 数据版本 v4"],
       ["model-5", "A 线外观 v3"],
     ])
+  })
+
+  it("titles a data version with its project", () => {
+    const [item] = recycleItems({
+      ...bin,
+      datasets: [],
+      versions: [],
+      models: [],
+    })
+    expect(item).toMatchObject({
+      kind: "data_version",
+      title: "A 线外观 · 数据版本 v4",
+      deletedAt: at(-3 * DAY),
+      purgeAt: at(4 * DAY),
+      dataVersion: { id: 12, project_deleted: true },
+    })
   })
 
   it("filters by kind and keyword", () => {
@@ -94,6 +136,25 @@ describe("recycleItems", () => {
       filterRecycleItems(items, { kind: null, q: "BEST" }).map((i) => i.key)
     ).toEqual(["model-5"])
     expect(filterRecycleItems(items, { kind: "model", q: "划痕" })).toEqual([])
+  })
+
+  it("finds data versions by project, note and source dataset", () => {
+    const items = recycleItems(bin)
+    const keys = (kind: RecycleKind | null, q: string) =>
+      filterRecycleItems(items, { kind, q }).map((i) => i.key)
+    expect(keys("data_version", "")).toEqual(["data_version-12"])
+    expect(keys(null, "数据版本 V4")).toEqual(["data_version-12"])
+    expect(keys(null, "3 号线")).toEqual(["data_version-12"])
+    expect(keys(null, "line3")).toEqual(["data_version-12"])
+    // 项目名称在标题中：同一项目的模型也匹配。
+    expect(keys(null, "A 线外观")).toEqual(["data_version-12", "model-5"])
+    expect(keys("data_version", "划痕")).toEqual([])
+  })
+})
+
+describe("dataVersionAddedBytes", () => {
+  it("counts copied and generated files, not hard links", () => {
+    expect(dataVersionAddedBytes(dataVersion(1, HOUR))).toBe(1_500)
   })
 })
 
@@ -146,6 +207,7 @@ describe("restoreBlockedReason", () => {
       versions: [version(9, "审图1.3", HOUR)],
     })
     expect(restoreBlockedReason(free)).toBeNull()
+    // 数据版本与模型的项目在回收站中时随它们一起恢复，不需要先恢复什么。
     for (const item of recycleItems({ ...bin, versions: [] })) {
       expect(restoreBlockedReason(item)).toBeNull()
     }
