@@ -2,6 +2,7 @@ package dataversion
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -75,3 +76,41 @@ func isDeletingName(name string) bool { return strings.HasPrefix(name, deletingP
 // WaitBackground waits for the background removals started so far (tests,
 // and Stop).
 func (s *Service) WaitBackground() { s.background.Wait() }
+
+// hasPending reports whether the folder dir has the .pending marker.
+func hasPending(dir string) bool {
+	fi, err := os.Lstat(filepath.Join(dir, pendingMarker))
+	return err == nil && fi.Mode().IsRegular()
+}
+
+// writePending creates the .pending marker of version id in dir.
+func writePending(dir string, id int64) error {
+	f, err := os.OpenFile(filepath.Join(dir, pendingMarker), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return fmt.Errorf("write %s: %w", pendingMarker, err)
+	}
+	_, err = fmt.Fprintf(f, "{\"version_id\": %d}\n", id)
+	if serr := f.Sync(); err == nil {
+		err = serr
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("write %s: %w", pendingMarker, err)
+	}
+	return nil
+}
+
+// discardOwned discards the folder dir of version id if it has the
+// .pending marker: a folder without it may be a finished version that is
+// not this one (restored from a backup) and is left alone. Errors are
+// logged.
+func (s *Service) discardOwned(id int64, dir string) {
+	if !hasPending(dir) {
+		return
+	}
+	if err := s.discard(id, dir); err != nil {
+		s.log.Warn("data version: clear folder", "version_id", id, "err", err)
+	}
+}
