@@ -147,9 +147,3 @@ func IsLosslessWebP(r io.ReaderAt) bool { return isLosslessWebP(r) }
 
 // Encode writes img in format ("jpeg": quality 95; "png": best speed).
 func Encode(w io.Writer, img image.Image, format string) error { return encode(w, img, format) }
-
-// DecodedBytes estimates the memory of a decoded image of cfg (its pixel
-// buffer as decoded) for the caller's memory budget; a copy being made
-// needs about three times that (source, result, scratch). It is at most
-// math.MaxInt64/4, so that such a multiple does not overflow.
-func DecodedBytes(cfg image.Config) int64 { return decodedBytes(cfg) }

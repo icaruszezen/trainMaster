@@ -270,6 +270,35 @@ func TestSplitLeakageGroups(t *testing.T) {
 	}
 }
 
+func TestSplitUncompressedSameSize(t *testing.T) {
+	// BMP files of one camera all have the same size: Image_0001.bmp of
+	// every lot folder is not one image.
+	var items []splitItem
+	for lot := range 50 {
+		for n := range 20 {
+			items = append(items, splitItem{DatasetID: 1, RelPath: fmt.Sprintf("lot%02d/Image_%04d.bmp", lot, n+1),
+				Size: 921654})
+		}
+	}
+	as := splitImages(items, coreSplitConfig(80, 20, 0))
+	counts := map[string]int{}
+	for _, a := range as {
+		counts[a.Split]++
+	}
+	if counts[SplitVal] < 100 || counts[SplitVal] > 300 {
+		t.Errorf("val = %d of %d, want about 20 %%", counts[SplitVal], len(items))
+	}
+	// The same JPEG name and size in two lots is still one group.
+	jpg := []splitItem{{DatasetID: 1, RelPath: "lot01/a.jpg", Size: 5000}, {DatasetID: 1, RelPath: "lot02/a.jpg", Size: 5000}}
+	for seed := range int64(20) {
+		cfg := coreSplitConfig(50, 50, 0)
+		cfg.Seed = seed
+		if as := splitImages(append(jpg, coreManyItems(20)...), cfg); as[0] != as[1] {
+			t.Fatalf("seed %d: %v %v", seed, as[0], as[1])
+		}
+	}
+}
+
 func TestSplitGroupByFolder(t *testing.T) {
 	var items []splitItem
 	for part := range 50 {

@@ -25,6 +25,9 @@ import (
 //     group key (dataset, folder and normalized name, or the folder alone
 //     with group_by folder) or the same duplicate key (normalized name and
 //     file size: the same file in two datasets or folders) share a split.
+//     The duplicate key is only used for compressed formats: the size of a
+//     BMP or TIFF follows from its dimensions, so Image_0001.bmp of every
+//     camera folder would otherwise be one group.
 //  3. Each group is hashed with the seed into a bucket 0..99: val first,
 //     then test, then train. The val sets of two versions with the same seed
 //     are therefore nested, and an image keeps its split across versions
@@ -117,6 +120,18 @@ func normalizeStem(stem string) string {
 		return lower
 	}
 	return s
+}
+
+// sizeIdentifies reports whether two files with the extension of rel, the
+// same name and the same size are likely the same image: true for the
+// compressed formats, false for BMP and TIFF (mostly uncompressed: images
+// of one camera all have the same size).
+func sizeIdentifies(rel string) bool {
+	switch strings.ToLower(path.Ext(rel)) {
+	case ".bmp", ".tif", ".tiff":
+		return false
+	}
+	return true
 }
 
 // fileStem is the base name of rel without its extension.
@@ -255,7 +270,9 @@ func splitImages(items []splitItem, cfg SplitConfig) []splitAssignment {
 		}
 		groupKeys[k] = groupKey
 		join(k, "g\x00"+groupKey)
-		join(k, "d\x00"+stem+"|"+strconv.FormatInt(it.Size, 10))
+		if sizeIdentifies(it.RelPath) {
+			join(k, "d\x00"+stem+"|"+strconv.FormatInt(it.Size, 10))
+		}
 	}
 	byRoot := map[int]*splitGroup{}
 	var groups []*splitGroup

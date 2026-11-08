@@ -61,7 +61,7 @@ type Service struct {
 	exports exportTickets // export.go
 	thumbs  thumbnails    // images.go
 
-	removeAll func(path string) error // os.RemoveAll; tests make it fail
+	removeAll func(path string) error // os.RemoveAll (thumbnail caches); tests make it fail
 	// link is os.Link; tests simulate EXDEV, EPERM or a link to another
 	// file (the SameFile check) with it.
 	link func(oldname, newname string) error

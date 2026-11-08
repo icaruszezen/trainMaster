@@ -242,7 +242,7 @@ export const SKIPPED_LABELS: Record<keyof DataVersionSkipped, string> = {
   changed: "文件在上次扫描后被修改",
   unknown_size: "无法读取图片尺寸",
   unsupported_format: "训练工具不支持的格式（GIF、AVIF）",
-  augment_skipped: "无法生成增强图片的训练集图片",
+  augment_skipped: "增强图片少于所选份数的训练集图片",
 }
 
 /** 各原因的说明（悬停或详情中显示）。 */
@@ -252,7 +252,8 @@ export const SKIPPED_HINTS: Partial<Record<keyof DataVersionSkipped, string>> =
     unlisted:
       "图片中有不在项目类别列表中、也没有选择忽略的标签：这些框可能是真实缺陷，纳入后会被当作背景。",
     changed: "重新扫描数据集后再生成即可纳入。",
-    augment_skipped: "这些图片本身已纳入，只是没有生成增强图片。",
+    augment_skipped:
+      "这些图片本身已纳入，只是少生成或没有生成增强图片：无法解码、太大，或者目标太小而不再有不同的增强方式。",
   }
 
 const SKIPPED_ORDER: (keyof DataVersionSkipped)[] = [

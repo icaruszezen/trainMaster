@@ -46,10 +46,13 @@ func (s *Service) discard(id int64, dir string) error {
 		}
 		return err
 	}
+	// The removal stops with the service (a large folder must not hold up
+	// a shutdown); the janitor removes the rest after the next start.
+	ctx := s.base
 	s.background.Add(1)
 	go func() {
 		defer s.background.Done()
-		if err := s.removeAll(aside); err != nil {
+		if err := removeTreeCtx(ctx, aside); err != nil && ctx.Err() == nil {
 			s.log.Warn("data version: remove folder", "path", aside, "err", err)
 		}
 	}()

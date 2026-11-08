@@ -4,11 +4,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
-	"image/color"
 	"image/jpeg"
 	"image/png"
 	"io"
-	"math"
 	"sync"
 )
 
@@ -88,38 +86,3 @@ func (p *pngBufferPool) Get() *png.EncoderBuffer {
 }
 
 func (p *pngBufferPool) Put(b *png.EncoderBuffer) { p.pool.Put(b) }
-
-// maxDecodedBytes caps DecodedBytes so that the caller's multiple of it
-// (three times for a copy being made) cannot overflow an int64.
-const maxDecodedBytes = math.MaxInt64 / 4
-
-func decodedBytes(cfg image.Config) int64 {
-	w, h := int64(max(cfg.Width, 0)), int64(max(cfg.Height, 0))
-	if w == 0 || h == 0 {
-		return 0
-	}
-	bpp := bytesPerPixel(cfg.ColorModel)
-	if w > maxDecodedBytes/h || w*h > maxDecodedBytes/bpp {
-		return maxDecodedBytes
-	}
-	return w * h * bpp
-}
-
-// bytesPerPixel is the size of a pixel of the image the decoders return
-// for a color model (4 for models not listed).
-func bytesPerPixel(m color.Model) int64 {
-	if _, ok := m.(color.Palette); ok {
-		return 1
-	}
-	switch m {
-	case color.GrayModel, color.AlphaModel:
-		return 1
-	case color.Gray16Model, color.Alpha16Model:
-		return 2
-	case color.YCbCrModel:
-		return 3 // at most: chroma subsampling makes it less
-	case color.RGBA64Model, color.NRGBA64Model:
-		return 8
-	}
-	return 4 // RGBA, NRGBA, CMYK, NYCbCrA, unknown
-}

@@ -39,9 +39,12 @@ type spaceGuard struct {
 	warn        func(err error)
 }
 
+// due reports whether the next before checks the free space.
+func (g *spaceGuard) due() bool { return !g.unsupported && (!g.checked || g.since >= spaceRecheck) }
+
 // before checks that need more bytes fit, when a check is due.
 func (g *spaceGuard) before(need int64) error {
-	if g.unsupported || (g.checked && g.since < spaceRecheck) {
+	if !g.due() {
 		return nil
 	}
 	u, err := g.usage()
@@ -165,7 +168,7 @@ func (b *build) storeOriginal(img *buildImage) (storedFile, error) {
 	}
 
 	need := fi.Size()
-	if b.crossDevice[img.source] {
+	if b.crossDevice[img.source] && b.space.due() { // only then: remainingBytes walks the rest
 		need = b.remainingBytes(img)
 	}
 	if err := b.space.before(need); err != nil {

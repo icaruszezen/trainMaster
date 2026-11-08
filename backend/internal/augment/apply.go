@@ -215,9 +215,11 @@ func rowConverter(src image.Image, gray bool) func(y int, row []uint8) {
 			}
 		}
 	case *image.YCbCr:
-		return yCbCrConverter(s, minX)
+		return yCbCrConverter(s, minX, color.YCbCrToRGB)
 	case *image.NYCbCrA: // non-premultiplied: the alpha plane is dropped
-		return yCbCrConverter(&s.YCbCr, minX)
+		return yCbCrConverter(&s.YCbCr, minX, color.YCbCrToRGB)
+	case *limitedYCbCr:
+		return yCbCrConverter(s.m, minX, limitedYCbCrToRGB)
 	case *image.CMYK:
 		return func(y int, row []uint8) {
 			p := s.Pix[s.PixOffset(minX, y):]
@@ -249,11 +251,11 @@ func rowConverter(src image.Image, gray bool) func(y int, row []uint8) {
 	}
 }
 
-func yCbCrConverter(s *image.YCbCr, minX int) func(y int, row []uint8) {
+func yCbCrConverter(s *image.YCbCr, minX int, toRGB func(y, cb, cr uint8) (r, g, b uint8)) func(y int, row []uint8) {
 	return func(y int, row []uint8) {
 		for x := range len(row) / 4 {
 			yi, ci := s.YOffset(minX+x, y), s.COffset(minX+x, y)
-			row[4*x], row[4*x+1], row[4*x+2] = color.YCbCrToRGB(s.Y[yi], s.Cb[ci], s.Cr[ci])
+			row[4*x], row[4*x+1], row[4*x+2] = toRGB(s.Y[yi], s.Cb[ci], s.Cr[ci])
 			row[4*x+3] = 0xff
 		}
 	}

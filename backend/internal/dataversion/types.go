@@ -192,7 +192,7 @@ type Skipped struct {
 	Changed           int `json:"changed"`            // file changed since the last scan (build only)
 	UnknownSize       int `json:"unknown_size"`       // image size unknown (cannot be decoded)
 	UnsupportedFormat int `json:"unsupported_format"` // a format training tools do not read (GIF, AVIF)
-	AugmentSkipped    int `json:"augment_skipped"`    // train images that could not be augmented (build only; counted once per image)
+	AugmentSkipped    int `json:"augment_skipped"`    // train images with fewer copies than asked, or none (build only; counted once per image)
 }
 
 // StorageStats describes how the image files are stored.

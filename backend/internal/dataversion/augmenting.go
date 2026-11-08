@@ -113,7 +113,7 @@ func (b *build) augmentImages() error {
 			if r.err != nil {
 				return r.err
 			}
-			if r.skipped {
+			if r.skipped || len(r.copies) < aug.Copies {
 				b.stats.Skipped.AugmentSkipped++
 			}
 			for _, c := range r.copies {
@@ -142,6 +142,34 @@ func (b *build) augmentImages() error {
 	return nil
 }
 
+// augmentCost estimates the memory needed to make the copies of the image
+// in f: the decoded image (dataset.DecodeCost, raised for the decoders that
+// return more than the header says), and 8 bytes per pixel for the result
+// (4) and the encoder and scratch buffers. Too many pixels count as more
+// than maxAugmentMemory.
+func augmentCost(f *os.File, format string, cfg image.Config) int64 {
+	w, h := int64(max(cfg.Width, 0)), int64(max(cfg.Height, 0))
+	if h > 0 && w > maxAugmentMemory/8/h {
+		return maxAugmentMemory + 1
+	}
+	pixels := w * h
+	decoded := dataset.DecodeCost(f, format, cfg)
+	switch format {
+	case "png":
+		// A gray image with a transparent color decodes as NRGBA (NRGBA64).
+		bpp := int64(4)
+		if m := cfg.ColorModel; m == color.Gray16Model || m == color.RGBA64Model || m == color.NRGBA64Model {
+			bpp = 8
+		}
+		decoded = max(decoded, bpp*pixels)
+	case "webp":
+		if augment.IsLosslessWebP(f) { // NRGBA and the decoder's ARGB buffer
+			decoded = max(decoded, 8*pixels)
+		}
+	}
+	return decoded + 8*pixels
+}
+
 // augmentOne makes the copies of one original (stems: their paths without
 // extension). An image that cannot be decoded, or would need too much
 // memory, gets no copies (skipped).
@@ -156,10 +184,7 @@ func (b *build) augmentOne(img *buildImage, methods []augment.Method, stems []st
 		b.log.Info("data version: cannot augment an image", "path", img.path, "err", err)
 		return augmentResult{skipped: true}
 	}
-	cost := augment.DecodedBytes(cfg) * 3
-	if _, paletted := cfg.ColorModel.(color.Palette); paletted {
-		cost = augment.DecodedBytes(cfg) + 8*int64(cfg.Width)*int64(cfg.Height)
-	}
+	cost := augmentCost(f, format, cfg)
 	if cost > maxAugmentMemory {
 		b.log.Info("data version: image too large to augment", "path", img.path, "width", cfg.Width, "height", cfg.Height)
 		return augmentResult{skipped: true}
@@ -177,7 +202,11 @@ func (b *build) augmentOne(img *buildImage, methods []augment.Method, stems []st
 		b.log.Info("data version: cannot augment an image", "path", img.path, "err", err)
 		return augmentResult{skipped: true}
 	}
-	outFormat, ext := augment.OutputFormat(format, format == "webp" && augment.IsLosslessWebP(f))
+	lossless := format == "webp" && augment.IsLosslessWebP(f)
+	if format == "webp" && !lossless {
+		src = augment.LimitedRange(src) // as libwebp and the training tools read it
+	}
+	outFormat, ext := augment.OutputFormat(format, lossless)
 	boxes := make([]augment.Box, len(img.objects))
 	minSide := 0
 	for i, o := range img.objects {

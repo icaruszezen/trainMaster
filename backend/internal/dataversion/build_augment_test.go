@@ -246,6 +246,14 @@ func TestCoreBuildAugmentSkips(t *testing.T) {
 			}
 		}
 	}
+
+	// Fewer copies than asked count too: the tiny box cannot be blurred,
+	// so tiny gets the flip only.
+	in.Augmentation = &Augmentation{Methods: []string{"hflip", "blur"}, Copies: 2, OnlyWithObjects: true}
+	v2 := e.coreCreateBuilt(t, in)
+	if v2.Stats.Skipped.AugmentSkipped != 3 || v2.AugmentedCount != 6+1 {
+		t.Errorf("version = %+v", v2)
+	}
 }
 
 func TestCoreBuildOrientationFix(t *testing.T) {

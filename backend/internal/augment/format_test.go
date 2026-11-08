@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"image"
-	"image/color"
 	"image/jpeg"
 	"image/png"
 	"math"
@@ -176,40 +175,6 @@ func TestOutputFormat(t *testing.T) {
 	for _, tt := range tests {
 		if f, e := OutputFormat(tt.src, tt.lossless); f != tt.format || e != tt.ext {
 			t.Errorf("OutputFormat(%s, %v) = %s, %s", tt.src, tt.lossless, f, e)
-		}
-	}
-}
-
-func TestDecodedBytes(t *testing.T) {
-	cfg := func(m color.Model, w, h int) image.Config { return image.Config{ColorModel: m, Width: w, Height: h} }
-	tests := []struct {
-		cfg  image.Config
-		want int64
-	}{
-		{cfg(color.GrayModel, 10, 10), 100},
-		{cfg(color.Gray16Model, 10, 10), 200},
-		{cfg(color.Palette{color.Black}, 10, 10), 100},
-		{cfg(color.YCbCrModel, 10, 10), 300},
-		{cfg(color.CMYKModel, 10, 10), 400},
-		{cfg(color.RGBAModel, 10, 10), 400},
-		{cfg(color.NRGBAModel, 10, 10), 400},
-		{cfg(color.RGBA64Model, 10, 10), 800},
-		{cfg(color.NRGBA64Model, 10, 10), 800},
-		{cfg(nil, 10, 10), 400},
-		{cfg(color.NRGBAModel, 0, 10), 0},
-		{cfg(color.NRGBAModel, -5, 10), 0},
-		{cfg(color.GrayModel, 1<<30, 1<<30), 1 << 60},
-		{cfg(color.NRGBA64Model, math.MaxInt32, math.MaxInt32), math.MaxInt64 / 4},
-		{cfg(color.NRGBA64Model, math.MaxInt, math.MaxInt), math.MaxInt64 / 4},
-		{cfg(color.NRGBA64Model, math.MaxInt/16, 2), math.MaxInt64 / 4},
-	}
-	for _, tt := range tests {
-		got := DecodedBytes(tt.cfg)
-		if got != tt.want {
-			t.Errorf("DecodedBytes(%v %dx%d) = %d, want %d", tt.cfg.ColorModel, tt.cfg.Width, tt.cfg.Height, got, tt.want)
-		}
-		if got*3 < 0 {
-			t.Errorf("3 × DecodedBytes overflows: %d", got)
 		}
 	}
 }

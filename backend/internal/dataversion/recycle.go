@@ -208,6 +208,9 @@ func (s *Service) purgeExpired(ctx context.Context) error {
 		return err
 	}
 	for _, id := range ids {
+		if ctx.Err() != nil { // purgeVersion itself does not stop
+			return ctx.Err()
+		}
 		if err := s.purgeVersion(ctx, id); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()

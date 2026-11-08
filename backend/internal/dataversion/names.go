@@ -6,6 +6,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 )
@@ -44,10 +45,35 @@ func (n *pathNamer) assign(want string) string {
 }
 
 // originalPath assigns the version path of an original of the dataset
-// folder dirName at rel: images/<dirName>/<rel>, renamed when taken.
+// folder dirName at rel: images/<dirName>/<rel> (listSafe), renamed when
+// taken.
 func (n *pathNamer) originalPath(dirName, rel string) string {
-	ext := path.Ext(rel)
-	return n.assign("images/"+dirName+"/"+strings.TrimSuffix(rel, ext)) + ext
+	p := listSafe(dirName + "/" + rel)
+	ext := path.Ext(p)
+	return n.assign("images/"+strings.TrimSuffix(p, ext)) + ext
+}
+
+// listSafe makes a slash-separated path usable as a line of an Ultralytics
+// image list: Ultralytics splits the list at every line break (control
+// characters, U+2028, U+2029) and replaces every "./" in a line with the
+// list's folder, so these characters become "_", and so do the dots that
+// end a folder name.
+func listSafe(rel string) string {
+	segs := strings.Split(rel, "/")
+	for i, seg := range segs {
+		seg = strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+				return '_'
+			}
+			return r
+		}, seg)
+		if i < len(segs)-1 {
+			trimmed := strings.TrimRight(seg, ".")
+			seg = trimmed + strings.Repeat("_", len(seg)-len(trimmed))
+		}
+		segs[i] = seg
+	}
+	return strings.Join(segs, "/")
 }
 
 // copyStem assigns the path without extension of augmented copy k of the

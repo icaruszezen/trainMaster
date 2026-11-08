@@ -2,6 +2,7 @@ package dataset
 
 import (
 	"image"
+	"io"
 	"os"
 	"path"
 	"strings"
@@ -22,6 +23,14 @@ func SidecarPath(rel, ext string) string { return sidecarPath(rel, ext) }
 // DecodeImageConfig reads the dimensions and format (as image.DecodeConfig
 // names it, "tiff" for TIFF) of the image in f. Decoder panics are errors.
 func DecodeImageConfig(f *os.File) (image.Config, string, error) { return decodeImageConfig(f) }
+
+// DecodeCost estimates the memory in bytes the decoder needs for the image
+// in f, of format (as DecodeImageConfig names it) with config cfg: the
+// pixel planes, and for a progressive JPEG its coefficients, for an
+// interlaced PNG its passes.
+func DecodeCost(f io.ReaderAt, format string, cfg image.Config) int64 {
+	return decodeCost(f, format, cfg)
+}
 
 // DecodeImage decodes the whole image in f (TIFF included). Decoder panics
 // are errors.
