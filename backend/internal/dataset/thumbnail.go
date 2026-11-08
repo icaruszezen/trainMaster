@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/sync/semaphore"
@@ -63,8 +64,32 @@ type thumbnailer struct {
 func newThumbnailer() *thumbnailer {
 	return &thumbnailer{
 		slots:  make(chan struct{}, max(2, runtime.NumCPU())),
-		memory: semaphore.NewWeighted(thumbMemoryBudget),
+		memory: imageMemory,
 	}
+}
+
+// imageMemory is the memory budget (bytes) of all image decoding in the
+// process: dataset thumbnails, and data version thumbnails and augmented
+// copies (ReserveImageMemory). One budget, so that they cannot add up.
+var imageMemory = semaphore.NewWeighted(thumbMemoryBudget)
+
+// ImageMemoryBudget is the size of the shared budget of ReserveImageMemory.
+const ImageMemoryBudget = thumbMemoryBudget
+
+// ReserveImageMemory waits until cost bytes of the process-wide image
+// memory budget are free and reserves them; call release when the decoded
+// image is no longer needed. A cost above ImageMemoryBudget is an error
+// (it could never be reserved).
+func ReserveImageMemory(ctx context.Context, cost int64) (release func(), err error) {
+	if cost > ImageMemoryBudget {
+		return nil, fmt.Errorf("image needs %d bytes, more than the whole budget", cost)
+	}
+	cost = max(cost, 1)
+	if err := imageMemory.Acquire(ctx, cost); err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() { once.Do(func() { imageMemory.Release(cost) }) }, nil
 }
 
 func (s *Service) thumbDir(datasetID int64) string {
