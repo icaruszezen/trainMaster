@@ -75,6 +75,20 @@ describe("navigation config", () => {
     })
   })
 
+  it("marks data versions as implemented with its API", () => {
+    expect(getNavItem("dataset-versions")).toMatchObject({
+      status: "ready",
+      title: "数据版本",
+      path: "/datasets/versions",
+      apiPath: "/api/v1/data-versions",
+    })
+    // 审图版本（数据集详情与回收站）用 GitBranch，数据版本用另一个图标。
+    const icon = getNavItem("dataset-versions").icon
+    expect(
+      navItems.filter((item) => item.icon === icon).map((item) => item.id)
+    ).toEqual(["dataset-versions"])
+  })
+
   it("lists model review under the data management group", () => {
     expect(getNavItem("reviews")).toMatchObject({
       status: "ready",
