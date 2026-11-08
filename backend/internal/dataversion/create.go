@@ -527,7 +527,13 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 		}
 		switch v.Status {
 		case StatusReady:
-			return s.moveToBin(ctx, id)
+			// After the transaction: moveToBin is its own guarded
+			// statement. Not found: deleted or moved meanwhile, look again.
+			err := s.moveToBin(ctx, id)
+			if !errors.Is(err, ErrNotFound) || attempt == 2 {
+				return err
+			}
+			continue
 		case StatusFailed:
 			s.discardOwned(id, s.versionDir(dirName))
 			s.discardThumbnails(id)
