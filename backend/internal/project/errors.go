@@ -13,6 +13,9 @@ var (
 	ErrInvalid   = errors.New("invalid input")      // a field value is not acceptable
 	ErrConflict  = errors.New("conflict")           // the current state does not allow it
 	ErrHasModels = errors.New("project has models") // a project with models cannot be deleted (a conflict too)
+	// ErrHasDataVersions: a project with data versions in use cannot be
+	// deleted (a conflict too).
+	ErrHasDataVersions = errors.New("project has data versions")
 )
 
 // Error is a user-facing error. Message is written in Chinese and is shown
