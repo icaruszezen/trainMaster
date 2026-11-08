@@ -18,6 +18,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/config"
 	"github.com/icaruszezen/trainmaster/backend/internal/database"
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
+	"github.com/icaruszezen/trainmaster/backend/internal/dataversion"
 	"github.com/icaruszezen/trainmaster/backend/internal/hostinfo"
 	"github.com/icaruszezen/trainmaster/backend/internal/httpapi"
 	"github.com/icaruszezen/trainmaster/backend/internal/model"
@@ -102,6 +103,16 @@ func run() error {
 		return interrupted(ctx, log, err)
 	}
 	defer reviews.Stop()
+	// Data versions (frozen training sets of a project). Start fails the
+	// builds a previous run left (they can be retried), then builds queued
+	// versions one at a time and purges the recycle bin until shutdown; Stop
+	// runs first, before the services whose data it reads.
+	dataVersions := dataversion.NewService(dataversion.Options{DB: db.Pool, Storage: store, Logger: log,
+		Datasets: datasets, Projects: projects})
+	if err := dataVersions.Start(ctx); err != nil {
+		return interrupted(ctx, log, err)
+	}
+	defer dataVersions.Stop()
 
 	// CPU utilization of this machine for the compute page, sampled in the
 	// background until shutdown.
@@ -125,6 +136,7 @@ func run() error {
 		}),
 		Models:            models,
 		Reviews:           reviews,
+		DataVersions:      dataVersions,
 		ReviewerTool:      cfg.ReviewerTool,
 		TrainerPackageDir: cfg.TrainerPackageDir,
 		Host:              host,

@@ -7,6 +7,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -285,29 +288,54 @@ func (s *Service) purgeModel(ctx context.Context, id int64) error {
 }
 
 // purgeEmptyProjects deletes the projects in the recycle bin whose last
-// model was purged, with their folders in models/.
+// model and data version are purged (project.PurgeEmptyProjects), with
+// their folders in models/. A project purged by package dataversion leaves
+// its (empty) folder here: the folders of projects that are gone are
+// removed too.
 func (s *Service) purgeEmptyProjects(ctx context.Context) error {
-	const empty = `deleted_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM models m WHERE m.project_id = p.id)`
-	rows, err := s.db.Query(ctx, "SELECT id FROM projects p WHERE "+empty)
+	ids, err := project.PurgeEmptyProjects(ctx, s.db)
+	for _, id := range ids {
+		s.RemoveProjectFolder(ctx, id)
+		s.log.Info("project deleted with its last model purged from the recycle bin", "project_id", id)
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		s.log.Error("delete projects left without models in the recycle bin", "err", err)
+	}
+	return s.removeGoneProjectFolders(ctx)
+}
+
+// removeGoneProjectFolders removes the empty folders in models/ of
+// projects that no longer exist.
+func (s *Service) removeGoneProjectFolders(ctx context.Context) error {
+	entries, err := os.ReadDir(s.modelsDir())
+	if err != nil {
+		return nil
+	}
+	var ids []int64
+	for _, e := range entries {
+		if n, ok := strings.CutPrefix(e.Name(), "project-"); ok && e.IsDir() {
+			if id, err := strconv.ParseInt(n, 10, 64); err == nil && id > 0 && strconv.FormatInt(id, 10) == n {
+				ids = append(ids, id)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	rows, err := s.db.Query(ctx, "SELECT id FROM projects WHERE id = ANY($1)", ids)
 	if err != nil {
 		return err
 	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	existing, err := pgx.CollectRows(rows, pgx.RowTo[int64])
 	if err != nil {
 		return err
 	}
 	for _, id := range ids {
-		tag, err := s.db.Exec(ctx, "DELETE FROM projects p WHERE id = $1 AND "+empty, id)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			s.log.Error("delete project left without models in the recycle bin", "project_id", id, "err", err)
-			continue
-		}
-		if tag.RowsAffected() == 1 {
-			s.RemoveProjectFolder(ctx, id)
-			s.log.Info("project deleted with its last model purged from the recycle bin", "project_id", id)
+		if !slices.Contains(existing, id) {
+			s.RemoveProjectFolder(ctx, id) // only an empty folder goes
 		}
 	}
 	return nil

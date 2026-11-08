@@ -13,6 +13,7 @@ import (
 
 	"github.com/icaruszezen/trainmaster/backend/internal/compute"
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
+	"github.com/icaruszezen/trainmaster/backend/internal/dataversion"
 	"github.com/icaruszezen/trainmaster/backend/internal/hostinfo"
 	"github.com/icaruszezen/trainmaster/backend/internal/model"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
@@ -56,6 +57,10 @@ type Options struct {
 	// (/api/v1/compute/agent/tasks, /model-exports) also need Compute,
 	// which identifies the nodes. If nil, those routes are not mounted.
 	Models *model.Service
+	// DataVersions serves /api/v1/data-versions (数据版本: frozen training
+	// sets of a project) and their restore from the recycle bin (with
+	// Datasets). If nil, those routes are not mounted.
+	DataVersions *dataversion.Service
 	// Reviews serves /api/v1/reviews (model reviews) and the review
 	// records of a dataset (/api/v1/datasets/{id}/reviews, with Datasets).
 	// The inference calls of the training nodes
@@ -111,6 +116,8 @@ type server struct {
 	reviewerTool string
 	// trainerPackage serves Options.TrainerPackageDir; never nil.
 	trainerPackage *trainerpkg.Source
+	// dataVersions is Options.DataVersions.
+	dataVersions *dataversion.Service
 }
 
 // NewHandler returns the root HTTP handler.
@@ -118,7 +125,7 @@ func NewHandler(o Options) http.Handler {
 	s := &server{log: o.Logger, db: o.DB, storage: o.Storage, datasets: o.Datasets, compute: o.Compute,
 		models: o.Models, reviews: o.Reviews, reviewerTool: o.ReviewerTool, host: o.Host, nodeToken: o.NodeToken,
 		localTrainerMode: o.LocalTrainerMode, startedAt: o.StartedAt,
-		trainerPackage: trainerpkg.New(o.TrainerPackageDir)}
+		trainerPackage: trainerpkg.New(o.TrainerPackageDir), dataVersions: o.DataVersions}
 	if o.Datasets != nil {
 		s.projects = o.Projects
 	}
@@ -159,6 +166,9 @@ func NewHandler(o Options) http.Handler {
 			}
 			if s.reviews != nil {
 				r.Route("/reviews", s.reviewRoutes)
+			}
+			if s.dataVersions != nil {
+				r.Route("/data-versions", s.dataVersionRoutes)
 			}
 			if s.datasets != nil {
 				r.Route("/recycle-bin", s.recycleBinRoutes)

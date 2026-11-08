@@ -7,13 +7,14 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
+	"github.com/icaruszezen/trainmaster/backend/internal/dataversion"
 	"github.com/icaruszezen/trainmaster/backend/internal/model"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/recycle"
 )
 
-// The recycle bin (回收站, package recycle): the datasets, review versions
-// and models deleted in the last recycle.RetentionDays days. Deleting one
+// The recycle bin (回收站, package recycle): the datasets, review versions,
+// models and data versions deleted in the last recycle.RetentionDays days. Deleting one
 // of them (DELETE on its resource) moves it here; it can be restored until
 // it is purged for good. There is no way to purge it sooner.
 func (s *server) recycleBinRoutes(r chi.Router) {
@@ -22,6 +23,9 @@ func (s *server) recycleBinRoutes(r chi.Router) {
 	r.Post("/versions/{versionID}/restore", s.restoreVersion)
 	if s.models != nil {
 		r.Post("/models/{modelID}/restore", s.restoreModel)
+	}
+	if s.dataVersions != nil {
+		r.Post("/data-versions/{dataVersionID}/restore", s.restoreDataVersion)
 	}
 }
 
@@ -32,10 +36,13 @@ type recycleBin struct {
 	Datasets      []dataset.TrashedDataset `json:"datasets"`
 	Versions      []dataset.TrashedVersion `json:"versions"`
 	Models        []model.TrashedModel     `json:"models"` // empty without the model repository
+	// DataVersions is empty without the data version service.
+	DataVersions []dataversion.TrashedDataVersion `json:"data_versions"`
 }
 
 func (s *server) listRecycleBin(w http.ResponseWriter, r *http.Request) {
-	bin := recycleBin{RetentionDays: recycle.RetentionDays, Models: []model.TrashedModel{}}
+	bin := recycleBin{RetentionDays: recycle.RetentionDays, Models: []model.TrashedModel{},
+		DataVersions: []dataversion.TrashedDataVersion{}}
 	var err error
 	if bin.Datasets, err = s.datasets.ListTrashedDatasets(r.Context()); err != nil {
 		s.datasetError(w, r, err)
@@ -48,6 +55,12 @@ func (s *server) listRecycleBin(w http.ResponseWriter, r *http.Request) {
 	if s.models != nil {
 		if bin.Models, err = s.models.ListTrashedModels(r.Context()); err != nil {
 			s.modelError(w, r, err)
+			return
+		}
+	}
+	if s.dataVersions != nil {
+		if bin.DataVersions, err = s.dataVersions.ListTrashed(r.Context()); err != nil {
+			s.dataVersionError(w, r, err)
 			return
 		}
 	}
@@ -115,4 +128,27 @@ func (s *server) restoreModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, m)
+}
+
+type restoreDataVersionRequest struct {
+	// ProjectName restores the version's project, deleted with it, under
+	// another name (409 name_taken).
+	ProjectName *string `json:"project_name"`
+}
+
+func (s *server) restoreDataVersion(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathIDOr404(w, r, "dataVersionID", "回收站中没有这个数据版本")
+	if !ok {
+		return
+	}
+	var req restoreDataVersionRequest
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
+	v, err := s.dataVersions.Restore(r.Context(), id, dataversion.RestoreInput{ProjectName: req.ProjectName})
+	if err != nil {
+		s.dataVersionError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
 }

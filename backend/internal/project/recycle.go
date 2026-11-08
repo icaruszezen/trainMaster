@@ -6,15 +6,18 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Projects and the recycle bin (回收站). Projects are not items of the bin
-// themselves, but the models deleted with a project are: models.project_id
-// is ON DELETE RESTRICT, so a project whose models are in the bin stays
-// too, out of use (deleted_at; it releases its name). Its dataset links
-// move to recycled_project_datasets meanwhile. Restoring one of its models
-// restores the project (RestoreInTx); package model deletes it for good
-// once its last model is purged.
+// themselves, but the models and the data versions deleted with a project
+// are: models.project_id and data_versions.project_id are ON DELETE
+// RESTRICT, so a project whose models or data versions are in the bin
+// stays too, out of use (deleted_at; it releases its name). Its dataset
+// links move to recycled_project_datasets meanwhile. Restoring one of its
+// models or data versions restores the project (RestoreInTx); the
+// background cleanups of packages model and dataversion delete it for good
+// (PurgeEmptyProjects) once the last of them is purged.
 
 // ErrNameTaken: restoring a project whose name another project took
 // meanwhile (a conflict; restore it under another name).
@@ -22,10 +25,12 @@ var ErrNameTaken = errors.New("name taken")
 
 // DeleteProject deletes a project. Its datasets are kept; they only leave
 // the project. A project with models in use cannot be deleted
-// (ErrHasModels): package model moves them to the recycle bin first. One
-// whose models are all in the bin goes there with them (see above);
-// otherwise it is deleted for good. Uploads of models into the project
-// that are still in progress go with it.
+// (ErrHasModels), nor one with data versions in use, in any state
+// (ErrHasDataVersions): packages model and dataversion move them to the
+// recycle bin (or remove them) first. One with models or data versions in
+// the bin goes there with them (see above); otherwise it is deleted for
+// good. Uploads of models into the project that are still in progress go
+// with it.
 func (s *Service) DeleteProject(ctx context.Context, id int64) error {
 	for range maxLinkRetries {
 		soft, err := s.deleteProject(ctx, id)
@@ -36,7 +41,8 @@ func (s *Service) DeleteProject(ctx context.Context, id int64) error {
 			return err
 		}
 		if soft {
-			s.log.Info("project deleted; kept until its models are purged from the recycle bin", "project_id", id)
+			s.log.Info("project deleted; kept until its models and data versions are purged from the recycle bin",
+				"project_id", id)
 		} else {
 			s.log.Info("project deleted", "project_id", id)
 		}
@@ -73,9 +79,9 @@ func (s *Service) deleteProject(ctx context.Context, id int64) (soft bool, err e
 		if locked == nil {
 			locked = []int64{} // not NULL for ANY below
 		}
-		// The lock waits for models being added to the project (they lock
-		// its row to allocate their version) and keeps new ones out, as well
-		// as new datasets.
+		// The lock waits for models and data versions being added to the
+		// project (they lock its row to allocate their version) and keeps new
+		// ones out, as well as new datasets.
 		var found bool
 		if err := tx.QueryRow(ctx, "SELECT true FROM projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
 			id).Scan(&found); errors.Is(err, pgx.ErrNoRows) {
@@ -83,14 +89,11 @@ func (s *Service) deleteProject(ctx context.Context, id int64) (soft bool, err e
 		} else if err != nil {
 			return err
 		}
-		live, trashed, err := countModels(ctx, tx, id)
+		trashed, err := checkDelete(ctx, tx, id, false, false)
 		if err != nil {
 			return err
 		}
-		if live > 0 {
-			return &Error{Kind: ErrHasModels, Message: fmt.Sprintf("项目中有 %d 个模型，请先删除模型，或选择同时删除模型", live)}
-		}
-		if trashed == 0 {
+		if !trashed {
 			_, err = tx.Exec(ctx, "DELETE FROM projects WHERE id = $1", id)
 			return err
 		}
@@ -118,13 +121,88 @@ func (s *Service) deleteProject(ctx context.Context, id int64) (soft bool, err e
 	return soft, err
 }
 
+// CheckDelete answers the conflict DeleteProject would answer for the
+// project's models (unless withModels: they are about to be moved to the
+// recycle bin) and data versions (unless withDataVersions), without
+// changing anything, so that a delete that would be refused can be refused
+// before any of them is moved. A project that is not in use is
+// ErrNotFound. DeleteProject checks again under its locks.
+func (s *Service) CheckDelete(ctx context.Context, id int64, withModels, withDataVersions bool) error {
+	if err := s.Exists(ctx, id); err != nil {
+		return err
+	}
+	_, err := checkDelete(ctx, s.db, id, withModels, withDataVersions)
+	return err
+}
+
+// checkDelete fails with ErrHasModels when the project has models in use
+// (unless skipModels), then with ErrHasDataVersions when it has data
+// versions in use (unless skipDataVersions). trashed reports whether models
+// or data versions of it are in the recycle bin (the project must stay
+// with them).
+func checkDelete(ctx context.Context, q querier, id int64, skipModels, skipDataVersions bool) (trashed bool, err error) {
+	liveModels, trashedModels, err := countModels(ctx, q, id)
+	if err != nil {
+		return false, err
+	}
+	if liveModels > 0 && !skipModels {
+		return false, newError(ErrHasModels, "项目中有 %d 个模型，请先删除模型，或选择同时删除模型", liveModels)
+	}
+	liveVersions, trashedVersions, err := countDataVersions(ctx, q, id)
+	if err != nil {
+		return false, err
+	}
+	if liveVersions > 0 && !skipDataVersions {
+		return false, newError(ErrHasDataVersions, "项目中有 %d 个数据版本，请先删除数据版本，或选择同时删除数据版本", liveVersions)
+	}
+	return trashedModels > 0 || trashedVersions > 0, nil
+}
+
+// PurgeEmptyProjects deletes for good the projects in the recycle bin that
+// have neither models nor data versions left (the last of them was purged
+// from the bin), and returns their IDs: the caller removes its folders of
+// them. Packages model and dataversion both call it after purging; a
+// project goes once, whichever comes first. It goes on after an error with
+// one project and returns the errors joined.
+func PurgeEmptyProjects(ctx context.Context, db *pgxpool.Pool) ([]int64, error) {
+	const empty = `deleted_at IS NOT NULL
+		AND NOT EXISTS (SELECT 1 FROM models m WHERE m.project_id = p.id)
+		AND NOT EXISTS (SELECT 1 FROM data_versions v WHERE v.project_id = p.id)`
+	rows, err := db.Query(ctx, "SELECT id FROM projects p WHERE "+empty+" ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, err
+	}
+	purged := []int64{}
+	var errs []error
+	for _, id := range ids {
+		// The condition again: a model or data version restored meanwhile
+		// (restoring the project) keeps it.
+		tag, err := db.Exec(ctx, "DELETE FROM projects p WHERE id = $1 AND "+empty, id)
+		if err != nil {
+			if ctx.Err() != nil {
+				return purged, ctx.Err()
+			}
+			errs = append(errs, fmt.Errorf("delete project %d left empty in the recycle bin: %w", id, err))
+			continue
+		}
+		if tag.RowsAffected() == 1 {
+			purged = append(purged, id)
+		}
+	}
+	return purged, errors.Join(errs...)
+}
+
 // RestoreInTx takes a project out of the recycle bin in tx (restoring one
-// of its models, package model): it is back in use with the datasets it
-// had that are in use themselves. It returns the project's name; a project
-// in use is left as it is. It fails with an *Error of kind ErrNameTaken
-// when another project took the name: name restores it under another one.
-// The caller may hold model rows, but no dataset or project rows (the
-// lock order).
+// of its models or data versions, packages model and dataversion): it is
+// back in use with the datasets it had that are in use themselves. It
+// returns the project's name; a project in use is left as it is. It fails
+// with an *Error of kind ErrNameTaken when another project took the name:
+// name restores it under another one. The caller may hold model or data
+// version rows, but no dataset or project rows (the lock order).
 func RestoreInTx(ctx context.Context, tx pgx.Tx, id int64, name *string) (string, error) {
 	// Datasets first, also those in the bin: one restored meanwhile is
 	// read again after the wait, so its link comes back too.

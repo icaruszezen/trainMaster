@@ -233,6 +233,45 @@ func queryModelStats(ctx context.Context, q querier, ids []int64) (map[int64]mod
 	return out, err
 }
 
+// dataVersionStats are the data version counter and the latest data
+// version of a project.
+type dataVersionStats struct {
+	count  int
+	latest DataVersionRef
+}
+
+// queryDataVersionStats returns the data versions of the given projects
+// that are not in the recycle bin, in any state: how many, and the one with
+// the highest version. Projects without any are missing. (Plain SQL on
+// data_versions: package dataversion imports this one.)
+func queryDataVersionStats(ctx context.Context, q querier, ids []int64) (map[int64]dataVersionStats, error) {
+	rows, err := q.Query(ctx, `SELECT DISTINCT ON (project_id) project_id, count(*) OVER (PARTITION BY project_id),
+			id, version, status, created_at
+		FROM data_versions WHERE project_id = ANY($1) AND deleted_at IS NULL
+		ORDER BY project_id, version DESC`, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := map[int64]dataVersionStats{}
+	var projectID int64
+	var st dataVersionStats
+	_, err = pgx.ForEachRow(rows, []any{&projectID, &st.count, &st.latest.ID, &st.latest.Version, &st.latest.Status,
+		&st.latest.CreatedAt}, func() error {
+		st.latest.CreatedAt = st.latest.CreatedAt.UTC()
+		out[projectID] = st
+		return nil
+	})
+	return out, err
+}
+
+// countDataVersions returns the number of data versions of a project in
+// use (any state) and in the recycle bin.
+func countDataVersions(ctx context.Context, q querier, projectID int64) (live, trashed int, err error) {
+	err = q.QueryRow(ctx, `SELECT count(*) FILTER (WHERE deleted_at IS NULL), count(*) FILTER (WHERE deleted_at IS NOT NULL)
+		FROM data_versions WHERE project_id = $1`, projectID).Scan(&live, &trashed)
+	return live, trashed, err
+}
+
 // countModels returns the number of models of a project in use and in
 // the recycle bin.
 func countModels(ctx context.Context, q querier, projectID int64) (live, trashed int, err error) {
