@@ -476,6 +476,7 @@ export function createDataVersion(input: CreateDataVersionInput) {
   return apiSend<DataVersion>("POST", BASE, input)
 }
 
+/** 修改备注（任何状态都可以，回收站中的除外）。 */
 export function updateDataVersion(id: number, input: { note: string }) {
   return apiSend<DataVersion>("PATCH", dataVersionPath(id), input)
 }
@@ -486,6 +487,18 @@ export function updateDataVersion(id: number, input: { note: string }) {
  */
 export function deleteDataVersion(id: number) {
   return apiSend<void>("DELETE", dataVersionPath(id))
+}
+
+/**
+ * 从回收站恢复数据版本（删除后提示中的“撤销”）。项目随它在回收站中时一并
+ * 恢复；项目的名称已被占用时 409 `name_taken`，带 `projectName` 用新名称恢复。
+ */
+export function restoreDataVersion(id: number, projectName?: string) {
+  return apiSend<DataVersion>(
+    "POST",
+    `/api/v1/recycle-bin/data-versions/${id}/restore`,
+    projectName === undefined ? undefined : { project_name: projectName }
+  )
 }
 
 /** 重新生成失败的版本（同样的类别、设置与数据集，按数据集现在的内容）。 */
@@ -509,5 +522,17 @@ export function refreshDataVersions() {
   return Promise.all([
     queryClient.invalidateQueries({ queryKey: dataVersionKeys.all }),
     queryClient.invalidateQueries({ queryKey: projectKeys.all }),
+  ])
+}
+
+/**
+ * 数据版本移入或移出回收站之后：数据版本、项目与回收站。回收站的查询键与
+ * features/recycle-bin/api 的 recycleBinKeys.all 相同（这里不导入它，避免循环
+ * 依赖）。
+ */
+export function refreshAfterDataVersionMove() {
+  return Promise.all([
+    refreshDataVersions(),
+    queryClient.invalidateQueries({ queryKey: ["recycle-bin"] }),
   ])
 }
