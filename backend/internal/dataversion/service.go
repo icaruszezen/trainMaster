@@ -12,6 +12,7 @@ package dataversion
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/icaruszezen/trainmaster/backend/internal/augment"
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
@@ -63,6 +65,13 @@ type Service struct {
 	// link is os.Link; tests simulate EXDEV, EPERM or a link to another
 	// file (the SameFile check) with it.
 	link func(oldname, newname string) error
+	// orientation is augment.FindOrientation.
+	orientation func(r io.ReaderAt, size int64) (augment.Orientation, error)
+	// augmentWorkers is the number of parallel augmenting workers (0:
+	// half the CPUs).
+	augmentWorkers int
+	// buildHook, when set (tests), is called when a build enters a stage.
+	buildHook func(id int64, stage string)
 }
 
 // NewService creates a Service. It does not touch the database yet.
@@ -75,8 +84,9 @@ func NewService(o Options) *Service {
 		projects:  o.Projects,
 		usage:     o.DiskUsage,
 		base:      context.Background(),
-		removeAll: os.RemoveAll,
-		link:      os.Link,
+		removeAll:   os.RemoveAll,
+		link:        os.Link,
+		orientation: augment.FindOrientation,
 	}
 	if s.usage == nil {
 		s.usage = o.Storage.Usage

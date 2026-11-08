@@ -41,3 +41,27 @@ var (
 	// errNotReady: the operation needs a ready version.
 	errNotReady = &Error{Kind: ErrConflict, Message: "数据版本还没有生成完成"}
 )
+
+// Messages of the build and of the checks before it.
+const (
+	// msgInternal: a build failed for a reason users cannot act on (logged).
+	msgInternal = "生成失败（服务器内部错误）"
+	// msgInterrupted: the server stopped while the version was building.
+	msgInterrupted = "服务重启，生成被中断，可以重新生成"
+)
+
+var (
+	errNoClasses      = &Error{Kind: ErrConflict, Message: "项目还没有类别，请先在项目中添加类别"}
+	errClassesChanged = &Error{Kind: ErrConflict, Message: "项目的类别列表已经修改，请检查后重新生成"}
+	errNoImages       = &Error{Kind: ErrConflict, Message: "没有可以放进数据版本的图片，请检查所选数据集的标注、类别列表和过滤设置"}
+	errNoValImages    = &Error{Kind: ErrConflict, Message: "划分后验证集没有图片，请调整划分比例、换一个随机种子，或增加图片"}
+	errNoTrainImages  = &Error{Kind: ErrConflict, Message: "划分后训练集没有图片，请调整划分比例、换一个随机种子，或增加图片"}
+	errNotFailed      = &Error{Kind: ErrConflict, Message: "只有生成失败的数据版本可以重新生成"}
+	// errDatasetGone: a source of a create or preview body that does not
+	// exist or is in the recycle bin.
+	errDatasetGone = &Error{Kind: ErrInvalid, Message: "数据集不存在（可能已被删除）"}
+	// errReviewVersionGone: a selected review version of a create or
+	// preview body that does not exist, belongs to another dataset or is
+	// in the recycle bin.
+	errReviewVersionGone = &Error{Kind: ErrInvalid, Message: "所选审图版本不存在（可能已被删除）"}
+)
