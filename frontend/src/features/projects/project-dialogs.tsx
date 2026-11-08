@@ -223,9 +223,11 @@ function ProjectForm({
       if (isEdit) {
         queryClient.setQueryData(projectKeys.detail(saved.id), saved)
         if (saved.name !== project.name) {
-          // 数据集上的项目标记与模型（标题为“项目名 v3”）显示项目名称。
+          // 数据集上的项目标记、模型（标题为“项目名 v3”）与数据版本（“项目名 ·
+          // 数据版本 v3”）显示项目名称。
           refreshMembership()
           void queryClient.invalidateQueries({ queryKey: modelKeys.all })
+          void queryClient.invalidateQueries({ queryKey: dataVersionKeys.all })
         } else {
           void queryClient.invalidateQueries({ queryKey: projectKeys.lists() })
         }
