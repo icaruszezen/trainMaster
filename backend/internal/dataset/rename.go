@@ -83,13 +83,16 @@ type ImageRename struct {
 // maxFileNameBytes is the longest file name the common file systems take.
 const maxFileNameBytes = 255
 
+// maxSuffixDigits is the most digits a number k of <stem>_<k> has.
+const maxSuffixDigits = 19
+
 // renamePlan is what renaming does with one new image.
 type renamePlan struct {
 	From, To       string // the image's path before and after (equal when identical)
 	XMLFrom, XMLTo string // its VOC file before and after, "" without one
 	SameNameAs     string // the first image that holds the name
 	Identical      bool
-	placed         bool // the import moved it into the dataset
+	seq            int // its place in the rename list (image order)
 }
 
 func (p *renamePlan) entry() ImageRename {
@@ -138,10 +141,9 @@ type namePlanner struct {
 	// get (see numberedIndex).
 	reuse map[reuseKey][]int
 	join  map[joinKey]*joinBucket
-	// same reports whether two images have the same content; digest
-	// returns a hash of an image's content, for comparing an image with
-	// many images of the same size at once. Both are called with images
-	// of equal size only.
+	// same reports whether two images have the same content (images of
+	// different sizes never do); digest returns a hash of an image's
+	// content, for comparing an image with many images of its size at once.
 	same    func(ctx context.Context, a, b nameRef) (bool, error)
 	digest  func(ctx context.Context, r nameRef) (string, error)
 	digests map[nameRef]string
@@ -409,6 +411,15 @@ func (pl *namePlanner) newName(rel string, ref nameRef, xmlRel string) (to strin
 	s := strings.ToLower(stem)
 
 	ks := pl.reuse[reuseKey{strings.ToLower(path.Dir(rel)) + "/" + s, ref.size}]
+	if len(stem)+len(ext)+len("_")+maxSuffixDigits > maxFileNameBytes {
+		// numberedStem may shorten the stem, so the index (by the stem of
+		// the numbered names) does not know these names: try every taken
+		// number instead (rare: names of about 230 bytes and more).
+		ks = nil
+		for k := 2; pl.taken[strings.ToLower(numberedStem(stem, ext, k))]; k++ {
+			ks = append(ks, k)
+		}
+	}
 	for _, k := range sortedUnique(ks) {
 		t := numberedStem(stem, ext, k)
 		cand := dir + t + ext
@@ -442,18 +453,28 @@ func (pl *namePlanner) newName(rel string, ref nameRef, xmlRel string) (to strin
 
 // joinable returns the smallest k such that the numbered name <stem>_<k>
 // (s is stem in lower case) is held by images with the content of ref only
-// and is free in the folders of rel and its VOC file xmlRel.
+// and no file has it yet where the image would pair with it: in the folder
+// of rel, of its VOC file xmlRel, or the Annotations/ folder next to a
+// JPEGImages/ (or images/) folder holding rel (see pairAnnotations).
 func (pl *namePlanner) joinable(s, stem, ext, rel, xmlRel string, ref nameRef) (int, bool, error) {
 	b := pl.join[joinKey{s, ref.size}]
 	if b == nil {
 		return 0, false, nil
 	}
-	fits := func(k int, compare bool) (bool, error) {
+	dir := path.Dir(rel)
+	vocDir := ""
+	if d := strings.ToLower(path.Base(dir)); d == "jpegimages" || d == "images" {
+		vocDir = path.Join(path.Dir(dir), "annotations")
+	}
+	// fits reports whether the name with number k may be joined: d is the
+	// digest of ref, or "" to compare the images themselves.
+	fits := func(k int, d string) (bool, error) {
 		t := numberedStem(stem, ext, k)
 		lt := strings.ToLower(t)
 		g := pl.groups[lt]
-		if g == nil || pl.incoming[lt] || pl.paths[pathStem(path.Join(path.Dir(rel), t))] ||
-			(xmlRel != "" && pl.paths[pathStem(path.Join(path.Dir(xmlRel), t))]) {
+		if g == nil || pl.incoming[lt] || pl.paths[strings.ToLower(path.Join(dir, t))] ||
+			(xmlRel != "" && pl.paths[strings.ToLower(path.Join(path.Dir(xmlRel), t))]) ||
+			(vocDir != "" && pl.paths[strings.ToLower(path.Join(vocDir, t))]) {
 			return false, nil
 		}
 		if err := pl.resolve(g); err != nil {
@@ -462,15 +483,16 @@ func (pl *namePlanner) joinable(s, stem, ext, rel, xmlRel string, ref nameRef) (
 		if len(g.reps) != 1 || g.reps[0].size != ref.size {
 			return false, nil
 		}
-		if !compare {
-			return true, nil
+		if d == "" {
+			return pl.same(pl.ctx, g.reps[0], ref)
 		}
-		return pl.same(pl.ctx, g.reps[0], ref)
+		rd, err := pl.digestOf(g.reps[0])
+		return rd == d, err
 	}
 
 	if b.byDigest == nil && len(b.ks) <= joinDirect {
 		for _, k := range sortedUnique(b.ks) {
-			if ok, err := fits(k, true); err != nil || ok {
+			if ok, err := fits(k, ""); err != nil || ok {
 				return k, ok, err
 			}
 		}
@@ -503,7 +525,7 @@ func (pl *namePlanner) joinable(s, stem, ext, rel, xmlRel string, ref nameRef) (
 		return 0, false, err
 	}
 	for _, k := range sortedUnique(b.byDigest[d]) {
-		if ok, err := fits(k, false); err != nil || ok {
+		if ok, err := fits(k, d); err != nil || ok {
 			return k, ok, err
 		}
 	}
@@ -613,6 +635,7 @@ func planRenames(pl *namePlanner, images map[string]diskFile, pairs map[string]s
 			return nil, err
 		}
 		if p != nil {
+			p.seq = len(plans)
 			plans = append(plans, p)
 		}
 		if tick != nil {
@@ -749,8 +772,8 @@ func (s *Service) renameInPlace(ctx context.Context, root *os.Root, p *progressT
 	return res, nil
 }
 
-// renameRecordBatch is how many entries of the rename list of a first scan
-// are stored at a time.
+// renameRecordBatch is how many entries of a rename list are stored at a
+// time while the images are renamed (in place) or moved (uploads).
 const renameRecordBatch = 500
 
 // renameImageFiles renames the image of plan inside root, and its VOC file
@@ -985,16 +1008,15 @@ type copier interface {
 	CopyFrom(ctx context.Context, table pgx.Identifier, columns []string, src pgx.CopyFromSource) (int64, error)
 }
 
-// insertRenames stores entries of the rename list of an import (in plan
-// order), numbered from seq.
-func insertRenames(ctx context.Context, q copier, importID int64, seq int, plans []*renamePlan) error {
+// insertRenames stores entries of the rename list of an import.
+func insertRenames(ctx context.Context, q copier, importID int64, plans []*renamePlan) error {
 	if len(plans) == 0 {
 		return nil
 	}
 	rows := make([][]any, len(plans))
 	for i, p := range plans {
 		e := p.entry()
-		rows[i] = []any{importID, seq + i, e.Kind, e.OriginalPath, e.Path, e.SameNameAs, e.AnnotationPath}
+		rows[i] = []any{importID, p.seq, e.Kind, e.OriginalPath, e.Path, e.SameNameAs, e.AnnotationPath}
 	}
 	_, err := q.CopyFrom(ctx, pgx.Identifier{"dataset_import_renames"},
 		[]string{"import_id", "seq", "kind", "original_path", "path", "same_name_as", "annotation_path"},
@@ -1002,20 +1024,21 @@ func insertRenames(ctx context.Context, q copier, importID int64, seq int, plans
 	return err
 }
 
-// recordRenames stores entries of the rename list of a job, numbered from
-// seq, even when the job was canceled or the service is stopping (bounded
-// by finishTimeout), and logs a failure: the files are renamed either way.
-// The counts in the job's summary are updated with them, so that the list
-// can be found from the job even when the process dies before the job
-// ends (the summary is otherwise written when it ends).
-func (s *Service) recordRenames(importID int64, seq int, plans []*renamePlan) {
+// recordRenames stores entries of the rename list of a job (a batch of the
+// images renamed or found identical so far) even when the job was canceled
+// or the service is stopping (bounded by finishTimeout), and logs a
+// failure: the files are renamed either way. The counts in the job's
+// summary are updated with them, so that the list can be found from the
+// job even when the process dies before the job ends (the summary is
+// otherwise written when it ends).
+func (s *Service) recordRenames(importID int64, plans []*renamePlan) {
 	if len(plans) == 0 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(s.indexContext()), finishTimeout)
 	defer cancel()
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		if err := insertRenames(ctx, tx, importID, seq, plans); err != nil {
+		if err := insertRenames(ctx, tx, importID, plans); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `UPDATE dataset_imports SET summary = summary || (

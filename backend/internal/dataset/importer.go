@@ -9,7 +9,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 	"syscall"
 )
@@ -53,11 +52,7 @@ func (s *Service) renameScanned(ctx context.Context, d Dataset, job Import, res 
 		return err
 	}
 	defer root.Close()
-	seq := 0
-	r, err := s.renameInPlace(ctx, root, p, func(plans []*renamePlan) {
-		s.recordRenames(job.ID, seq, plans)
-		seq += len(plans)
-	})
+	r, err := s.renameInPlace(ctx, root, p, func(plans []*renamePlan) { s.recordRenames(job.ID, plans) })
 	res.Renamed, res.Identical, res.RenameFailed = r.Renamed, r.Identical, r.Failed
 	return err
 }
@@ -166,11 +161,9 @@ func (s *Service) runImport(ctx context.Context, d Dataset, job Import, p *progr
 		}
 	}
 
-	moved, err := s.moveStaged(ctx, root, staged, job.OnConflict, unconverted, renames, sum, p)
+	moved, err := s.moveStaged(ctx, root, staged, job.OnConflict, unconverted, renames, sum, p,
+		func(plans []*renamePlan) { s.recordRenames(job.ID, plans) })
 	err = diskFull(err)
-	if len(plans) > 0 {
-		s.recordRenames(job.ID, 0, slices.DeleteFunc(plans, func(plan *renamePlan) bool { return !plan.placed }))
-	}
 	if moved > 0 || err == nil {
 		res, serr := s.syncIndex(s.indexContext(), d, p)
 		sum.NamesInvalid = res.NamesInvalid
@@ -348,7 +341,9 @@ const (
 // renames are the plans of renamed and identical images (by their staged
 // path): those moved in are marked placed and counted.
 func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConflict string, unconverted map[string]bool,
-	renames map[string]*renamePlan, sum *importSummary, p *progressTracker) (int, error) {
+	renames map[string]*renamePlan, sum *importSummary, p *progressTracker, record func([]*renamePlan)) (int, error) {
+	var batch []*renamePlan
+	defer func() { record(batch) }()
 	set, err := walkFiles(ctx, s.log, staged, nil)
 	if errors.Is(err, fs.ErrNotExist) {
 		set, err = &fileSet{}, nil // nothing was staged
@@ -399,11 +394,14 @@ func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConfli
 				sum.Replaced++
 			}
 			if plan := renames[rel]; plan != nil {
-				plan.placed = true
 				if plan.Identical {
 					sum.Identical++
 				} else {
 					sum.Renamed++
+				}
+				if batch = append(batch, plan); len(batch) == renameRecordBatch {
+					record(batch)
+					batch = nil
 				}
 			}
 			if xmlRel != "" {

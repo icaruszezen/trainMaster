@@ -341,8 +341,8 @@ func TestIntegrationRenameListSurvivesCrash(t *testing.T) {
 	if _, err := e.db.Exec(ctx, `UPDATE dataset_imports SET status = 'running' WHERE id = $1`, d.ActiveImport.ID); err != nil {
 		t.Fatal(err)
 	}
-	e.svc.recordRenames(d.ActiveImport.ID, 0, []*renamePlan{{From: "B/1.png", To: "B/1_2.png", SameNameAs: "A/1.png"}})
-	e.svc.recordRenames(d.ActiveImport.ID, 1, []*renamePlan{{From: "C/1.png", To: "C/1.png", SameNameAs: "A/1.png", Identical: true}})
+	e.svc.recordRenames(d.ActiveImport.ID, []*renamePlan{{From: "B/1.png", To: "B/1_2.png", SameNameAs: "A/1.png"}})
+	e.svc.recordRenames(d.ActiveImport.ID, []*renamePlan{{From: "C/1.png", To: "C/1.png", SameNameAs: "A/1.png", Identical: true, seq: 1}})
 	if err := e.svc.recoverJobs(ctx); err != nil {
 		t.Fatal(err)
 	}

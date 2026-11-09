@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,9 +19,10 @@ import (
 )
 
 // planFor runs the planner over new images given by content (path →
-// bytes), with existing images of the dataset and XML files, and returns
-// the plans as "from>to" (renamed) or "from=same_name_as" (identical).
-func planFor(t *testing.T, existing, incoming map[string]string, xmls []string, pairs map[string]string, onConflict string) []string {
+// bytes), with existing images and XML files of the dataset and new XML
+// files, and returns the plans as "from>to" (renamed) or
+// "from=same_name_as" (identical).
+func planFor(t *testing.T, existing, incoming map[string]string, existingXMLs, xmls []string, pairs map[string]string, onConflict string) []string {
 	t.Helper()
 	files := func(m map[string]string) map[string]diskFile {
 		out := map[string]diskFile{}
@@ -46,7 +49,7 @@ func planFor(t *testing.T, existing, incoming map[string]string, xmls []string, 
 		return existing[r.rel]
 	}
 	digest := func(_ context.Context, r nameRef) (string, error) { return content(r), nil }
-	pl := newNamePlanner(context.Background(), files(existing), nil, files(incoming), xmls, onConflict, same, digest)
+	pl := newNamePlanner(context.Background(), files(existing), existingXMLs, files(incoming), xmls, onConflict, same, digest)
 	plans, err := planRenames(pl, files(incoming), pairs, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -70,6 +73,7 @@ func TestPlanRenames(t *testing.T) {
 		name       string
 		existing   map[string]string
 		incoming   map[string]string
+		oldXMLs    []string // of the dataset
 		xmls       []string
 		pairs      map[string]string
 		onConflict string
@@ -189,6 +193,36 @@ func TestPlanRenames(t *testing.T) {
 			want:     []string{"c/n.jpg>c/n_3.jpg"},
 		},
 		{
+			name:     "a copy does not take a number its folder has (name with a dot)",
+			existing: map[string]string{"a/x.v1.jpg": "A", "b/x.v1_2.jpg": "B"},
+			oldXMLs:  []string{"c/x.v1_2.xml"},
+			incoming: map[string]string{"c/x.v1.jpg": "B"},
+			want:     []string{"c/x.v1.jpg>c/x.v1_3.jpg"},
+		},
+		{
+			name:     "a copy does not take a number its annotation folder has",
+			existing: map[string]string{"a/x.jpg": "A", "b/x_2.jpg": "B"},
+			oldXMLs:  []string{"c/Annotations/x_2.xml"},
+			incoming: map[string]string{"c/JPEGImages/x.jpg": "B"},
+			xmls:     []string{"c/Annotations/x.xml"},
+			pairs:    map[string]string{"c/JPEGImages/x.jpg": "c/Annotations/x.xml"},
+			want:     []string{"c/JPEGImages/x.jpg>c/JPEGImages/x_3.jpg c/Annotations/x.xml>c/Annotations/x_3.xml"},
+		},
+		{
+			name:     "a copy in JPEGImages/ without annotation does not take a number Annotations/ has",
+			existing: map[string]string{"a/JPEGImages/n.jpg": "A", "b/JPEGImages/n_2.jpg": "B"},
+			oldXMLs:  []string{"c/Annotations/n_2.xml"},
+			incoming: map[string]string{"c/JPEGImages/n.jpg": "B"},
+			want:     []string{"c/JPEGImages/n.jpg>c/JPEGImages/n_3.jpg"},
+		},
+		{
+			// The same picture twice in one folder: VOC's <filename> decides
+			// which one the annotation belongs to, as before.
+			name:     "identical images in one folder keep their names",
+			incoming: map[string]string{"a/k.jpg": "1", "a/k.JPG": "1"},
+			want:     []string{"a/k.jpg=a/k.JPG"},
+		},
+		{
 			name:     "a copy does not take a number held by images of two contents",
 			existing: map[string]string{"a/n.jpg": "A", "b/n_2.jpg": "B", "d/n_2.jpg": "C"},
 			incoming: map[string]string{"c/n.jpg": "B"},
@@ -209,7 +243,7 @@ func TestPlanRenames(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := planFor(t, tt.existing, tt.incoming, tt.xmls, tt.pairs, tt.onConflict)
+			got := planFor(t, tt.existing, tt.incoming, tt.oldXMLs, tt.xmls, tt.pairs, tt.onConflict)
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("plans = %q\nwant %q", got, tt.want)
 			}
@@ -275,6 +309,173 @@ func TestPlanRenamesManyImagesOfOneName(t *testing.T) {
 	}
 	if digests > n {
 		t.Errorf("hashed %d times for %d images", digests, n)
+	}
+}
+
+func TestPlanRenamesLongNames(t *testing.T) {
+	// Names so long that the number replaces their end (numberedStem):
+	// importing again finds the numbered copy, and copies with extensions
+	// of other lengths are compared by content, not by their index entry.
+	s := strings.Repeat("a", 250)
+	n2 := numberedStem(s, ".jpg", 2)
+	first := planFor(t, nil, map[string]string{"a/" + s + ".jpg": "A", "b/" + s + ".jpg": "B"}, nil, nil, nil, "")
+	if want := []string{"b/" + s + ".jpg>b/" + n2 + ".jpg"}; !slices.Equal(first, want) {
+		t.Fatalf("first import = %q\nwant %q", first, want)
+	}
+	again := planFor(t, map[string]string{"a/" + s + ".jpg": "A", "b/" + n2 + ".jpg": "B"},
+		map[string]string{"a/" + s + ".jpg": "A", "b/" + s + ".jpg": "B"}, nil, nil, nil, "")
+	if want := []string{"b/" + s + ".jpg>b/" + n2 + ".jpg"}; !slices.Equal(again, want) {
+		t.Errorf("imported again = %q\nwant %q", again, want)
+	}
+
+	incoming := map[string]string{}
+	for i, c := range []string{"A", "B", "C", "D", "E", "B"} {
+		ext := ".jpg"
+		if i == 3 || i == 5 {
+			ext = ".jpeg"
+		}
+		incoming[fmt.Sprintf("f%d/%s%s", i, s, ext)] = c
+	}
+	checkPlanInvariants(t, nil, incoming, nil, nil, nil)
+}
+
+// checkPlanInvariants plans the new images incoming (path → content) for a
+// dataset with images existing and XML files existingXMLs, and checks that
+// no numbered name it gives out holds two contents, and that no new image
+// ends up with the path (without extension) of another image or of an XML
+// file it was not paired with.
+func checkPlanInvariants(t *testing.T, existing, incoming map[string]string, existingXMLs, xmls []string, pairs map[string]string) {
+	t.Helper()
+	files := func(m map[string]string) map[string]diskFile {
+		out := map[string]diskFile{}
+		for rel, data := range m {
+			out[rel] = diskFile{Size: int64(len(data))}
+		}
+		return out
+	}
+	content := func(r nameRef) string {
+		if r.staged {
+			return incoming[r.rel]
+		}
+		return existing[r.rel]
+	}
+	same := func(_ context.Context, a, b nameRef) (bool, error) {
+		return a.size == b.size && content(a) == content(b), nil
+	}
+	hashed := map[nameRef]bool{}
+	digest := func(_ context.Context, r nameRef) (string, error) {
+		if hashed[r] {
+			t.Errorf("hashed %s twice", r.rel)
+		}
+		hashed[r] = true
+		return content(r), nil
+	}
+	pl := newNamePlanner(context.Background(), files(existing), existingXMLs, files(incoming), xmls, ConflictSkip, same, digest)
+	plans, err := planRenames(pl, files(incoming), pairs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	final := map[string]string{} // image path → content, after the import
+	maps.Copy(final, existing)
+	renamed := map[string]*renamePlan{}
+	for _, p := range plans {
+		renamed[p.From] = p
+	}
+	for rel, c := range incoming {
+		if _, ok := existing[rel]; ok {
+			continue // skipped
+		}
+		if p := renamed[rel]; p != nil {
+			rel = p.To
+		}
+		if _, ok := final[rel]; ok && existing[rel] != c {
+			t.Errorf("%s holds two images", rel)
+		}
+		final[rel] = c
+	}
+	byName := map[string]map[string]bool{} // lower stem → contents
+	for rel, c := range final {
+		s := nameStem(rel)
+		if byName[s] == nil {
+			byName[s] = map[string]bool{}
+		}
+		byName[s][c] = true
+	}
+	before := map[string]bool{} // path stems of the files before the import
+	for _, rel := range slices.Concat(slices.Collect(maps.Keys(existing)), slices.Collect(maps.Keys(incoming)), existingXMLs, xmls) {
+		before[pathStem(rel)] = true
+	}
+	for _, p := range plans {
+		if p.Identical {
+			continue
+		}
+		if _, reused := existing[p.To]; reused {
+			continue
+		}
+		if len(byName[nameStem(p.To)]) != 1 {
+			t.Errorf("%s: the name %s holds %d contents", p.From, nameStem(p.To), len(byName[nameStem(p.To)]))
+		}
+		if before[pathStem(p.To)] {
+			t.Errorf("%s: renamed to %s, whose name a file there has", p.From, p.To)
+		}
+		if p.XMLTo != "" && before[pathStem(p.XMLTo)] {
+			t.Errorf("%s: annotation renamed to %s, whose name a file there has", p.From, p.XMLTo)
+		}
+	}
+	stems := map[string]string{}
+	for rel := range final {
+		ps := pathStem(rel)
+		if other, ok := stems[ps]; ok {
+			_, a := existing[rel]
+			_, b := existing[other]
+			if (!a || !b) && final[rel] != final[other] { // the same picture twice in one folder keeps its names
+				t.Errorf("%s and %s share a path stem", rel, other)
+			}
+		}
+		stems[ps] = rel
+	}
+}
+
+func TestPlanRenamesInvariants(t *testing.T) {
+	// Random datasets and uploads of a few names, folders, extensions and
+	// contents (of one size and of several).
+	rng := rand.New(rand.NewPCG(1, 2))
+	pick := func(xs ...string) string { return xs[rng.IntN(len(xs))] }
+	for range 3000 {
+		existing, incoming := map[string]string{}, map[string]string{}
+		var oldXMLs, xmls []string
+		pairs := map[string]string{}
+		for range rng.IntN(5) {
+			rel := pick("a/", "b/", "c/", "") + pick("x", "X", "x_2", "x_3", "y.v1", "y.v1_2") + pick(".jpg", ".png", ".jpeg")
+			existing[rel] = pick("A", "B", "C", "DD")
+		}
+		for range rng.IntN(4) {
+			oldXMLs = append(oldXMLs, pick("a/", "b/", "d/", "d/Annotations/")+pick("x_2", "x_3", "y.v1_2", "y.v1_3")+".xml")
+		}
+		for range 1 + rng.IntN(7) {
+			dir := pick("a/", "b/", "c/", "d/", "e/", "d/JPEGImages/", "")
+			stem := pick("x", "X", "x_2", "y.v1", "z")
+			rel := dir + stem + pick(".jpg", ".png", ".jpeg")
+			if _, ok := incoming[rel]; ok {
+				continue
+			}
+			incoming[rel] = pick("A", "B", "C", "DD", "EEE")
+			if rng.IntN(2) == 0 {
+				x := dir + stem + ".xml"
+				if dir == "d/JPEGImages/" {
+					x = "d/Annotations/" + stem + ".xml"
+				}
+				if !slices.Contains(xmls, x) {
+					xmls = append(xmls, x)
+					pairs[rel] = x
+				}
+			}
+		}
+		checkPlanInvariants(t, existing, incoming, oldXMLs, xmls, pairs)
+		if t.Failed() {
+			t.Fatalf("existing %v\nincoming %v\nold XMLs %v\nXMLs %v", existing, incoming, oldXMLs, xmls)
+		}
 	}
 }
 
