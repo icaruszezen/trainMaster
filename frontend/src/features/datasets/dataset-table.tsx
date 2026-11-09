@@ -115,7 +115,7 @@ export function DatasetTable({
                       >
                         {dataset.name}
                       </Link>
-                      <div className="flex min-w-0 items-center gap-2">
+                      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
                         {/* 手机上没有“状态”列，状态显示在名称下方（代替描述）。 */}
                         <DatasetStatusPicker
                           dataset={dataset}

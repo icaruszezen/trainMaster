@@ -121,7 +121,6 @@ import {
   blockingWarning,
   buildPreviewInput,
   CUSTOM_RATIO,
-  defaultSelection,
   defaultUnlistedChoice,
   effectiveCopies,
   effectiveScope,
@@ -142,6 +141,8 @@ import {
   previewWarnings,
   readyReviewVersions,
   scopeOverride,
+  selectionAfterScopeChange,
+  selectionToInclude,
   sourceDisabledReason,
   sourceInputs,
   toggleVersion,
@@ -625,9 +626,12 @@ function NewDataVersionForm({
     }))
   )
   // 空标注的开关只影响“仅有标注的图片”的数据集。
-  const annotatedSelected = rows.some(
-    (row) => isSelected(row.selection) && row.scope === "annotated"
-  )
+  // 还没有选中数据集时按默认的设置。
+  const selectedRows = rows.filter((row) => isSelected(row.selection))
+  const annotatedSelected =
+    selectedRows.length === 0
+      ? draft.scope === "annotated"
+      : selectedRows.some((row) => row.scope === "annotated")
 
   const classes = lastPreview?.classes ?? classList.items
   // 忽略的标签不能是类别：两份列表都算（项目的类别列表可能比上次的预览新）。
@@ -794,17 +798,66 @@ function NewDataVersionForm({
     create.reset()
   }
   /** 修改数据集参与训练的图片；`selection` 同时选中它（原来没有选中时）。 */
-  const setSourceScope = (
-    datasetId: number,
-    scope: ScopeOverride,
-    selection?: SourceSelection
+  /**
+   * 来源随参与训练的图片的修改（见 selectionAfterScopeChange）：`rows` 中的
+   * 数据集改为 `scopeOf(row)` 之后需要修改的来源。
+   */
+  const scopeChangeOverrides = (
+    changed: SourceRowData[],
+    scopeOf: (row: SourceRowData) => TrainingScope,
+    select: boolean
   ) => {
+    const overrides: Record<number, SourceSelection> = {}
+    for (const row of changed) {
+      if (row.disabled) {
+        continue
+      }
+      const scope = scopeOf(row)
+      const next = selectionAfterScopeChange({
+        dataset: row.dataset,
+        versions: row.versions,
+        selection: effectiveSelection({
+          dataset: row.dataset,
+          versions: row.versions,
+          template,
+          override: draft.overrides[row.dataset.id],
+          scope,
+        }),
+        scope,
+        select,
+      })
+      if (next) {
+        overrides[row.dataset.id] = next
+      }
+    }
+    return overrides
+  }
+  /** 修改默认的参与训练的图片（使用默认设置的数据集随之改变）。 */
+  const setDefaultScope = (scope: TrainingScope) => {
+    const overrides = scopeChangeOverrides(
+      rows.filter((row) => row.scopeSetting === ""),
+      () => scope,
+      false
+    )
     setDraft((previous) => ({
       ...previous,
-      scopes: { ...previous.scopes, [datasetId]: scope },
-      overrides: selection
-        ? { ...previous.overrides, [datasetId]: selection }
-        : previous.overrides,
+      scope,
+      overrides: { ...previous.overrides, ...overrides },
+    }))
+    setServerError(null)
+    create.reset()
+  }
+  /** 修改一个数据集参与训练的图片；取背景图时没有选中的数据集一并选中。 */
+  const setSourceScope = (row: SourceRowData, value: ScopeOverride) => {
+    const overrides = scopeChangeOverrides(
+      [row],
+      () => value || draft.scope,
+      true
+    )
+    setDraft((previous) => ({
+      ...previous,
+      scopes: { ...previous.scopes, [row.dataset.id]: value },
+      overrides: { ...previous.overrides, ...overrides },
     }))
     setServerError(null)
     create.reset()
@@ -897,7 +950,7 @@ function NewDataVersionForm({
             rows={rows}
             template={template}
             scope={draft.scope}
-            onScopeChange={(scope) => update({ scope })}
+            onScopeChange={setDefaultScope}
             onSourceScopeChange={setSourceScope}
             previewSources={lastPreview?.sources}
             error={
@@ -1137,11 +1190,7 @@ function SourcesSection({
   /** 默认的参与训练的图片。 */
   scope: TrainingScope
   onScopeChange: (scope: TrainingScope) => void
-  onSourceScopeChange: (
-    datasetId: number,
-    scope: ScopeOverride,
-    selection?: SourceSelection
-  ) => void
+  onSourceScopeChange: (row: SourceRowData, scope: ScopeOverride) => void
   previewSources: DataVersionPreview["sources"] | undefined
   error: string | null
   onChange: (datasetId: number, selection: SourceSelection) => void
@@ -1276,9 +1325,7 @@ function SourcesSection({
               row={row}
               template={template}
               defaultScope={scope}
-              onScopeChange={(value, selection) =>
-                onSourceScopeChange(row.dataset.id, value, selection)
-              }
+              onScopeChange={(value) => onSourceScopeChange(row, value)}
               previewSource={previewSources?.find(
                 (s) => s.dataset_id === row.dataset.id
               )}
@@ -1313,7 +1360,7 @@ function SourceRow({
   row: SourceRowData
   template: DataVersion | null
   defaultScope: TrainingScope
-  onScopeChange: (scope: ScopeOverride, selection?: SourceSelection) => void
+  onScopeChange: (scope: ScopeOverride) => void
   previewSource: DataVersionPreview["sources"][number] | undefined
   onChange: (selection: SourceSelection) => void
 }) {
@@ -1324,22 +1371,9 @@ function SourceRow({
   const unannotated = unannotatedCount(dataset)
   const background = unannotated + dataset.empty_count
 
-  /** 选中这个数据集时的来源：默认的，没有时只选基础标注。 */
-  const selectionFor = (next: TrainingScope) => {
-    const defaults = defaultSelection(dataset, versions, next)
-    return isSelected(defaults)
-      ? defaults
-      : { include_base: true, version_ids: [] }
-  }
   const toggleDataset = (checked: boolean) => {
-    onChange(checked ? selectionFor(scope) : NO_SOURCE)
+    onChange(checked ? selectionToInclude(dataset, versions, scope) : NO_SOURCE)
   }
-  // 为没有选中的数据集选择参与训练的图片时，同时选中它。
-  const changeScope = (value: ScopeOverride) =>
-    onScopeChange(
-      value,
-      selected ? undefined : selectionFor(value || defaultScope)
-    )
 
   return (
     <li
@@ -1419,7 +1453,7 @@ function SourceRow({
             datasetName={dataset.name}
             value={row.scopeSetting}
             defaultScope={defaultScope}
-            onChange={changeScope}
+            onChange={onScopeChange}
           />
           <SourceOption
             checked={selection.include_base}

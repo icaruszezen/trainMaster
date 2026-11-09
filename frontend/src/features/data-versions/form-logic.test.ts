@@ -25,6 +25,8 @@ import {
   ratioDraftOf,
   readyReviewVersions,
   scopeOverride,
+  selectionAfterScopeChange,
+  selectionToInclude,
   sourceDisabledReason,
   sourceInputs,
   templateScope,
@@ -215,6 +217,66 @@ describe("training scopes", () => {
       "background",
       "all",
     ])
+  })
+
+  it("ticks the base when background images are asked for", () => {
+    const reviewed = dataset({ annotated_count: 0, image_count: 40 })
+    // 模板只选了审图版本：改为取背景图时补选基础标注。
+    const onlyReview = { include_base: false, version_ids: [5] }
+    for (const scope of ["background", "all"] as const) {
+      for (const select of [true, false]) {
+        expect(
+          selectionAfterScopeChange({
+            dataset: reviewed,
+            versions: [v5],
+            selection: onlyReview,
+            scope,
+            select,
+          })
+        ).toEqual({ include_base: true, version_ids: [5] })
+      }
+    }
+    // 已经选了基础标注、或改为“仅有标注的图片”时不修改。
+    expect(
+      selectionAfterScopeChange({
+        dataset: reviewed,
+        versions: [v5],
+        selection: { include_base: true, version_ids: [] },
+        scope: "background",
+        select: true,
+      })
+    ).toBeNull()
+    expect(
+      selectionAfterScopeChange({
+        dataset: reviewed,
+        versions: [v5],
+        selection: onlyReview,
+        scope: "annotated",
+        select: true,
+      })
+    ).toBeNull()
+  })
+
+  it("selects an unselected dataset only when it is changed on its own", () => {
+    const background = dataset({ annotated_count: 0, image_count: 40 })
+    const change = (select: boolean) =>
+      selectionAfterScopeChange({
+        dataset: background,
+        versions: [],
+        selection: NO_SOURCE,
+        scope: "background",
+        select,
+      })
+    expect(change(true)).toEqual({ include_base: true, version_ids: [] })
+    expect(change(false)).toBeNull()
+    expect(selectionToInclude(background, [v5], "annotated")).toEqual({
+      include_base: false,
+      version_ids: [5],
+    })
+    expect(selectionToInclude(background, [], "annotated")).toEqual({
+      include_base: true,
+      version_ids: [],
+    })
   })
 
   it("lets the user change a dataset or the default", () => {

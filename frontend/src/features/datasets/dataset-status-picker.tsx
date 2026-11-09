@@ -81,18 +81,35 @@ export function DatasetStatusBadge({
   )
 }
 
-/** 用修改后的数据集更新缓存：详情与数据集列表就地替换，其余重新读取。 */
+/** 项目中的数据集列表（`projectKeys.datasets(id)`）。 */
+const isProjectDatasetsQuery = (query: { queryKey: readonly unknown[] }) => {
+  const [root, detail, , leaf] = query.queryKey
+  return (
+    root === projectKeys.all[0] &&
+    detail === "detail" &&
+    leaf === "datasets" &&
+    query.queryKey.length === 4
+  )
+}
+
+/**
+ * 用修改后的数据集更新缓存：详情、数据集列表与项目中的数据集列表就地替换
+ * （状态按钮与撤销读取的都是它们），之后在后台重新读取。
+ */
 function applyUpdatedDataset(updated: Dataset) {
+  const replace = (old: ListResponse<Dataset> | undefined) =>
+    old && {
+      ...old,
+      items: old.items.map((item) => (item.id === updated.id ? updated : item)),
+    }
   queryClient.setQueryData(datasetKeys.detail(updated.id), updated)
   queryClient.setQueriesData<ListResponse<Dataset>>(
     { queryKey: datasetKeys.lists() },
-    (old) =>
-      old && {
-        ...old,
-        items: old.items.map((item) =>
-          item.id === updated.id ? updated : item
-        ),
-      }
+    replace
+  )
+  queryClient.setQueriesData<ListResponse<Dataset>>(
+    { predicate: isProjectDatasetsQuery },
+    replace
   )
   void queryClient.invalidateQueries({ queryKey: datasetKeys.lists() })
   // 项目中的数据集列表、生成数据版本时的数据集都显示状态。
@@ -154,9 +171,12 @@ export function useSetDatasetStatus() {
 /** 状态的单选列表（状态按钮的菜单与“设置状态”子菜单共用）。 */
 function StatusRadioItems({
   dataset,
+  disabled = false,
   onSelect,
 }: {
   dataset: Dataset
+  /** 正在保存上一次的修改。 */
+  disabled?: boolean
   onSelect: (status: DatasetStatus) => void
 }) {
   return (
@@ -170,7 +190,7 @@ function StatusRadioItems({
       }}
     >
       {DATASET_STATUSES.map((status) => (
-        <DropdownMenuRadioItem key={status} value={status}>
+        <DropdownMenuRadioItem key={status} value={status} disabled={disabled}>
           <DatasetStatusDot status={status} />
           <span className="grid">
             <span>{datasetStatusLabels[status]}</span>
@@ -181,7 +201,11 @@ function StatusRadioItems({
         </DropdownMenuRadioItem>
       ))}
       <DropdownMenuSeparator />
-      <DropdownMenuRadioItem value="none" className="text-muted-foreground">
+      <DropdownMenuRadioItem
+        value="none"
+        disabled={disabled}
+        className="text-muted-foreground"
+      >
         <DatasetStatusDot status="" />
         未设置
       </DropdownMenuRadioItem>
@@ -206,18 +230,23 @@ export function DatasetStatusPicker({
   const { status } = dataset
   const pending = mutation.isPending
 
+  const visible = status ? datasetStatusLabels[status] : "设置状态"
+
   return (
+    // 保存时不禁用按钮（禁用的按钮不能接收焦点，菜单关闭后焦点会丢失），只是
+    // 不再接受新的选择。
     <DropdownMenu modal={false}>
-      <DropdownMenuTrigger asChild disabled={pending}>
+      <DropdownMenuTrigger asChild>
         <button
           type="button"
           className={cn(
-            "group/status inline-flex h-6 shrink-0 items-center gap-1 rounded-full border px-2 text-xs font-medium whitespace-nowrap transition-[color,box-shadow,background-color] outline-none hover:brightness-95 focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-70 data-[state=open]:ring-[3px] data-[state=open]:ring-ring/30 dark:hover:brightness-110",
+            "group/status inline-flex h-6 shrink-0 items-center gap-1 rounded-full border px-2 text-xs font-medium whitespace-nowrap transition-[color,box-shadow,background-color] outline-none hover:brightness-95 focus-visible:ring-[3px] focus-visible:ring-ring/50 aria-busy:opacity-70 data-[state=open]:ring-[3px] data-[state=open]:ring-ring/30 dark:hover:brightness-110",
             datasetStatusStyles[status].badge,
             !status && "hover:bg-muted hover:text-foreground",
             className
           )}
-          aria-label={`数据集状态：${datasetStatusLabels[status]}，点击修改`}
+          aria-label={`${visible}：数据集“${dataset.name}”的状态${status ? "" : "（未设置）"}，点击修改`}
+          aria-busy={pending || undefined}
         >
           {pending ? (
             <Spinner className="size-3" aria-hidden />
@@ -226,7 +255,7 @@ export function DatasetStatusPicker({
           ) : (
             <CircleDot className="size-3" aria-hidden />
           )}
-          {status ? datasetStatusLabels[status] : "设置状态"}
+          {visible}
           <ChevronDown
             className="size-3 opacity-60 transition-transform group-data-[state=open]/status:rotate-180"
             aria-hidden
@@ -239,6 +268,7 @@ export function DatasetStatusPicker({
         </DropdownMenuLabel>
         <StatusRadioItems
           dataset={dataset}
+          disabled={pending}
           onSelect={(next) => mutation.mutate({ dataset, status: next })}
         />
       </DropdownMenuContent>

@@ -146,6 +146,47 @@ export function effectiveSelection({
   return defaultSelection(dataset, versions, scope)
 }
 
+/** 选中一个数据集时的来源：默认的，默认什么都不选时只选基础标注。 */
+export function selectionToInclude(
+  dataset: Pick<Dataset, "annotated_count" | "image_count">,
+  versions: readonly Pick<DatasetVersion, "id">[],
+  scope: TrainingScope
+): SourceSelection {
+  const defaults = defaultSelection(dataset, versions, scope)
+  return isSelected(defaults)
+    ? defaults
+    : { include_base: true, version_ids: [] }
+}
+
+/**
+ * 参与训练的图片改为 `scope` 之后需要的来源修改（不需要时为 null）。
+ * `selection` 是按新的设置得出的来源。背景图（`background` / `all`）来自数据集
+ * 自己的图片，所以：选中了、但没有选基础标注的数据集补选基础标注（模板或用户
+ * 只选了审图版本时）；`select` 时（为单个数据集选择时）没有选中的数据集一并
+ * 选中。改为 `annotated` 时不修改。
+ */
+export function selectionAfterScopeChange({
+  dataset,
+  versions,
+  selection,
+  scope,
+  select,
+}: {
+  dataset: Pick<Dataset, "annotated_count" | "image_count">
+  versions: readonly Pick<DatasetVersion, "id">[]
+  selection: SourceSelection
+  scope: TrainingScope
+  select: boolean
+}): SourceSelection | null {
+  if (scope === "annotated" || dataset.image_count === 0) {
+    return null
+  }
+  if (!isSelected(selection)) {
+    return select ? selectionToInclude(dataset, versions, scope) : null
+  }
+  return selection.include_base ? null : { ...selection, include_base: true }
+}
+
 /** 勾选 / 取消一个审图版本，结果保持新的在前（与 versions 的顺序一致）。 */
 export function toggleVersion(
   selection: SourceSelection,

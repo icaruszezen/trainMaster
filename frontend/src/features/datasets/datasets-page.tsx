@@ -197,6 +197,19 @@ export function DatasetsPage() {
   const projects = useQuery(projectsQuery())
   const projectFilter = useProjectFilter(projects.data?.items)
   const statusFilter = useStatusFilter()
+  // 两个筛选一次清除：分别调用各自的 setFilter 时，后一次会基于渲染时的地址栏
+  // 参数覆盖前一次。
+  const [, setParams] = useSearchParams()
+  const clearFilters = () =>
+    setParams(
+      (previous) => {
+        const updated = new URLSearchParams(previous)
+        updated.delete("project")
+        updated.delete("status")
+        return updated
+      },
+      { replace: true }
+    )
 
   // 不带筛选条件的完整列表用于统计；筛选结果单独查询。
   const all = useQuery(datasetsQuery())
@@ -373,8 +386,7 @@ export function DatasetsPage() {
                   size="sm"
                   onClick={() => {
                     setSearch("")
-                    projectFilter.setFilter(null)
-                    statusFilter.setFilter(null)
+                    clearFilters()
                   }}
                 >
                   清除筛选

@@ -18,6 +18,7 @@ import {
   setDatasetStatus,
 } from "@/features/datasets/dataset-status-picker"
 import { dataset } from "@/features/data-versions/test-fixtures"
+import { projectKeys } from "@/features/projects/api"
 import { queryClient } from "@/lib/query-client"
 
 afterEach(() => {
@@ -96,7 +97,9 @@ describe("status badges", () => {
   it("offers to set the status of an unmarked dataset", () => {
     const html = render(<DatasetStatusPicker dataset={dataset()} />)
     expect(html).toContain("设置状态")
-    expect(html).toContain("数据集状态：未设置，点击修改")
+    expect(html).toContain(
+      "设置状态：数据集“产线A-外观”的状态（未设置），点击修改"
+    )
     const marked = render(
       <DatasetStatusPicker dataset={dataset({ status: "annotating" })} />
     )
@@ -119,6 +122,11 @@ describe("setDatasetStatus", () => {
       items: [before, other],
       total: 2,
     })
+    queryClient.setQueryData(projectKeys.datasets(3), {
+      items: [other, before],
+      total: 2,
+    })
+    queryClient.setQueryData(projectKeys.lists(), { items: [], total: 0 })
     const fetchMock = vi.fn(async () => Response.json(after))
     vi.stubGlobal("fetch", fetchMock)
 
@@ -136,5 +144,14 @@ describe("setDatasetStatus", () => {
       queryClient.getQueryData<{ items: unknown[] }>(datasetKeys.list("", null))
         ?.items
     ).toEqual([after, other])
+    // 项目中的数据集列表也就地替换（状态按钮不会在重新读取前显示旧状态）。
+    expect(
+      queryClient.getQueryData<{ items: unknown[] }>(projectKeys.datasets(3))
+        ?.items
+    ).toEqual([other, after])
+    expect(queryClient.getQueryData(projectKeys.lists())).toEqual({
+      items: [],
+      total: 0,
+    })
   })
 })
