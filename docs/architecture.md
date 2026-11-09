@@ -198,6 +198,7 @@ flowchart LR
 | `GET /api/v1/datasets/{id}/imports` | 导入 / 扫描记录（新的在前）；可按 `annotation_format`、`status` 筛选，`limit` 默认 20 |
 | `POST /api/v1/datasets/{id}/imports` | 创建导入任务：`{source: "archive" \| "folder", file_name, file_size, file_count?, on_conflict?: "skip" \| "overwrite", annotation_format?: "voc" \| "xanylabeling" \| "yolo", classes?: [...]}`（`yolo` 时 `classes` 必填，见“标注格式”） |
 | `GET /api/v1/datasets/{id}/imports/{importId}` | 导入任务状态与进度（前端轮询） |
+| `GET /api/v1/datasets/{id}/imports/{importId}/renames` | 这个任务中的同名图片明细 `{items: [{kind, original_path, path, same_name_as, annotation_path}], total}`，按图片顺序：`kind` 为 `renamed`（改名为 `path`，`annotation_path` 是一并改名的 VOC 文件，没有标注时为 null）或 `identical`（与 `same_name_as` 内容完全相同，保留原名，`path` 与 `original_path` 相同）。可按 `kind` 筛选，`offset` / `limit`（默认 100，最多 500）分页；任务不存在或不属于这个数据集时 404。见第 6 节“同名图片” |
 | `PUT /api/v1/datasets/{id}/imports/{importId}/archive?offset=N` | 上传压缩包的一个分块（原始字节，≤ 64 MiB），`offset` 必须等于已接收字节数，支持断点续传 |
 | `POST /api/v1/datasets/{id}/imports/{importId}/files` | 上传文件夹中的一批文件（multipart，每个文件前带一个 `path` 字段给出相对路径，单次 ≤ 256 MiB） |
 | `POST /api/v1/datasets/{id}/imports/{importId}/commit` | 上传完成，进入后台处理队列 |
@@ -445,16 +446,28 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 | 来源 | 上传 | 后台处理 |
 |---|---|---|
-| 压缩包（`source=archive`） | 浏览器按 8 MiB 分块上传到 `tmp/imports/<任务ID>/`，可断点续传 | 按文件头识别格式（zip、tar、tar.gz / bz2 / xz / zst、7z、rar）→ 解压图片与所选格式的标注文件（zip 中未标记 UTF-8 的文件名按 GB18030 解码；跳过 `..`、绝对路径、符号链接等不安全条目）→ 所有文件位于同一个顶层文件夹时去掉这一层 →（X-AnyLabeling / YOLO）转换为 VOC → 配对标注 → 移入数据集文件夹并建立索引 |
-| 文件夹（`source=folder`） | 浏览器分批（每批 ≤ 64 个文件或 32 MiB，3 路并发）上传图片与所选格式的标注文件，路径相对于所选文件夹 |（X-AnyLabeling / YOLO）转换为 VOC → 配对标注 → 移入数据集文件夹并建立索引 |
-| 扫描（`source=scan`） | — | 遍历数据集文件夹，与索引比对：新增、变化（大小 / 修改时间 / 标注变化）的文件重新解析，已删除的文件移除索引 |
+| 压缩包（`source=archive`） | 浏览器按 8 MiB 分块上传到 `tmp/imports/<任务ID>/`，可断点续传 | 按文件头识别格式（zip、tar、tar.gz / bz2 / xz / zst、7z、rar）→ 解压图片与所选格式的标注文件（zip 中未标记 UTF-8 的文件名按 GB18030 解码；跳过 `..`、绝对路径、符号链接等不安全条目）→ 所有文件位于同一个顶层文件夹时去掉这一层 →（X-AnyLabeling / YOLO）转换为 VOC → 同名图片改名（见下方“同名图片”）→ 配对标注 → 移入数据集文件夹并建立索引 |
+| 文件夹（`source=folder`） | 浏览器分批（每批 ≤ 64 个文件或 32 MiB，3 路并发）上传图片与所选格式的标注文件，路径相对于所选文件夹 |（X-AnyLabeling / YOLO）转换为 VOC → 同名图片改名 → 配对标注 → 移入数据集文件夹并建立索引 |
+| 扫描（`source=scan`） | — | 遍历数据集文件夹，与索引比对：新增、变化（大小 / 修改时间 / 标注变化）的文件重新解析，已删除的文件移除索引。添加已有目录后的第一次扫描先在原文件夹中给同名图片改名 |
 
 - 上传时选择压缩包 / 文件夹中标注文件的格式（`annotation_format`）：`voc`（默认）、`xanylabeling` 或 `yolo`；YOLO 需要同时提供类别顺序（`classes`）。转换规则见下方“标注格式”。
-- 导入到已有数据集时可选择同名文件的处理方式：`skip`（默认，保留已有文件）或 `overwrite`。
+- 导入到已有数据集时可选择路径相同的文件的处理方式：`skip`（默认，保留已有文件）或 `overwrite`。路径不同、名称相同的图片见下方“同名图片”。
 - 任务状态：`uploading` → `queued` → `running` → `succeeded` / `failed` / `canceled`，进度与结果摘要（新增、跳过、匹配标注、无效标注、忽略文件等）写入 `dataset_imports`，前端轮询显示。
 - 开始上传前检查磁盘剩余空间（压缩包需要约 2 倍空间用于解压）；解压时也会持续检查实际剩余空间（始终保留 512 MiB），防止压缩炸弹或同时进行的多个导入写满磁盘。xz / zstd / rar 的解压字典大小有上限，避免构造的压缩包耗尽内存。
 - 任务执行器在进程内运行（2 个 worker，同一数据集的任务串行执行）。服务重启时：执行中的任务标记为失败（已移入数据集的文件可以通过“重新扫描”纳入），排队中的任务重新入队；超过 24 小时未完成的上传自动取消并清理临时文件。
 - 因为任务执行器在进程内，**目前只支持单实例部署**（一个 app 容器）。
+
+### 同名图片
+
+数据集的不同子文件夹中可能有名称相同的图片，如 `cam1/0001.jpg` 与 `cam2/0001.jpg`。平台按路径区分它们，但把图片汇集到一个文件夹、或只按文件名查找标注文件的工具会把它们混在一起，所以导入时给名称被占用、内容又不同的图片换一个名称，连同它的标注文件（`internal/dataset/rename.go`）：
+
+- **名称**不含扩展名、不区分大小写，在数据集的所有文件夹之间比较：`0001.jpg`、`0001.PNG` 与 `0001.bmp` 同名（它们的标注文件 `0001.xml`、`0001.txt`、`0001.json` 也会同名）。
+- **谁改名**：数据集中已有的图片保持原名。新的图片中按图片顺序（见“图片顺序”）第一张、名称又没有被占用的保持原名，之后名称被占用的改为同一文件夹中的 `<名称>_2`（再有就是 `_3`…）：取数据集与这次上传中都没有图片或 XML 文件使用的第一个编号。名称超过 255 字节时截短原名（在字符边界）以放下编号。
+- **标注文件一并改名**：配对的 VOC 文件在它自己的文件夹中同样改名（图片旁边的 `<名称>.xml`，或 `Annotations/` 中的），文件中的 `<filename>` 改为新的文件名，`<path>` 只替换最后的文件名；其余内容逐字节保留（同保存标注时的规则，见“标注”）。X-AnyLabeling 与 YOLO 标注先转换为 VOC，再与图片一起改名，因此 json 中的 `imagePath` 等原始引用不需要处理（原始 json / txt 不保存）。文件无法在保留其它内容的情况下修改（如无法解析）时原样改名。
+- **内容完全相同**（逐字节比较，先比较大小）的图片是同一张图片存了两份，保留原名，记为 `identical`。导入只把路径相同的图片当作重复（跳过或覆盖，见上），路径不同的照常导入；数据版本划分时文件名与大小都相同的 JPEG / PNG 等图片总在同一个划分中（见第 13 节“划分”）。
+- **重复导入**：同一份内容再次导入时，图片会找到第一次导入时得到的名称：数据集中带编号的名称上已有内容相同的图片时直接用它，然后像路径相同的图片一样跳过或覆盖，不会再改成 `_3`。
+- **什么时候改名**：上传压缩包 / 文件夹时在临时文件夹中改名（标注转换之后、移入数据集之前）；添加已有目录时在第一次扫描中直接在原文件夹中改名（`dataset_imports.rename_images`），文件夹不允许修改（如只读）时保留原名并计入 `images_rename_failed`，写入服务日志。之后的重新扫描**不会改名**：图片一旦进入数据集，审图任务、版本等都按路径引用它，在服务器上新增的同名图片需要自己改名。在这之前建立的数据集也不会被改名。
+- **结果**：处理阶段多一个 `renaming`（正在检查同名图片）；结果摘要中有 `images_renamed`（改名的图片数）与 `images_identical`（内容相同、保留原名的图片数，只统计实际导入了的图片：跳过的不计）。明细逐条写入 `dataset_import_renames`，用 `GET …/imports/{importId}/renames` 读取，导入记录中“查看同名图片”打开。
 
 ### 标注格式
 
@@ -543,7 +556,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 因此迁移文件中**不要写 `BEGIN` / `COMMIT`**，也不能包含无法在事务中执行的语句（如 `CREATE INDEX CONCURRENTLY`）。
 - 迁移只向前：**已发布的迁移文件不要修改，也不要改名**，需要变更就新增一个文件。
 - 同一个版本号只能对应一个文件。执行器会比对 `schema_migrations` 中记录的文件名：数据库里已执行过的版本号在当前代码中对应另一个文件名时（典型情况是两个分支各自新增了 `0002_*.sql`，又共用一个开发数据库），启动直接失败并给出两个文件名，而不是悄悄跳过。此时给后合入的那个文件换一个新编号；开发数据库可以删掉 `data/postgres` 重建。
-- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）；`0008_create_models.sql` 建立模型仓库的 `models`、`model_uploads`、`model_exports`（转换任务，同时是转换结果的缓存），并为 `projects` 增加 `model_version_seq`（见第 10 节）；`0009_project_classes.sql` 把类别列表从数据集移到项目（`projects.classes`），带上每个项目中数据集原有的列表，然后删除 `datasets.classes`（见第 6 节“类别列表”）；`0010_create_reviews.sql` 建立模型审图的 `reviews`、`review_datasets`、`review_images`、`review_uploads`、`review_merges`（见第 11 节）；`0011_dataset_versions.sql` 建立数据集的审图版本 `dataset_versions`、`dataset_version_images`，为 `datasets` 增加 `review_version_seq`，为 `review_merges` 增加 `note` 并允许 `on_existing` 为空（见第 11 节“审图版本”）；`0012_recycle_bin.sql` 为 `datasets`、`dataset_versions`、`models`、`projects` 增加 `deleted_at`（回收站），为 `datasets` 增加 `delete_files`，把名称的唯一索引改为只约束使用中的记录，并建立 `recycled_project_datasets`、`recycled_review_datasets`、`recycled_review_images`（见第 12 节）；`0013_data_versions.sql` 建立数据版本的 `data_versions`、`data_version_images`，并为 `projects` 增加 `data_version_seq`（见第 13 节）；`0014_dataset_status.sql` 为 `datasets` 增加状态 `status` 与 `status_updated_at`（见“数据集接口”）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
+- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）；`0008_create_models.sql` 建立模型仓库的 `models`、`model_uploads`、`model_exports`（转换任务，同时是转换结果的缓存），并为 `projects` 增加 `model_version_seq`（见第 10 节）；`0009_project_classes.sql` 把类别列表从数据集移到项目（`projects.classes`），带上每个项目中数据集原有的列表，然后删除 `datasets.classes`（见第 6 节“类别列表”）；`0010_create_reviews.sql` 建立模型审图的 `reviews`、`review_datasets`、`review_images`、`review_uploads`、`review_merges`（见第 11 节）；`0011_dataset_versions.sql` 建立数据集的审图版本 `dataset_versions`、`dataset_version_images`，为 `datasets` 增加 `review_version_seq`，为 `review_merges` 增加 `note` 并允许 `on_existing` 为空（见第 11 节“审图版本”）；`0012_recycle_bin.sql` 为 `datasets`、`dataset_versions`、`models`、`projects` 增加 `deleted_at`（回收站），为 `datasets` 增加 `delete_files`，把名称的唯一索引改为只约束使用中的记录，并建立 `recycled_project_datasets`、`recycled_review_datasets`、`recycled_review_images`（见第 12 节）；`0013_data_versions.sql` 建立数据版本的 `data_versions`、`data_version_images`，并为 `projects` 增加 `data_version_seq`（见第 13 节）；`0014_dataset_status.sql` 为 `datasets` 增加状态 `status` 与 `status_updated_at`（见“数据集接口”）；`0015_import_renames.sql` 为 `dataset_imports` 增加 `rename_images`，并建立导入时同名图片的明细表 `dataset_import_renames`（见第 6 节“同名图片”）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
 
 ## 8. 日志
 

@@ -50,6 +50,7 @@ function job(overrides: Partial<DatasetImport> = {}): DatasetImport {
     source: "archive",
     status: "uploading",
     on_conflict: "skip",
+    rename_images: false,
     annotation_format: "voc",
     classes: [],
     file_name: "batch.zip",

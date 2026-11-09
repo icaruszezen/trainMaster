@@ -162,10 +162,14 @@ type scanResult struct {
 	Total, Added, Updated, Removed, Unchanged int
 	Matched, Invalid, Orphaned, Ignored       int
 	NamesInvalid                              int
+	// The first scan of a folder added as a dataset renames images whose
+	// name is taken (rename.go).
+	renamed                          bool
+	Renamed, Identical, RenameFailed int
 }
 
 func (r scanResult) summary() map[string]int64 {
-	return map[string]int64{
+	m := map[string]int64{
 		sumImagesTotal:        int64(r.Total),
 		sumImagesAdded:        int64(r.Added),
 		sumImagesUpdated:      int64(r.Updated),
@@ -177,6 +181,12 @@ func (r scanResult) summary() map[string]int64 {
 		sumFilesIgnored:       int64(r.Ignored),
 		sumNamesInvalid:       int64(r.NamesInvalid),
 	}
+	if r.renamed {
+		m[sumImagesRenamed] = int64(r.Renamed)
+		m[sumImagesIdentical] = int64(r.Identical)
+		m[sumImagesRenameFailed] = int64(r.RenameFailed)
+	}
+	return m
 }
 
 // errDatasetDirMissing builds the error for a dataset folder that is gone

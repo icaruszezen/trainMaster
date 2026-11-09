@@ -124,7 +124,7 @@ var (
 		"covers", "projects", "version_count", "active_import", "scanned_at", "created_at", "updated_at"}
 	importKeys = []string{"id", "dataset_id", "source", "status", "on_conflict", "annotation_format", "classes", "file_name", "file_size",
 		"file_count", "received_bytes", "received_files", "stage", "progress", "summary", "error",
-		"created_at", "updated_at", "started_at", "finished_at"}
+		"created_at", "updated_at", "started_at", "finished_at", "rename_images"}
 	imageKeys = []string{"id", "dataset_id", "path", "file_name", "size_bytes", "width", "height",
 		"mod_time", "version", "annotation_state", "annotation_path", "annotation"}
 )
@@ -926,4 +926,54 @@ func TestDatasetAPIStatus(t *testing.T) {
 	if got := list("?status=none"); !slices.Equal(got, []int64{a.ID, b.ID}) && !slices.Equal(got, []int64{b.ID, a.ID}) {
 		t.Errorf("status=none after clearing: %v", got)
 	}
+}
+
+func TestDatasetAPIImportRenames(t *testing.T) {
+	e := newAPIEnv(t, true)
+	ds := want[dataset.Dataset](t, e.do("POST", "/api/v1/datasets", map[string]any{"name": "cams"}), 201)
+	base := fmt.Sprintf("/api/v1/datasets/%d", ds.ID)
+	a := string(testPNG(t, 20, 10))
+	archive := testZip(t, [][2]string{
+		{"cam1/0001.png", a},
+		{"cam2/0001.png", string(testPNG(t, 21, 10))},
+		{"cam2/0001.xml", testVOC("0001.png", "dent")},
+		{"cam3/0001.png", a},
+	})
+	job := want[dataset.Import](t, e.do("POST", base+"/imports", map[string]any{"source": "archive", "file_name": "cams.zip", "file_size": len(archive)}), 201)
+	if !job.RenameImages {
+		t.Errorf("an upload should rename images whose name is taken: %+v", job)
+	}
+	jobURL := fmt.Sprintf("%s/imports/%d", base, job.ID)
+	want[dataset.Import](t, e.do("PUT", jobURL+"/archive?offset=0", archive), 200)
+	want[dataset.Import](t, e.do("POST", jobURL+"/commit", nil), http.StatusAccepted)
+	job = e.waitImport(t, ds.ID, job.ID)
+	if job.Status != dataset.StatusSucceeded || job.Summary["images_renamed"] != 1 || job.Summary["images_identical"] != 1 {
+		t.Fatalf("import = %+v", job)
+	}
+
+	raw := want[map[string]any](t, e.do("GET", jobURL+"/renames", nil), 200)
+	items := raw["items"].([]any)
+	if raw["total"] != float64(2) || len(items) != 2 {
+		t.Fatalf("renames = %v", raw)
+	}
+	wantKeys(t, "rename", items[0].(map[string]any), "kind", "original_path", "path", "same_name_as", "annotation_path")
+	renames := want[List[dataset.ImageRename]](t, e.do("GET", jobURL+"/renames", nil), 200).Items
+	if r := renames[0]; r.Kind != "renamed" || r.OriginalPath != "cam2/0001.png" || r.Path != "cam2/0001_2.png" ||
+		r.SameNameAs != "cam1/0001.png" || r.AnnotationPath == nil || *r.AnnotationPath != "cam2/0001_2.xml" {
+		t.Errorf("renamed = %+v", r)
+	}
+	if r := renames[1]; r.Kind != "identical" || r.Path != "cam3/0001.png" || r.AnnotationPath != nil {
+		t.Errorf("identical = %+v", r)
+	}
+	page := want[List[dataset.ImageRename]](t, e.do("GET", jobURL+"/renames?kind=identical&offset=0&limit=1", nil), 200)
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].Kind != "identical" {
+		t.Errorf("identical page = %+v", page)
+	}
+	if page := want[List[dataset.ImageRename]](t, e.do("GET", jobURL+"/renames?offset=5", nil), 200); page.Total != 2 || page.Items == nil || len(page.Items) != 0 {
+		t.Errorf("page past the end = %+v", page)
+	}
+	wantError(t, e.do("GET", jobURL+"/renames?kind=moved", nil), 400, codeBadRequest, "参数 kind 无效")
+	wantError(t, e.do("GET", jobURL+"/renames?limit=501", nil), 400, codeBadRequest, "limit")
+	wantError(t, e.do("GET", base+"/imports/77777/renames", nil), 404, codeNotFound, "导入任务不存在")
+	wantError(t, e.do("GET", fmt.Sprintf("/api/v1/datasets/88888/imports/%d/renames", job.ID), nil), 404, codeNotFound, "数据集不存在")
 }

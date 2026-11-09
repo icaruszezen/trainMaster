@@ -47,12 +47,12 @@ const conflictOptions: {
   {
     value: "skip",
     label: "跳过",
-    description: "保留数据集中已有的图片与标注，不导入同名文件",
+    description: "保留数据集中已有的图片与标注，不导入路径相同的文件",
   },
   {
     value: "overwrite",
     label: "覆盖",
-    description: "用导入的图片替换同名图片；导入中带标注时一并替换标注",
+    description: "用导入的图片替换路径相同的图片；导入中带标注时一并替换标注",
   },
 ]
 
@@ -219,7 +219,7 @@ export function ImportDialog({
           />
 
           <div className="grid gap-3">
-            <Label id={conflictId}>同名文件</Label>
+            <Label id={conflictId}>路径相同的文件</Label>
             <RadioGroup
               value={onConflict}
               onValueChange={(value) => setOnConflict(value as ConflictPolicy)}
@@ -261,6 +261,11 @@ export function ImportDialog({
                 )
               })}
             </RadioGroup>
+            <p className="text-xs text-muted-foreground">
+              不同子文件夹中名称相同、内容不同的图片会自动改名（如{" "}
+              <code className="font-mono">cam2/0001_2.jpg</code>
+              ），标注文件一并改名，可在导入记录中查看。
+            </p>
           </div>
 
           {error && (

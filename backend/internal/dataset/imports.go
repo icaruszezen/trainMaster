@@ -90,7 +90,7 @@ func (s *Service) CreateImport(ctx context.Context, datasetID int64, in CreateIm
 func validateImportInput(datasetID int64, in CreateImportInput) (newImport, error) {
 	invalid := func(msg string) (newImport, error) { return newImport{}, &Error{Kind: ErrInvalid, Message: msg} }
 	n := newImport{DatasetID: datasetID, Source: in.Source, Status: StatusUploading, FileSize: in.FileSize,
-		FileCount: in.FileCount, OnConflict: in.OnConflict, FileName: strings.TrimSpace(in.FileName)}
+		FileCount: in.FileCount, OnConflict: in.OnConflict, FileName: strings.TrimSpace(in.FileName), RenameImages: true}
 	switch {
 	case n.Source != SourceArchive && n.Source != SourceFolder:
 		return invalid("导入类型必须是 archive（压缩包）或 folder（文件夹）")
