@@ -65,8 +65,10 @@ func scanVersionWith(row pgx.Row, extra ...any) (DataVersion, error) {
 	return v, nil
 }
 
-// normalizeVersion makes the slices of v non-nil and its times UTC.
+// normalizeVersion makes the slices of v non-nil, its times UTC and gives
+// the versions created before scopes theirs.
 func normalizeVersion(v *DataVersion) {
+	normalizeScopes(&v.Config, v.Sources)
 	if v.Classes == nil {
 		v.Classes = []Class{}
 	}
@@ -89,6 +91,19 @@ func normalizeVersion(v *DataVersion) {
 	}
 	v.CreatedAt, v.UpdatedAt = v.CreatedAt.UTC(), v.UpdatedAt.UTC()
 	v.StartedAt, v.FinishedAt = utcPtr(v.StartedAt), utcPtr(v.FinishedAt)
+}
+
+// normalizeScopes gives a version created before scopes (no scope stored)
+// the scope it was built with: ScopeAnnotated, for all of its sources.
+func normalizeScopes(cfg *Config, sources []Source) {
+	if cfg.Scope == "" {
+		cfg.Scope = ScopeAnnotated
+	}
+	for i := range sources {
+		if sources[i].Scope == "" {
+			sources[i].Scope = cfg.Scope
+		}
+	}
 }
 
 func utcPtr(t *time.Time) *time.Time {

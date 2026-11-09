@@ -234,6 +234,7 @@ func (s *Service) claim(ctx context.Context) (*buildJob, error) {
 	if err != nil {
 		return nil, fmt.Errorf("claim a queued data version: %w", err)
 	}
+	normalizeScopes(&j.Config, j.Sources) // queued before scopes existed
 	return &j, nil
 }
 
@@ -588,6 +589,7 @@ func (b *build) prepare() error {
 // (counted).
 func (b *build) prepareImage(source int, snap *dataset.Snapshot, img dataset.SnapshotImage) (*buildImage, error) {
 	skipped := &b.stats.Skipped
+	scope := b.job.Sources[source].Scope
 	var objects []dataset.AnnotationObject
 	var annW, annH int
 	switch {
@@ -597,8 +599,11 @@ func (b *build) prepareImage(source int, snap *dataset.Snapshot, img dataset.Sna
 			annW, annH = *img.VersionWidth, *img.VersionHeight
 		}
 	case img.AnnotationPath == nil:
-		skipped.Unannotated++
-		return nil, nil
+		if scope == ScopeAnnotated {
+			skipped.Unannotated++
+			return nil, nil
+		}
+		// A background image: no objects.
 	default:
 		voc, err := readVOC(snap.Root, *img.AnnotationPath)
 		if err != nil {
@@ -606,6 +611,10 @@ func (b *build) prepareImage(source int, snap *dataset.Snapshot, img dataset.Sna
 			return nil, nil
 		}
 		objects, annW, annH = voc.Objects, voc.Width, voc.Height
+	}
+	if scope == ScopeBackground && len(objects) > 0 {
+		skipped.WithObjects++
+		return nil, nil
 	}
 	if !dataset.IsTrainableImage(img.RelPath) {
 		skipped.UnsupportedFormat++
@@ -647,7 +656,7 @@ func (b *build) prepareImage(source int, snap *dataset.Snapshot, img dataset.Sna
 		return nil, nil
 	}
 	r := b.filter.objects(objects, w, h)
-	if len(r.kept) == 0 && !b.filter.includeEmpty {
+	if len(r.kept) == 0 && !b.filter.takesNegatives(scope) {
 		skipped.Empty++
 		return nil, nil
 	}

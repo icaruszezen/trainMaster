@@ -50,6 +50,7 @@ type manifestSource struct {
 	DirName     string          `json:"dir_name"`
 	IncludeBase bool            `json:"include_base"`
 	Versions    []SourceVersion `json:"versions"`
+	Scope       string          `json:"scope"`
 	ImageCount  int             `json:"image_count"`
 }
 
@@ -76,7 +77,8 @@ func newManifest(v DataVersion) manifest {
 			versions = []SourceVersion{}
 		}
 		m.Sources = append(m.Sources, manifestSource{DatasetID: src.DatasetID, DatasetName: src.DatasetName,
-			DirName: src.DirName, IncludeBase: src.IncludeBase, Versions: versions, ImageCount: src.ImageCount})
+			DirName: src.DirName, IncludeBase: src.IncludeBase, Versions: versions, Scope: src.Scope,
+			ImageCount: src.ImageCount})
 	}
 	return m
 }

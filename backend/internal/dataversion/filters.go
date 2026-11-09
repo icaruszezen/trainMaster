@@ -5,14 +5,17 @@ import (
 )
 
 // Filters (过滤): which images a version takes and which of their objects.
-// An image without an annotation, or with an annotation file that cannot
-// be read, is never taken. Objects of the ignored labels are dropped; any
-// other label not in the class list makes the image skipped (unlisted: it
-// may show a real defect that would otherwise train as background). An
-// image left without objects is a negative sample, taken only with
-// include_empty. Boxes are clipped to the image; a box without area after
-// clipping is dropped (degenerate). The preview applies the same rules to
-// the label counts of the index.
+// An image with an annotation file that cannot be read is never taken. The
+// scope of its source decides about the rest (see ScopeAnnotated): an
+// image without an annotation is taken, as a negative sample, only by the
+// background and all scopes; an image with objects is skipped by the
+// background scope. Objects of the ignored labels are dropped; any other
+// label not in the class list makes the image skipped (unlisted: it may
+// show a real defect that would otherwise train as background). An image
+// left without objects is a negative sample: the annotated scope takes it
+// only with include_empty, the others always. Boxes are clipped to the
+// image; a box without area after clipping is dropped (degenerate). The
+// preview applies the same rules to the label counts of the index.
 
 // labelFilter holds the class list and the ignored labels of a version.
 type labelFilter struct {
@@ -55,6 +58,22 @@ func (f labelFilter) counts(labels map[string]int) countResult {
 		}
 	}
 	return r
+}
+
+// takesNegatives reports whether a source with the scope takes the images
+// left without objects.
+func (f labelFilter) takesNegatives(scope string) bool {
+	return scope != ScopeAnnotated || f.includeEmpty
+}
+
+// hasObjects reports whether label counts have an object.
+func hasObjects(labels map[string]int) bool {
+	for _, n := range labels {
+		if n > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (f labelFilter) has(name string) bool {
