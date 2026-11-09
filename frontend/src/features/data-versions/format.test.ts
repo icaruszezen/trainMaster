@@ -247,7 +247,7 @@ describe("training scopes", () => {
         sources: [source, { ...source, scope: "all" }],
       })
     ).toBe(
-      "不纳入空标注图片（仅有标注的图片的数据集），其它数据集纳入没有目标的图片"
+      "不纳入空标注图片（“仅有标注的图片”的数据集），其它数据集纳入没有目标的图片"
     )
     expect(
       negativesText({ config, sources: [{ ...source, scope: "background" }] })

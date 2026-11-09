@@ -272,7 +272,7 @@ export function negativesText(v: Pick<DataVersion, "config" | "sources">) {
     return "纳入没有目标的图片"
   }
   return annotated < v.sources.length
-    ? `${setting}（${TRAINING_SCOPE_LABELS.annotated}的数据集），其它数据集纳入没有目标的图片`
+    ? `${setting}（“${TRAINING_SCOPE_LABELS.annotated}”的数据集），其它数据集纳入没有目标的图片`
     : setting
 }
 
