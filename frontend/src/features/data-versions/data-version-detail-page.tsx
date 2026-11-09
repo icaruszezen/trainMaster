@@ -72,6 +72,7 @@ import {
   augmentationText,
   classSplitWarnings,
   compareText,
+  customScopeCount,
   dataVersionAddedBytes,
   dataVersionFullTitle,
   dataVersionTitle,
@@ -79,6 +80,7 @@ import {
   emptyClasses,
   GROUP_BY_DESCRIPTIONS,
   GROUP_BY_LABELS,
+  negativesText,
   progressPercent,
   progressText,
   queueText,
@@ -89,6 +91,8 @@ import {
   splitSummary,
   storageCountsText,
   storageText,
+  TRAINING_SCOPE_HINTS,
+  TRAINING_SCOPE_LABELS,
   versionSplitCounts,
 } from "@/features/data-versions/format"
 import {
@@ -691,6 +695,15 @@ function SourceList({ version }: { version: DataVersion }) {
             )}
           </div>
           <div className="flex flex-wrap gap-1.5">
+            {source.scope !== version.config.scope && (
+              <Badge
+                variant="outline"
+                className="border-primary/40 bg-primary/5 font-normal"
+                title={TRAINING_SCOPE_HINTS[source.scope]}
+              >
+                {TRAINING_SCOPE_LABELS[source.scope]}
+              </Badge>
+            )}
             {source.include_base && (
               <Badge variant="secondary" className="font-normal">
                 基础标注
@@ -747,9 +760,17 @@ function SettingsList({ version }: { version: DataVersion }) {
           "不沿用，全部按比例划分"
         )}
       </InfoRow>
-      <InfoRow label="负样本">
-        {config.include_empty ? "纳入空标注图片" : "不纳入空标注图片"}
+      <InfoRow label="参与训练">
+        <span title={TRAINING_SCOPE_HINTS[config.scope]}>
+          {TRAINING_SCOPE_LABELS[config.scope]}
+        </span>
+        {customScopeCount(version) > 0 && (
+          <span className="text-muted-foreground tabular-nums">
+            （{formatNumber(customScopeCount(version))} 个数据集单独设置）
+          </span>
+        )}
       </InfoRow>
+      <InfoRow label="负样本">{negativesText(version)}</InfoRow>
       <InfoRow label="忽略的标签">
         {config.ignore_labels.length > 0 ? (
           <span className="flex flex-wrap gap-1">

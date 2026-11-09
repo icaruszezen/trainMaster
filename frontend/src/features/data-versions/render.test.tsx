@@ -168,6 +168,7 @@ describe("DataVersionOverview", () => {
               dir_name: "line_a",
               include_base: true,
               versions: [{ id: 5, name: "审图1.2" }],
+              scope: "annotated",
               image_count: 120,
               dataset_deleted: true,
             },

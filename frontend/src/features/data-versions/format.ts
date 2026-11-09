@@ -24,6 +24,7 @@ import {
   type SplitConfig,
   type SplitCounts,
   type StoredKind,
+  type TrainingScope,
 } from "@/features/data-versions/api"
 import { augmentMethodsText } from "@/features/data-versions/augmentations"
 
@@ -231,6 +232,50 @@ export function randomSeed(current: number | null, random = Math.random) {
   }
 }
 
+// ---- 参与训练的图片 ----
+
+/** 参与训练的图片的选项，按界面上的顺序（第一个是默认值）。 */
+export const TRAINING_SCOPES: readonly TrainingScope[] = [
+  "annotated",
+  "background",
+  "all",
+]
+
+export const TRAINING_SCOPE_LABELS: Record<TrainingScope, string> = {
+  annotated: "仅有标注的图片",
+  background: "仅无标注的背景图",
+  all: "整个数据集",
+}
+
+/** 各选项的说明。 */
+export const TRAINING_SCOPE_HINTS: Record<TrainingScope, string> = {
+  annotated:
+    "纳入有目标的图片（按“过滤”中的设置纳入空标注图片），没有标注的图片不纳入。",
+  background:
+    "只纳入没有目标的图片（没有标注文件或空标注）作为负样本，有目标的图片不纳入。",
+  all: "纳入全部图片：有目标的图片照常训练，没有目标的图片作为负样本。",
+}
+
+/** 单独设置了参与训练的图片（与版本的默认不同）的数据集数。 */
+export function customScopeCount(v: Pick<DataVersion, "config" | "sources">) {
+  return v.sources.filter((source) => source.scope !== v.config.scope).length
+}
+
+/**
+ * 版本的负样本设置：空标注的开关只影响“仅有标注的图片”的数据集，其它数据集
+ * 总是纳入没有目标的图片。
+ */
+export function negativesText(v: Pick<DataVersion, "config" | "sources">) {
+  const annotated = v.sources.filter((s) => s.scope === "annotated").length
+  const setting = v.config.include_empty ? "纳入空标注图片" : "不纳入空标注图片"
+  if (annotated === 0 && v.sources.length > 0) {
+    return "纳入没有目标的图片"
+  }
+  return annotated < v.sources.length
+    ? `${setting}（${TRAINING_SCOPE_LABELS.annotated}的数据集），其它数据集纳入没有目标的图片`
+    : setting
+}
+
 // ---- 跳过的图片 ----
 
 export const SKIPPED_LABELS: Record<keyof DataVersionSkipped, string> = {
@@ -238,6 +283,7 @@ export const SKIPPED_LABELS: Record<keyof DataVersionSkipped, string> = {
   invalid: "标注文件无法读取",
   unlisted: "含有不在类别列表中的标签",
   empty: "空标注（未纳入负样本）",
+  with_objects: "有目标（只取背景图的数据集）",
   missing: "文件已不存在",
   changed: "文件在上次扫描后被修改",
   unknown_size: "无法读取图片尺寸",
@@ -248,7 +294,10 @@ export const SKIPPED_LABELS: Record<keyof DataVersionSkipped, string> = {
 /** 各原因的说明（悬停或详情中显示）。 */
 export const SKIPPED_HINTS: Partial<Record<keyof DataVersionSkipped, string>> =
   {
-    unannotated: "没有标注文件，也没有审图标注的图片不会纳入。",
+    unannotated:
+      "参与训练的图片为“仅有标注的图片”的数据集中，没有标注文件、也没有审图标注的图片不会纳入。",
+    with_objects:
+      "参与训练的图片为“仅无标注的背景图”的数据集中，有目标的图片不会纳入。",
     unlisted:
       "图片中有不在项目类别列表中、也没有选择忽略的标签：这些框可能是真实缺陷，纳入后会被当作背景。",
     changed: "重新扫描数据集后再生成即可纳入。",
@@ -261,6 +310,7 @@ const SKIPPED_ORDER: (keyof DataVersionSkipped)[] = [
   "invalid",
   "unlisted",
   "empty",
+  "with_objects",
   "missing",
   "changed",
   "unknown_size",
@@ -406,7 +456,11 @@ export function emptyClasses(labels: readonly DataVersionLabelStats[]) {
 export function previewSourceText(
   source: Pick<
     DataVersionPreview["sources"][number],
-    "selected_count" | "image_count" | "from_versions" | "by_folder"
+    | "selected_count"
+    | "image_count"
+    | "from_versions"
+    | "by_folder"
+    | "negatives"
   >
 ) {
   const parts = [
@@ -416,6 +470,9 @@ export function previewSourceText(
         ? `（${formatNumber(source.from_versions)} 张用审图标注）`
         : ""),
   ]
+  if (source.negatives > 0) {
+    parts.push(`负样本 ${formatNumber(source.negatives)} 张`)
+  }
   if (source.by_folder > 0) {
     parts.push(`${formatNumber(source.by_folder)} 张按文件夹划分`)
   }

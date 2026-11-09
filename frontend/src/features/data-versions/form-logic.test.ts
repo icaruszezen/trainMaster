@@ -7,6 +7,7 @@ import {
   defaultSelection,
   defaultUnlistedChoice,
   effectiveCopies,
+  effectiveScope,
   effectiveSelection,
   fieldOfServerError,
   ignoreLabels,
@@ -16,14 +17,17 @@ import {
   mergeKnownUnlisted,
   missingTemplateReviewVersions,
   missingTemplateSources,
+  NO_SOURCE,
   notInTemplate,
   parseAugmentation,
   parseRatio,
   previewWarnings,
   ratioDraftOf,
   readyReviewVersions,
+  scopeOverride,
   sourceDisabledReason,
   sourceInputs,
+  templateScope,
   toggleVersion,
   type FormDraft,
 } from "@/features/data-versions/form-logic"
@@ -89,6 +93,7 @@ describe("default sources", () => {
             { id: 5, name: "审图1.2" },
             { id: 4, name: "审图1.1（已删除）" },
           ],
+          scope: "annotated",
           image_count: 0,
           dataset_deleted: false,
         },
@@ -136,12 +141,95 @@ describe("default sources", () => {
     expect(
       sourceInputs([
         { datasetId: 1, selection: { include_base: true, version_ids: [] } },
-        { datasetId: 2, selection: { include_base: false, version_ids: [] } },
-        { datasetId: 3, selection: { include_base: false, version_ids: [8] } },
+        {
+          datasetId: 2,
+          selection: { include_base: false, version_ids: [] },
+          scope: "all",
+        },
+        {
+          datasetId: 3,
+          selection: { include_base: false, version_ids: [8] },
+          scope: "background",
+        },
       ])
     ).toEqual([
-      { dataset_id: 1, include_base: true, version_ids: [] },
-      { dataset_id: 3, include_base: false, version_ids: [8] },
+      { dataset_id: 1, include_base: true, version_ids: [], scope: "" },
+      {
+        dataset_id: 3,
+        include_base: false,
+        version_ids: [8],
+        scope: "background",
+      },
+    ])
+  })
+
+  it("takes the base of an unannotated dataset for background images", () => {
+    const unannotated = dataset({ annotated_count: 0, image_count: 40 })
+    expect(defaultSelection(unannotated, [], "annotated")).toEqual(NO_SOURCE)
+    for (const scope of ["background", "all"] as const) {
+      expect(defaultSelection(unannotated, [v5], scope)).toEqual({
+        include_base: true,
+        version_ids: [5],
+      })
+      expect(
+        effectiveSelection({
+          dataset: unannotated,
+          versions: [],
+          template: null,
+          override: undefined,
+          scope,
+        })
+      ).toEqual({ include_base: true, version_ids: [] })
+    }
+    // 没有图片的数据集不能选择。
+    expect(
+      defaultSelection(
+        dataset({ annotated_count: 0, image_count: 0 }),
+        [],
+        "all"
+      )
+    ).toEqual(NO_SOURCE)
+  })
+})
+
+describe("training scopes", () => {
+  const template = dataVersion({
+    config: { ...dataVersion().config, scope: "all" },
+    sources: [
+      { ...dataVersion().sources[0], dataset_id: 1, scope: "all" },
+      { ...dataVersion().sources[0], dataset_id: 2, scope: "background" },
+    ],
+  })
+
+  it("starts from the template's default and its datasets' own settings", () => {
+    expect(initialDraft(null).scope).toBe("annotated")
+    const draft = initialDraft(template)
+    expect(draft.scope).toBe("all")
+    // 与模板默认相同的数据集使用默认；不同的单独设置；不在模板中的使用默认。
+    expect(templateScope(template, 1)).toBe("")
+    expect(templateScope(template, 2)).toBe("background")
+    expect(templateScope(template, 3)).toBe("")
+    expect(templateScope(null, 2)).toBe("")
+    expect([1, 2, 3].map((id) => effectiveScope(draft, template, id))).toEqual([
+      "all",
+      "background",
+      "all",
+    ])
+  })
+
+  it("lets the user change a dataset or the default", () => {
+    const draft = {
+      ...initialDraft(template),
+      scope: "annotated" as const,
+      scopes: { 1: "background" as const, 2: "" as const },
+    }
+    expect(scopeOverride(draft, template, 1)).toBe("background")
+    // 改回“使用默认”覆盖模板中的设置。
+    expect(scopeOverride(draft, template, 2)).toBe("")
+    expect([1, 2, 3].map((id) => effectiveScope(draft, template, id))).toEqual([
+      "background",
+      "annotated",
+      "annotated",
     ])
   })
 })
@@ -213,6 +301,7 @@ describe("prefill", () => {
           use_folders: false,
           group_by: "folder",
         },
+        scope: "background",
         include_empty: false,
         ignore_labels: ["dirt"],
         augmentation: {
@@ -238,6 +327,8 @@ describe("prefill", () => {
     expect(draft.use_folders).toBe(false)
     expect(draft.group_by).toBe("folder")
     expect(draft.include_empty).toBe(false)
+    expect(draft.scope).toBe("background")
+    expect(draft.scopes).toEqual({})
     expect(draft.augment).toEqual({
       enabled: true,
       methods: ["hflip", "noise"],
@@ -331,7 +422,9 @@ describe("augmentation", () => {
 
 describe("buildPreviewInput", () => {
   const draft: FormDraft = initialDraft(null)
-  const sources = [{ dataset_id: 1, include_base: true, version_ids: [5] }]
+  const sources = [
+    { dataset_id: 1, include_base: true, version_ids: [5], scope: "" as const },
+  ]
 
   it("builds the request", () => {
     expect(
@@ -348,6 +441,7 @@ describe("buildPreviewInput", () => {
           use_folders: true,
           group_by: "stem",
         },
+        scope: "annotated",
         include_empty: true,
         ignore_labels: ["dirt"],
         augmentation: null,
@@ -419,6 +513,35 @@ describe("previewWarnings", () => {
     expect(warnings.map((w) => w.key)).toEqual(["empty"])
   })
 
+  it("warns about a selected dataset none of whose images are taken", () => {
+    const source = {
+      dataset_id: 4,
+      dataset_name: "背景",
+      scope: "background" as const,
+      selected_count: 30,
+      from_versions: 0,
+      image_count: 0,
+      negatives: 0,
+      by_folder: 0,
+    }
+    const warnings = previewWarnings(
+      preview({
+        sources: [
+          source,
+          { ...source, dataset_id: 5, image_count: 30, negatives: 30 },
+          { ...source, dataset_id: 6, selected_count: 0 },
+        ],
+      }),
+      0
+    )
+    expect(warnings.map((w) => [w.key, w.tone])).toEqual([
+      ["source:4", "warning"],
+    ])
+    expect(warnings[0]?.text).toContain(
+      "数据集“背景”选中的 30 张图片都不会纳入"
+    )
+  })
+
   it("refuses too many augmented images", () => {
     expect(
       previewWarnings(preview({ augmented_count: 100_001 }), 0)[0]?.key
@@ -441,6 +564,11 @@ describe("server errors", () => {
     )
     expect(fieldOfServerError("忽略的标签“scratch”在类别列表中")).toBe("labels")
     expect(fieldOfServerError("数据集“A”不在项目中")).toBe("sources")
+    expect(
+      fieldOfServerError(
+        "参与训练的图片无效：应为 annotated（仅有标注的图片）、background（仅无标注的背景图）或 all（整个数据集）"
+      )
+    ).toBe("sources")
     // 名称中的字词不影响判断。
     expect(fieldOfServerError("数据集“产线A 副本”不在项目中")).toBe("sources")
     expect(fieldOfServerError("审图版本“划分备注”还没有生成完成")).toBe(
