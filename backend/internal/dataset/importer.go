@@ -53,9 +53,12 @@ func (s *Service) renameScanned(ctx context.Context, d Dataset, job Import, res 
 		return err
 	}
 	defer root.Close()
-	plans, r, err := s.renameInPlace(ctx, root, p)
+	seq := 0
+	r, err := s.renameInPlace(ctx, root, p, func(plans []*renamePlan) {
+		s.recordRenames(job.ID, seq, plans)
+		seq += len(plans)
+	})
 	res.Renamed, res.Identical, res.RenameFailed = r.Renamed, r.Identical, r.Failed
-	s.recordRenames(job.ID, plans)
 	return err
 }
 
@@ -166,7 +169,7 @@ func (s *Service) runImport(ctx context.Context, d Dataset, job Import, p *progr
 	moved, err := s.moveStaged(ctx, root, staged, job.OnConflict, unconverted, renames, sum, p)
 	err = diskFull(err)
 	if len(plans) > 0 {
-		s.recordRenames(job.ID, slices.DeleteFunc(plans, func(plan *renamePlan) bool { return !plan.placed }))
+		s.recordRenames(job.ID, 0, slices.DeleteFunc(plans, func(plan *renamePlan) bool { return !plan.placed }))
 	}
 	if moved > 0 || err == nil {
 		res, serr := s.syncIndex(s.indexContext(), d, p)

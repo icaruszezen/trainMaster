@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -37,7 +39,14 @@ func planFor(t *testing.T, existing, incoming map[string]string, xmls []string, 
 		}
 		return a.size == b.size && content(a) == content(b), nil
 	}
-	pl := newNamePlanner(context.Background(), files(existing), nil, files(incoming), xmls, onConflict, same)
+	content := func(r nameRef) string {
+		if r.staged {
+			return incoming[r.rel]
+		}
+		return existing[r.rel]
+	}
+	digest := func(_ context.Context, r nameRef) (string, error) { return content(r), nil }
+	pl := newNamePlanner(context.Background(), files(existing), nil, files(incoming), xmls, onConflict, same, digest)
 	plans, err := planRenames(pl, files(incoming), pairs, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -159,6 +168,40 @@ func TestPlanRenames(t *testing.T) {
 			want:     []string{"a/k.png>a/k_2.png a/k.xml>a/k_2.xml"},
 		},
 		{
+			name:     "a copy of a renamed image gets the same number in its folder",
+			incoming: map[string]string{"cam1/0001.jpg": "A", "cam2/0001.jpg": "B", "cam3/0001.jpg": "B", "cam4/0001.jpg": "C"},
+			xmls:     []string{"cam3/0001.xml"},
+			pairs:    map[string]string{"cam3/0001.jpg": "cam3/0001.xml"},
+			want: []string{"cam2/0001.jpg>cam2/0001_2.jpg", "cam3/0001.jpg>cam3/0001_2.jpg cam3/0001.xml>cam3/0001_2.xml",
+				"cam4/0001.jpg>cam4/0001_3.jpg"},
+		},
+		{
+			name:     "a copy of an image renamed by an earlier import",
+			existing: map[string]string{"cam1/0001.jpg": "A", "cam2/0001_2.jpg": "B"},
+			incoming: map[string]string{"cam3/0001.jpg": "B"},
+			want:     []string{"cam3/0001.jpg>cam3/0001_2.jpg"},
+		},
+		{
+			name:     "a copy does not take a number its folder already has",
+			existing: map[string]string{"a/n.jpg": "A", "b/n_2.jpg": "B"},
+			incoming: map[string]string{"c/n.jpg": "B"},
+			xmls:     []string{"c/n_2.xml"},
+			want:     []string{"c/n.jpg>c/n_3.jpg"},
+		},
+		{
+			name:     "a copy does not take a number held by images of two contents",
+			existing: map[string]string{"a/n.jpg": "A", "b/n_2.jpg": "B", "d/n_2.jpg": "C"},
+			incoming: map[string]string{"c/n.jpg": "B"},
+			want:     []string{"c/n.jpg>c/n_3.jpg"},
+		},
+		{
+			name: "copies among many numbers of one size",
+			incoming: map[string]string{"x1/f.bmp": "A", "x2/f.bmp": "B", "x3/f.bmp": "C", "x4/f.bmp": "D",
+				"x5/f.bmp": "C", "x6/f.bmp": "B", "x7/f.bmp": "E"},
+			want: []string{"x2/f.bmp>x2/f_2.bmp", "x3/f.bmp>x3/f_3.bmp", "x4/f.bmp>x4/f_4.bmp",
+				"x5/f.bmp>x5/f_3.bmp", "x6/f.bmp>x6/f_2.bmp", "x7/f.bmp>x7/f_5.bmp"},
+		},
+		{
 			name:     "first in image order keeps the name (numbers by value)",
 			incoming: map[string]string{"batch10/a.jpg": "1", "batch9/a.jpg": "2"},
 			want:     []string{"batch10/a.jpg>batch10/a_2.jpg"},
@@ -190,13 +233,48 @@ func TestPlanRenamesComparesLazily(t *testing.T) {
 	for rel := range existing {
 		files[rel] = diskFile{Size: 1}
 	}
-	pl := newNamePlanner(context.Background(), files, nil, map[string]diskFile{"z/1.jpg": {Size: 1}}, nil, ConflictSkip, same)
+	digest := func(_ context.Context, r nameRef) (string, error) {
+		t.Errorf("digest(%s): no image should be hashed", r.rel)
+		return r.rel, nil
+	}
+	pl := newNamePlanner(context.Background(), files, nil, map[string]diskFile{"z/1.jpg": {Size: 1}}, nil, ConflictSkip, same, digest)
 	plans, err := planRenames(pl, map[string]diskFile{"z/1.jpg": {Size: 1}}, nil, nil)
 	if err != nil || len(plans) != 1 || plans[0].To != "z/1_2.jpg" || plans[0].SameNameAs != "a/1.jpg" {
 		t.Fatalf("plans = %+v, %v", plans, err)
 	}
 	if compared > 2 {
 		t.Errorf("compared %d times, want at most 2", compared)
+	}
+}
+
+func TestPlanRenamesManyImagesOfOneName(t *testing.T) {
+	// One name in many folders (each folder numbers its images from 0001,
+	// all of one size like BMP images): numbering and comparing stay linear.
+	const n = 20000
+	images := make(map[string]diskFile, n)
+	for i := range n {
+		images[fmt.Sprintf("clip%05d/0001.bmp", i)] = diskFile{Size: 7}
+	}
+	digests := 0
+	same := func(_ context.Context, a, b nameRef) (bool, error) { return a.rel == b.rel, nil }
+	digest := func(_ context.Context, r nameRef) (string, error) {
+		digests++
+		return r.rel, nil
+	}
+	start := time.Now()
+	pl := newNamePlanner(context.Background(), nil, nil, images, nil, ConflictSkip, same, digest)
+	plans, err := planRenames(pl, images, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("planning %d images took %v", n, elapsed)
+	}
+	if len(plans) != n-1 || plans[n-2].To != fmt.Sprintf("clip%05d/0001_%d.bmp", n-1, n) {
+		t.Fatalf("%d plans, last %+v", len(plans), plans[len(plans)-1])
+	}
+	if digests > n {
+		t.Errorf("hashed %d times for %d images", digests, n)
 	}
 }
 
@@ -321,6 +399,8 @@ func TestRenameImageFiles(t *testing.T) {
 		"e/y.xml":      vocFile("y.jpg"),
 		"e/y_2.xml":    []byte("taken"),
 		"f/plain.tiff": []byte("img"),
+		"g/1.jpg":      []byte("img"),
+		"g/1.xml":      vocFile("1.jpg"),
 	})
 	root, err := os.OpenRoot(dir)
 	if err != nil {
@@ -335,7 +415,7 @@ func TestRenameImageFiles(t *testing.T) {
 		return string(data)
 	}
 
-	if err := renameImageFiles(root, &renamePlan{From: "b/0001.jpg", To: "b/0001_2.jpg", XMLFrom: "b/0001.xml", XMLTo: "b/0001_2.xml"}); err != nil {
+	if err := renameImageFiles(root, &renamePlan{From: "b/0001.jpg", To: "b/0001_2.jpg", XMLFrom: "b/0001.xml", XMLTo: "b/0001_2.xml"}, false); err != nil {
 		t.Fatal(err)
 	}
 	if read("b/0001.jpg") != "<missing>" || read("b/0001.xml") != "<missing>" || read("b/0001_2.jpg") != "img" ||
@@ -343,7 +423,7 @@ func TestRenameImageFiles(t *testing.T) {
 		t.Errorf("b after rename: %v", datasetFiles(t, filepath.Join(dir, "b")))
 	}
 
-	if err := renameImageFiles(root, &renamePlan{From: "c/k.png", To: "c/k_2.png", XMLFrom: "c/k.xml", XMLTo: "c/k_2.xml"}); err != nil {
+	if err := renameImageFiles(root, &renamePlan{From: "c/k.png", To: "c/k_2.png", XMLFrom: "c/k.xml", XMLTo: "c/k_2.xml"}, false); err != nil {
 		t.Fatal(err)
 	}
 	if read("c/k_2.png") != "img" || read("c/k_2.xml") != "<annotation><object>" || read("c/k.xml") != "<missing>" {
@@ -351,16 +431,32 @@ func TestRenameImageFiles(t *testing.T) {
 	}
 
 	// Targets that exist are never replaced, and nothing changes.
-	err = renameImageFiles(root, &renamePlan{From: "d/x.jpg", To: "d/x_2.jpg"})
+	err = renameImageFiles(root, &renamePlan{From: "d/x.jpg", To: "d/x_2.jpg"}, false)
 	if !errors.Is(err, os.ErrExist) || read("d/x.jpg") != "img" || read("d/x_2.jpg") != "taken" {
 		t.Errorf("rename onto an image: %v", err)
 	}
-	err = renameImageFiles(root, &renamePlan{From: "e/y.jpg", To: "e/y_2.jpg", XMLFrom: "e/y.xml", XMLTo: "e/y_2.xml"})
+	err = renameImageFiles(root, &renamePlan{From: "e/y.jpg", To: "e/y_2.jpg", XMLFrom: "e/y.xml", XMLTo: "e/y_2.xml"}, true)
 	if !errors.Is(err, os.ErrExist) || read("e/y.jpg") != "img" || read("e/y_2.jpg") != "<missing>" || read("e/y_2.xml") != "taken" {
 		t.Errorf("rename onto an annotation: %v", err)
 	}
 
-	if err := renameImageFiles(root, &renamePlan{From: "f/plain.tiff", To: "f/plain_2.tiff"}); err != nil || read("f/plain_2.tiff") != "img" {
+	if err := renameImageFiles(root, &renamePlan{From: "f/plain.tiff", To: "f/plain_2.tiff"}, true); err != nil || read("f/plain_2.tiff") != "img" {
 		t.Errorf("rename without annotation: %v", err)
+	}
+
+	// In place, the renamed VOC file keeps the permissions of the old one
+	// and no temporary file is left.
+	if err := os.Chmod(filepath.Join(dir, "g", "1.xml"), 0o664); err != nil {
+		t.Fatal(err)
+	}
+	if err := renameImageFiles(root, &renamePlan{From: "g/1.jpg", To: "g/1_2.jpg", XMLFrom: "g/1.xml", XMLTo: "g/1_2.xml"}, true); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Join(dir, "g", "1_2.xml"))
+	if err != nil || fi.Mode().Perm() != 0o664 || !strings.Contains(read("g/1_2.xml"), "<filename>1_2.jpg</filename>") {
+		t.Errorf("g/1_2.xml: %v, %v", fi, err)
+	}
+	if got := datasetFiles(t, filepath.Join(dir, "g")); !slices.Equal(got, []string{"1_2.jpg", "1_2.xml"}) {
+		t.Errorf("g after rename: %v", got)
 	}
 }

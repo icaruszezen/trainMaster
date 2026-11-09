@@ -289,3 +289,70 @@ func TestIntegrationRenameRegisteredDirectory(t *testing.T) {
 		t.Errorf("a rescan renamed D/1.png: %v", err)
 	}
 }
+
+func TestIntegrationRenameRegisteredDirectoryKeepsGoing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root may write to read-only folders")
+	}
+	e := newTestEnv(t, false)
+	ctx := context.Background()
+	dir := filepath.Join(e.datasetsDir(), "line3")
+	writeFiles(t, dir, map[string][]byte{
+		"A/1.png": pngFile(t, 64, 48),
+		"B/1.png": pngFile(t, 64, 40), "B/1.xml": []byte(labelledVOC("B", "1.png", "b")),
+		"C/1.png": pngFile(t, 8, 8),
+	})
+	// B cannot be changed: its image keeps its name, C is still renamed and
+	// the folder is indexed.
+	if err := os.Chmod(filepath.Join(dir, "B"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(dir, "B"), 0o755) })
+	dirName := "line3"
+	d, err := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "产线3", Directory: &dirName})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.start(t)
+	job := e.waitJob(t, d.ID, d.ActiveImport.ID)
+	if job.Status != StatusSucceeded {
+		t.Fatalf("scan = %+v", job)
+	}
+	wantSummary(t, job.Summary, map[string]int64{sumImagesTotal: 3, sumImagesAdded: 3, sumAnnotationsMatched: 1,
+		sumImagesRenamed: 1, sumImagesIdentical: 0, sumImagesRenameFailed: 1})
+	want := []string{"A/1.png", "B/1.png", "B/1.xml", "C/1_3.png"}
+	if got := datasetFiles(t, dir); !slices.Equal(got, want) {
+		t.Errorf("folder = %v\nwant %v", got, want)
+	}
+}
+
+func TestIntegrationRenameListSurvivesCrash(t *testing.T) {
+	// The process dies after renaming (while indexing): the job fails on the
+	// next start, and its summary still leads to the rename list.
+	e := newTestEnv(t, false)
+	ctx := context.Background()
+	dir := filepath.Join(e.datasetsDir(), "line4")
+	writeFiles(t, dir, map[string][]byte{"A/1.png": pngFile(t, 4, 4), "B/1.png": pngFile(t, 5, 5)})
+	dirName := "line4"
+	d, err := e.svc.CreateDataset(ctx, CreateDatasetInput{Name: "产线4", Directory: &dirName})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Exec(ctx, `UPDATE dataset_imports SET status = 'running' WHERE id = $1`, d.ActiveImport.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.svc.recordRenames(d.ActiveImport.ID, 0, []*renamePlan{{From: "B/1.png", To: "B/1_2.png", SameNameAs: "A/1.png"}})
+	e.svc.recordRenames(d.ActiveImport.ID, 1, []*renamePlan{{From: "C/1.png", To: "C/1.png", SameNameAs: "A/1.png", Identical: true}})
+	if err := e.svc.recoverJobs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	job, err := e.svc.GetImport(ctx, d.ID, d.ActiveImport.ID)
+	if err != nil || job.Status != StatusFailed {
+		t.Fatalf("job = %+v, %v", job, err)
+	}
+	wantSummary(t, job.Summary, map[string]int64{sumImagesRenamed: 1, sumImagesIdentical: 1})
+	wantList := []string{"renamed B/1.png>B/1_2.png (A/1.png)", "identical C/1.png>C/1.png (A/1.png)"}
+	if got := e.renameList(t, d.ID, job.ID); !slices.Equal(got, wantList) {
+		t.Errorf("rename list = %q\nwant %q", got, wantList)
+	}
+}

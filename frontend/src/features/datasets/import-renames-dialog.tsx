@@ -196,13 +196,13 @@ export function ImportRenamesDialog({
             ，名称（不含扩展名，不区分大小写）与数据集中其它图片相同的图片。内容不同的
             {inPlace ? "已在文件夹中" : ""}
             连同标注文件一起改名，在原名后加上
-            _2、_3…；内容完全相同的是同一张图片，保留原名。
+            _2、_3…（同一张图片的几份副本用同一个编号）；与占用这个名称的图片内容完全相同的，保留原名。
           </DialogDescription>
         </DialogHeader>
         <RenameCounts job={job} />
         {(job.summary.images_rename_failed ?? 0) > 0 && (
           <p className="text-sm text-muted-foreground">
-            无法重命名的图片所在的文件夹不允许修改（如只读），保留了原名，详见服务日志。
+            有些图片无法在文件夹中改名（如文件夹只读或磁盘已满），保留了原名，原因见服务日志。
           </p>
         )}
         <RenameList job={job} />

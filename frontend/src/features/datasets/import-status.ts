@@ -167,7 +167,7 @@ const scanParts: SummaryPart[] = [
   [
     "images_rename_failed",
     (n) =>
-      `${formatNumber(n)} 张同名图片无法重命名（文件夹不允许修改），保留原名`,
+      `${formatNumber(n)} 张同名图片无法重命名，保留原名（原因见服务日志）`,
   ],
   ["annotations_invalid", (n) => `${formatNumber(n)} 个标注无法解析`],
   ["annotations_orphaned", (n) => `${formatNumber(n)} 个标注没有对应图片`],
