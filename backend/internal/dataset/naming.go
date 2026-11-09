@@ -1,6 +1,7 @@
 package dataset
 
 import (
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -65,6 +66,16 @@ func NormalizeDescription(raw string) (string, error) {
 		return "", &Error{Kind: ErrInvalid, Message: "描述不能超过 500 个字符"}
 	}
 	return d, nil
+}
+
+// NormalizeDatasetStatus checks a dataset status: one of DatasetStatuses,
+// or DatasetStatusNone ("") to clear it.
+func NormalizeDatasetStatus(raw string) (string, error) {
+	if raw == DatasetStatusNone || slices.Contains(DatasetStatuses, raw) {
+		return raw, nil
+	}
+	return "", &Error{Kind: ErrInvalid, Message: "数据集状态无效，可选值：pending_annotation（待标注）、" +
+		"annotating（标注中）、pending_review（待审图）、reviewing（审图中）、trainable（可训练），空字符串表示未设置"}
 }
 
 func hasControlChar(s string) bool {

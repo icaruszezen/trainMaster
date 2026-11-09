@@ -48,6 +48,28 @@ const (
 	FormatYOLO         = "yolo"         // <stem>.txt with class ids; needs the class names in order
 )
 
+// Dataset statuses (数据集状态): where a dataset is in the team's
+// workflow, set by hand (migration 0014). DatasetStatusNone is a dataset
+// nobody has marked.
+const (
+	DatasetStatusNone              = ""
+	DatasetStatusPendingAnnotation = "pending_annotation" // 待标注
+	DatasetStatusAnnotating        = "annotating"         // 标注中
+	DatasetStatusPendingReview     = "pending_review"     // 待审图
+	DatasetStatusReviewing         = "reviewing"          // 审图中
+	DatasetStatusTrainable         = "trainable"          // 可训练
+)
+
+// DatasetStatuses lists the statuses a dataset can be marked with, in
+// workflow order (the order the pages list them in).
+var DatasetStatuses = []string{
+	DatasetStatusPendingAnnotation,
+	DatasetStatusAnnotating,
+	DatasetStatusPendingReview,
+	DatasetStatusReviewing,
+	DatasetStatusTrainable,
+}
+
 // Processing stages and progress units of a running job.
 const (
 	stageExtracting = "extracting"
@@ -68,6 +90,8 @@ type Dataset struct {
 	DirName          string       `json:"dir_name"`
 	Path             string       `json:"path"` // absolute folder path on the server
 	Origin           string       `json:"origin"`
+	Status           string       `json:"status"`            // DatasetStatus*: "" when not marked
+	StatusUpdatedAt  *time.Time   `json:"status_updated_at"` // when the status last changed; nil: never set
 	DirectoryMissing bool         `json:"directory_missing"`
 	ImageCount       int          `json:"image_count"`
 	AnnotatedCount   int          `json:"annotated_count"` // VOC file with >= 1 object

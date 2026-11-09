@@ -119,7 +119,7 @@ func wantKeys(t *testing.T, what string, obj map[string]any, keys ...string) {
 }
 
 var (
-	datasetKeys = []string{"id", "name", "description", "dir_name", "path", "origin", "directory_missing",
+	datasetKeys = []string{"id", "name", "description", "dir_name", "path", "origin", "status", "status_updated_at", "directory_missing",
 		"image_count", "annotated_count", "empty_count", "invalid_count", "object_count", "label_count", "total_bytes",
 		"covers", "projects", "version_count", "active_import", "scanned_at", "created_at", "updated_at"}
 	importKeys = []string{"id", "dataset_id", "source", "status", "on_conflict", "annotation_format", "classes", "file_name", "file_size",
@@ -866,5 +866,64 @@ func TestLimitBody(t *testing.T) {
 	status, code := datasetErrorStatus(de.Kind)
 	if status != 413 || code != codePayloadTooLarge {
 		t.Errorf("status = %d %s", status, code)
+	}
+}
+
+func TestDatasetAPIStatus(t *testing.T) {
+	e := newAPIEnv(t, false)
+	a := want[dataset.Dataset](t, e.do("POST", "/api/v1/datasets", map[string]any{"name": "a"}), 201)
+	b := want[dataset.Dataset](t, e.do("POST", "/api/v1/datasets", map[string]any{"name": "b"}), 201)
+	if a.Status != "" || a.StatusUpdatedAt != nil {
+		t.Fatalf("new dataset = %+v", a)
+	}
+	// The JSON fields exist without a status.
+	rec := e.do("GET", fmt.Sprintf("/api/v1/datasets/%d", a.ID), nil)
+	if body := rec.Body.String(); !strings.Contains(body, `"status":""`) || !strings.Contains(body, `"status_updated_at":null`) {
+		t.Errorf("dataset JSON = %s", body)
+	}
+
+	aURL := fmt.Sprintf("/api/v1/datasets/%d", a.ID)
+	upd := want[dataset.Dataset](t, e.do("PATCH", aURL, map[string]any{"status": "trainable"}), 200)
+	if upd.Status != "trainable" || upd.StatusUpdatedAt == nil || upd.Name != "a" || !upd.UpdatedAt.Equal(a.UpdatedAt) {
+		t.Errorf("PATCH status = %+v", upd)
+	}
+	wantError(t, e.do("PATCH", aURL, map[string]any{"status": "done"}), 422, codeValidationFailed, "数据集状态无效")
+	wantError(t, e.do("PATCH", aURL, map[string]any{"status": 3}), 400, codeBadRequest, "")
+	// null leaves it alone, like the other fields.
+	if got := want[dataset.Dataset](t, e.do("PATCH", aURL, map[string]any{"status": nil, "description": "d"}), 200); got.Status != "trainable" || got.Description != "d" {
+		t.Errorf("PATCH status null = %+v", got)
+	}
+
+	list := func(query string) []int64 {
+		t.Helper()
+		l := want[List[dataset.Dataset]](t, e.do("GET", "/api/v1/datasets"+query, nil), 200)
+		var ids []int64
+		for _, d := range l.Items {
+			ids = append(ids, d.ID)
+		}
+		return ids
+	}
+	if got := list("?status=trainable"); !slices.Equal(got, []int64{a.ID}) {
+		t.Errorf("status=trainable: %v", got)
+	}
+	if got := list("?status=none"); !slices.Equal(got, []int64{b.ID}) {
+		t.Errorf("status=none: %v", got)
+	}
+	if got := list("?status=annotating"); len(got) != 0 {
+		t.Errorf("status=annotating: %v", got)
+	}
+	if got := list("?status=trainable&project_id=none&q=a"); !slices.Equal(got, []int64{a.ID}) {
+		t.Errorf("combined filters: %v", got)
+	}
+	for _, bad := range []string{"bogus", "Trainable", "%20trainable"} {
+		wantError(t, e.do("GET", "/api/v1/datasets?status="+bad, nil), 400, codeBadRequest, "status")
+	}
+
+	// Clearing it.
+	if got := want[dataset.Dataset](t, e.do("PATCH", aURL, map[string]any{"status": ""}), 200); got.Status != "" || got.StatusUpdatedAt == nil {
+		t.Errorf("clearing = %+v", got)
+	}
+	if got := list("?status=none"); !slices.Equal(got, []int64{a.ID, b.ID}) && !slices.Equal(got, []int64{b.ID, a.ID}) {
+		t.Errorf("status=none after clearing: %v", got)
 	}
 }

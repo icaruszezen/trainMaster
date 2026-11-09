@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -247,6 +248,18 @@ func (s *server) listDatasets(w http.ResponseWriter, r *http.Request) {
 		}
 		q.ProjectID = id
 	}
+	// status: one status, or "none" for the datasets not marked.
+	switch v := r.URL.Query().Get("status"); {
+	case v == "":
+	case v == "none":
+		none := dataset.DatasetStatusNone
+		q.Status = &none
+	case slices.Contains(dataset.DatasetStatuses, v):
+		q.Status = &v
+	default:
+		badRequest(w, "参数 status 无效，可选值："+strings.Join(dataset.DatasetStatuses, "、")+"、none")
+		return
+	}
 	items, err := s.datasets.ListDatasets(r.Context(), q)
 	if err != nil {
 		s.datasetError(w, r, err)
@@ -301,6 +314,7 @@ func (s *server) getDataset(w http.ResponseWriter, r *http.Request) {
 type updateDatasetRequest struct {
 	Name        *string `json:"name"`
 	Description *string `json:"description"`
+	Status      *string `json:"status"` // "" clears it
 }
 
 func (s *server) updateDataset(w http.ResponseWriter, r *http.Request) {
@@ -312,7 +326,8 @@ func (s *server) updateDataset(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	d, err := s.datasets.UpdateDataset(r.Context(), id, dataset.UpdateDatasetInput{Name: req.Name, Description: req.Description})
+	d, err := s.datasets.UpdateDataset(r.Context(), id, dataset.UpdateDatasetInput{Name: req.Name, Description: req.Description,
+		Status: req.Status})
 	if err != nil {
 		s.datasetError(w, r, err)
 		return
