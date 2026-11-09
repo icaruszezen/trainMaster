@@ -76,6 +76,7 @@ import {
   Select,
   SelectContent,
   SelectItem,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
@@ -91,6 +92,9 @@ import {
 } from "@/features/datasets/api"
 import { ClassIdPreview } from "@/features/datasets/class-list-field"
 import { DescriptionCounter } from "@/features/datasets/dataset-actions"
+import { datasetStatusLabels } from "@/features/datasets/dataset-status"
+import { DatasetStatusBadge } from "@/features/datasets/dataset-status-picker"
+import { unannotatedCount } from "@/features/datasets/images"
 import { LoadError } from "@/features/datasets/load-error"
 import { versionCountsText } from "@/features/datasets/versions"
 import {
@@ -104,6 +108,7 @@ import {
   type DataVersionPreview,
   type DataVersionPreviewInput,
   type GroupBy,
+  type TrainingScope,
 } from "@/features/data-versions/api"
 import {
   AUGMENT_METHODS,
@@ -116,9 +121,9 @@ import {
   blockingWarning,
   buildPreviewInput,
   CUSTOM_RATIO,
-  defaultSelection,
   defaultUnlistedChoice,
   effectiveCopies,
+  effectiveScope,
   effectiveSelection,
   fieldOfServerError,
   ignoreLabels,
@@ -135,12 +140,18 @@ import {
   parseRatio,
   previewWarnings,
   readyReviewVersions,
+  scopeOverride,
+  selectionOnScopeChange,
+  selectionToInclude,
+  sourceOverride,
   sourceDisabledReason,
   sourceInputs,
   toggleVersion,
   type FormDraft,
   type KnownUnlisted,
   type PreviewWarning,
+  type ScopeOverride,
+  type SourceChange,
   type SourceSelection,
   type UnlistedChoice,
 } from "@/features/data-versions/form-logic"
@@ -156,6 +167,9 @@ import {
   RATIO_PRESETS,
   ratioPresetLabel,
   selectionHint,
+  TRAINING_SCOPE_HINTS,
+  TRAINING_SCOPE_LABELS,
+  TRAINING_SCOPES,
 } from "@/features/data-versions/format"
 import {
   dataVersionDetailPath,
@@ -200,6 +214,7 @@ const PLACEHOLDER_INPUT: DataVersionPreviewInput = {
     use_folders: true,
     group_by: "stem",
   },
+  scope: "annotated",
   include_empty: true,
   ignore_labels: [],
   augmentation: null,
@@ -532,6 +547,10 @@ type SourceRowData = {
   /** 有正在生成的审图版本（完成后才能选择）。 */
   building: boolean
   selection: SourceSelection
+  /** 单独设置的参与训练的图片，`""` 使用默认的。 */
+  scopeSetting: ScopeOverride
+  /** 实际使用的参与训练的图片。 */
+  scope: TrainingScope
 }
 
 type ServerError = {
@@ -580,6 +599,7 @@ function NewDataVersionForm({
   const rows: SourceRowData[] = datasets.map((dataset, index) => {
     const query = versionQueries[index]
     const versions = readyReviewVersions(query.data?.items ?? [])
+    const scope = effectiveScope(draft, template, dataset.id)
     return {
       dataset,
       query,
@@ -591,15 +611,29 @@ function NewDataVersionForm({
         versions,
         template,
         override: draft.overrides[dataset.id],
+        scope,
       }),
+      scopeSetting: scopeOverride(draft, template, dataset.id),
+      scope,
     }
   })
   const versionsLoaded = rows.every(
     (row) => row.disabled !== null || !row.query.isPending
   )
   const sources = sourceInputs(
-    rows.map((row) => ({ datasetId: row.dataset.id, selection: row.selection }))
+    rows.map((row) => ({
+      datasetId: row.dataset.id,
+      selection: row.selection,
+      scope: row.scopeSetting,
+    }))
   )
+  // 空标注的开关只影响“仅有标注的图片”的数据集。
+  // 还没有选中数据集时按默认的设置。
+  const selectedRows = rows.filter((row) => isSelected(row.selection))
+  const annotatedSelected =
+    selectedRows.length === 0
+      ? draft.scope === "annotated"
+      : selectedRows.some((row) => row.scope === "annotated")
 
   const classes = lastPreview?.classes ?? classList.items
   // 忽略的标签不能是类别：两份列表都算（项目的类别列表可能比上次的预览新）。
@@ -757,10 +791,48 @@ function NewDataVersionForm({
     setServerError(null)
     create.reset()
   }
-  const setSource = (datasetId: number, selection: SourceSelection) => {
+  const selectionArgs = (row: SourceRowData, scope = row.scope) => ({
+    dataset: row.dataset,
+    versions: row.versions,
+    template,
+    override: draft.overrides[row.dataset.id],
+    scope,
+  })
+  const setSource = (
+    row: SourceRowData,
+    selection: SourceSelection,
+    change: SourceChange
+  ) => {
+    const override = sourceOverride(selectionArgs(row), selection, change)
     setDraft((previous) => ({
       ...previous,
-      overrides: { ...previous.overrides, [datasetId]: selection },
+      overrides: { ...previous.overrides, [row.dataset.id]: override },
+    }))
+    setServerError(null)
+    create.reset()
+  }
+  /**
+   * 修改一个数据集参与训练的图片；取背景图时没有选中的数据集一并选中（审图
+   * 版本还没有读到时不选：模板的来源还不完整）。
+   */
+  const setSourceScope = (row: SourceRowData, value: ScopeOverride) => {
+    const args = selectionArgs(row, value || draft.scope)
+    const include =
+      row.disabled || row.query.data === undefined
+        ? null
+        : selectionOnScopeChange({
+            ...args,
+            selection: effectiveSelection(args),
+          })
+    setDraft((previous) => ({
+      ...previous,
+      scopes: { ...previous.scopes, [row.dataset.id]: value },
+      overrides: include
+        ? {
+            ...previous.overrides,
+            [row.dataset.id]: sourceOverride(args, include, "dataset"),
+          }
+        : previous.overrides,
     }))
     setServerError(null)
     create.reset()
@@ -852,6 +924,9 @@ function NewDataVersionForm({
             projectId={projectId}
             rows={rows}
             template={template}
+            scope={draft.scope}
+            onScopeChange={(scope) => update({ scope })}
+            onSourceScopeChange={setSourceScope}
             previewSources={lastPreview?.sources}
             error={
               serverError?.field === "sources"
@@ -878,6 +953,7 @@ function NewDataVersionForm({
           />
           <FilterSection
             projectId={projectId}
+            annotatedSelected={annotatedSelected}
             draft={draft}
             update={update}
             preview={lastPreview}
@@ -1076,6 +1152,9 @@ function SourcesSection({
   projectId,
   rows,
   template,
+  scope,
+  onScopeChange,
+  onSourceScopeChange,
   previewSources,
   error,
   onChange,
@@ -1083,9 +1162,17 @@ function SourcesSection({
   projectId: number
   rows: SourceRowData[]
   template: DataVersion | null
+  /** 默认的参与训练的图片。 */
+  scope: TrainingScope
+  onScopeChange: (scope: TrainingScope) => void
+  onSourceScopeChange: (row: SourceRowData, scope: ScopeOverride) => void
   previewSources: DataVersionPreview["sources"] | undefined
   error: string | null
-  onChange: (datasetId: number, selection: SourceSelection) => void
+  onChange: (
+    row: SourceRowData,
+    selection: SourceSelection,
+    change: SourceChange
+  ) => void
 }) {
   const newVersions = rows.flatMap((row) =>
     row.disabled
@@ -1124,7 +1211,7 @@ function SourcesSection({
       for (const id of ids) {
         selection = toggleVersion(selection, id, true, row.versions)
       }
-      onChange(row.dataset.id, selection)
+      onChange(row, selection, "versions")
     }
   }
 
@@ -1135,6 +1222,17 @@ function SourcesSection({
       title="数据集与标注来源"
       description="每个数据集可以选择基础标注（数据集自己的标注文件）与审图版本。同一张图片在多个来源中时，新的审图版本优先；不选基础标注时只纳入审图版本中标为需加样的图片。"
     >
+      {rows.length > 0 && (
+        <ScopeChoice
+          value={scope}
+          onChange={onScopeChange}
+          overridden={
+            rows.filter(
+              (row) => !row.disabled && row.scopeSetting && row.scope !== scope
+            ).length
+          }
+        />
+      )}
       {template &&
         (newVersions.length > 0 ||
           missing.length > 0 ||
@@ -1205,10 +1303,12 @@ function SourcesSection({
               key={row.dataset.id}
               row={row}
               template={template}
+              defaultScope={scope}
+              onScopeChange={(value) => onSourceScopeChange(row, value)}
               previewSource={previewSources?.find(
                 (s) => s.dataset_id === row.dataset.id
               )}
-              onChange={(selection) => onChange(row.dataset.id, selection)}
+              onChange={(selection, change) => onChange(row, selection, change)}
             />
           ))}
         </ul>
@@ -1231,27 +1331,31 @@ function SourcesSection({
 function SourceRow({
   row,
   template,
+  defaultScope,
+  onScopeChange,
   previewSource,
   onChange,
 }: {
   row: SourceRowData
   template: DataVersion | null
+  defaultScope: TrainingScope
+  onScopeChange: (scope: ScopeOverride) => void
   previewSource: DataVersionPreview["sources"][number] | undefined
-  onChange: (selection: SourceSelection) => void
+  onChange: (selection: SourceSelection, change: SourceChange) => void
 }) {
   const id = useId()
-  const { dataset, disabled, versions, selection, query } = row
+  const { dataset, disabled, versions, selection, query, scope } = row
   const selected = isSelected(selection)
+  // 审图版本读到之前不能修改来源：模板与默认的来源还不完整。
+  const locked = disabled !== null || query.data === undefined
   const newDataset = !disabled && notInTemplate(dataset.id, template)
+  const unannotated = unannotatedCount(dataset)
+  const background = unannotated + dataset.empty_count
 
   const toggleDataset = (checked: boolean) => {
-    if (!checked) {
-      onChange(NO_SOURCE)
-      return
-    }
-    const defaults = defaultSelection(dataset, versions)
     onChange(
-      isSelected(defaults) ? defaults : { include_base: true, version_ids: [] }
+      checked ? selectionToInclude(dataset, versions, scope) : NO_SOURCE,
+      "dataset"
     )
   }
 
@@ -1268,20 +1372,21 @@ function SourceRow({
           id={id}
           checked={selected}
           onCheckedChange={(checked) => toggleDataset(checked === true)}
-          disabled={disabled !== null}
+          disabled={locked}
           className="mt-0.5"
         />
         <label
           htmlFor={id}
           className={cn(
             "grid min-w-0 flex-1 gap-0.5",
-            disabled ? "opacity-70" : "cursor-pointer"
+            disabled ? "opacity-70" : !locked && "cursor-pointer"
           )}
         >
           <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
             <span className="truncate text-sm font-medium" title={dataset.name}>
               {dataset.name}
             </span>
+            <DatasetStatusBadge status={dataset.status} />
             {newDataset && template && (
               <Badge variant="outline" className="font-normal">
                 {dataVersionTitle(template)} 中没有
@@ -1293,6 +1398,7 @@ function SourceRow({
             {formatNumber(dataset.annotated_count)} 张
             {dataset.empty_count > 0 &&
               ` · 负样本 ${formatNumber(dataset.empty_count)} 张`}
+            {unannotated > 0 && ` · 未标注 ${formatNumber(unannotated)} 张`}
           </span>
         </label>
       </div>
@@ -1312,19 +1418,35 @@ function SourceRow({
         </p>
       )}
 
+      {!disabled &&
+        selected &&
+        dataset.status !== "" &&
+        dataset.status !== "trainable" && (
+          <p className="flex items-start gap-1.5 pl-7 text-xs text-muted-foreground">
+            <Info className="mt-px size-3.5 shrink-0" />
+            <span className="min-w-0">
+              数据集的状态是“{datasetStatusLabels[dataset.status]}
+              ”，还没有标记为可训练。
+            </span>
+          </p>
+        )}
+
       {!disabled && (
         <div className="grid min-w-0 gap-1.5 pl-7">
+          <SourceScopeSelect
+            datasetName={dataset.name}
+            value={row.scopeSetting}
+            defaultScope={defaultScope}
+            onChange={onScopeChange}
+          />
           <SourceOption
             checked={selection.include_base}
             onCheckedChange={(checked) =>
-              onChange({ ...selection, include_base: checked })
+              onChange({ ...selection, include_base: checked }, "base")
             }
+            disabled={locked}
             title="基础标注"
-            detail={
-              dataset.annotated_count > 0
-                ? `数据集自己的标注文件：已标注 ${formatNumber(dataset.annotated_count)} 张`
-                : "数据集自己的标注文件：还没有已标注的图片"
-            }
+            detail={baseDetail(scope, dataset.annotated_count, background)}
           />
           {query.isPending ? (
             <p className="flex items-center gap-1.5 py-1 text-xs text-muted-foreground">
@@ -1358,7 +1480,8 @@ function SourceRow({
                 checked={selection.version_ids.includes(version.id)}
                 onCheckedChange={(checked) =>
                   onChange(
-                    toggleVersion(selection, version.id, checked, versions)
+                    toggleVersion(selection, version.id, checked, versions),
+                    "versions"
                   )
                 }
                 title={`${version.name}（需加样 ${formatNumber(version.needs_sample_count)}）`}
@@ -1389,10 +1512,134 @@ function SourceRow({
   )
 }
 
+/** 基础标注的说明：按参与训练的图片说明会纳入哪些图片。 */
+function baseDetail(
+  scope: TrainingScope,
+  annotated: number,
+  background: number
+) {
+  switch (scope) {
+    case "background":
+      return `数据集自己的图片：没有目标的 ${formatNumber(background)} 张作为负样本`
+    case "all":
+      return `数据集自己的全部图片：有目标 ${formatNumber(annotated)} 张，没有目标 ${formatNumber(background)} 张`
+    default:
+      return annotated > 0
+        ? `数据集自己的标注文件：已标注 ${formatNumber(annotated)} 张`
+        : "数据集自己的标注文件：还没有已标注的图片"
+  }
+}
+
+/** 默认的参与训练的图片（所有数据集），每个数据集可以在列表中单独修改。 */
+function ScopeChoice({
+  value,
+  onChange,
+  overridden,
+}: {
+  value: TrainingScope
+  onChange: (scope: TrainingScope) => void
+  /** 单独设置了、与默认不同的数据集数。 */
+  overridden: number
+}) {
+  const groupId = useId()
+  const hintId = useId()
+  return (
+    <div className="grid gap-2">
+      <div className="grid gap-0.5">
+        <Label id={groupId}>参与训练的图片</Label>
+        <p id={hintId} className="text-xs text-pretty text-muted-foreground">
+          所有数据集默认使用这个设置，也可以在下面为单个数据集修改
+          {overridden > 0 && `（已单独修改 ${formatNumber(overridden)} 个）`}。
+        </p>
+      </div>
+      <RadioGroup
+        value={value}
+        onValueChange={(next) => onChange(next as TrainingScope)}
+        aria-labelledby={groupId}
+        aria-describedby={hintId}
+        className="grid gap-2 sm:grid-cols-3"
+      >
+        {TRAINING_SCOPES.map((scope) => {
+          const itemId = `${groupId}-${scope}`
+          return (
+            <label
+              key={scope}
+              htmlFor={itemId}
+              className={cn(
+                "flex cursor-pointer items-start gap-2.5 rounded-lg border px-3 py-2.5 text-sm transition-colors hover:bg-muted/40 has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50",
+                value === scope && "border-primary/60 bg-muted/40"
+              )}
+            >
+              <RadioGroupItem id={itemId} value={scope} className="mt-0.5" />
+              <span className="grid min-w-0 gap-0.5">
+                <span className="font-medium">
+                  {TRAINING_SCOPE_LABELS[scope]}
+                </span>
+                <span className="text-xs text-pretty text-muted-foreground">
+                  {TRAINING_SCOPE_HINTS[scope]}
+                </span>
+              </span>
+            </label>
+          )
+        })}
+      </RadioGroup>
+    </div>
+  )
+}
+
+/** 单个数据集参与训练的图片：使用默认的，或单独设置。 */
+function SourceScopeSelect({
+  datasetName,
+  value,
+  defaultScope,
+  onChange,
+}: {
+  datasetName: string
+  value: ScopeOverride
+  defaultScope: TrainingScope
+  onChange: (value: ScopeOverride) => void
+}) {
+  const custom = value !== "" && value !== defaultScope
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-1 py-0.5">
+      <span className="text-xs text-muted-foreground">参与训练的图片</span>
+      <Select
+        value={value || "default"}
+        onValueChange={(next) =>
+          onChange(next === "default" ? "" : (next as TrainingScope))
+        }
+      >
+        <SelectTrigger
+          size="sm"
+          className={cn(
+            "h-7 max-w-full min-w-0 gap-1.5 px-2 text-xs",
+            custom && "border-primary/60 bg-primary/5 font-medium"
+          )}
+          aria-label={`数据集“${datasetName}”参与训练的图片`}
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="default">
+            使用默认（{TRAINING_SCOPE_LABELS[defaultScope]}）
+          </SelectItem>
+          <SelectSeparator />
+          {TRAINING_SCOPES.map((scope) => (
+            <SelectItem key={scope} value={scope}>
+              {TRAINING_SCOPE_LABELS[scope]}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  )
+}
+
 /** 标注来源的选项：名称、新标记、备注与图片数。 */
 function SourceOption({
   checked,
   onCheckedChange,
+  disabled = false,
   title,
   isNew = false,
   note,
@@ -1400,6 +1647,7 @@ function SourceOption({
 }: {
   checked: boolean
   onCheckedChange: (checked: boolean) => void
+  disabled?: boolean
   title: string
   isNew?: boolean
   note?: string
@@ -1409,12 +1657,16 @@ function SourceOption({
   return (
     <label
       htmlFor={id}
-      className="flex min-w-0 cursor-pointer items-start gap-2.5 rounded-md px-1 py-1 transition-colors hover:bg-muted/60 has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50"
+      className={cn(
+        "flex min-w-0 items-start gap-2.5 rounded-md px-1 py-1 transition-colors has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50",
+        !disabled && "cursor-pointer hover:bg-muted/60"
+      )}
     >
       <Checkbox
         id={id}
         checked={checked}
         onCheckedChange={(next) => onCheckedChange(next === true)}
+        disabled={disabled}
         className="mt-0.5"
       />
       <span className="grid min-w-0 flex-1 gap-0.5">
@@ -1705,6 +1957,7 @@ type UnlistedRow = {
 
 function FilterSection({
   projectId,
+  annotatedSelected,
   draft,
   update,
   preview,
@@ -1714,6 +1967,8 @@ function FilterSection({
   serverError,
 }: SectionProps & {
   projectId: number
+  /** 有选中的数据集参与训练的图片是“仅有标注的图片”（空标注的开关只影响它们）。 */
+  annotatedSelected: boolean
   preview: DataVersionPreview | undefined
   ignore: string[]
   templateIgnore: readonly string[] | null
@@ -1741,14 +1996,25 @@ function FilterSection({
   return (
     <Section
       title="过滤"
-      description="没有标注或标注文件无法读取的图片不会纳入。"
+      description="标注文件无法读取的图片不会纳入；没有标注的图片是否纳入由数据集参与训练的图片决定。"
     >
       <div className="flex items-start justify-between gap-4 rounded-lg border p-3">
         <div className="grid min-w-0 gap-1">
-          <Label htmlFor={emptyId}>纳入空标注图片（负样本）</Label>
+          <Label
+            htmlFor={emptyId}
+            className={cn(!annotatedSelected && "text-muted-foreground")}
+          >
+            纳入空标注图片（负样本）
+          </Label>
           <p className="text-xs text-pretty text-muted-foreground">
             标注文件中没有目标的图片作为背景参与训练，可以减少误检。
-            {preview && preview.skipped.empty > 0 && !draft.include_empty
+            {annotatedSelected
+              ? `只影响参与训练的图片为“${TRAINING_SCOPE_LABELS.annotated}”的数据集，其它数据集总是纳入没有目标的图片。`
+              : `所选数据集参与训练的图片都不是“${TRAINING_SCOPE_LABELS.annotated}”，总是纳入没有目标的图片。`}
+            {annotatedSelected &&
+            preview &&
+            preview.skipped.empty > 0 &&
+            !draft.include_empty
               ? `将有 ${formatNumber(preview.skipped.empty)} 张空标注图片不纳入。`
               : ""}
           </p>
@@ -1757,6 +2023,7 @@ function FilterSection({
           id={emptyId}
           checked={draft.include_empty}
           onCheckedChange={(include_empty) => update({ include_empty })}
+          disabled={!annotatedSelected}
         />
       </div>
 

@@ -9,6 +9,7 @@ import {
   InputGroupInput,
 } from "@/components/ui/input-group"
 import type { Dataset } from "@/features/datasets/api"
+import { DatasetStatusBadge } from "@/features/datasets/dataset-status-picker"
 import { DatasetThumbnail } from "@/features/datasets/dataset-thumbnail"
 import { formatNumber } from "@/lib/format"
 import { cn } from "@/lib/utils"
@@ -199,7 +200,10 @@ function DatasetOption({
           )}
         </div>
         <span className="grid min-w-0 flex-1">
-          <span className="truncate text-sm font-medium">{dataset.name}</span>
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span className="truncate text-sm font-medium">{dataset.name}</span>
+            <DatasetStatusBadge status={dataset.status} />
+          </span>
           <span className="truncate text-xs text-muted-foreground">
             {formatNumber(dataset.image_count)} 张图片
             {projects && ` · 已在 ${projects}`}

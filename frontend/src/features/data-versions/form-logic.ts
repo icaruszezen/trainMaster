@@ -1,6 +1,6 @@
 /**
  * “生成数据版本”表单的纯逻辑（见 form-logic.test.ts）：数据集与标注来源的默认
- * 选择、以已有版本为模板时的预填、不在类别列表中的标签的处理方式、把表单
+ * 选择、每个数据集参与训练的图片、以已有版本为模板时的预填、不在类别列表中的标签的处理方式、把表单
  * 转换成预览 / 创建的请求，以及预览中的警告。
  */
 import type { Dataset, DatasetVersion } from "@/features/datasets/api"
@@ -12,6 +12,7 @@ import type {
   DataVersionPreviewInput,
   GroupBy,
   SourceInput,
+  TrainingScope,
 } from "@/features/data-versions/api"
 import { validateVersionNote } from "@/features/reviews/review-format"
 import { formatNumber } from "@/lib/format"
@@ -73,15 +74,21 @@ export function readyReviewVersions(versions: readonly DatasetVersion[]) {
 }
 
 /**
- * 没有模板时的默认来源：数据集有标注（至少一个目标）时选基础标注，并选中
- * 全部已生成的审图版本（只审图、基础没有标注的数据集也能纳入需加样的图片）。
+ * 没有模板时的默认来源：选中全部已生成的审图版本（只审图、基础没有标注的
+ * 数据集也能纳入需加样的图片）；基础标注在数据集有标注（至少一个目标）时
+ * 选中，参与训练的图片不是“仅有标注的图片”时有图片就选中（背景图来自数据集
+ * 自己的文件）。
  */
 export function defaultSelection(
-  dataset: Pick<Dataset, "annotated_count">,
-  versions: readonly Pick<DatasetVersion, "id">[]
+  dataset: Pick<Dataset, "annotated_count" | "image_count">,
+  versions: readonly Pick<DatasetVersion, "id">[],
+  scope: TrainingScope = "annotated"
 ): SourceSelection {
   return {
-    include_base: dataset.annotated_count > 0,
+    include_base:
+      scope === "annotated"
+        ? dataset.annotated_count > 0
+        : dataset.image_count > 0,
     version_ids: versions.map((version) => version.id),
   }
 }
@@ -106,34 +113,154 @@ export function templateSelection(
 }
 
 /**
- * 数据集当前的来源：用户改过的（`override`）> 模板 > 默认。不能使用的数据集
- * 总是不选。`versions` 是这个数据集已生成的审图版本。
+ * 用户改过的来源（按数据集保存，见 sourceOverride）。没有 `include_base` 时基础
+ * 标注照模板 / 默认得出：只改审图版本时不保存自动补选的基础标注，参与训练的
+ * 图片改回去时随之恢复。
  */
-export function effectiveSelection({
-  dataset,
-  versions,
-  template,
-  override,
-}: {
+export type SourceOverride = { include_base?: boolean; version_ids: number[] }
+
+type SelectionArgs = {
   dataset: DatasetForSource
+  /** 这个数据集已生成的审图版本。 */
   versions: readonly Pick<DatasetVersion, "id">[]
   template: Pick<DataVersion, "sources"> | null
-  override: SourceSelection | undefined
-}): SourceSelection {
+  override: SourceOverride | undefined
+  /** 这个数据集参与训练的图片。 */
+  scope?: TrainingScope
+}
+
+/**
+ * 用户没有选择时的基础标注（`versionIds` 是选中的审图版本，`overridden` 表示
+ * 用户改过这个数据集的来源）。没有模板、或数据集不在模板中而用户选中了它时按
+ * 默认（defaultSelection）；不在模板中、用户也没有选中时不选。有模板时用模板
+ * 的。背景图来自数据集自己的图片：取背景图（`background` / `all`）时，选了审图
+ * 版本、模板中（按“仅有标注的图片”）没有选基础标注的数据集补选基础标注；模板
+ * 本来就取背景图时照原样。
+ */
+function inferredBase(
+  { dataset, template, scope = "annotated" }: SelectionArgs,
+  versionIds: readonly number[],
+  overridden: boolean
+) {
+  const source = template?.sources.find((s) => s.dataset_id === dataset.id)
+  if (!template || (!source && overridden)) {
+    return defaultSelection(dataset, [], scope).include_base
+  }
+  if (!source) {
+    return false
+  }
+  if (source.include_base) {
+    return true
+  }
+  if (source.scope !== "annotated") {
+    return false
+  }
+  return scope !== "annotated" && versionIds.length > 0
+}
+
+/**
+ * 数据集当前的来源：用户改过的（`override`）> 模板 > 默认。不能使用的数据集
+ * 总是不选；不存在的审图版本不选。基础标注没有保存时在读取时得出（见
+ * inferredBase），参与训练的图片改回去时随之恢复。
+ */
+export function effectiveSelection(args: SelectionArgs): SourceSelection {
+  const { dataset, versions, template, override } = args
   if (sourceDisabledReason(dataset)) {
     return NO_SOURCE
   }
-  if (override) {
-    const available = new Set(versions.map((version) => version.id))
-    return {
-      include_base: override.include_base,
-      version_ids: override.version_ids.filter((id) => available.has(id)),
+  const available = new Set(versions.map((version) => version.id))
+  const version_ids = override
+    ? override.version_ids.filter((id) => available.has(id))
+    : template
+      ? (templateSelection(template, dataset.id, versions)?.version_ids ?? [])
+      : versions.map((version) => version.id)
+  return {
+    include_base:
+      override?.include_base ??
+      inferredBase(args, version_ids, override !== undefined),
+    version_ids,
+  }
+}
+
+/** 用户怎样改动了一个数据集的来源。 */
+export type SourceChange = "dataset" | "base" | "versions"
+
+/**
+ * 用户改动来源后要保存的 override（`next` 是改动后显示的来源，`args` 是改动前
+ * 的）。
+ *
+ * - 勾选 / 取消基础标注，或取消数据集：照原样保存（改参与训练的图片时不会再
+ *   改变）。
+ * - 只改审图版本：保存过的基础标注照旧；否则基础标注照样得出、不保存，例如
+ *   模板中只选了审图版本的数据集取背景图时补选的基础标注，参与训练的图片改
+ *   回去时随之取消。得出的与显示的不同时照显示的保存；取消最后一个审图版本、
+ *   补选的基础标注随之取消时保存为不选。
+ * - 勾选数据集：基础标注与得出的相同时不保存。
+ */
+export function sourceOverride(
+  args: SelectionArgs,
+  next: SourceSelection,
+  change: SourceChange
+): SourceOverride {
+  const saved = {
+    include_base: next.include_base,
+    version_ids: next.version_ids,
+  }
+  if (change === "base" || !isSelected(next)) {
+    return saved
+  }
+  if (change === "versions") {
+    if (args.override?.include_base !== undefined) {
+      return saved
     }
+    const derived = { version_ids: next.version_ids }
+    const shown = effectiveSelection({ ...args, override: derived })
+    if (!isSelected(shown)) {
+      return { include_base: false, version_ids: next.version_ids }
+    }
+    return shown.include_base === next.include_base ? derived : saved
   }
-  if (template) {
-    return templateSelection(template, dataset.id, versions) ?? NO_SOURCE
+  return inferredBase(args, next.version_ids, true) === next.include_base
+    ? { version_ids: next.version_ids }
+    : saved
+}
+
+/** 选中一个数据集时的来源：默认的，默认什么都不选时只选基础标注。 */
+export function selectionToInclude(
+  dataset: Pick<Dataset, "annotated_count" | "image_count">,
+  versions: readonly Pick<DatasetVersion, "id">[],
+  scope: TrainingScope
+): SourceSelection {
+  const defaults = defaultSelection(dataset, versions, scope)
+  return isSelected(defaults)
+    ? defaults
+    : { include_base: true, version_ids: [] }
+}
+
+/**
+ * 为单个数据集选择取背景图（`background` / `all`）时，没有选中的数据集一并
+ * 选中：返回要使用的来源，不需要时为 null。`selection` 是按新的设置得出的
+ * 来源。
+ */
+export function selectionOnScopeChange({
+  dataset,
+  versions,
+  selection,
+  scope,
+}: {
+  dataset: Pick<Dataset, "annotated_count" | "image_count">
+  versions: readonly Pick<DatasetVersion, "id">[]
+  selection: SourceSelection
+  scope: TrainingScope
+}): SourceSelection | null {
+  if (
+    scope === "annotated" ||
+    dataset.image_count === 0 ||
+    isSelected(selection)
+  ) {
+    return null
   }
-  return defaultSelection(dataset, versions)
+  return selectionToInclude(dataset, versions, scope)
 }
 
 /** 勾选 / 取消一个审图版本，结果保持新的在前（与 versions 的顺序一致）。 */
@@ -157,7 +284,12 @@ export function toggleVersion(
 
 /** 请求中的来源：选中的数据集，按项目中的顺序。 */
 export function sourceInputs(
-  entries: readonly { datasetId: number; selection: SourceSelection }[]
+  entries: readonly {
+    datasetId: number
+    selection: SourceSelection
+    /** 单独设置的参与训练的图片，`""` 使用默认的。 */
+    scope?: ScopeOverride
+  }[]
 ): SourceInput[] {
   return entries
     .filter((entry) => isSelected(entry.selection))
@@ -165,7 +297,45 @@ export function sourceInputs(
       dataset_id: entry.datasetId,
       include_base: entry.selection.include_base,
       version_ids: entry.selection.version_ids,
+      scope: entry.scope ?? "",
     }))
+}
+
+// ---- 参与训练的图片 ----
+
+/** 数据集单独设置的参与训练的图片；`""` 使用默认的（表单的 `scope`）。 */
+export type ScopeOverride = TrainingScope | ""
+
+/**
+ * 模板中这个数据集单独设置的参与训练的图片：与模板的默认设置不同时为它，
+ * 否则（或不在模板中）为 `""`。
+ */
+export function templateScope(
+  template: Pick<DataVersion, "config" | "sources"> | null,
+  datasetId: number
+): ScopeOverride {
+  const source = template?.sources.find((s) => s.dataset_id === datasetId)
+  return template && source && source.scope !== template.config.scope
+    ? source.scope
+    : ""
+}
+
+/** 数据集的单独设置：用户改过的 > 模板中的 > 使用默认（`""`）。 */
+export function scopeOverride(
+  draft: Pick<FormDraft, "scopes">,
+  template: Pick<DataVersion, "config" | "sources"> | null,
+  datasetId: number
+): ScopeOverride {
+  return draft.scopes[datasetId] ?? templateScope(template, datasetId)
+}
+
+/** 数据集实际使用的参与训练的图片。 */
+export function effectiveScope(
+  draft: Pick<FormDraft, "scope" | "scopes">,
+  template: Pick<DataVersion, "config" | "sources"> | null,
+  datasetId: number
+): TrainingScope {
+  return scopeOverride(draft, template, datasetId) || draft.scope
 }
 
 const timeOf = (value: string | null | undefined) =>
@@ -386,7 +556,14 @@ export function parseAugmentation(
 
 export type FormDraft = {
   /** 用户改过的数据集来源（按数据集 ID）；没有改过的用模板或默认值。 */
-  overrides: Record<number, SourceSelection>
+  overrides: Record<number, SourceOverride>
+  /** 数据集默认的参与训练的图片。 */
+  scope: TrainingScope
+  /**
+   * 用户改过的数据集参与训练的图片（按数据集 ID，`""` 为使用默认）；没有改过
+   * 的用模板中的设置，见 scopeOverride。
+   */
+  scopes: Record<number, ScopeOverride>
   ratio: RatioDraft
   seed: string
   use_folders: boolean
@@ -403,6 +580,8 @@ export function initialDraft(template: DataVersion | null): FormDraft {
   if (!template) {
     return {
       overrides: {},
+      scope: "annotated",
+      scopes: {},
       ratio: ratioDraftOf(RATIO_PRESETS[0]),
       seed: String(DEFAULT_SEED),
       use_folders: true,
@@ -416,6 +595,8 @@ export function initialDraft(template: DataVersion | null): FormDraft {
   const { split, augmentation } = template.config
   return {
     overrides: {},
+    scope: template.config.scope,
+    scopes: {},
     ratio: ratioDraftOf(split),
     seed: String(split.seed),
     use_folders: split.use_folders,
@@ -487,6 +668,7 @@ export function buildPreviewInput({
         use_folders: draft.use_folders,
         group_by: draft.group_by,
       },
+      scope: draft.scope,
       include_empty: draft.include_empty,
       ignore_labels: ignore,
       augmentation: augmentation.value,
@@ -538,6 +720,14 @@ export function previewWarnings(
       `增强图片约 ${formatNumber(preview.augmented_count)} 张，超过上限 ${formatNumber(MAX_AUGMENTED_IMAGES)} 张，请减少份数或方法`
     )
   }
+  for (const source of preview.sources) {
+    if (source.selected_count > 0 && source.image_count === 0) {
+      warn(
+        `source:${source.dataset_id}`,
+        `数据集“${source.dataset_name}”选中的 ${formatNumber(source.selected_count)} 张图片都不会纳入，请检查它参与训练的图片与过滤设置`
+      )
+    }
+  }
   if (preview.skipped.unlisted > 0) {
     warn(
       "unlisted",
@@ -572,6 +762,9 @@ export function fieldOfServerError(
   const message = raw.replace(/“[^”]*”/g, "“”")
   if (message.includes("备注")) {
     return "note"
+  }
+  if (message.includes("参与训练的图片")) {
+    return "sources"
   }
   if (message.includes("增强") || message.includes("副本")) {
     return "augment"

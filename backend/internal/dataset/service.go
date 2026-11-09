@@ -388,15 +388,34 @@ func (s *Service) registerDirectory(ctx context.Context, name, desc, dirName str
 type UpdateDatasetInput struct {
 	Name        *string
 	Description *string
+	Status      *string // a DatasetStatus*; DatasetStatusNone clears it
 }
 
-// UpdateDataset renames a dataset or changes its description. The folder
-// keeps its name.
+// UpdateDataset renames a dataset, changes its description or its status.
+// The folder keeps its name. Changing only the status leaves updated_at
+// alone (the dataset list is ordered by it) and sets status_updated_at
+// when the status is a different one.
 func (s *Service) UpdateDataset(ctx context.Context, id int64, in UpdateDatasetInput) (Dataset, error) {
+	var status string
+	if in.Status != nil {
+		var err error
+		if status, err = NormalizeDatasetStatus(*in.Status); err != nil {
+			return Dataset{}, err
+		}
+	}
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		d, err := queryDataset(ctx, tx, id, true)
 		if err != nil {
 			return err
+		}
+		if in.Status != nil && status != d.Status {
+			if _, err := tx.Exec(ctx, "UPDATE datasets SET status = $2, status_updated_at = now() WHERE id = $1",
+				id, status); err != nil {
+				return err
+			}
+		}
+		if in.Status != nil && in.Name == nil && in.Description == nil {
+			return nil
 		}
 		name, desc := d.Name, d.Description
 		if in.Name != nil {

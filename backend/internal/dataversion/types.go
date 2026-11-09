@@ -56,6 +56,26 @@ const (
 	StoredGenerated = "generated" // augmented copy
 )
 
+// Scopes (参与训练的图片): which images of a dataset a version takes. A
+// version has a default scope (Config.Scope); each source can choose
+// another one.
+const (
+	// ScopeAnnotated takes the images that have an annotation: those with
+	// objects and, with Config.IncludeEmpty, those whose annotation has
+	// none (仅有标注的图片). Images without an annotation are skipped.
+	ScopeAnnotated = "annotated"
+	// ScopeBackground takes only the images without objects, as negative
+	// samples: those without an annotation and those whose annotation has
+	// no objects (仅无标注的背景图). Images with objects are skipped.
+	ScopeBackground = "background"
+	// ScopeAll takes both: every image, those without objects (with or
+	// without an annotation) as negative samples (整个数据集).
+	ScopeAll = "all"
+)
+
+// Scopes lists the scopes in display order.
+var Scopes = []string{ScopeAnnotated, ScopeBackground, ScopeAll}
+
 // Download formats.
 const (
 	FormatYOLO = "yolo"
@@ -114,8 +134,14 @@ type Progress struct {
 
 // Config is the normalized configuration of a version.
 type Config struct {
-	Split        SplitConfig   `json:"split"`
-	IncludeEmpty bool          `json:"include_empty"` // take negative samples (annotations without objects)
+	Split SplitConfig `json:"split"`
+	// Scope is the default scope of the sources (Source.Scope is the one a
+	// source uses). Versions created before scopes have ScopeAnnotated.
+	Scope string `json:"scope"`
+	// IncludeEmpty takes the images of ScopeAnnotated sources whose
+	// annotation has no objects (negative samples); the other scopes take
+	// the images without objects anyway.
+	IncludeEmpty bool          `json:"include_empty"`
 	IgnoreLabels []string      `json:"ignore_labels"` // labels not in the class list whose objects are dropped; sorted
 	Augmentation *Augmentation `json:"augmentation"`  // nil: none
 }
@@ -145,6 +171,7 @@ type Source struct {
 	DirName     string          `json:"dir_name"` // its folder: the images are under images/<dir_name>/
 	IncludeBase bool            `json:"include_base"`
 	Versions    []SourceVersion `json:"versions"` // review versions, newest first
+	Scope       string          `json:"scope"`    // the scope it uses: its own or the version's default
 	// ImageCount is the originals taken from it (0 until ready).
 	ImageCount int `json:"image_count"`
 	// DatasetDeleted: the dataset is no longer in use (in the recycle bin
@@ -188,6 +215,7 @@ type Skipped struct {
 	Invalid           int `json:"invalid"`            // annotation file that cannot be read
 	Unlisted          int `json:"unlisted"`           // labels neither in the class list nor ignored
 	Empty             int `json:"empty"`              // negative samples left out (IncludeEmpty false)
+	WithObjects       int `json:"with_objects"`       // images with objects of a ScopeBackground source
 	Missing           int `json:"missing"`            // file gone since the last scan (build only)
 	Changed           int `json:"changed"`            // file changed since the last scan (build only)
 	UnknownSize       int `json:"unknown_size"`       // image size unknown (cannot be decoded)
@@ -238,6 +266,7 @@ type CreateInput struct {
 	ClassVersion string        `json:"class_version"` // the class list version the client showed
 	Sources      []SourceInput `json:"sources"`
 	Split        SplitConfig   `json:"split"`
+	Scope        string        `json:"scope"` // the default scope of the sources
 	IncludeEmpty bool          `json:"include_empty"`
 	IgnoreLabels []string      `json:"ignore_labels"`
 	Augmentation *Augmentation `json:"augmentation"`
@@ -249,6 +278,7 @@ type SourceInput struct {
 	DatasetID   int64   `json:"dataset_id"`
 	IncludeBase bool    `json:"include_base"`
 	VersionIDs  []int64 `json:"version_ids"`
+	Scope       string  `json:"scope"` // a scope of its own; "": CreateInput.Scope
 }
 
 // Preview is what a version created with an input would contain, counted
@@ -273,9 +303,11 @@ type Preview struct {
 type PreviewSource struct {
 	DatasetID     int64  `json:"dataset_id"`
 	DatasetName   string `json:"dataset_name"`
+	Scope         string `json:"scope"`          // the scope it uses
 	SelectedCount int    `json:"selected_count"` // images of its selection
 	FromVersions  int    `json:"from_versions"`  // of them, with the annotation of a review version
 	ImageCount    int    `json:"image_count"`    // of them, those taken
+	Negatives     int    `json:"negatives"`      // of those, without objects
 	ByFolder      int    `json:"by_folder"`      // of those, split by their folder
 }
 

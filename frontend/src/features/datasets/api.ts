@@ -15,6 +15,19 @@ import { apiGet, apiSend, type ListResponse } from "@/lib/api"
 
 export type DatasetOrigin = "upload" | "directory"
 
+/**
+ * 数据集的状态（团队标记的工作进度，与图片的标注统计无关）：`""` 为未设置，
+ * 其余按工作流的顺序为待标注、标注中、待审图、审图中、可训练（名称与配色见
+ * `dataset-status.ts`）。
+ */
+export type DatasetStatus =
+  | ""
+  | "pending_annotation"
+  | "annotating"
+  | "pending_review"
+  | "reviewing"
+  | "trainable"
+
 /** 图片的引用；`version` 随文件变化而变化，用于缩略图 / 原图的缓存失效。 */
 export type DatasetImageRef = { id: number; version: string }
 
@@ -30,6 +43,9 @@ export type Dataset = {
   /** 服务器（容器）内的绝对路径，如 `/data/datasets/划痕-A`。 */
   path: string
   origin: DatasetOrigin
+  status: DatasetStatus
+  /** 最近一次修改状态的时间；从未设置过时为 null。只改状态不更新 `updated_at`。 */
+  status_updated_at: string | null
   /** 文件夹已不在磁盘上。 */
   directory_missing: boolean
   image_count: number
@@ -528,7 +544,7 @@ export function createDataset(input: CreateDatasetInput) {
 
 export function updateDataset(
   id: number,
-  input: { name?: string; description?: string }
+  input: { name?: string; description?: string; status?: DatasetStatus }
 ) {
   return apiSend<Dataset>("PATCH", datasetPath(id), input)
 }

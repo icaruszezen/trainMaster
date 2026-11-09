@@ -7,6 +7,7 @@ import {
   defaultSelection,
   defaultUnlistedChoice,
   effectiveCopies,
+  effectiveScope,
   effectiveSelection,
   fieldOfServerError,
   ignoreLabels,
@@ -16,16 +17,25 @@ import {
   mergeKnownUnlisted,
   missingTemplateReviewVersions,
   missingTemplateSources,
+  NO_SOURCE,
   notInTemplate,
   parseAugmentation,
   parseRatio,
   previewWarnings,
   ratioDraftOf,
   readyReviewVersions,
+  scopeOverride,
+  selectionOnScopeChange,
+  selectionToInclude,
   sourceDisabledReason,
   sourceInputs,
+  sourceOverride,
+  templateScope,
   toggleVersion,
   type FormDraft,
+  type SourceChange,
+  type SourceOverride,
+  type SourceSelection,
 } from "@/features/data-versions/form-logic"
 import {
   dataVersion,
@@ -89,6 +99,7 @@ describe("default sources", () => {
             { id: 5, name: "审图1.2" },
             { id: 4, name: "审图1.1（已删除）" },
           ],
+          scope: "annotated",
           image_count: 0,
           dataset_deleted: false,
         },
@@ -136,13 +147,345 @@ describe("default sources", () => {
     expect(
       sourceInputs([
         { datasetId: 1, selection: { include_base: true, version_ids: [] } },
-        { datasetId: 2, selection: { include_base: false, version_ids: [] } },
-        { datasetId: 3, selection: { include_base: false, version_ids: [8] } },
+        {
+          datasetId: 2,
+          selection: { include_base: false, version_ids: [] },
+          scope: "all",
+        },
+        {
+          datasetId: 3,
+          selection: { include_base: false, version_ids: [8] },
+          scope: "background",
+        },
       ])
     ).toEqual([
-      { dataset_id: 1, include_base: true, version_ids: [] },
-      { dataset_id: 3, include_base: false, version_ids: [8] },
+      { dataset_id: 1, include_base: true, version_ids: [], scope: "" },
+      {
+        dataset_id: 3,
+        include_base: false,
+        version_ids: [8],
+        scope: "background",
+      },
     ])
+  })
+
+  it("takes the base of an unannotated dataset for background images", () => {
+    const unannotated = dataset({ annotated_count: 0, image_count: 40 })
+    expect(defaultSelection(unannotated, [], "annotated")).toEqual(NO_SOURCE)
+    for (const scope of ["background", "all"] as const) {
+      expect(defaultSelection(unannotated, [v5], scope)).toEqual({
+        include_base: true,
+        version_ids: [5],
+      })
+      expect(
+        effectiveSelection({
+          dataset: unannotated,
+          versions: [],
+          template: null,
+          override: undefined,
+          scope,
+        })
+      ).toEqual({ include_base: true, version_ids: [] })
+    }
+    // 没有图片的数据集不能选择。
+    expect(
+      defaultSelection(
+        dataset({ annotated_count: 0, image_count: 0 }),
+        [],
+        "all"
+      )
+    ).toEqual(NO_SOURCE)
+  })
+})
+
+describe("training scopes", () => {
+  const template = dataVersion({
+    config: { ...dataVersion().config, scope: "all" },
+    sources: [
+      { ...dataVersion().sources[0], dataset_id: 1, scope: "all" },
+      { ...dataVersion().sources[0], dataset_id: 2, scope: "background" },
+    ],
+  })
+
+  it("starts from the template's default and its datasets' own settings", () => {
+    expect(initialDraft(null).scope).toBe("annotated")
+    const draft = initialDraft(template)
+    expect(draft.scope).toBe("all")
+    // 与模板默认相同的数据集使用默认；不同的单独设置；不在模板中的使用默认。
+    expect(templateScope(template, 1)).toBe("")
+    expect(templateScope(template, 2)).toBe("background")
+    expect(templateScope(template, 3)).toBe("")
+    expect(templateScope(null, 2)).toBe("")
+    expect([1, 2, 3].map((id) => effectiveScope(draft, template, id))).toEqual([
+      "all",
+      "background",
+      "all",
+    ])
+  })
+
+  it("takes the base of a template's review-only dataset for background images", () => {
+    const reviewed = dataset({ id: 1, annotated_count: 0, image_count: 40 })
+    const templateWith = (scope: "annotated" | "background") =>
+      dataVersion({
+        sources: [
+          {
+            ...dataVersion().sources[0],
+            dataset_id: 1,
+            include_base: false,
+            versions: [{ id: 5, name: "审图1.2" }],
+            scope,
+          },
+        ],
+      })
+    const select = (
+      scope: "annotated" | "background" | "all",
+      template = templateWith("annotated"),
+      override?: { include_base: boolean; version_ids: number[] }
+    ) =>
+      effectiveSelection({
+        dataset: reviewed,
+        versions: [v5],
+        template,
+        override,
+        scope,
+      })
+    // 模板按“仅有标注的图片”只选了审图版本：取背景图时补选基础标注，改回去
+    // 时恢复（在读取时得出，不保存）。
+    expect(select("annotated")).toEqual({
+      include_base: false,
+      version_ids: [5],
+    })
+    expect(select("background")).toEqual({
+      include_base: true,
+      version_ids: [5],
+    })
+    expect(select("all")).toEqual({ include_base: true, version_ids: [5] })
+    // 模板本来就取背景图、只选了审图版本：照原样。
+    expect(select("background", templateWith("background"))).toEqual({
+      include_base: false,
+      version_ids: [5],
+    })
+    // 用户改过的来源照原样。
+    expect(
+      select("all", templateWith("annotated"), {
+        include_base: false,
+        version_ids: [5],
+      })
+    ).toEqual({ include_base: false, version_ids: [5] })
+    // 审图版本还在读取时，模板的来源看起来没有选中，不补选。
+    expect(
+      effectiveSelection({
+        dataset: reviewed,
+        versions: [],
+        template: templateWith("annotated"),
+        override: undefined,
+        scope: "background",
+      })
+    ).toEqual(NO_SOURCE)
+  })
+
+  it("selects an unselected dataset when it is set to take background images", () => {
+    const background = dataset({ annotated_count: 0, image_count: 40 })
+    const change = (
+      scope: "annotated" | "background" | "all",
+      selection = NO_SOURCE
+    ) =>
+      selectionOnScopeChange({
+        dataset: background,
+        versions: [],
+        selection,
+        scope,
+      })
+    expect(change("background")).toEqual({
+      include_base: true,
+      version_ids: [],
+    })
+    expect(change("all")).toEqual({ include_base: true, version_ids: [] })
+    expect(change("annotated")).toBeNull()
+    expect(change("all", { include_base: false, version_ids: [5] })).toBeNull()
+    expect(selectionToInclude(background, [v5], "annotated")).toEqual({
+      include_base: false,
+      version_ids: [5],
+    })
+    expect(selectionToInclude(background, [], "annotated")).toEqual({
+      include_base: true,
+      version_ids: [],
+    })
+  })
+
+  it("lets the user change a dataset or the default", () => {
+    const draft = {
+      ...initialDraft(template),
+      scope: "annotated" as const,
+      scopes: { 1: "background" as const, 2: "" as const },
+    }
+    expect(scopeOverride(draft, template, 1)).toBe("background")
+    // 改回“使用默认”覆盖模板中的设置。
+    expect(scopeOverride(draft, template, 2)).toBe("")
+    expect([1, 2, 3].map((id) => effectiveScope(draft, template, id))).toEqual([
+      "background",
+      "annotated",
+      "annotated",
+    ])
+  })
+})
+
+describe("saving source changes", () => {
+  type Scope = "annotated" | "background" | "all"
+  // 模板按“仅有标注的图片”只选了数据集 1 的审图版本 5。
+  const template = dataVersion({
+    sources: [
+      {
+        ...dataVersion().sources[0],
+        dataset_id: 1,
+        include_base: false,
+        versions: [{ id: 5, name: "审图1.2" }],
+        scope: "annotated",
+      },
+    ],
+  })
+  const inTemplate = dataset({ id: 1, annotated_count: 10, image_count: 40 })
+  const notInTemplate = dataset({ id: 2, annotated_count: 10, image_count: 40 })
+  type Row = {
+    dataset?: ReturnType<typeof dataset>
+    versions?: (typeof v5)[]
+    template?: typeof template | null
+    override?: SourceOverride
+  }
+  const args = (scope: Scope, row: Row = {}) => ({
+    dataset: row.dataset ?? inTemplate,
+    versions: row.versions ?? [v6, v5],
+    template: row.template === undefined ? template : row.template,
+    override: row.override,
+    scope,
+  })
+  const show = (scope: Scope, row: Row = {}) =>
+    effectiveSelection(args(scope, row))
+  /** 在显示的来源上做一次改动，返回要保存的 override。 */
+  const edit = (
+    scope: Scope,
+    change: SourceChange,
+    next: (shown: SourceSelection) => SourceSelection,
+    row: Row = {}
+  ) => sourceOverride(args(scope, row), next(show(scope, row)), change)
+  const tick = (id: number, checked: boolean) => (shown: SourceSelection) =>
+    toggleVersion(shown, id, checked, [v6, v5])
+
+  it("does not save the base worked out for background images", () => {
+    expect(show("background")).toEqual({ include_base: true, version_ids: [5] })
+    // 勾选新的审图版本（“全部选中”也一样）：补选的基础标注不保存。
+    const more = edit("background", "versions", tick(6, true))
+    expect(more).toEqual({ version_ids: [6, 5] })
+    expect(show("background", { override: more })).toEqual({
+      include_base: true,
+      version_ids: [6, 5],
+    })
+    // 改回“仅有标注的图片”：与模板一样不选基础标注。
+    expect(show("annotated", { override: more })).toEqual({
+      include_base: false,
+      version_ids: [6, 5],
+    })
+  })
+
+  it("drops the worked-out base with the last review version", () => {
+    const none = edit("background", "versions", tick(5, false))
+    expect(none).toEqual({ include_base: false, version_ids: [] })
+    for (const scope of ["annotated", "background", "all"] as const) {
+      expect(show(scope, { override: none })).toEqual(NO_SOURCE)
+    }
+    // 再勾选：照显示的只选审图版本，改参与训练的图片时不变。
+    const again = edit("background", "versions", tick(5, true), {
+      override: none,
+    })
+    expect(again).toEqual({ include_base: false, version_ids: [5] })
+    expect(show("annotated", { override: again })).toEqual({
+      include_base: false,
+      version_ids: [5],
+    })
+  })
+
+  it("keeps the base the user chose", () => {
+    const unticked = edit("background", "base", (shown) => ({
+      ...shown,
+      include_base: false,
+    }))
+    expect(unticked).toEqual({ include_base: false, version_ids: [5] })
+    expect(show("all", { override: unticked })).toEqual(unticked)
+    const ticked = edit("annotated", "base", (shown) => ({
+      ...shown,
+      include_base: true,
+    }))
+    // 之后改审图版本也照旧。
+    const more = edit("annotated", "versions", tick(6, true), {
+      override: ticked,
+    })
+    expect(more).toEqual({ include_base: true, version_ids: [6, 5] })
+  })
+
+  it("keeps a dataset the user left out unselected whatever the scope", () => {
+    const off = edit("annotated", "dataset", () => NO_SOURCE, {
+      template: null,
+    })
+    expect(off).toEqual({ include_base: false, version_ids: [] })
+    expect(show("background", { template: null, override: off })).toEqual(
+      NO_SOURCE
+    )
+    // 没有已标注图片的数据集取消最后一个审图版本：取背景图时也不再选中。
+    const unannotated = {
+      dataset: dataset({ annotated_count: 0, image_count: 40 }),
+      versions: [v5],
+      template: null,
+    }
+    expect(show("annotated", unannotated)).toEqual({
+      include_base: false,
+      version_ids: [5],
+    })
+    const none = edit("annotated", "versions", tick(5, false), unannotated)
+    expect(none).toEqual({ include_base: false, version_ids: [] })
+    expect(show("background", { ...unannotated, override: none })).toEqual(
+      NO_SOURCE
+    )
+  })
+
+  it("does not tick the base with a review version of an unselected dataset", () => {
+    const row = { dataset: notInTemplate }
+    expect(show("annotated", row)).toEqual(NO_SOURCE)
+    expect(edit("annotated", "versions", tick(5, true), row)).toEqual({
+      include_base: false,
+      version_ids: [5],
+    })
+  })
+
+  it("works the base out again when a dataset is ticked", () => {
+    // 模板中没有的数据集：按默认，与在哪种设置下勾选无关。
+    for (const scope of ["annotated", "background"] as const) {
+      const row = { dataset: notInTemplate }
+      const saved = sourceOverride(
+        args(scope, row),
+        selectionToInclude(notInTemplate, [v6, v5], scope),
+        "dataset"
+      )
+      expect(saved).toEqual({ version_ids: [6, 5] })
+      for (const shownScope of ["annotated", "background"] as const) {
+        expect(show(shownScope, { ...row, override: saved })).toEqual({
+          include_base: true,
+          version_ids: [6, 5],
+        })
+      }
+    }
+    // 默认什么都不选时只选基础标注：保存它。
+    const background = dataset({ annotated_count: 0, image_count: 40 })
+    expect(
+      sourceOverride(
+        args("annotated", {
+          dataset: background,
+          versions: [],
+          template: null,
+        }),
+        selectionToInclude(background, [], "annotated"),
+        "dataset"
+      )
+    ).toEqual({ include_base: true, version_ids: [] })
   })
 })
 
@@ -213,6 +556,7 @@ describe("prefill", () => {
           use_folders: false,
           group_by: "folder",
         },
+        scope: "background",
         include_empty: false,
         ignore_labels: ["dirt"],
         augmentation: {
@@ -238,6 +582,8 @@ describe("prefill", () => {
     expect(draft.use_folders).toBe(false)
     expect(draft.group_by).toBe("folder")
     expect(draft.include_empty).toBe(false)
+    expect(draft.scope).toBe("background")
+    expect(draft.scopes).toEqual({})
     expect(draft.augment).toEqual({
       enabled: true,
       methods: ["hflip", "noise"],
@@ -331,7 +677,9 @@ describe("augmentation", () => {
 
 describe("buildPreviewInput", () => {
   const draft: FormDraft = initialDraft(null)
-  const sources = [{ dataset_id: 1, include_base: true, version_ids: [5] }]
+  const sources = [
+    { dataset_id: 1, include_base: true, version_ids: [5], scope: "" as const },
+  ]
 
   it("builds the request", () => {
     expect(
@@ -348,6 +696,7 @@ describe("buildPreviewInput", () => {
           use_folders: true,
           group_by: "stem",
         },
+        scope: "annotated",
         include_empty: true,
         ignore_labels: ["dirt"],
         augmentation: null,
@@ -419,6 +768,35 @@ describe("previewWarnings", () => {
     expect(warnings.map((w) => w.key)).toEqual(["empty"])
   })
 
+  it("warns about a selected dataset none of whose images are taken", () => {
+    const source = {
+      dataset_id: 4,
+      dataset_name: "背景",
+      scope: "background" as const,
+      selected_count: 30,
+      from_versions: 0,
+      image_count: 0,
+      negatives: 0,
+      by_folder: 0,
+    }
+    const warnings = previewWarnings(
+      preview({
+        sources: [
+          source,
+          { ...source, dataset_id: 5, image_count: 30, negatives: 30 },
+          { ...source, dataset_id: 6, selected_count: 0 },
+        ],
+      }),
+      0
+    )
+    expect(warnings.map((w) => [w.key, w.tone])).toEqual([
+      ["source:4", "warning"],
+    ])
+    expect(warnings[0]?.text).toContain(
+      "数据集“背景”选中的 30 张图片都不会纳入"
+    )
+  })
+
   it("refuses too many augmented images", () => {
     expect(
       previewWarnings(preview({ augmented_count: 100_001 }), 0)[0]?.key
@@ -441,6 +819,11 @@ describe("server errors", () => {
     )
     expect(fieldOfServerError("忽略的标签“scratch”在类别列表中")).toBe("labels")
     expect(fieldOfServerError("数据集“A”不在项目中")).toBe("sources")
+    expect(
+      fieldOfServerError(
+        "参与训练的图片无效：应为 annotated（仅有标注的图片）、background（仅无标注的背景图）或 all（整个数据集）"
+      )
+    ).toBe("sources")
     // 名称中的字词不影响判断。
     expect(fieldOfServerError("数据集“产线A 副本”不在项目中")).toBe("sources")
     expect(fieldOfServerError("审图版本“划分备注”还没有生成完成")).toBe(

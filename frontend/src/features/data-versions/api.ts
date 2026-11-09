@@ -48,6 +48,15 @@ export type DataVersionFormat = "yolo" | "voc" | "coco"
 
 export type DataVersionClass = { name: string; color: string }
 
+/**
+ * 参与训练的图片：`annotated` 仅有标注的图片（有目标的图片，加上
+ * `include_empty` 时的空标注图片；没有标注的图片不纳入）；`background` 仅无标注
+ * 的背景图（没有目标的图片，含没有标注文件的，作为负样本；有目标的图片不纳入）；
+ * `all` 整个数据集（没有目标的图片作为负样本）。版本有一个默认的设置，每个
+ * 数据集可以单独修改（名称与说明见 format.ts）。
+ */
+export type TrainingScope = "annotated" | "background" | "all"
+
 export type SplitConfig = {
   /** 百分比：train ≥ 1，val ≥ 1，test ≥ 0，三者之和为 100。 */
   train: number
@@ -73,7 +82,9 @@ export type Augmentation = {
 
 export type DataVersionConfig = {
   split: SplitConfig
-  /** 纳入空标注图片（负样本）。 */
+  /** 数据集默认的参与训练的图片（各数据集使用的见 {@link DataVersionSource}）。 */
+  scope: TrainingScope
+  /** 纳入空标注图片（负样本）；只影响 `annotated` 的数据集，其它两种总是纳入。 */
   include_empty: boolean
   /**
    * 不在类别列表中、去掉其目标（保留图片）的标签。含有其它不在类别列表中的
@@ -90,6 +101,8 @@ export type DataVersionSource = {
   include_base: boolean
   /** 所选的审图版本，新的在前。 */
   versions: { id: number; name: string }[]
+  /** 这个数据集使用的参与训练的图片（单独设置的或默认的）。 */
+  scope: TrainingScope
   /** 从这个数据集纳入的原图数（生成完成前为 0）。 */
   image_count: number
   /** 数据集已不在使用中（在回收站中或已永久删除）。 */
@@ -124,6 +137,8 @@ export type DataVersionSkipped = {
   unlisted: number
   /** 空标注图片（include_empty 为 false 时）。 */
   empty: number
+  /** 有目标的图片（参与训练的图片为“仅无标注的背景图”的数据集）。 */
+  with_objects: number
   /** 文件在上次扫描后被删除（生成时才知道）。 */
   missing: number
   /** 文件在上次扫描后被修改（生成时才知道，重新扫描数据集即可）。 */
@@ -217,6 +232,8 @@ export type SourceInput = {
   dataset_id: number
   include_base: boolean
   version_ids: number[]
+  /** 单独设置的参与训练的图片；`""` 使用默认的（`scope`）。 */
+  scope: TrainingScope | ""
 }
 
 export type CreateDataVersionInput = {
@@ -227,6 +244,8 @@ export type CreateDataVersionInput = {
   /** 1–1000 个项目中的数据集，每个一次（版本中的顺序是项目中数据集的顺序）。 */
   sources: SourceInput[]
   split: SplitConfig
+  /** 数据集默认的参与训练的图片。 */
+  scope: TrainingScope
   include_empty: boolean
   ignore_labels: string[]
   augmentation: Augmentation | null
@@ -257,12 +276,16 @@ export type DataVersionPreview = {
   sources: {
     dataset_id: number
     dataset_name: string
+    /** 这个数据集使用的参与训练的图片。 */
+    scope: TrainingScope
     /** 所选标注来源中的图片数（过滤前）。 */
     selected_count: number
     /** 其中标注来自审图版本的图片数。 */
     from_versions: number
     /** 其中纳入的图片数。 */
     image_count: number
+    /** 纳入的图片中没有目标的图片数（负样本）。 */
+    negatives: number
     /** 纳入的图片中按所在文件夹划分的图片数。 */
     by_folder: number
   }[]

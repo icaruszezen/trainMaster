@@ -16,9 +16,10 @@ import type { Dataset } from "@/features/datasets/api"
 import { DatasetActionsMenu } from "@/features/datasets/dataset-actions"
 import {
   annotatedPercent,
-  DatasetStatusBadges,
+  DatasetActivityBadges,
   originLabels,
 } from "@/features/datasets/dataset-card"
+import { DatasetStatusPicker } from "@/features/datasets/dataset-status-picker"
 import { DatasetThumbnail } from "@/features/datasets/dataset-thumbnail"
 import { DatasetProjectBadges } from "@/features/projects/dataset-project-badges"
 import {
@@ -66,6 +67,7 @@ export function DatasetTable({
         <TableHeader>
           <TableRow className="hover:bg-transparent">
             <TableHead className="pl-4">名称</TableHead>
+            <TableHead className="hidden sm:table-cell">状态</TableHead>
             <TableHead className="text-right">图片</TableHead>
             <TableHead className="hidden w-44 sm:table-cell">已标注</TableHead>
             <TableHead className="hidden text-right lg:table-cell">
@@ -113,15 +115,25 @@ export function DatasetTable({
                       >
                         {dataset.name}
                       </Link>
-                      {dataset.directory_missing || dataset.active_import ? (
-                        <DatasetStatusBadges dataset={dataset} />
-                      ) : (
-                        <span className="max-w-xs truncate text-xs text-muted-foreground">
-                          {dataset.description || dataset.dir_name}
-                        </span>
-                      )}
+                      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                        {/* 手机上没有“状态”列，状态显示在名称下方（代替描述）。 */}
+                        <DatasetStatusPicker
+                          dataset={dataset}
+                          className="sm:hidden"
+                        />
+                        {dataset.directory_missing || dataset.active_import ? (
+                          <DatasetActivityBadges dataset={dataset} />
+                        ) : (
+                          <span className="hidden max-w-xs truncate text-xs text-muted-foreground sm:block">
+                            {dataset.description || dataset.dir_name}
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </div>
+                </TableCell>
+                <TableCell className="hidden sm:table-cell">
+                  <DatasetStatusPicker dataset={dataset} />
                 </TableCell>
                 <TableCell className="text-right tabular-nums">
                   {formatNumber(dataset.image_count)}

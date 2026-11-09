@@ -6,11 +6,13 @@ import {
   classColor,
   classSplitWarnings,
   compareText,
+  customScopeCount,
   DATA_VERSION_STATUS_LABELS,
   dataVersionFullTitle,
   dataVersionTitle,
   emptyClasses,
   findRatioPreset,
+  negativesText,
   noteFirstLine,
   parseCustomRatio,
   parseSeed,
@@ -29,8 +31,14 @@ import {
   splitSummary,
   statusDetailText,
   storageText,
+  TRAINING_SCOPE_LABELS,
+  TRAINING_SCOPES,
 } from "@/features/data-versions/format"
-import { EMPTY_STATS, NO_SKIPPED } from "@/features/data-versions/test-fixtures"
+import {
+  dataVersion,
+  EMPTY_STATS,
+  NO_SKIPPED,
+} from "@/features/data-versions/test-fixtures"
 import type { DataVersionLabelStats } from "@/features/data-versions/api"
 
 describe("titles", () => {
@@ -191,10 +199,59 @@ describe("skipped", () => {
     expect(skippedSummary(NO_SKIPPED)).toBe("")
   })
 
+  it("lists images with objects after the empty ones", () => {
+    const skipped = { ...NO_SKIPPED, with_objects: 12, empty: 1, missing: 2 }
+    expect(skippedEntries(skipped).map((e) => e.key)).toEqual([
+      "empty",
+      "with_objects",
+      "missing",
+    ])
+    expect(skippedTotal(skipped)).toBe(15)
+  })
+
   it("does not count images that were only not augmented", () => {
     expect(
       skippedTotal({ ...NO_SKIPPED, unlisted: 2, augment_skipped: 5 })
     ).toBe(2)
+  })
+})
+
+describe("training scopes", () => {
+  const version = dataVersion()
+  const source = version.sources[0]
+
+  it("names every scope", () => {
+    expect(
+      TRAINING_SCOPES.map((scope) => TRAINING_SCOPE_LABELS[scope])
+    ).toEqual(["仅有标注的图片", "仅无标注的背景图", "整个数据集"])
+  })
+
+  it("counts the datasets with a scope of their own", () => {
+    expect(customScopeCount(version)).toBe(0)
+    expect(
+      customScopeCount({
+        config: version.config,
+        sources: [source, { ...source, scope: "background" }],
+      })
+    ).toBe(1)
+  })
+
+  it("says the empty switch only applies to annotated datasets", () => {
+    const config = { ...version.config, include_empty: false }
+    expect(negativesText({ config, sources: [source] })).toBe(
+      "不纳入空标注图片"
+    )
+    expect(
+      negativesText({
+        config,
+        sources: [source, { ...source, scope: "all" }],
+      })
+    ).toBe(
+      "不纳入空标注图片（“仅有标注的图片”的数据集），其它数据集纳入没有目标的图片"
+    )
+    expect(
+      negativesText({ config, sources: [{ ...source, scope: "background" }] })
+    ).toBe("纳入没有目标的图片")
   })
 })
 
@@ -309,6 +366,7 @@ describe("sources", () => {
         image_count: 120,
         from_versions: 20,
         by_folder: 15,
+        negatives: 0,
       })
     ).toBe("选中 130 张 · 纳入 120 张（20 张用审图标注） · 15 张按文件夹划分")
     expect(
@@ -317,8 +375,18 @@ describe("sources", () => {
         image_count: 10,
         from_versions: 0,
         by_folder: 0,
+        negatives: 0,
       })
     ).toBe("选中 10 张 · 纳入 10 张")
+    expect(
+      previewSourceText({
+        selected_count: 40,
+        image_count: 25,
+        from_versions: 0,
+        by_folder: 0,
+        negatives: 25,
+      })
+    ).toBe("选中 40 张 · 纳入 25 张 · 负样本 25 张")
   })
 
   it("explains the annotation sources", () => {

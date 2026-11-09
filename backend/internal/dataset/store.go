@@ -24,22 +24,24 @@ const upsertBatchSize = 500
 
 // ---- datasets ----
 
-const datasetColumns = `id, name, description, dir_name, origin, image_count, annotated_count, empty_count,
-	invalid_count, object_count, label_count, total_bytes, scanned_at, created_at, updated_at`
+const datasetColumns = `id, name, description, dir_name, origin, status, status_updated_at, image_count,
+	annotated_count, empty_count, invalid_count, object_count, label_count, total_bytes, scanned_at, created_at,
+	updated_at`
 
 func scanDataset(row pgx.Row) (Dataset, error) { return scanDatasetWith(row) }
 
 // scanDatasetWith scans datasetColumns followed by the extra columns.
 func scanDatasetWith(row pgx.Row, extra ...any) (Dataset, error) {
 	var d Dataset
-	err := row.Scan(append([]any{&d.ID, &d.Name, &d.Description, &d.DirName, &d.Origin, &d.ImageCount,
-		&d.AnnotatedCount, &d.EmptyCount, &d.InvalidCount, &d.ObjectCount, &d.LabelCount, &d.TotalBytes,
-		&d.ScannedAt, &d.CreatedAt, &d.UpdatedAt}, extra...)...)
+	err := row.Scan(append([]any{&d.ID, &d.Name, &d.Description, &d.DirName, &d.Origin, &d.Status,
+		&d.StatusUpdatedAt, &d.ImageCount, &d.AnnotatedCount, &d.EmptyCount, &d.InvalidCount, &d.ObjectCount,
+		&d.LabelCount, &d.TotalBytes, &d.ScannedAt, &d.CreatedAt, &d.UpdatedAt}, extra...)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return d, errDatasetNotFound
 	}
 	d.CreatedAt, d.UpdatedAt = d.CreatedAt.UTC(), d.UpdatedAt.UTC()
 	d.ScannedAt = utcPtr(d.ScannedAt)
+	d.StatusUpdatedAt = utcPtr(d.StatusUpdatedAt)
 	d.Covers = []ImageRef{}
 	d.Projects = []ProjectRef{}
 	return d, err
@@ -68,6 +70,9 @@ type DatasetQuery struct {
 	Search    string // case-insensitive substring of the name or description, "" for any
 	ProjectID int64  // > 0: only the datasets of this project
 	NoProject bool   // only the datasets that belong to no project
+	// Status, when not nil, selects the datasets with this status (a
+	// DatasetStatus*; DatasetStatusNone: those not marked).
+	Status *string
 }
 
 func queryDatasets(ctx context.Context, q querier, f DatasetQuery) ([]Dataset, error) {
@@ -75,7 +80,8 @@ func queryDatasets(ctx context.Context, q querier, f DatasetQuery) ([]Dataset, e
 		WHERE deleted_at IS NULL AND ($1 = '' OR strpos(lower(name), lower($1)) > 0 OR strpos(lower(description), lower($1)) > 0)
 			AND ($2::bigint = 0 OR EXISTS (SELECT 1 FROM project_datasets pd WHERE pd.dataset_id = d.id AND pd.project_id = $2::bigint))
 			AND NOT ($3::boolean AND EXISTS (SELECT 1 FROM project_datasets pd WHERE pd.dataset_id = d.id))
-		ORDER BY updated_at DESC, id DESC`, f.Search, f.ProjectID, f.NoProject)
+			AND ($4::text IS NULL OR status = $4::text)
+		ORDER BY updated_at DESC, id DESC`, f.Search, f.ProjectID, f.NoProject, f.Status)
 	if err != nil {
 		return nil, err
 	}

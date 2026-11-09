@@ -259,8 +259,8 @@ func (e *coreEnv) coreReviewVersion(t *testing.T, datasetID int64, images ...cor
 // coreInput is a create input with the UI defaults.
 func coreInput(projectID int64, classVersion string, sources ...SourceInput) CreateInput {
 	return CreateInput{ProjectID: projectID, Note: "第一版", ClassVersion: classVersion, Sources: sources,
-		Split:        SplitConfig{Train: 80, Val: 20, Test: 0, Seed: 42, UseFolders: true, GroupBy: GroupByStem},
-		IncludeEmpty: true, IgnoreLabels: []string{}}
+		Split: SplitConfig{Train: 80, Val: 20, Test: 0, Seed: 42, UseFolders: true, GroupBy: GroupByStem},
+		Scope: ScopeAnnotated, IncludeEmpty: true, IgnoreLabels: []string{}}
 }
 
 // coreBase selects the base annotations of datasets.

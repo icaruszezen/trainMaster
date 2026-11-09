@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react"
 import { keepPreviousData, useQuery } from "@tanstack/react-query"
 import {
+  CircleDot,
   Database,
   FolderKanban,
   FolderOpen,
@@ -62,6 +63,16 @@ import {
   useScanDataset,
 } from "@/features/datasets/dataset-actions"
 import { DatasetCard } from "@/features/datasets/dataset-card"
+import {
+  countByStatus,
+  DATASET_STATUSES,
+  datasetStatusLabels,
+  filterByStatus,
+  parseStatusFilter,
+  statusFilterParam,
+  type DatasetStatusFilter,
+} from "@/features/datasets/dataset-status"
+import { DatasetStatusDot } from "@/features/datasets/dataset-status-picker"
 import { DatasetTable } from "@/features/datasets/dataset-table"
 import { DatasetsRootHint } from "@/features/datasets/directory-picker"
 import { ExportDialog } from "@/features/datasets/export-dialog"
@@ -140,6 +151,33 @@ function useProjectFilter(projects: Project[] | undefined) {
   return { filter, project, setFilter }
 }
 
+/**
+ * 状态筛选也保存在地址栏中（`?status=trainable` / `?status=none`），与后端
+ * `GET /datasets?status=` 的取值相同。列表在浏览器中按状态筛选，以便显示每个
+ * 状态的数量、修改状态后立即生效。
+ */
+function useStatusFilter() {
+  const [params, setParams] = useSearchParams()
+  const filter = parseStatusFilter(params.get("status"))
+
+  const setFilter = (next: DatasetStatusFilter) => {
+    setParams(
+      (previous) => {
+        const updated = new URLSearchParams(previous)
+        const value = statusFilterParam(next)
+        if (value === null) {
+          updated.delete("status")
+        } else {
+          updated.set("status", value)
+        }
+        return updated
+      },
+      { replace: true }
+    )
+  }
+  return { filter, setFilter }
+}
+
 export function DatasetsPage() {
   const [search, setSearch] = useState("")
   const q = useDebouncedValue(search.trim(), 300)
@@ -158,6 +196,20 @@ export function DatasetsPage() {
 
   const projects = useQuery(projectsQuery())
   const projectFilter = useProjectFilter(projects.data?.items)
+  const statusFilter = useStatusFilter()
+  // 两个筛选一次清除：分别调用各自的 setFilter 时，后一次会基于渲染时的地址栏
+  // 参数覆盖前一次。
+  const [, setParams] = useSearchParams()
+  const clearFilters = () =>
+    setParams(
+      (previous) => {
+        const updated = new URLSearchParams(previous)
+        updated.delete("project")
+        updated.delete("status")
+        return updated
+      },
+      { replace: true }
+    )
 
   // 不带筛选条件的完整列表用于统计；筛选结果单独查询。
   const all = useQuery(datasetsQuery())
@@ -165,11 +217,21 @@ export function DatasetsPage() {
     ...datasetsQuery(q, projectFilter.filter),
     placeholderData: keepPreviousData,
   })
-  const isFiltered = q !== "" || projectFilter.filter !== null
+  const isFiltered =
+    q !== "" || projectFilter.filter !== null || statusFilter.filter !== null
 
+  // 各状态的数量按搜索与项目筛选后的结果计算。
+  const statusCounts = useMemo(
+    () => countByStatus(filtered.data?.items ?? []),
+    [filtered.data]
+  )
   const items = useMemo(
-    () => sortDatasets(filtered.data?.items ?? [], sort),
-    [filtered.data, sort]
+    () =>
+      sortDatasets(
+        filterByStatus(filtered.data?.items ?? [], statusFilter.filter),
+        sort
+      ),
+    [filtered.data, statusFilter.filter, sort]
   )
 
   const openCreate = (tab: CreateTab) => {
@@ -254,6 +316,12 @@ export function DatasetsPage() {
               value={projectFilter.filter}
               onChange={projectFilter.setFilter}
             />
+            <StatusFilterSelect
+              value={statusFilter.filter}
+              onChange={statusFilter.setFilter}
+              counts={statusCounts}
+              total={filtered.data?.items.length}
+            />
             <Select
               value={sort}
               onValueChange={(value) => setSort(value as SortKey)}
@@ -304,7 +372,12 @@ export function DatasetsPage() {
                 </EmptyMedia>
                 <EmptyTitle className="text-base">没有匹配的数据集</EmptyTitle>
                 <EmptyDescription>
-                  {noMatchText(q, projectFilter.filter, projectFilter.project)}
+                  {noMatchText(
+                    q,
+                    projectFilter.filter,
+                    projectFilter.project,
+                    statusFilter.filter
+                  )}
                 </EmptyDescription>
               </EmptyHeader>
               <EmptyContent>
@@ -313,7 +386,7 @@ export function DatasetsPage() {
                   size="sm"
                   onClick={() => {
                     setSearch("")
-                    projectFilter.setFilter(null)
+                    clearFilters()
                   }}
                 >
                   清除筛选
@@ -376,7 +449,8 @@ export function DatasetsPage() {
 function noMatchText(
   q: string,
   filter: DatasetProjectFilter,
-  project: Project | undefined
+  project: Project | undefined,
+  status: DatasetStatusFilter = null
 ) {
   const scope =
     filter === "none"
@@ -386,12 +460,91 @@ function noMatchText(
         : filter !== null
           ? "所选项目中"
           : ""
+  const statusText =
+    status === null
+      ? ""
+      : status
+        ? `状态为“${datasetStatusLabels[status]}”`
+        : "未设置状态"
   if (q) {
-    return `${scope}没有名称或描述包含“${q}”的数据集。`
+    return statusText
+      ? `${scope}没有${statusText}、名称或描述包含“${q}”的数据集。`
+      : `${scope}没有名称或描述包含“${q}”的数据集。`
+  }
+  if (statusText) {
+    return `${scope}没有${statusText}的数据集。`
   }
   return filter === "none"
     ? "所有数据集都已纳入项目。"
     : `${scope}还没有数据集。`
+}
+
+/** 按状态筛选：全部状态 / 某个状态 / 未设置，每项带搜索与项目筛选后的数量。 */
+function StatusFilterSelect({
+  value,
+  onChange,
+  counts,
+  total,
+}: {
+  value: DatasetStatusFilter
+  onChange: (value: DatasetStatusFilter) => void
+  counts: Record<string, number>
+  /** 搜索与项目筛选后的数据集数；还在加载时为 undefined。 */
+  total: number | undefined
+}) {
+  const count = (n: number | undefined) =>
+    n === undefined ? null : (
+      <span className="ml-auto pl-3 text-xs text-muted-foreground tabular-nums">
+        {formatNumber(n)}
+      </span>
+    )
+  // 选项文字占满一行，数量靠右对齐。
+  const itemClass = "[&>span:last-child]:flex-1"
+
+  return (
+    <Select
+      value={value === null ? "all" : value || "none"}
+      onValueChange={(next) =>
+        onChange(next === "all" ? null : parseStatusFilter(next))
+      }
+    >
+      <SelectTrigger className="w-32" aria-label="按状态筛选">
+        <SelectValue>
+          {value === null ? (
+            <>
+              <CircleDot className="text-muted-foreground" />
+              全部状态
+            </>
+          ) : (
+            <>
+              <DatasetStatusDot status={value} />
+              {datasetStatusLabels[value]}
+            </>
+          )}
+        </SelectValue>
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value="all" className={itemClass}>
+          全部状态
+          {count(total)}
+        </SelectItem>
+        <SelectSeparator />
+        {DATASET_STATUSES.map((status) => (
+          <SelectItem key={status} value={status} className={itemClass}>
+            <DatasetStatusDot status={status} />
+            {datasetStatusLabels[status]}
+            {count(total === undefined ? undefined : counts[status])}
+          </SelectItem>
+        ))}
+        <SelectSeparator />
+        <SelectItem value="none" className={itemClass}>
+          <DatasetStatusDot status="" />
+          未设置
+          {count(total === undefined ? undefined : counts[""])}
+        </SelectItem>
+      </SelectContent>
+    </Select>
+  )
 }
 
 /** 按项目筛选：全部项目 / 未纳入项目 / 某个项目。 */

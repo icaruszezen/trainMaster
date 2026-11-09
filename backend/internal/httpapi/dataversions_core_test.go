@@ -46,9 +46,9 @@ func (e *dataVersionEnv) buildProject(t *testing.T, name string) (project.Projec
 // createInput is the CreateInput the UI sends by default, split 50/50.
 func createInput(projectID, datasetID int64, classVersion string) map[string]any {
 	return map[string]any{"project_id": projectID, "note": "第一版", "class_version": classVersion,
-		"sources":       []map[string]any{{"dataset_id": datasetID, "include_base": true, "version_ids": []int64{}}},
-		"split":         map[string]any{"train": 50, "val": 50, "test": 0, "seed": 42, "use_folders": true, "group_by": "stem"},
-		"include_empty": true, "ignore_labels": []string{}, "augmentation": nil}
+		"sources": []map[string]any{{"dataset_id": datasetID, "include_base": true, "version_ids": []int64{}}},
+		"split":   map[string]any{"train": 50, "val": 50, "test": 0, "seed": 42, "use_folders": true, "group_by": "stem"},
+		"scope":   "annotated", "include_empty": true, "ignore_labels": []string{}, "augmentation": nil}
 }
 
 // waitBuilt polls a version until its build ends.
@@ -190,4 +190,46 @@ func TestDataVersionAPIProjectDeleteVersions(t *testing.T) {
 		t.Errorf("restored = %+v", got)
 	}
 	want[project.Project](t, e.do("GET", projectURL, nil), 200)
+}
+
+func TestDataVersionAPIScope(t *testing.T) {
+	e := startedDataVersionEnv(t)
+	p, ds, classVersion := e.buildProject(t, "背景图")
+
+	// The default scope is required, a source's own is optional.
+	in := createInput(p.ID, ds.ID, classVersion)
+	delete(in, "scope")
+	wantError(t, e.do("POST", "/api/v1/data-versions/preview", in), 422, codeValidationFailed, "参与训练的图片无效")
+	in["scope"] = "bogus"
+	wantError(t, e.do("POST", "/api/v1/data-versions", in), 422, codeValidationFailed, "参与训练的图片无效")
+	in = createInput(p.ID, ds.ID, classVersion)
+	in["sources"] = []map[string]any{{"dataset_id": ds.ID, "include_base": true, "version_ids": []int64{}, "scope": "x"}}
+	wantError(t, e.do("POST", "/api/v1/data-versions/preview", in), 422, codeValidationFailed,
+		fmt.Sprintf("数据集 ID %d 参与训练的图片无效", ds.ID))
+
+	// The JSON contract of the new fields.
+	in["sources"] = []map[string]any{{"dataset_id": ds.ID, "include_base": true, "version_ids": []int64{}, "scope": "all"}}
+	raw := want[map[string]any](t, e.do("POST", "/api/v1/data-versions/preview", in), http.StatusOK)
+	src := raw["sources"].([]any)[0].(map[string]any)
+	wantKeys(t, "preview source", src, "dataset_id", "dataset_name", "scope", "selected_count", "from_versions",
+		"image_count", "negatives", "by_folder")
+	if src["scope"] != "all" {
+		t.Errorf("preview source = %v", src)
+	}
+	if _, ok := raw["skipped"].(map[string]any)["with_objects"]; !ok {
+		t.Errorf("skipped = %v", raw["skipped"])
+	}
+	created := want[map[string]any](t, e.do("POST", "/api/v1/data-versions", in), http.StatusCreated)
+	config := created["config"].(map[string]any)
+	wantKeys(t, "config", config, "split", "scope", "include_empty", "ignore_labels", "augmentation")
+	sources := created["sources"].([]any)
+	wantKeys(t, "source", sources[0].(map[string]any), "dataset_id", "dataset_name", "dir_name", "include_base",
+		"versions", "scope", "image_count", "dataset_deleted")
+	if config["scope"] != "annotated" || sources[0].(map[string]any)["scope"] != "all" {
+		t.Errorf("created = %v", created)
+	}
+	v := e.waitBuilt(t, int64(created["id"].(float64)))
+	if v.Status != dataversion.StatusReady || v.Sources[0].Scope != dataversion.ScopeAll {
+		t.Errorf("built = %+v", v)
+	}
 }

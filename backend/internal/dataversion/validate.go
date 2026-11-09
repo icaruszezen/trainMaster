@@ -52,13 +52,16 @@ func normalizeInput(in CreateInput, forCreate bool) (createRequest, error) {
 		req.note = note
 	}
 	var err error
-	if req.sources, err = normalizeSources(in.Sources); err != nil {
+	if req.sources, err = normalizeSources(in.Sources, in.Scope); err != nil {
 		return req, err
 	}
 	if err := checkSplit(in.Split); err != nil {
 		return req, err
 	}
-	req.config = Config{Split: in.Split, IncludeEmpty: in.IncludeEmpty}
+	if !slices.Contains(Scopes, in.Scope) {
+		return req, errInvalidScope
+	}
+	req.config = Config{Split: in.Split, Scope: in.Scope, IncludeEmpty: in.IncludeEmpty}
 	if req.config.IgnoreLabels, err = normalizeIgnoreLabels(in.IgnoreLabels); err != nil {
 		return req, err
 	}
@@ -98,7 +101,13 @@ func invalidFrom(err error) error {
 	return err
 }
 
-func normalizeSources(raw []SourceInput) ([]SourceInput, error) {
+// errInvalidScope: the default scope is not one of Scopes.
+var errInvalidScope = &Error{Kind: ErrInvalid,
+	Message: "参与训练的图片无效：应为 annotated（仅有标注的图片）、background（仅无标注的背景图）或 all（整个数据集）"}
+
+// normalizeSources checks the sources and resolves their scope: their own,
+// else the default scope.
+func normalizeSources(raw []SourceInput, defaultScope string) ([]SourceInput, error) {
 	switch {
 	case len(raw) == 0:
 		return nil, &Error{Kind: ErrInvalid, Message: "请至少选择一个数据集"}
@@ -114,6 +123,9 @@ func normalizeSources(raw []SourceInput) ([]SourceInput, error) {
 			return nil, newError(ErrInvalid, "同一个数据集只能选择一次（数据集 ID %d）", src.DatasetID)
 		case len(src.VersionIDs) > maxSourceVersions:
 			return nil, newError(ErrInvalid, "每个数据集最多选择 %d 个审图版本", maxSourceVersions)
+		case src.Scope != "" && !slices.Contains(Scopes, src.Scope):
+			return nil, newError(ErrInvalid, "数据集 ID %d 参与训练的图片无效：应为 annotated、background、all，"+
+				"或为空（使用默认的设置）", src.DatasetID)
 		}
 		ids := []int64{}
 		for _, id := range src.VersionIDs {
@@ -127,7 +139,9 @@ func normalizeSources(raw []SourceInput) ([]SourceInput, error) {
 		if !src.IncludeBase && len(ids) == 0 {
 			return nil, &Error{Kind: ErrInvalid, Message: "请为每个数据集至少选择一个标注来源（基础标注或审图版本）"}
 		}
-		out = append(out, SourceInput{DatasetID: src.DatasetID, IncludeBase: src.IncludeBase, VersionIDs: ids})
+		scope := cmp.Or(src.Scope, defaultScope)
+		out = append(out, SourceInput{DatasetID: src.DatasetID, IncludeBase: src.IncludeBase, VersionIDs: ids,
+			Scope: scope})
 	}
 	return out, nil
 }
@@ -228,7 +242,8 @@ func queryReviewVersions(ctx context.Context, q querier, ids []int64) (map[int64
 // every review version exists, is of its dataset, is ready and not in the
 // bin. It returns the sources as a version stores them: in the project's
 // dataset order (the order they were added), the review versions newest
-// first, with their names now.
+// first, with their names now, and the scope of the input (resolved by
+// normalizeSources).
 func validateNewSources(ctx context.Context, q querier, projectID int64, inputs []SourceInput) ([]Source, error) {
 	ids := make([]int64, len(inputs))
 	var versionIDs []int64
@@ -286,7 +301,7 @@ func validateNewSources(ctx context.Context, q querier, projectID int64, inputs 
 			return cmp.Or(cmp.Compare(*b.Major, *a.Major), cmp.Compare(*b.Minor, *a.Minor), cmp.Compare(b.ID, a.ID))
 		})
 		src := Source{DatasetID: d.ID, DatasetName: d.Name, DirName: d.DirName, IncludeBase: in.IncludeBase,
-			Versions: []SourceVersion{}}
+			Versions: []SourceVersion{}, Scope: in.Scope}
 		for _, v := range picked {
 			src.Versions = append(src.Versions, SourceVersion{ID: v.ID, Name: v.name()})
 		}

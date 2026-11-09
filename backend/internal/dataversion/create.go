@@ -117,7 +117,8 @@ func (s *Service) preview(ctx context.Context, req createRequest, forCreate bool
 		if err != nil {
 			return Preview{}, nil, s.newSourceError(ctx, req, err)
 		}
-		ps := PreviewSource{DatasetID: src.DatasetID, DatasetName: src.DatasetName, SelectedCount: len(snap.Images)}
+		ps := PreviewSource{DatasetID: src.DatasetID, DatasetName: src.DatasetName, Scope: src.Scope,
+			SelectedCount: len(snap.Images)}
 		for _, img := range snap.Images {
 			if img.VersionID != nil {
 				ps.FromVersions++
@@ -125,10 +126,17 @@ func (s *Service) preview(ctx context.Context, req createRequest, forCreate bool
 			labels, state := indexAnnotation(img)
 			switch state {
 			case annotationNone:
-				p.Skipped.Unannotated++
-				continue
+				if src.Scope == ScopeAnnotated {
+					p.Skipped.Unannotated++
+					continue
+				}
+				// A background image: no objects.
 			case annotationInvalid:
 				p.Skipped.Invalid++
+				continue
+			}
+			if src.Scope == ScopeBackground && hasObjects(labels) {
+				p.Skipped.WithObjects++
 				continue
 			}
 			for name, n := range labels {
@@ -155,7 +163,7 @@ func (s *Service) preview(ctx context.Context, req createRequest, forCreate bool
 				p.Skipped.UnknownSize++
 				continue
 			}
-			if r.objects == 0 && !filter.includeEmpty {
+			if r.objects == 0 && !filter.takesNegatives(src.Scope) {
 				p.Skipped.Empty++
 				continue
 			}
@@ -163,6 +171,9 @@ func (s *Service) preview(ctx context.Context, req createRequest, forCreate bool
 			items = append(items, splitItem{Source: si, DatasetID: src.DatasetID, RelPath: img.RelPath, Size: img.SizeBytes})
 			taken = append(taken, previewImage{kept: r.kept, objects: r.objects})
 			ps.ImageCount++
+			if r.objects == 0 {
+				ps.Negatives++
+			}
 		}
 		p.Sources = append(p.Sources, ps)
 	}
