@@ -370,8 +370,10 @@ func (s *Service) registerDirectory(ctx context.Context, name, desc, dirName str
 		if err != nil {
 			return err
 		}
+		// The first scan renames images whose name another image of the
+		// folder has (rename.go); nothing refers to them yet.
 		if _, err := insertImport(ctx, tx, newImport{DatasetID: d.ID, Source: SourceScan, Status: StatusQueued,
-			OnConflict: ConflictSkip, FileName: dirName}); err != nil {
+			OnConflict: ConflictSkip, FileName: dirName, RenameImages: true}); err != nil {
 			return err
 		}
 		id = d.ID

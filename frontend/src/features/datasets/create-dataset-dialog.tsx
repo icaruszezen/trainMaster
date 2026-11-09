@@ -510,6 +510,13 @@ export function CreateDatasetDialog({
                 rowStates={rowStates}
                 disabled={submitting}
               />
+              {selectedSet.size > 0 && (
+                <p className="mt-3 text-xs text-muted-foreground">
+                  添加时，子文件夹之间名称相同、内容不同的图片会在原文件夹中改名（如{" "}
+                  <code className="font-mono">0001_2.jpg</code>
+                  ），标注文件一并改名，可在导入记录中查看。
+                </p>
+              )}
             </TabsContent>
           </Tabs>
 
@@ -564,7 +571,9 @@ export function CreateDatasetDialog({
                         <code className="font-mono text-foreground">
                           datasets/{name.trim() || "名称"}/
                         </code>
-                        ，导入的文件保持原有的子目录结构
+                        ，导入的文件保持原有的子目录结构；不同子文件夹中名称相同、内容不同的图片会自动改名（如{" "}
+                        <code className="font-mono">0001_2.jpg</code>
+                        ），标注文件一并改名
                       </>
                     ) : (
                       <>
@@ -572,7 +581,7 @@ export function CreateDatasetDialog({
                         <code className="font-mono text-foreground">
                           datasets/{singleDirectory?.name}/
                         </code>
-                        ，文件不会被移动或复制
+                        ，不会复制文件
                       </>
                     )}
                   </FieldDescription>

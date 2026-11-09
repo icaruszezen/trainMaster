@@ -1,13 +1,16 @@
+import { useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import {
   FileArchive,
   Folder,
   History,
+  ListTree,
   ScanSearch,
   type LucideIcon,
 } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import {
   Empty,
@@ -37,9 +40,11 @@ import {
   type DatasetImport,
   type ImportSource,
 } from "@/features/datasets/api"
+import { ImportRenamesDialog } from "@/features/datasets/import-renames-dialog"
 import {
   importFormatLabel,
   jobDurationSeconds,
+  renameCount,
   sourceLabels,
   statusLabels,
   summaryText,
@@ -100,6 +105,8 @@ export function DatasetImports({ dataset }: { dataset: Dataset }) {
   const { data, error, isPending, isFetching, refetch } = useQuery(
     importsQuery(dataset.id)
   )
+  const [renamesJob, setRenamesJob] = useState<DatasetImport | null>(null)
+  const [renamesOpen, setRenamesOpen] = useState(false)
 
   if (isPending) {
     return <Skeleton className="h-64 w-full rounded-xl" />
@@ -152,6 +159,7 @@ export function DatasetImports({ dataset }: { dataset: Dataset }) {
               const duration = jobDurationSeconds(job)
               const summary = summaryText(job)
               const formatLabel = importFormatLabel(job)
+              const renames = renameCount(job)
               return (
                 <TableRow key={job.id}>
                   <TableCell className="pl-4">
@@ -186,6 +194,21 @@ export function DatasetImports({ dataset }: { dataset: Dataset }) {
                     <span className="line-clamp-2" title={summary}>
                       {summary || "—"}
                     </span>
+                    {renames > 0 && (
+                      <Button
+                        type="button"
+                        variant="link"
+                        size="xs"
+                        className="h-auto px-0 py-0.5 text-xs has-[>svg]:px-0"
+                        onClick={() => {
+                          setRenamesJob(job)
+                          setRenamesOpen(true)
+                        }}
+                      >
+                        <ListTree aria-hidden />
+                        查看同名图片（{formatNumber(renames)}）
+                      </Button>
+                    )}
                   </TableCell>
                   <TableCell className="hidden text-muted-foreground tabular-nums lg:table-cell">
                     {formatDateTime(job.started_at ?? job.created_at)}
@@ -206,6 +229,14 @@ export function DatasetImports({ dataset }: { dataset: Dataset }) {
           共 {formatNumber(data.total)} 条记录，显示最近 {data.items.length}{" "}
           条。
         </p>
+      )}
+      {renamesJob && (
+        <ImportRenamesDialog
+          key={renamesJob.id}
+          job={renamesJob}
+          open={renamesOpen}
+          onOpenChange={setRenamesOpen}
+        />
       )}
     </div>
   )

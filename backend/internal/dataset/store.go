@@ -254,14 +254,14 @@ func queryDatasetProjects(ctx context.Context, q querier, ids []int64) (map[int6
 
 const importColumns = `id, dataset_id, source, status, on_conflict, annotation_format, classes, file_name,
 	file_size, file_count, received_bytes, received_files, stage, progress_done, progress_total, progress_unit,
-	summary, error, created_at, updated_at, started_at, finished_at`
+	summary, error, created_at, updated_at, started_at, finished_at, rename_images`
 
 func scanImport(row pgx.Row) (Import, error) {
 	var j Import
 	err := row.Scan(&j.ID, &j.DatasetID, &j.Source, &j.Status, &j.OnConflict, &j.AnnotationFormat, &j.Classes,
 		&j.FileName, &j.FileSize, &j.FileCount, &j.ReceivedBytes, &j.ReceivedFiles, &j.Stage, &j.Progress.Done,
 		&j.Progress.Total, &j.Progress.Unit, &j.Summary, &j.Error, &j.CreatedAt, &j.UpdatedAt, &j.StartedAt,
-		&j.FinishedAt)
+		&j.FinishedAt, &j.RenameImages)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return j, errImportNotFound
 	}
@@ -326,6 +326,8 @@ type newImport struct {
 	FileName   string
 	FileSize   int64
 	FileCount  int
+	// RenameImages renames images whose name is taken (rename.go).
+	RenameImages bool
 }
 
 func insertImport(ctx context.Context, q querier, n newImport) (Import, error) {
@@ -336,10 +338,10 @@ func insertImport(ctx context.Context, q querier, n newImport) (Import, error) {
 	// FOR KEY SHARE waits for the dataset being moved to the recycle bin
 	// (FOR UPDATE) and then reads it again: one in the bin takes no jobs.
 	job, err := scanImport(q.QueryRow(ctx, `INSERT INTO dataset_imports
-		(dataset_id, source, status, on_conflict, annotation_format, classes, file_name, file_size, file_count)
-		SELECT id, $2, $3, $4, $5, $6, $7, $8, $9 FROM datasets WHERE id = $1 AND deleted_at IS NULL FOR KEY SHARE
+		(dataset_id, source, status, on_conflict, annotation_format, classes, file_name, file_size, file_count, rename_images)
+		SELECT id, $2, $3, $4, $5, $6, $7, $8, $9, $10 FROM datasets WHERE id = $1 AND deleted_at IS NULL FOR KEY SHARE
 		RETURNING `+importColumns,
-		n.DatasetID, n.Source, n.Status, n.OnConflict, format, classes, n.FileName, n.FileSize, n.FileCount))
+		n.DatasetID, n.Source, n.Status, n.OnConflict, format, classes, n.FileName, n.FileSize, n.FileCount, n.RenameImages))
 	if errors.Is(err, errImportNotFound) {
 		return job, errDatasetNotFound
 	}

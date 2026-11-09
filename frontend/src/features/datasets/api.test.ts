@@ -7,12 +7,14 @@ import {
   datasetsQuery,
   deleteDataset,
   imagesQuery,
+  importRenamesQuery,
   lastYoloImportQuery,
   liveDatasetQuery,
   parseProjectFilter,
   setDatasetProjects,
   type Dataset,
   type DatasetProjectRef,
+  type ImageRename,
 } from "@/features/datasets/api"
 import { refreshMembership } from "@/features/projects/api"
 import { queryClient } from "@/lib/query-client"
@@ -192,6 +194,43 @@ describe("lastYoloImportQuery", () => {
   it("is null when there is none", async () => {
     mockFetch(() => Response.json({ items: [], total: 0 }))
     await expect(run(5)).resolves.toBeNull()
+  })
+})
+
+describe("importRenamesQuery", () => {
+  const options = importRenamesQuery(5, 9)
+  const run = (pageParam: number) =>
+    (options.queryFn as (context: unknown) => Promise<unknown>)({
+      signal: new AbortController().signal,
+      pageParam,
+    })
+  const page = (count: number, total: number) => ({
+    items: Array.from({ length: count }, () => ({}) as ImageRename),
+    total,
+  })
+
+  it("loads a page of renames of one import", async () => {
+    const fetchMock = mockFetch(() => Response.json(page(0, 0)))
+    await run(100)
+    expect(requestOf(fetchMock).path).toBe(
+      "/api/v1/datasets/5/imports/9/renames?offset=100&limit=100"
+    )
+  })
+
+  it("continues until every rename is loaded", () => {
+    const next = options.getNextPageParam
+    expect(next(page(100, 250), [page(100, 250)], 0, [0])).toBe(100)
+    expect(
+      next(
+        page(50, 250),
+        [page(100, 250), page(100, 250), page(50, 250)],
+        200,
+        [0, 100, 200]
+      )
+    ).toBeUndefined()
+    expect(
+      next(page(0, 250), [page(100, 250), page(0, 250)], 100, [0, 100])
+    ).toBeUndefined()
   })
 })
 

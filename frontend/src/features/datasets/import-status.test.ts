@@ -6,6 +6,7 @@ import {
   jobDurationSeconds,
   jobPercent,
   progressDetail,
+  renameCount,
   stageLabel,
   summaryText,
 } from "@/features/datasets/import-status"
@@ -17,6 +18,7 @@ function job(overrides: Partial<DatasetImport> = {}): DatasetImport {
     source: "archive",
     status: "running",
     on_conflict: "skip",
+    rename_images: false,
     annotation_format: "voc",
     classes: [],
     file_name: "batch.zip",
@@ -42,6 +44,7 @@ describe("stageLabel", () => {
     expect(stageLabel(job({ status: "queued", stage: "" }))).toBe("等待处理")
     expect(stageLabel(job({ stage: "extracting" }))).toBe("正在解压")
     expect(stageLabel(job({ stage: "converting" }))).toBe("正在转换标注")
+    expect(stageLabel(job({ stage: "renaming" }))).toBe("正在检查同名图片")
     expect(stageLabel(job({ stage: "importing" }))).toBe("正在导入")
     expect(stageLabel(job({ stage: "scanning" }))).toBe("正在扫描")
     expect(stageLabel(job({ stage: "" }))).toBe("正在处理")
@@ -144,7 +147,45 @@ describe("summaryText", () => {
           },
         })
       )
-    ).toBe("新增 120 张图片，匹配 118 个标注，跳过 2 张同名图片")
+    ).toBe("新增 120 张图片，匹配 118 个标注，跳过 2 张已有图片")
+  })
+
+  it("reports renamed and identical same-name images", () => {
+    expect(
+      summaryText(
+        job({
+          status: "succeeded",
+          rename_images: true,
+          summary: {
+            images_added: 40,
+            annotations_matched: 40,
+            images_renamed: 12,
+            images_identical: 3,
+          },
+        })
+      )
+    ).toBe(
+      "新增 40 张图片，匹配 40 个标注，重命名 12 张同名图片，" +
+        "3 张同名图片内容完全相同，保留原名"
+    )
+    expect(
+      summaryText(
+        job({
+          source: "scan",
+          status: "succeeded",
+          rename_images: true,
+          summary: {
+            images_total: 30,
+            images_added: 30,
+            images_renamed: 4,
+            images_rename_failed: 2,
+          },
+        })
+      )
+    ).toBe(
+      "共 30 张图片，新增 30 张，重命名 4 张同名图片，" +
+        "2 张同名图片无法重命名，保留原名（原因见服务日志）"
+    )
   })
 
   it("summarises converted annotations and conversion problems", () => {
@@ -246,5 +287,16 @@ describe("jobDurationSeconds", () => {
   it("measures running jobs up to now, falling back to created_at", () => {
     const now = Date.parse("2026-10-30T08:00:30Z")
     expect(jobDurationSeconds(job(), now)).toBe(30)
+  })
+})
+
+describe("renameCount", () => {
+  it("counts renamed and identical images of finished jobs", () => {
+    const summary = { images_renamed: 5, images_identical: 2 }
+    expect(renameCount(job({ status: "succeeded", summary }))).toBe(7)
+    expect(renameCount(job({ status: "failed", summary }))).toBe(7)
+    expect(renameCount(job({ status: "canceled", summary }))).toBe(7)
+    expect(renameCount(job({ status: "running", summary }))).toBe(0)
+    expect(renameCount(job({ status: "succeeded", summary: {} }))).toBe(0)
   })
 })

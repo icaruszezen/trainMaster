@@ -167,9 +167,13 @@ export type DatasetLabel = {
 export type ImportSource = "archive" | "folder" | "scan"
 export type ImportStatus =
   "uploading" | "queued" | "running" | "succeeded" | "failed" | "canceled"
-/** `converting`：把 X-AnyLabeling / YOLO 标注转换为 VOC（位于解压之后、导入之前）。 */
+/**
+ * `converting`：把 X-AnyLabeling / YOLO 标注转换为 VOC（位于解压之后、导入之前）；
+ * `renaming`：检查与其它图片同名的图片并重命名（上传在转换之后、导入之前，
+ * 添加已有目录在扫描之前）。
+ */
 export type ImportStage =
-  "" | "extracting" | "converting" | "importing" | "scanning"
+  "" | "extracting" | "converting" | "renaming" | "importing" | "scanning"
 export type ProgressUnit = "" | "bytes" | "files" | "entries"
 export type ConflictPolicy = "skip" | "overwrite"
 
@@ -196,6 +200,12 @@ export type ImportSummaryKey =
   | "files_ignored"
   | "entries_unsafe"
   | "names_invalid"
+  /** 与数据集中其它图片同名（不含扩展名、不区分大小写）、内容不同而重命名的图片。 */
+  | "images_renamed"
+  /** 与同名图片内容完全相同、保留原名的图片。 */
+  | "images_identical"
+  /** 添加已有目录时文件夹不允许重命名（如只读）而保留原名的图片。 */
+  | "images_rename_failed"
 
 export type DatasetImport = {
   id: number
@@ -224,6 +234,28 @@ export type DatasetImport = {
   updated_at: string
   started_at: string | null
   finished_at: string | null
+  /**
+   * 这个任务会重命名同名图片：上传压缩包 / 文件夹，以及添加已有目录后的
+   * 第一次扫描（之后的重新扫描不会）。为 true 时结果摘要中有
+   * `images_renamed` 与 `images_identical`，明细见 `importRenamesQuery`。
+   */
+  rename_images: boolean
+}
+
+/**
+ * 导入时重命名的图片（`renamed`），或因与同名图片内容完全相同而保留原名的图片
+ * （`identical`）。路径都相对于数据集文件夹。
+ */
+export type ImageRename = {
+  kind: "renamed" | "identical"
+  /** 上传内容 / 文件夹中原来的路径。 */
+  original_path: string
+  /** 现在在数据集中的路径；`identical` 时与 `original_path` 相同。 */
+  path: string
+  /** 占用这个名称的图片（按图片顺序第一张）。 */
+  same_name_as: string
+  /** 一并改名后的 VOC 标注文件；没有标注或 `identical` 时为 null。 */
+  annotation_path: string | null
 }
 
 export type DatasetDirectory = {
@@ -338,6 +370,8 @@ export const datasetKeys = {
     [...datasetKeys.imports(id), "last-yolo"] as const,
   import: (id: number, importId: number) =>
     [...datasetKeys.detail(id), "import", importId] as const,
+  importRenames: (id: number, importId: number) =>
+    [...datasetKeys.import(id, importId), "renames"] as const,
 }
 
 const ACTIVE_STATUSES: ReadonlySet<ImportStatus> = new Set([
@@ -528,6 +562,31 @@ export function importQuery(datasetId: number, importId: number) {
       return !job || isActiveImport(job) ? 1_500 : false
     },
     staleTime: 0,
+  })
+}
+
+export const IMPORT_RENAMES_PAGE_SIZE = 100
+
+/** 导入任务的重命名明细（按图片顺序），分页加载。任务结束后不再变化。 */
+export function importRenamesQuery(datasetId: number, importId: number) {
+  return infiniteQueryOptions({
+    queryKey: datasetKeys.importRenames(datasetId, importId),
+    queryFn: ({ signal, pageParam }) =>
+      apiGet<ListResponse<ImageRename>>(
+        withQuery(`${importPath(datasetId, importId)}/renames`, {
+          offset: pageParam,
+          limit: IMPORT_RENAMES_PAGE_SIZE,
+        }),
+        { signal }
+      ),
+    initialPageParam: 0,
+    getNextPageParam: (lastPage, pages) => {
+      const loaded = pages.reduce((sum, page) => sum + page.items.length, 0)
+      return lastPage.items.length > 0 && loaded < lastPage.total
+        ? loaded
+        : undefined
+    },
+    staleTime: Infinity,
   })
 }
 

@@ -61,6 +61,8 @@ export function stageLabel(job: Pick<DatasetImport, "status" | "stage">) {
           return "正在解压"
         case "converting":
           return "正在转换标注"
+        case "renaming":
+          return "正在检查同名图片"
         case "importing":
           return "正在导入"
         case "scanning":
@@ -122,12 +124,24 @@ const namesInvalidPart: SummaryPart = [
     `${formatNumber(n)} 个文件名不是 UTF-8 编码，已跳过（请在服务器上重命名）`,
 ]
 
+/** 与数据集中其它图片同名（不含扩展名、不区分大小写）的图片。 */
+const renamedPart: SummaryPart = [
+  "images_renamed",
+  (n) => `重命名 ${formatNumber(n)} 张同名图片`,
+]
+const identicalPart: SummaryPart = [
+  "images_identical",
+  (n) => `${formatNumber(n)} 张同名图片内容完全相同，保留原名`,
+]
+
 const importParts: SummaryPart[] = [
   ["images_added", (n) => `新增 ${formatNumber(n)} 张图片`],
   ["annotations_converted", (n) => `转换 ${formatNumber(n)} 个标注为 VOC`],
   ["annotations_matched", (n) => `匹配 ${formatNumber(n)} 个标注`],
-  ["images_replaced", (n) => `覆盖 ${formatNumber(n)} 张同名图片`],
-  ["images_skipped", (n) => `跳过 ${formatNumber(n)} 张同名图片`],
+  renamedPart,
+  identicalPart,
+  ["images_replaced", (n) => `覆盖 ${formatNumber(n)} 张已有图片`],
+  ["images_skipped", (n) => `跳过 ${formatNumber(n)} 张已有图片`],
   ["annotations_invalid", (n) => `${formatNumber(n)} 个标注无法解析`],
   [
     "annotations_failed",
@@ -148,14 +162,35 @@ const scanParts: SummaryPart[] = [
   ["images_updated", (n) => `更新 ${formatNumber(n)} 张`],
   ["images_removed", (n) => `移除 ${formatNumber(n)} 张`],
   ["annotations_matched", (n) => `匹配 ${formatNumber(n)} 个标注`],
+  renamedPart,
+  identicalPart,
+  [
+    "images_rename_failed",
+    (n) =>
+      `${formatNumber(n)} 张同名图片无法重命名，保留原名（原因见服务日志）`,
+  ],
   ["annotations_invalid", (n) => `${formatNumber(n)} 个标注无法解析`],
   ["annotations_orphaned", (n) => `${formatNumber(n)} 个标注没有对应图片`],
   ["files_ignored", (n) => `忽略 ${formatNumber(n)} 个其他文件`],
   namesInvalidPart,
 ]
 
+/** 任务的重命名明细条数（重命名与内容相同的同名图片）；没有时为 0。 */
+export function renameCount(
+  job: Pick<DatasetImport, "status" | "summary">
+): number {
+  if (
+    job.status !== "succeeded" &&
+    job.status !== "failed" &&
+    job.status !== "canceled"
+  ) {
+    return 0
+  }
+  return (job.summary.images_renamed ?? 0) + (job.summary.images_identical ?? 0)
+}
+
 /**
- * 已完成任务的结果摘要，例如“新增 120 张图片，匹配 118 个标注，跳过 2 张同名图片”。
+ * 已完成任务的结果摘要，例如“新增 120 张图片，匹配 118 个标注，跳过 2 张已有图片”。
  * 失败时返回错误原因；其它状态返回空字符串。
  */
 export function summaryText(

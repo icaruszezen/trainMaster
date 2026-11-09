@@ -74,6 +74,7 @@ var DatasetStatuses = []string{
 const (
 	stageExtracting = "extracting"
 	stageConverting = "converting"
+	stageRenaming   = "renaming" // looking for images whose name is taken (rename.go)
 	stageImporting  = "importing"
 	stageScanning   = "scanning"
 
@@ -217,6 +218,11 @@ type Import struct {
 	UpdatedAt        time.Time        `json:"updated_at"`
 	StartedAt        *time.Time       `json:"started_at"`
 	FinishedAt       *time.Time       `json:"finished_at"`
+	// RenameImages is set for jobs that rename images whose name another
+	// image of the dataset has (rename.go): uploads, and the first scan of
+	// a folder added as a dataset. The summary then has sumImagesRenamed
+	// and sumImagesIdentical, and the list is in dataset_import_renames.
+	RenameImages bool `json:"rename_images"`
 }
 
 // Progress of the current stage of a running job.
@@ -260,6 +266,11 @@ const (
 	sumAnnotationsConverted = "annotations_converted" // source files written as VOC
 	sumAnnotationsFailed    = "annotations_failed"    // paired source files that could not be converted
 	sumObjectsSkipped       = "objects_skipped"       // shapes that are not a box (points, lines, ...)
+
+	// Images whose name another image of the dataset has (rename.go).
+	sumImagesRenamed      = "images_renamed"       // renamed with their annotation file
+	sumImagesIdentical    = "images_identical"     // kept their name: the same content as the image holding it
+	sumImagesRenameFailed = "images_rename_failed" // first scan of an added folder: the folder refused the rename
 )
 
 // fileVersion identifies the content of a file by its modification time

@@ -22,7 +22,18 @@ func (s *Service) execute(ctx context.Context, job Import, p *progressTracker) (
 	}
 	switch job.Source {
 	case SourceScan:
-		res, err := s.syncIndex(ctx, d, p)
+		var res scanResult
+		var err error
+		if job.RenameImages {
+			res.renamed = true
+			err = s.renameScanned(ctx, d, job, &res, p)
+		}
+		if err == nil {
+			var r scanResult
+			r, err = s.syncIndex(ctx, d, p)
+			r.renamed, r.Renamed, r.Identical, r.RenameFailed = res.renamed, res.Renamed, res.Identical, res.RenameFailed
+			res = r
+		}
 		if aerr := s.finishIndex(d.ID); err == nil {
 			err = aerr
 		}
@@ -31,6 +42,19 @@ func (s *Service) execute(ctx context.Context, job Import, p *progressTracker) (
 		return s.runImport(ctx, d, job, p)
 	}
 	return nil, fmt.Errorf("unknown import source %q", job.Source)
+}
+
+// renameScanned renames the images of a folder just added as a dataset
+// whose name another image of it has (rename.go), and records the list.
+func (s *Service) renameScanned(ctx context.Context, d Dataset, job Import, res *scanResult, p *progressTracker) error {
+	root, err := s.openDatasetRoot(d)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	r, err := s.renameInPlace(ctx, root, p, func(plans []*renamePlan) { s.recordRenames(job.ID, plans) })
+	res.Renamed, res.Identical, res.RenameFailed = r.Renamed, r.Identical, r.Failed
+	return err
 }
 
 // indexContext is the context for indexing files that were already moved
@@ -63,6 +87,9 @@ type importSummary struct {
 	converted                bool
 	Converted, ConvertFailed int
 	ObjectsSkipped           int
+	// Images whose name was taken (rename.go).
+	renaming           bool
+	Renamed, Identical int
 }
 
 func (r *importSummary) summary() map[string]int64 {
@@ -85,13 +112,18 @@ func (r *importSummary) summary() map[string]int64 {
 		m[sumAnnotationsFailed] = int64(r.ConvertFailed)
 		m[sumObjectsSkipped] = int64(r.ObjectsSkipped)
 	}
+	if r.renaming {
+		m[sumImagesRenamed] = int64(r.Renamed)
+		m[sumImagesIdentical] = int64(r.Identical)
+	}
 	return m
 }
 
 // runImport extracts (archives) and moves the staged files into the
 // dataset folder, then indexes the folder (spec §5.1 / §5.2).
 func (s *Service) runImport(ctx context.Context, d Dataset, job Import, p *progressTracker) (map[string]int64, error) {
-	sum := &importSummary{archive: job.Source == SourceArchive, converted: job.AnnotationFormat != FormatVOC}
+	sum := &importSummary{archive: job.Source == SourceArchive, converted: job.AnnotationFormat != FormatVOC,
+		renaming: job.RenameImages}
 	// Fail early, before extracting a large archive for nothing.
 	root, err := s.openDatasetRoot(d)
 	if err != nil {
@@ -114,7 +146,23 @@ func (s *Service) runImport(ctx context.Context, d Dataset, job Import, p *progr
 		}
 	}
 
-	moved, err := s.moveStaged(ctx, root, staged, job.OnConflict, unconverted, sum, p)
+	var plans []*renamePlan
+	if job.RenameImages {
+		if plans, err = s.renameStaged(ctx, root, staged, job.OnConflict, p); err != nil {
+			return sum.summary(), diskFull(err)
+		}
+	}
+	renames := make(map[string]*renamePlan, len(plans))
+	for _, plan := range plans {
+		renames[plan.To] = plan
+		if unconverted[plan.From] && plan.From != plan.To {
+			delete(unconverted, plan.From)
+			unconverted[plan.To] = true
+		}
+	}
+
+	moved, err := s.moveStaged(ctx, root, staged, job.OnConflict, unconverted, renames, sum, p,
+		func(plans []*renamePlan) { s.recordRenames(job.ID, plans) })
 	err = diskFull(err)
 	if moved > 0 || err == nil {
 		res, serr := s.syncIndex(s.indexContext(), d, p)
@@ -290,8 +338,12 @@ const (
 // unconverted are images whose annotation file could not be converted to
 // VOC: an image among them that replaces one in the dataset also drops the
 // replaced image's annotation, so it ends up unannotated as reported.
+// renames are the plans of renamed and identical images (by their staged
+// path): those moved in are marked placed and counted.
 func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConflict string, unconverted map[string]bool,
-	sum *importSummary, p *progressTracker) (int, error) {
+	renames map[string]*renamePlan, sum *importSummary, p *progressTracker, record func([]*renamePlan)) (int, error) {
+	var batch []*renamePlan
+	defer func() { record(batch) }()
 	set, err := walkFiles(ctx, s.log, staged, nil)
 	if errors.Is(err, fs.ErrNotExist) {
 		set, err = &fileSet{}, nil // nothing was staged
@@ -340,6 +392,17 @@ func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConfli
 				sum.Added++
 			} else {
 				sum.Replaced++
+			}
+			if plan := renames[rel]; plan != nil {
+				if plan.Identical {
+					sum.Identical++
+				} else {
+					sum.Renamed++
+				}
+				if batch = append(batch, plan); len(batch) == renameRecordBatch {
+					record(batch)
+					batch = nil
+				}
 			}
 			if xmlRel != "" {
 				if valid {

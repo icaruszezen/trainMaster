@@ -42,6 +42,7 @@ func (s *server) datasetRoutes(r chi.Router) {
 		r.Get("/imports", s.listDatasetImports)
 		r.Post("/imports", s.createDatasetImport)
 		r.Get("/imports/{importID}", s.getDatasetImport)
+		r.Get("/imports/{importID}/renames", s.listImportRenames)
 		r.Put("/imports/{importID}/archive", s.uploadImportArchive)
 		r.Post("/imports/{importID}/files", s.uploadImportFiles)
 		r.Post("/imports/{importID}/commit", s.commitDatasetImport)
@@ -591,6 +592,34 @@ func (s *server) getDatasetImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// listImportRenames lists the images an import renamed because another
+// image of the dataset has their name, and those it kept because their
+// content is the same (kind=renamed / identical filters them).
+func (s *server) listImportRenames(w http.ResponseWriter, r *http.Request) {
+	id, importID, ok := datasetIDs(w, r, "importID")
+	if !ok {
+		return
+	}
+	var q dataset.RenameQuery
+	if r.URL.Query().Get("kind") != "" {
+		if q.Kind, ok = enumParam(w, r, "kind", dataset.RenameRenamed, dataset.RenameIdentical); !ok {
+			return
+		}
+	}
+	if q.Offset, ok = intParam(w, r, "offset", 0, 0, 1<<31-1); !ok {
+		return
+	}
+	if q.Limit, ok = intParam(w, r, "limit", 100, 1, 500); !ok {
+		return
+	}
+	items, total, err := s.datasets.ListImportRenames(r.Context(), id, importID, q)
+	if err != nil {
+		s.datasetError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, NewList(items, total))
 }
 
 // limitBody caps a request body at limit bytes; reading past it fails with
