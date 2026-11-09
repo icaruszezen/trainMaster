@@ -143,6 +143,7 @@ import {
   scopeOverride,
   selectionOnScopeChange,
   selectionToInclude,
+  sourceOverride,
   sourceDisabledReason,
   sourceInputs,
   toggleVersion,
@@ -150,6 +151,7 @@ import {
   type KnownUnlisted,
   type PreviewWarning,
   type ScopeOverride,
+  type SourceChange,
   type SourceSelection,
   type UnlistedChoice,
 } from "@/features/data-versions/form-logic"
@@ -789,40 +791,47 @@ function NewDataVersionForm({
     setServerError(null)
     create.reset()
   }
-  const setSource = (datasetId: number, selection: SourceSelection) => {
+  const selectionArgs = (row: SourceRowData, scope = row.scope) => ({
+    dataset: row.dataset,
+    versions: row.versions,
+    template,
+    override: draft.overrides[row.dataset.id],
+    scope,
+  })
+  const setSource = (
+    row: SourceRowData,
+    selection: SourceSelection,
+    change: SourceChange
+  ) => {
+    const override = sourceOverride(selectionArgs(row), selection, change)
     setDraft((previous) => ({
       ...previous,
-      overrides: { ...previous.overrides, [datasetId]: selection },
+      overrides: { ...previous.overrides, [row.dataset.id]: override },
     }))
     setServerError(null)
     create.reset()
   }
   /**
    * 修改一个数据集参与训练的图片；取背景图时没有选中的数据集一并选中（审图
-   * 版本还在读取时不选：模板的来源还不完整）。
+   * 版本还没有读到时不选：模板的来源还不完整）。
    */
   const setSourceScope = (row: SourceRowData, value: ScopeOverride) => {
-    const scope = value || draft.scope
+    const args = selectionArgs(row, value || draft.scope)
     const include =
-      row.disabled || row.query.isPending
+      row.disabled || row.query.data === undefined
         ? null
         : selectionOnScopeChange({
-            dataset: row.dataset,
-            versions: row.versions,
-            selection: effectiveSelection({
-              dataset: row.dataset,
-              versions: row.versions,
-              template,
-              override: draft.overrides[row.dataset.id],
-              scope,
-            }),
-            scope,
+            ...args,
+            selection: effectiveSelection(args),
           })
     setDraft((previous) => ({
       ...previous,
       scopes: { ...previous.scopes, [row.dataset.id]: value },
       overrides: include
-        ? { ...previous.overrides, [row.dataset.id]: include }
+        ? {
+            ...previous.overrides,
+            [row.dataset.id]: sourceOverride(args, include, "dataset"),
+          }
         : previous.overrides,
     }))
     setServerError(null)
@@ -1159,7 +1168,11 @@ function SourcesSection({
   onSourceScopeChange: (row: SourceRowData, scope: ScopeOverride) => void
   previewSources: DataVersionPreview["sources"] | undefined
   error: string | null
-  onChange: (datasetId: number, selection: SourceSelection) => void
+  onChange: (
+    row: SourceRowData,
+    selection: SourceSelection,
+    change: SourceChange
+  ) => void
 }) {
   const newVersions = rows.flatMap((row) =>
     row.disabled
@@ -1198,7 +1211,7 @@ function SourcesSection({
       for (const id of ids) {
         selection = toggleVersion(selection, id, true, row.versions)
       }
-      onChange(row.dataset.id, selection)
+      onChange(row, selection, "versions")
     }
   }
 
@@ -1295,7 +1308,7 @@ function SourcesSection({
               previewSource={previewSources?.find(
                 (s) => s.dataset_id === row.dataset.id
               )}
-              onChange={(selection) => onChange(row.dataset.id, selection)}
+              onChange={(selection, change) => onChange(row, selection, change)}
             />
           ))}
         </ul>
@@ -1328,17 +1341,22 @@ function SourceRow({
   defaultScope: TrainingScope
   onScopeChange: (scope: ScopeOverride) => void
   previewSource: DataVersionPreview["sources"][number] | undefined
-  onChange: (selection: SourceSelection) => void
+  onChange: (selection: SourceSelection, change: SourceChange) => void
 }) {
   const id = useId()
   const { dataset, disabled, versions, selection, query, scope } = row
   const selected = isSelected(selection)
+  // 审图版本读到之前不能修改来源：模板与默认的来源还不完整。
+  const locked = disabled !== null || query.data === undefined
   const newDataset = !disabled && notInTemplate(dataset.id, template)
   const unannotated = unannotatedCount(dataset)
   const background = unannotated + dataset.empty_count
 
   const toggleDataset = (checked: boolean) => {
-    onChange(checked ? selectionToInclude(dataset, versions, scope) : NO_SOURCE)
+    onChange(
+      checked ? selectionToInclude(dataset, versions, scope) : NO_SOURCE,
+      "dataset"
+    )
   }
 
   return (
@@ -1354,14 +1372,14 @@ function SourceRow({
           id={id}
           checked={selected}
           onCheckedChange={(checked) => toggleDataset(checked === true)}
-          disabled={disabled !== null}
+          disabled={locked}
           className="mt-0.5"
         />
         <label
           htmlFor={id}
           className={cn(
             "grid min-w-0 flex-1 gap-0.5",
-            disabled ? "opacity-70" : "cursor-pointer"
+            disabled ? "opacity-70" : !locked && "cursor-pointer"
           )}
         >
           <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
@@ -1424,8 +1442,9 @@ function SourceRow({
           <SourceOption
             checked={selection.include_base}
             onCheckedChange={(checked) =>
-              onChange({ ...selection, include_base: checked })
+              onChange({ ...selection, include_base: checked }, "base")
             }
+            disabled={locked}
             title="基础标注"
             detail={baseDetail(scope, dataset.annotated_count, background)}
           />
@@ -1461,7 +1480,8 @@ function SourceRow({
                 checked={selection.version_ids.includes(version.id)}
                 onCheckedChange={(checked) =>
                   onChange(
-                    toggleVersion(selection, version.id, checked, versions)
+                    toggleVersion(selection, version.id, checked, versions),
+                    "versions"
                   )
                 }
                 title={`${version.name}（需加样 ${formatNumber(version.needs_sample_count)}）`}
@@ -1619,6 +1639,7 @@ function SourceScopeSelect({
 function SourceOption({
   checked,
   onCheckedChange,
+  disabled = false,
   title,
   isNew = false,
   note,
@@ -1626,6 +1647,7 @@ function SourceOption({
 }: {
   checked: boolean
   onCheckedChange: (checked: boolean) => void
+  disabled?: boolean
   title: string
   isNew?: boolean
   note?: string
@@ -1635,12 +1657,16 @@ function SourceOption({
   return (
     <label
       htmlFor={id}
-      className="flex min-w-0 cursor-pointer items-start gap-2.5 rounded-md px-1 py-1 transition-colors hover:bg-muted/60 has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50"
+      className={cn(
+        "flex min-w-0 items-start gap-2.5 rounded-md px-1 py-1 transition-colors has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-ring/50",
+        !disabled && "cursor-pointer hover:bg-muted/60"
+      )}
     >
       <Checkbox
         id={id}
         checked={checked}
         onCheckedChange={(next) => onCheckedChange(next === true)}
+        disabled={disabled}
         className="mt-0.5"
       />
       <span className="grid min-w-0 flex-1 gap-0.5">

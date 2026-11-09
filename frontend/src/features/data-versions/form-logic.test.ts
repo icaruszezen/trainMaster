@@ -29,9 +29,13 @@ import {
   selectionToInclude,
   sourceDisabledReason,
   sourceInputs,
+  sourceOverride,
   templateScope,
   toggleVersion,
   type FormDraft,
+  type SourceChange,
+  type SourceOverride,
+  type SourceSelection,
 } from "@/features/data-versions/form-logic"
 import {
   dataVersion,
@@ -323,6 +327,165 @@ describe("training scopes", () => {
       "annotated",
       "annotated",
     ])
+  })
+})
+
+describe("saving source changes", () => {
+  type Scope = "annotated" | "background" | "all"
+  // 模板按“仅有标注的图片”只选了数据集 1 的审图版本 5。
+  const template = dataVersion({
+    sources: [
+      {
+        ...dataVersion().sources[0],
+        dataset_id: 1,
+        include_base: false,
+        versions: [{ id: 5, name: "审图1.2" }],
+        scope: "annotated",
+      },
+    ],
+  })
+  const inTemplate = dataset({ id: 1, annotated_count: 10, image_count: 40 })
+  const notInTemplate = dataset({ id: 2, annotated_count: 10, image_count: 40 })
+  type Row = {
+    dataset?: ReturnType<typeof dataset>
+    versions?: (typeof v5)[]
+    template?: typeof template | null
+    override?: SourceOverride
+  }
+  const args = (scope: Scope, row: Row = {}) => ({
+    dataset: row.dataset ?? inTemplate,
+    versions: row.versions ?? [v6, v5],
+    template: row.template === undefined ? template : row.template,
+    override: row.override,
+    scope,
+  })
+  const show = (scope: Scope, row: Row = {}) =>
+    effectiveSelection(args(scope, row))
+  /** 在显示的来源上做一次改动，返回要保存的 override。 */
+  const edit = (
+    scope: Scope,
+    change: SourceChange,
+    next: (shown: SourceSelection) => SourceSelection,
+    row: Row = {}
+  ) => sourceOverride(args(scope, row), next(show(scope, row)), change)
+  const tick = (id: number, checked: boolean) => (shown: SourceSelection) =>
+    toggleVersion(shown, id, checked, [v6, v5])
+
+  it("does not save the base worked out for background images", () => {
+    expect(show("background")).toEqual({ include_base: true, version_ids: [5] })
+    // 勾选新的审图版本（“全部选中”也一样）：补选的基础标注不保存。
+    const more = edit("background", "versions", tick(6, true))
+    expect(more).toEqual({ version_ids: [6, 5] })
+    expect(show("background", { override: more })).toEqual({
+      include_base: true,
+      version_ids: [6, 5],
+    })
+    // 改回“仅有标注的图片”：与模板一样不选基础标注。
+    expect(show("annotated", { override: more })).toEqual({
+      include_base: false,
+      version_ids: [6, 5],
+    })
+  })
+
+  it("drops the worked-out base with the last review version", () => {
+    const none = edit("background", "versions", tick(5, false))
+    expect(none).toEqual({ include_base: false, version_ids: [] })
+    for (const scope of ["annotated", "background", "all"] as const) {
+      expect(show(scope, { override: none })).toEqual(NO_SOURCE)
+    }
+    // 再勾选：照显示的只选审图版本，改参与训练的图片时不变。
+    const again = edit("background", "versions", tick(5, true), {
+      override: none,
+    })
+    expect(again).toEqual({ include_base: false, version_ids: [5] })
+    expect(show("annotated", { override: again })).toEqual({
+      include_base: false,
+      version_ids: [5],
+    })
+  })
+
+  it("keeps the base the user chose", () => {
+    const unticked = edit("background", "base", (shown) => ({
+      ...shown,
+      include_base: false,
+    }))
+    expect(unticked).toEqual({ include_base: false, version_ids: [5] })
+    expect(show("all", { override: unticked })).toEqual(unticked)
+    const ticked = edit("annotated", "base", (shown) => ({
+      ...shown,
+      include_base: true,
+    }))
+    // 之后改审图版本也照旧。
+    const more = edit("annotated", "versions", tick(6, true), {
+      override: ticked,
+    })
+    expect(more).toEqual({ include_base: true, version_ids: [6, 5] })
+  })
+
+  it("keeps a dataset the user left out unselected whatever the scope", () => {
+    const off = edit("annotated", "dataset", () => NO_SOURCE, {
+      template: null,
+    })
+    expect(off).toEqual({ include_base: false, version_ids: [] })
+    expect(show("background", { template: null, override: off })).toEqual(
+      NO_SOURCE
+    )
+    // 没有已标注图片的数据集取消最后一个审图版本：取背景图时也不再选中。
+    const unannotated = {
+      dataset: dataset({ annotated_count: 0, image_count: 40 }),
+      versions: [v5],
+      template: null,
+    }
+    expect(show("annotated", unannotated)).toEqual({
+      include_base: false,
+      version_ids: [5],
+    })
+    const none = edit("annotated", "versions", tick(5, false), unannotated)
+    expect(none).toEqual({ include_base: false, version_ids: [] })
+    expect(show("background", { ...unannotated, override: none })).toEqual(
+      NO_SOURCE
+    )
+  })
+
+  it("does not tick the base with a review version of an unselected dataset", () => {
+    const row = { dataset: notInTemplate }
+    expect(show("annotated", row)).toEqual(NO_SOURCE)
+    expect(edit("annotated", "versions", tick(5, true), row)).toEqual({
+      include_base: false,
+      version_ids: [5],
+    })
+  })
+
+  it("works the base out again when a dataset is ticked", () => {
+    // 模板中没有的数据集：按默认，与在哪种设置下勾选无关。
+    for (const scope of ["annotated", "background"] as const) {
+      const row = { dataset: notInTemplate }
+      const saved = sourceOverride(
+        args(scope, row),
+        selectionToInclude(notInTemplate, [v6, v5], scope),
+        "dataset"
+      )
+      expect(saved).toEqual({ version_ids: [6, 5] })
+      for (const shownScope of ["annotated", "background"] as const) {
+        expect(show(shownScope, { ...row, override: saved })).toEqual({
+          include_base: true,
+          version_ids: [6, 5],
+        })
+      }
+    }
+    // 默认什么都不选时只选基础标注：保存它。
+    const background = dataset({ annotated_count: 0, image_count: 40 })
+    expect(
+      sourceOverride(
+        args("annotated", {
+          dataset: background,
+          versions: [],
+          template: null,
+        }),
+        selectionToInclude(background, [], "annotated"),
+        "dataset"
+      )
+    ).toEqual({ include_base: true, version_ids: [] })
   })
 })
 

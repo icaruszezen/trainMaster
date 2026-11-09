@@ -113,52 +113,116 @@ export function templateSelection(
 }
 
 /**
- * 数据集当前的来源：用户改过的（`override`）> 模板 > 默认。不能使用的数据集
- * 总是不选。`versions` 是这个数据集已生成的审图版本，`scope` 是它参与训练的
- * 图片：取背景图（`background` / `all`）时，默认与模板的来源包含基础标注（背景
- * 图来自数据集自己的图片）；用户改过的来源照原样。这些都在读取时得出，参与
- * 训练的图片改回去时随之恢复。
+ * 用户改过的来源（按数据集保存，见 sourceOverride）。没有 `include_base` 时基础
+ * 标注照模板 / 默认得出：只改审图版本时不保存自动补选的基础标注，参与训练的
+ * 图片改回去时随之恢复。
  */
-export function effectiveSelection({
-  dataset,
-  versions,
-  template,
-  override,
-  scope = "annotated",
-}: {
+export type SourceOverride = { include_base?: boolean; version_ids: number[] }
+
+type SelectionArgs = {
   dataset: DatasetForSource
+  /** 这个数据集已生成的审图版本。 */
   versions: readonly Pick<DatasetVersion, "id">[]
   template: Pick<DataVersion, "sources"> | null
-  override: SourceSelection | undefined
+  override: SourceOverride | undefined
+  /** 这个数据集参与训练的图片。 */
   scope?: TrainingScope
-}): SourceSelection {
+}
+
+/**
+ * 用户没有选择时的基础标注（`versionIds` 是选中的审图版本，`overridden` 表示
+ * 用户改过这个数据集的来源）。没有模板、或数据集不在模板中而用户选中了它时按
+ * 默认（defaultSelection）；不在模板中、用户也没有选中时不选。有模板时用模板
+ * 的。背景图来自数据集自己的图片：取背景图（`background` / `all`）时，选了审图
+ * 版本、模板中（按“仅有标注的图片”）没有选基础标注的数据集补选基础标注；模板
+ * 本来就取背景图时照原样。
+ */
+function inferredBase(
+  { dataset, template, scope = "annotated" }: SelectionArgs,
+  versionIds: readonly number[],
+  overridden: boolean
+) {
+  const source = template?.sources.find((s) => s.dataset_id === dataset.id)
+  if (!template || (!source && overridden)) {
+    return defaultSelection(dataset, [], scope).include_base
+  }
+  if (!source) {
+    return false
+  }
+  if (source.include_base) {
+    return true
+  }
+  if (source.scope !== "annotated") {
+    return false
+  }
+  return scope !== "annotated" && versionIds.length > 0
+}
+
+/**
+ * 数据集当前的来源：用户改过的（`override`）> 模板 > 默认。不能使用的数据集
+ * 总是不选；不存在的审图版本不选。基础标注没有保存时在读取时得出（见
+ * inferredBase），参与训练的图片改回去时随之恢复。
+ */
+export function effectiveSelection(args: SelectionArgs): SourceSelection {
+  const { dataset, versions, template, override } = args
   if (sourceDisabledReason(dataset)) {
     return NO_SOURCE
   }
-  if (override) {
-    const available = new Set(versions.map((version) => version.id))
-    return {
-      include_base: override.include_base,
-      version_ids: override.version_ids.filter((id) => available.has(id)),
-    }
+  const available = new Set(versions.map((version) => version.id))
+  const version_ids = override
+    ? override.version_ids.filter((id) => available.has(id))
+    : template
+      ? (templateSelection(template, dataset.id, versions)?.version_ids ?? [])
+      : versions.map((version) => version.id)
+  return {
+    include_base:
+      override?.include_base ??
+      inferredBase(args, version_ids, override !== undefined),
+    version_ids,
   }
-  if (template) {
-    const selection =
-      templateSelection(template, dataset.id, versions) ?? NO_SOURCE
-    // 背景图来自数据集自己的图片：模板中（按“仅有标注的图片”）只选了审图版本
-    // 的数据集，现在取背景图时补选基础标注。模板本来就取背景图时照原样。
-    const source = template.sources.find((s) => s.dataset_id === dataset.id)
-    if (
-      scope !== "annotated" &&
-      source?.scope === "annotated" &&
-      isSelected(selection) &&
-      !selection.include_base
-    ) {
-      return { ...selection, include_base: true }
-    }
-    return selection
+}
+
+/** 用户怎样改动了一个数据集的来源。 */
+export type SourceChange = "dataset" | "base" | "versions"
+
+/**
+ * 用户改动来源后要保存的 override（`next` 是改动后显示的来源，`args` 是改动前
+ * 的）。
+ *
+ * - 勾选 / 取消基础标注，或取消数据集：照原样保存（改参与训练的图片时不会再
+ *   改变）。
+ * - 只改审图版本：保存过的基础标注照旧；否则基础标注照样得出、不保存，例如
+ *   模板中只选了审图版本的数据集取背景图时补选的基础标注，参与训练的图片改
+ *   回去时随之取消。得出的与显示的不同时照显示的保存；取消最后一个审图版本、
+ *   补选的基础标注随之取消时保存为不选。
+ * - 勾选数据集：基础标注与得出的相同时不保存。
+ */
+export function sourceOverride(
+  args: SelectionArgs,
+  next: SourceSelection,
+  change: SourceChange
+): SourceOverride {
+  const saved = {
+    include_base: next.include_base,
+    version_ids: next.version_ids,
   }
-  return defaultSelection(dataset, versions, scope)
+  if (change === "base" || !isSelected(next)) {
+    return saved
+  }
+  if (change === "versions") {
+    if (args.override?.include_base !== undefined) {
+      return saved
+    }
+    const derived = { version_ids: next.version_ids }
+    const shown = effectiveSelection({ ...args, override: derived })
+    if (!isSelected(shown)) {
+      return { include_base: false, version_ids: next.version_ids }
+    }
+    return shown.include_base === next.include_base ? derived : saved
+  }
+  return inferredBase(args, next.version_ids, true) === next.include_base
+    ? { version_ids: next.version_ids }
+    : saved
 }
 
 /** 选中一个数据集时的来源：默认的，默认什么都不选时只选基础标注。 */
@@ -492,7 +556,7 @@ export function parseAugmentation(
 
 export type FormDraft = {
   /** 用户改过的数据集来源（按数据集 ID）；没有改过的用模板或默认值。 */
-  overrides: Record<number, SourceSelection>
+  overrides: Record<number, SourceOverride>
   /** 数据集默认的参与训练的图片。 */
   scope: TrainingScope
   /**
