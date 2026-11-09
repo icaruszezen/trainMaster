@@ -6,6 +6,7 @@ import { Progress } from "@/components/ui/progress"
 import { Spinner } from "@/components/ui/spinner"
 import type { Dataset, DatasetImport } from "@/features/datasets/api"
 import { DatasetActionsMenu } from "@/features/datasets/dataset-actions"
+import { DatasetStatusPicker } from "@/features/datasets/dataset-status-picker"
 import { DatasetThumbnail } from "@/features/datasets/dataset-thumbnail"
 import { jobPercent, stageLabel } from "@/features/datasets/import-status"
 import { DatasetProjectBadges } from "@/features/projects/dataset-project-badges"
@@ -35,7 +36,8 @@ export function activeImportText(job: DatasetImport) {
   return percent === null ? stage : `${stage} ${formatPercent(percent)}`
 }
 
-export function DatasetStatusBadges({
+/** 文件夹缺失、正在导入等提醒（数据集的状态见 `dataset-status-picker`）。 */
+export function DatasetActivityBadges({
   dataset,
   className,
 }: {
@@ -129,7 +131,7 @@ export function DatasetCard({
     <article className="group/card relative flex flex-col overflow-hidden rounded-xl border bg-card text-card-foreground shadow-sm transition-shadow hover:shadow-md has-[a:focus-visible]:ring-[3px] has-[a:focus-visible]:ring-ring/50">
       <div className="relative aspect-[16/9] overflow-hidden border-b bg-muted">
         <CoverMosaic dataset={dataset} />
-        <DatasetStatusBadges
+        <DatasetActivityBadges
           dataset={dataset}
           className="absolute top-2.5 left-2.5 max-w-[calc(100%-3.5rem)]"
         />
@@ -146,15 +148,22 @@ export function DatasetCard({
 
       <div className="flex flex-1 flex-col gap-4 p-4">
         <div className="grid gap-1">
-          <h3 className="truncate leading-snug font-semibold">
-            {/* 伸展的链接覆盖整张卡片；菜单按钮通过 z-[1] 浮在它上面（低于吸顶的页头）。 */}
-            <Link
-              to={`/datasets/${dataset.id}`}
-              className="outline-none after:absolute after:inset-0 after:content-['']"
-            >
-              {dataset.name}
-            </Link>
-          </h3>
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="min-w-0 truncate leading-snug font-semibold">
+              {/* 伸展的链接覆盖整张卡片；菜单与状态按钮通过 z-[1] 浮在它上面（低于吸顶的页头）。 */}
+              <Link
+                to={`/datasets/${dataset.id}`}
+                className="outline-none after:absolute after:inset-0 after:content-['']"
+              >
+                {dataset.name}
+              </Link>
+            </h3>
+            <DatasetStatusPicker
+              dataset={dataset}
+              align="end"
+              className="relative z-[1]"
+            />
+          </div>
           <p
             className={cn(
               "line-clamp-2 min-h-10 text-sm text-muted-foreground",

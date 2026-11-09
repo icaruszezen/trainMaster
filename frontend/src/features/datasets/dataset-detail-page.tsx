@@ -67,6 +67,7 @@ import {
   DatasetReviews,
   DatasetReviewsCount,
 } from "@/features/datasets/dataset-reviews"
+import { DatasetStatusPicker } from "@/features/datasets/dataset-status-picker"
 import {
   canExportDataset,
   ExportDialog,
@@ -441,6 +442,16 @@ function DatasetMeta({
 
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted-foreground">
+      <span
+        className="inline-flex"
+        title={
+          dataset.status_updated_at
+            ? `状态修改于 ${formatDateTime(dataset.status_updated_at)}`
+            : undefined
+        }
+      >
+        <DatasetStatusPicker dataset={dataset} />
+      </span>
       <Badge variant="outline" className="font-normal">
         {originLabels[dataset.origin]}
       </Badge>

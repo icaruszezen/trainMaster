@@ -101,6 +101,8 @@ export function dataset(changes: Partial<Dataset> = {}): Dataset {
     dir_name: "line_a",
     path: "/data/datasets/line_a",
     origin: "directory",
+    status: "",
+    status_updated_at: null,
     directory_missing: false,
     image_count: 130,
     annotated_count: 100,

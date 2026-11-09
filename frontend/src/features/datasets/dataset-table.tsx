@@ -16,9 +16,10 @@ import type { Dataset } from "@/features/datasets/api"
 import { DatasetActionsMenu } from "@/features/datasets/dataset-actions"
 import {
   annotatedPercent,
-  DatasetStatusBadges,
+  DatasetActivityBadges,
   originLabels,
 } from "@/features/datasets/dataset-card"
+import { DatasetStatusPicker } from "@/features/datasets/dataset-status-picker"
 import { DatasetThumbnail } from "@/features/datasets/dataset-thumbnail"
 import { DatasetProjectBadges } from "@/features/projects/dataset-project-badges"
 import {
@@ -66,6 +67,7 @@ export function DatasetTable({
         <TableHeader>
           <TableRow className="hover:bg-transparent">
             <TableHead className="pl-4">名称</TableHead>
+            <TableHead>状态</TableHead>
             <TableHead className="text-right">图片</TableHead>
             <TableHead className="hidden w-44 sm:table-cell">已标注</TableHead>
             <TableHead className="hidden text-right lg:table-cell">
@@ -114,7 +116,7 @@ export function DatasetTable({
                         {dataset.name}
                       </Link>
                       {dataset.directory_missing || dataset.active_import ? (
-                        <DatasetStatusBadges dataset={dataset} />
+                        <DatasetActivityBadges dataset={dataset} />
                       ) : (
                         <span className="max-w-xs truncate text-xs text-muted-foreground">
                           {dataset.description || dataset.dir_name}
@@ -122,6 +124,9 @@ export function DatasetTable({
                       )}
                     </div>
                   </div>
+                </TableCell>
+                <TableCell>
+                  <DatasetStatusPicker dataset={dataset} />
                 </TableCell>
                 <TableCell className="text-right tabular-nums">
                   {formatNumber(dataset.image_count)}

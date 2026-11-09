@@ -33,6 +33,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { lastImageKey } from "@/features/annotation/annotation-editor"
 import { workspacePath } from "@/features/annotation/workspace-params"
 import { datasetsQuery, type Dataset } from "@/features/datasets/api"
+import { DatasetStatusBadge } from "@/features/datasets/dataset-status-picker"
 import { DatasetThumbnail } from "@/features/datasets/dataset-thumbnail"
 import { unannotatedCount } from "@/features/datasets/images"
 import { LoadError } from "@/features/datasets/load-error"
@@ -177,6 +178,7 @@ function DatasetRow({ dataset }: { dataset: Dataset }) {
       <div className="grid min-w-0 flex-1 gap-1.5">
         <div className="flex items-center gap-2">
           <span className="truncate font-medium">{dataset.name}</span>
+          <DatasetStatusBadge status={dataset.status} />
           {dataset.directory_missing && (
             <Badge variant="destructive" className="shrink-0">
               文件夹缺失

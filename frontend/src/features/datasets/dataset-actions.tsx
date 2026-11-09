@@ -53,6 +53,7 @@ import {
   updateDataset,
   type Dataset,
 } from "@/features/datasets/api"
+import { DatasetStatusSubmenu } from "@/features/datasets/dataset-status-picker"
 import { canExportDataset } from "@/features/datasets/export-dialog"
 import {
   refreshStartedImport,
@@ -159,6 +160,7 @@ export function DatasetActionsMenu({
           <FolderKanban />
           纳入项目
         </DropdownMenuItem>
+        <DatasetStatusSubmenu dataset={dataset} />
         <DropdownMenuSeparator />
         <DropdownMenuItem variant="destructive" onSelect={onDelete}>
           <Trash2 />
