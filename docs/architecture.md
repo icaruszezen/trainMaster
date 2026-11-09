@@ -977,7 +977,7 @@ exports/data-versions/
 
 - **参与训练的图片**（`scope`）：版本有一个默认的设置（`config.scope`），每个数据集可以单独设置（`sources[].scope`），页面上默认“仅有标注的图片”。图片有没有目标按它使用的标注判断（审图版本中有的用审图标注，否则用数据集自己的标注）：
   - `annotated`（仅有标注的图片）：取用有目标的图片，以及按 `include_empty` 取用空标注的图片；没有标注的图片计入 `unannotated`。这是加入这个设置之前的行为，旧版本读取时都是它。
-  - `background`（仅无标注的背景图）：只取用没有目标的图片作为负样本，包括没有标注文件的与空标注的；有目标的图片计入 `with_objects`。
+  - `background`（仅无标注的背景图）：只取用没有目标的图片作为负样本，包括没有标注文件的与空标注的；标注中有目标的图片计入 `with_objects`。这里按标注中原有的框判断（在去掉忽略的标签、裁剪框之前），所以只有忽略的标签的框或没有面积的框的图片也不取用。
   - `all`（整个数据集）：取用全部图片，没有目标的（包括没有标注文件的）作为负样本。
   - `include_empty` 只影响 `annotated` 的数据集，其它两种总是取用没有目标的图片。没有标注文件的图片与空标注的图片一样作为负样本保存（YOLO 的标注文件为空）。
 - 标注无法解析（`invalid`）的图片从不取用；`annotated` 的数据集中没有标注（`unannotated`）的图片不取用。
@@ -1024,7 +1024,7 @@ exports/data-versions/
 **步骤**：
 
 1. **preparing**：再次校验来源；按来源的顺序，为每个数据集打开快照（`dataset.Service.OpenSnapshot`：在一个 `REPEATABLE READ READ ONLY` 事务中读出数据集、所选的审图版本与按下载规则组合后的图片（`layerSQL` / `composedSQL` 的语义，另带 `size_bytes`）；审图版本的框在事务之后分批读出（每批 1000 张，不按 `deleted_at` 过滤），数据集文件夹以 `os.Root` 打开）。然后对每张图片（按图片顺序）：
-   - 有效的标注：审图版本的框，否则通过 root 读取基础版本的 VOC 文件（不超过标注文件的大小上限；无法读取或解析为 `invalid`，没有标注为 `unannotated`）；
+   - 有效的标注：审图版本的框，否则通过 root 读取基础版本的 VOC 文件（不超过标注文件的大小上限；无法读取或解析为 `invalid`）。没有标注时：数据集参与训练的图片为 `annotated` 时为 `unannotated`，否则作为没有目标的图片；`background` 的数据集中有框的图片为 `with_objects`（见“过滤”）；
    - 通过 root 打开图片并 fstat：文件已不在为 `missing`；大小或修改时间（微秒）与快照不同说明扫描或合并之后文件被改动过，为 `changed`（跳过，重新扫描数据集后再生成即可）；打开的文件留到链接时使用，但同时打开的不超过约 256 个：其余的在链接时重新打开，并再次核对大小与修改时间；
    - 训练工具读不了的格式（扩展名为 `.gif`、`.avif`，`dataset.IsTrainableImage`）为 `unsupported_format`；
    - 尺寸：快照（索引）中的，否则 VOC 中的，否则读取文件头（`dataset.DecodeImageConfig`）；都没有时为 `unknown_size`；

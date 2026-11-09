@@ -115,7 +115,9 @@ export function templateSelection(
 /**
  * 数据集当前的来源：用户改过的（`override`）> 模板 > 默认。不能使用的数据集
  * 总是不选。`versions` 是这个数据集已生成的审图版本，`scope` 是它参与训练的
- * 图片（决定默认是否选中基础标注）。
+ * 图片：取背景图（`background` / `all`）时，默认与模板的来源包含基础标注（背景
+ * 图来自数据集自己的图片）；用户改过的来源照原样。这些都在读取时得出，参与
+ * 训练的图片改回去时随之恢复。
  */
 export function effectiveSelection({
   dataset,
@@ -141,7 +143,20 @@ export function effectiveSelection({
     }
   }
   if (template) {
-    return templateSelection(template, dataset.id, versions) ?? NO_SOURCE
+    const selection =
+      templateSelection(template, dataset.id, versions) ?? NO_SOURCE
+    // 背景图来自数据集自己的图片：模板中（按“仅有标注的图片”）只选了审图版本
+    // 的数据集，现在取背景图时补选基础标注。模板本来就取背景图时照原样。
+    const source = template.sources.find((s) => s.dataset_id === dataset.id)
+    if (
+      scope !== "annotated" &&
+      source?.scope === "annotated" &&
+      isSelected(selection) &&
+      !selection.include_base
+    ) {
+      return { ...selection, include_base: true }
+    }
+    return selection
   }
   return defaultSelection(dataset, versions, scope)
 }
@@ -159,32 +174,29 @@ export function selectionToInclude(
 }
 
 /**
- * 参与训练的图片改为 `scope` 之后需要的来源修改（不需要时为 null）。
- * `selection` 是按新的设置得出的来源。背景图（`background` / `all`）来自数据集
- * 自己的图片，所以：选中了、但没有选基础标注的数据集补选基础标注（模板或用户
- * 只选了审图版本时）；`select` 时（为单个数据集选择时）没有选中的数据集一并
- * 选中。改为 `annotated` 时不修改。
+ * 为单个数据集选择取背景图（`background` / `all`）时，没有选中的数据集一并
+ * 选中：返回要使用的来源，不需要时为 null。`selection` 是按新的设置得出的
+ * 来源。
  */
-export function selectionAfterScopeChange({
+export function selectionOnScopeChange({
   dataset,
   versions,
   selection,
   scope,
-  select,
 }: {
   dataset: Pick<Dataset, "annotated_count" | "image_count">
   versions: readonly Pick<DatasetVersion, "id">[]
   selection: SourceSelection
   scope: TrainingScope
-  select: boolean
 }): SourceSelection | null {
-  if (scope === "annotated" || dataset.image_count === 0) {
+  if (
+    scope === "annotated" ||
+    dataset.image_count === 0 ||
+    isSelected(selection)
+  ) {
     return null
   }
-  if (!isSelected(selection)) {
-    return select ? selectionToInclude(dataset, versions, scope) : null
-  }
-  return selection.include_base ? null : { ...selection, include_base: true }
+  return selectionToInclude(dataset, versions, scope)
 }
 
 /** 勾选 / 取消一个审图版本，结果保持新的在前（与 versions 的顺序一致）。 */

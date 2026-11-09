@@ -25,7 +25,7 @@ import {
   ratioDraftOf,
   readyReviewVersions,
   scopeOverride,
-  selectionAfterScopeChange,
+  selectionOnScopeChange,
   selectionToInclude,
   sourceDisabledReason,
   sourceInputs,
@@ -219,56 +219,86 @@ describe("training scopes", () => {
     ])
   })
 
-  it("ticks the base when background images are asked for", () => {
-    const reviewed = dataset({ annotated_count: 0, image_count: 40 })
-    // 模板只选了审图版本：改为取背景图时补选基础标注。
-    const onlyReview = { include_base: false, version_ids: [5] }
-    for (const scope of ["background", "all"] as const) {
-      for (const select of [true, false]) {
-        expect(
-          selectionAfterScopeChange({
-            dataset: reviewed,
-            versions: [v5],
-            selection: onlyReview,
+  it("takes the base of a template's review-only dataset for background images", () => {
+    const reviewed = dataset({ id: 1, annotated_count: 0, image_count: 40 })
+    const templateWith = (scope: "annotated" | "background") =>
+      dataVersion({
+        sources: [
+          {
+            ...dataVersion().sources[0],
+            dataset_id: 1,
+            include_base: false,
+            versions: [{ id: 5, name: "审图1.2" }],
             scope,
-            select,
-          })
-        ).toEqual({ include_base: true, version_ids: [5] })
-      }
-    }
-    // 已经选了基础标注、或改为“仅有标注的图片”时不修改。
-    expect(
-      selectionAfterScopeChange({
+          },
+        ],
+      })
+    const select = (
+      scope: "annotated" | "background" | "all",
+      template = templateWith("annotated"),
+      override?: { include_base: boolean; version_ids: number[] }
+    ) =>
+      effectiveSelection({
         dataset: reviewed,
         versions: [v5],
-        selection: { include_base: true, version_ids: [] },
+        template,
+        override,
+        scope,
+      })
+    // 模板按“仅有标注的图片”只选了审图版本：取背景图时补选基础标注，改回去
+    // 时恢复（在读取时得出，不保存）。
+    expect(select("annotated")).toEqual({
+      include_base: false,
+      version_ids: [5],
+    })
+    expect(select("background")).toEqual({
+      include_base: true,
+      version_ids: [5],
+    })
+    expect(select("all")).toEqual({ include_base: true, version_ids: [5] })
+    // 模板本来就取背景图、只选了审图版本：照原样。
+    expect(select("background", templateWith("background"))).toEqual({
+      include_base: false,
+      version_ids: [5],
+    })
+    // 用户改过的来源照原样。
+    expect(
+      select("all", templateWith("annotated"), {
+        include_base: false,
+        version_ids: [5],
+      })
+    ).toEqual({ include_base: false, version_ids: [5] })
+    // 审图版本还在读取时，模板的来源看起来没有选中，不补选。
+    expect(
+      effectiveSelection({
+        dataset: reviewed,
+        versions: [],
+        template: templateWith("annotated"),
+        override: undefined,
         scope: "background",
-        select: true,
       })
-    ).toBeNull()
-    expect(
-      selectionAfterScopeChange({
-        dataset: reviewed,
-        versions: [v5],
-        selection: onlyReview,
-        scope: "annotated",
-        select: true,
-      })
-    ).toBeNull()
+    ).toEqual(NO_SOURCE)
   })
 
-  it("selects an unselected dataset only when it is changed on its own", () => {
+  it("selects an unselected dataset when it is set to take background images", () => {
     const background = dataset({ annotated_count: 0, image_count: 40 })
-    const change = (select: boolean) =>
-      selectionAfterScopeChange({
+    const change = (
+      scope: "annotated" | "background" | "all",
+      selection = NO_SOURCE
+    ) =>
+      selectionOnScopeChange({
         dataset: background,
         versions: [],
-        selection: NO_SOURCE,
-        scope: "background",
-        select,
+        selection,
+        scope,
       })
-    expect(change(true)).toEqual({ include_base: true, version_ids: [] })
-    expect(change(false)).toBeNull()
+    expect(change("background")).toEqual({
+      include_base: true,
+      version_ids: [],
+    })
+    expect(change("all")).toEqual({ include_base: true, version_ids: [] })
+    expect(change("annotated")).toBeNull()
+    expect(change("all", { include_base: false, version_ids: [5] })).toBeNull()
     expect(selectionToInclude(background, [v5], "annotated")).toEqual({
       include_base: false,
       version_ids: [5],

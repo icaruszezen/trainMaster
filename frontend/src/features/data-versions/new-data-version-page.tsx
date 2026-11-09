@@ -141,7 +141,7 @@ import {
   previewWarnings,
   readyReviewVersions,
   scopeOverride,
-  selectionAfterScopeChange,
+  selectionOnScopeChange,
   selectionToInclude,
   sourceDisabledReason,
   sourceInputs,
@@ -797,67 +797,33 @@ function NewDataVersionForm({
     setServerError(null)
     create.reset()
   }
-  /** 修改数据集参与训练的图片；`selection` 同时选中它（原来没有选中时）。 */
   /**
-   * 来源随参与训练的图片的修改（见 selectionAfterScopeChange）：`rows` 中的
-   * 数据集改为 `scopeOf(row)` 之后需要修改的来源。
+   * 修改一个数据集参与训练的图片；取背景图时没有选中的数据集一并选中（审图
+   * 版本还在读取时不选：模板的来源还不完整）。
    */
-  const scopeChangeOverrides = (
-    changed: SourceRowData[],
-    scopeOf: (row: SourceRowData) => TrainingScope,
-    select: boolean
-  ) => {
-    const overrides: Record<number, SourceSelection> = {}
-    for (const row of changed) {
-      if (row.disabled) {
-        continue
-      }
-      const scope = scopeOf(row)
-      const next = selectionAfterScopeChange({
-        dataset: row.dataset,
-        versions: row.versions,
-        selection: effectiveSelection({
-          dataset: row.dataset,
-          versions: row.versions,
-          template,
-          override: draft.overrides[row.dataset.id],
-          scope,
-        }),
-        scope,
-        select,
-      })
-      if (next) {
-        overrides[row.dataset.id] = next
-      }
-    }
-    return overrides
-  }
-  /** 修改默认的参与训练的图片（使用默认设置的数据集随之改变）。 */
-  const setDefaultScope = (scope: TrainingScope) => {
-    const overrides = scopeChangeOverrides(
-      rows.filter((row) => row.scopeSetting === ""),
-      () => scope,
-      false
-    )
-    setDraft((previous) => ({
-      ...previous,
-      scope,
-      overrides: { ...previous.overrides, ...overrides },
-    }))
-    setServerError(null)
-    create.reset()
-  }
-  /** 修改一个数据集参与训练的图片；取背景图时没有选中的数据集一并选中。 */
   const setSourceScope = (row: SourceRowData, value: ScopeOverride) => {
-    const overrides = scopeChangeOverrides(
-      [row],
-      () => value || draft.scope,
-      true
-    )
+    const scope = value || draft.scope
+    const include =
+      row.disabled || row.query.isPending
+        ? null
+        : selectionOnScopeChange({
+            dataset: row.dataset,
+            versions: row.versions,
+            selection: effectiveSelection({
+              dataset: row.dataset,
+              versions: row.versions,
+              template,
+              override: draft.overrides[row.dataset.id],
+              scope,
+            }),
+            scope,
+          })
     setDraft((previous) => ({
       ...previous,
       scopes: { ...previous.scopes, [row.dataset.id]: value },
-      overrides: { ...previous.overrides, ...overrides },
+      overrides: include
+        ? { ...previous.overrides, [row.dataset.id]: include }
+        : previous.overrides,
     }))
     setServerError(null)
     create.reset()
@@ -950,7 +916,7 @@ function NewDataVersionForm({
             rows={rows}
             template={template}
             scope={draft.scope}
-            onScopeChange={setDefaultScope}
+            onScopeChange={(scope) => update({ scope })}
             onSourceScopeChange={setSourceScope}
             previewSources={lastPreview?.sources}
             error={
