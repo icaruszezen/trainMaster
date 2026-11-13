@@ -38,11 +38,21 @@ var errVersionNotInBin = &Error{Kind: ErrNotFound, Message: "回收站中没有�
 // holding the version's row lock in another transaction.
 func (s *Service) moveToBin(ctx context.Context, id int64) error {
 	tag, err := s.db.Exec(ctx, `UPDATE data_versions SET deleted_at = now(), updated_at = now()
-		WHERE id = $1 AND status = 'ready' AND deleted_at IS NULL`, id)
+		WHERE id = $1 AND status = 'ready' AND deleted_at IS NULL
+			AND NOT EXISTS (SELECT 1 FROM training_jobs WHERE data_version_id = $1)`, id)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
+		var live bool
+		var usedBy int
+		if err := s.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM data_versions WHERE id = $1 AND deleted_at IS NULL),
+				(SELECT count(*) FROM training_jobs WHERE data_version_id = $1)`, id).Scan(&live, &usedBy); err != nil {
+			return err
+		}
+		if live && usedBy > 0 {
+			return newError(ErrConflict, "该数据版本已被 %d 个训练任务使用，请先删除相关训练任务", usedBy)
+		}
 		return errVersionNotFound
 	}
 	s.log.Info("data version moved to the recycle bin", "data_version_id", id)
@@ -198,8 +208,10 @@ func (s *Service) janitorPass(ctx context.Context) error {
 // purgeExpired purges the versions whose time in the recycle bin is over,
 // then the projects in the bin left without models and data versions.
 func (s *Service) purgeExpired(ctx context.Context) error {
-	rows, err := s.db.Query(ctx, `SELECT id FROM data_versions
-		WHERE deleted_at <= now() - $1 * interval '1 second' ORDER BY deleted_at, id`, recycle.RetentionSeconds)
+	rows, err := s.db.Query(ctx, `SELECT id FROM data_versions v
+		WHERE v.deleted_at <= now() - $1 * interval '1 second'
+			AND NOT EXISTS (SELECT 1 FROM training_jobs j WHERE j.data_version_id = v.id)
+		ORDER BY v.deleted_at, v.id`, recycle.RetentionSeconds)
 	if err != nil {
 		return err
 	}
@@ -235,7 +247,8 @@ func (s *Service) purgeVersion(ctx context.Context, id int64) error {
 	purged := false
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `SELECT dir_name FROM data_versions
-			WHERE id = $1 AND deleted_at <= now() - $2 * interval '1 second' FOR UPDATE`,
+			WHERE id = $1 AND deleted_at <= now() - $2 * interval '1 second'
+				AND NOT EXISTS (SELECT 1 FROM training_jobs WHERE data_version_id = $1) FOR UPDATE`,
 			id, recycle.RetentionSeconds).Scan(&dirName)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil // restored meanwhile

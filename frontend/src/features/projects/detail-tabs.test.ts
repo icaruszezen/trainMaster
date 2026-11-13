@@ -10,6 +10,7 @@ describe("parseDetailTab", () => {
   it("reads the tab from the address bar", () => {
     expect(parseDetailTab("classes")).toBe("classes")
     expect(parseDetailTab("data-versions")).toBe("data-versions")
+    expect(parseDetailTab("training-jobs")).toBe("training-jobs")
     expect(parseDetailTab("models")).toBe("models")
   })
 
@@ -24,7 +25,13 @@ describe("parseDetailTab", () => {
   })
 
   it("round-trips the links it builds", () => {
-    const tabs: DetailTab[] = ["datasets", "classes", "data-versions", "models"]
+    const tabs: DetailTab[] = [
+      "datasets",
+      "classes",
+      "data-versions",
+      "training-jobs",
+      "models",
+    ]
     for (const tab of tabs) {
       const url = new URL(projectTabPath(3, tab), "http://localhost")
       expect(url.pathname).toBe("/projects/3")
@@ -33,6 +40,9 @@ describe("parseDetailTab", () => {
     expect(projectTabPath(3, "datasets")).toBe("/projects/3")
     expect(projectTabPath(3, "data-versions")).toBe(
       "/projects/3?tab=data-versions"
+    )
+    expect(projectTabPath(3, "training-jobs")).toBe(
+      "/projects/3?tab=training-jobs"
     )
   })
 })

@@ -27,6 +27,8 @@ import { MembersPage } from "@/features/system/members-page"
 import { SettingsPage } from "@/features/system/settings-page"
 import { StoragePage } from "@/features/system/storage-page"
 import { ComputePage } from "@/features/training/compute-page"
+import { NewTrainingJobPage } from "@/features/training/new-training-job-page"
+import { TrainingJobDetailPage } from "@/features/training/training-job-detail-page"
 import { TrainingJobsPage } from "@/features/training/training-jobs-page"
 import { AppLayout } from "@/layouts/app-layout"
 import { NotFoundPage } from "@/pages/not-found-page"
@@ -82,6 +84,11 @@ export const routes: RouteObject[] = [
           { path: "/projects/:projectId", Component: ProjectDetailPage },
           { path: "/datasets/:datasetId", Component: DatasetDetailPage },
           { path: "/models/:modelId", Component: ModelDetailPage },
+          { path: "/training/jobs/new", Component: NewTrainingJobPage },
+          {
+            path: "/training/jobs/:jobId",
+            Component: TrainingJobDetailPage,
+          },
           { path: "/datasets/versions/new", Component: NewDataVersionPage },
           {
             path: "/datasets/versions/:versionId",

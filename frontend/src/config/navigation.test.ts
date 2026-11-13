@@ -54,7 +54,12 @@ describe("navigation config", () => {
     }
   })
 
-  it("marks the compute module as implemented with its API", () => {
+  it("marks training jobs and compute modules as implemented with their APIs", () => {
+    expect(getNavItem("training-jobs")).toMatchObject({
+      status: "ready",
+      path: "/training/jobs",
+      apiPath: "/api/v1/training/jobs",
+    })
     expect(getNavItem("compute")).toMatchObject({
       status: "ready",
       path: "/training/compute",

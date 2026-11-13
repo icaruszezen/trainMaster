@@ -1,15 +1,16 @@
-"""任务线程：注册成功后向平台长轮询领取任务并执行。任务有两类：model_export（模型仓库的 pt → ONNX 转换，
-model_export.py）与 review_inference（用模型识别审图任务的图片，review_inference.py）。
+"""任务线程：注册成功后向平台长轮询领取任务并执行。任务有三类：model_export（模型仓库的 pt → ONNX 转换，
+model_export.py）、review_inference（用模型识别审图任务的图片，review_inference.py）与 training_job
+（YOLO 模型训练，training.py）。
 
 - 能力：本机能找到每类任务需要的模块（REQUIRED_MODULES；importlib.util.find_spec 检查，不导入）时才在领取时
-  带上这类任务：model_export 需要 torch、ultralytics 与 onnx，review_inference 需要 torch 与 ultralytics。
-  缺少时记录一次 INFO 日志，之后每 5 分钟重新检查（裸机节点可能随后安装了依赖）。
+  带上这类任务：model_export 需要 torch、ultralytics 与 onnx，review_inference 与 training_job 需要
+  torch 与 ultralytics。缺少时记录一次 INFO 日志，之后每 5 分钟重新检查（裸机节点可能随后安装了依赖）。
 - 领取：POST /api/v1/compute/agent/tasks/claim（wait_seconds=25，客户端超时 = 等待时间 + 15 秒）；
   没有任务时立即再领。404 unknown_node（节点记录被删除）时请主循环重新注册并等待；其它 404 / 405
   （旧版平台没有任务接口）时每 5 分钟重试一次，只记录一次日志；网络错误与 5xx 按心跳相同的指数退避。
-- 一次只执行一个任务（按 kind 交给 ModelExportTask 或 ReviewInferenceTask）。停止（Agent.stop）时结束
-  正在运行的子进程，向平台上报可重试的失败（任务立即重新排队），不等待正在进行的长轮询（线程是守护线程，
-  进程退出时随之结束；万一领到了任务，租约过期后平台会重新排队）。
+- 一次只执行一个任务（按 kind 交给 ModelExportTask、ReviewInferenceTask 或 TrainingJobTask）。停止
+  （Agent.stop）时结束正在运行的子进程，向平台上报可重试的失败（任务立即重新排队），不等待正在进行的长轮询
+  （线程是守护线程，进程退出时随之结束；万一领到了任务，租约过期后平台会重新排队）。
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from typing import Any, Protocol
 from . import __version__
 from . import model_export as model_export_mod
 from . import review_inference as review_inference_mod
+from . import training as training_mod
 from .backoff import Backoff
 from .client import ApiError, Client, TransportError
 from .config import DEFAULT_INFERENCE_IMAGE_TIMEOUT
@@ -45,13 +47,18 @@ STOP_JOIN_TIMEOUT = 15.0
 REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
     model_export_mod.KIND: ("torch", "ultralytics", "onnx"),
     review_inference_mod.KIND: ("torch", "ultralytics"),
+    training_mod.KIND: ("torch", "ultralytics"),
 }
 # 各类任务在状态目录 work/ 中的工作目录；任务线程启动时删除上次运行（进程崩溃、被强制结束）的残留。
-WORK_DIR_PATTERNS = ("model-export-*", f"{review_inference_mod.WORK_DIR_PREFIX}*")
+WORK_DIR_PATTERNS = (
+    "model-export-*",
+    f"{review_inference_mod.WORK_DIR_PREFIX}*",
+    f"{training_mod.WORK_DIR_PREFIX}*",
+)
 
 
 class Runner(Protocol):
-    """一个正在执行的任务（ModelExportTask、ReviewInferenceTask）。"""
+    """一个正在执行的任务（ModelExportTask、ReviewInferenceTask、TrainingJobTask）。"""
 
     def run(self) -> str: ...
 
@@ -98,6 +105,7 @@ class TaskWorker:
         state_dir: Path,
         node_name: str,
         export_timeout: float,
+        data_dir: Path | None = None,
         find_spec: Callable[[str], Any] = importlib.util.find_spec,
         wait: Callable[[float], bool] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -106,17 +114,20 @@ class TaskWorker:
         progress_interval: float = model_export_mod.PROGRESS_INTERVAL,
         inference_image_timeout: float = DEFAULT_INFERENCE_IMAGE_TIMEOUT,
         inference_command: Sequence[str] | None = None,
+        training_command: Sequence[str] | None = None,
     ) -> None:
         self.client = client
         self.node_key = node_key
         self.registration = registration
         self.state_dir = state_dir
         self.node_name = node_name
+        self.data_dir = data_dir
         self.export_timeout = export_timeout
         self.export_command = list(export_command) if export_command else None
         self.progress_interval = progress_interval
         self.inference_image_timeout = inference_image_timeout
         self.inference_command = list(inference_command) if inference_command else None
+        self.training_command = list(training_command) if training_command else None
         self._find_spec = find_spec
         self._wait_fn = wait
         self._clock = clock
@@ -321,6 +332,17 @@ class TaskWorker:
                 node_name=self.node_name,
                 image_timeout=self.inference_image_timeout,
                 command=self.inference_command,
+                progress_interval=self.progress_interval,
+            )
+        if kind == training_mod.KIND:
+            return training_mod.TrainingJobTask(
+                task,
+                client=self.client,
+                node_key=self.node_key,
+                state_dir=self.state_dir,
+                node_name=self.node_name,
+                data_dir=self.data_dir,
+                command=self.training_command,
                 progress_interval=self.progress_interval,
             )
         return None

@@ -89,7 +89,7 @@ func (s *Service) deleteProject(ctx context.Context, id int64) (soft bool, err e
 		} else if err != nil {
 			return err
 		}
-		trashed, err := checkDelete(ctx, tx, id, false, false)
+		trashed, err := checkDelete(ctx, tx, id, false, false, false)
 		if err != nil {
 			return err
 		}
@@ -128,19 +128,25 @@ func (s *Service) deleteProject(ctx context.Context, id int64) (soft bool, err e
 // before any of them is moved. A project that is not in use is
 // ErrNotFound. DeleteProject checks again under its locks.
 func (s *Service) CheckDelete(ctx context.Context, id int64, withModels, withDataVersions bool) error {
+	return s.CheckDeleteAll(ctx, id, withModels, withDataVersions, false)
+}
+
+// CheckDeleteAll is CheckDelete with an additional flag for training jobs
+// that are about to be deleted with the project.
+func (s *Service) CheckDeleteAll(ctx context.Context, id int64, withModels, withDataVersions, withTrainingJobs bool) error {
 	if err := s.Exists(ctx, id); err != nil {
 		return err
 	}
-	_, err := checkDelete(ctx, s.db, id, withModels, withDataVersions)
+	_, err := checkDelete(ctx, s.db, id, withModels, withDataVersions, withTrainingJobs)
 	return err
 }
 
 // checkDelete fails with ErrHasModels when the project has models in use
-// (unless skipModels), then with ErrHasDataVersions when it has data
-// versions in use (unless skipDataVersions). trashed reports whether models
-// or data versions of it are in the recycle bin (the project must stay
-// with them).
-func checkDelete(ctx context.Context, q querier, id int64, skipModels, skipDataVersions bool) (trashed bool, err error) {
+// (unless skipModels), ErrHasDataVersions when it has data versions in use
+// (unless skipDataVersions), or ErrHasTrainingJobs when it has training jobs
+// (unless skipTrainingJobs). trashed reports whether models or data versions
+// of it are in the recycle bin (the project must stay with them).
+func checkDelete(ctx context.Context, q querier, id int64, skipModels, skipDataVersions, skipTrainingJobs bool) (trashed bool, err error) {
 	liveModels, trashedModels, err := countModels(ctx, q, id)
 	if err != nil {
 		return false, err
@@ -155,6 +161,13 @@ func checkDelete(ctx context.Context, q querier, id int64, skipModels, skipDataV
 	if liveVersions > 0 && !skipDataVersions {
 		return false, newError(ErrHasDataVersions, "项目中有 %d 个数据版本，请先删除数据版本，或选择同时删除数据版本", liveVersions)
 	}
+	trainingJobs, err := countTrainingJobs(ctx, q, id)
+	if err != nil {
+		return false, err
+	}
+	if trainingJobs > 0 && !skipTrainingJobs {
+		return false, newError(ErrHasTrainingJobs, "项目中有 %d 个训练任务，请先删除训练任务，或选择同时删除训练任务", trainingJobs)
+	}
 	return trashedModels > 0 || trashedVersions > 0, nil
 }
 
@@ -167,7 +180,8 @@ func checkDelete(ctx context.Context, q querier, id int64, skipModels, skipDataV
 func PurgeEmptyProjects(ctx context.Context, db *pgxpool.Pool) ([]int64, error) {
 	const empty = `deleted_at IS NOT NULL
 		AND NOT EXISTS (SELECT 1 FROM models m WHERE m.project_id = p.id)
-		AND NOT EXISTS (SELECT 1 FROM data_versions v WHERE v.project_id = p.id)`
+		AND NOT EXISTS (SELECT 1 FROM data_versions v WHERE v.project_id = p.id)
+		AND NOT EXISTS (SELECT 1 FROM training_jobs j WHERE j.project_id = p.id)`
 	rows, err := db.Query(ctx, "SELECT id FROM projects p WHERE "+empty+" ORDER BY id")
 	if err != nil {
 		return nil, err

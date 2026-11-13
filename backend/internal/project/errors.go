@@ -16,6 +16,9 @@ var (
 	// ErrHasDataVersions: a project with data versions in use cannot be
 	// deleted (a conflict too).
 	ErrHasDataVersions = errors.New("project has data versions")
+	// ErrHasTrainingJobs: a project with training jobs cannot be deleted
+	// until its training jobs are removed (a conflict too).
+	ErrHasTrainingJobs = errors.New("project has training jobs")
 )
 
 // Error is a user-facing error. Message is written in Chinese and is shown

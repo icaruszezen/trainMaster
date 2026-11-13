@@ -217,7 +217,7 @@ def test_review_inference_end_to_end(platform, tmp_path, fake_ml, caplog):
     assert all(r["headers"]["Authorization"] == f"Bearer {TOKEN}" for r in requests)
     assert platform.claims[0] == {
         "node_key": NODE_KEY,
-        "kinds": ["model_export", "review_inference"],
+        "kinds": ["model_export", "review_inference", "training_job"],
         "wait_seconds": 25,
     }
 
