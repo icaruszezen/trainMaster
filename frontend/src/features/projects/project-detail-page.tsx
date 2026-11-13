@@ -9,6 +9,7 @@ import {
   FolderX,
   Images,
   Plus,
+  Rocket,
   SquareDashed,
 } from "lucide-react"
 import { Link, useNavigate, useParams, useSearchParams } from "react-router"
@@ -50,6 +51,9 @@ import {
 import { ProjectClasses } from "@/features/projects/project-classes"
 import { ProjectDatasets } from "@/features/projects/project-datasets"
 import { ProjectModels } from "@/features/projects/project-models"
+import { projectTrainingJobsQuery } from "@/features/training/api"
+import { newTrainingJobPath } from "@/features/training/paths"
+import { ProjectTrainingJobs } from "@/features/training/project-training-jobs"
 import { usePageTitle } from "@/hooks/use-page-title"
 import { ApiError } from "@/lib/api"
 import {
@@ -130,9 +134,10 @@ function useDetailTab() {
 function ProjectDetail({ id }: { id: number }) {
   const navigate = useNavigate()
   const query = useQuery(projectQuery(id))
-  // 类别数量显示在标签页上，所以随页面一起加载；“类别”中还会显示标签分布。
+  // 类别数量与训练任务数量显示在标签页上，所以随页面一起加载。
   const classes = useQuery(projectClassesQuery(id))
   const labels = useQuery(projectLabelsQuery(id))
+  const trainingJobs = useQuery(projectTrainingJobsQuery(id))
   const [tab, setTab] = useDetailTab()
 
   const [addOpen, setAddOpen] = useState(false)
@@ -169,6 +174,12 @@ function ProjectDetail({ id }: { id: number }) {
           description={project.description || undefined}
           actions={
             <>
+              <Button variant="outline" asChild>
+                <Link to={newTrainingJobPath({ projectId: project.id })}>
+                  <Rocket />
+                  发起训练
+                </Link>
+              </Button>
               <Button onClick={() => setAddOpen(true)}>
                 <Plus />
                 添加数据集
@@ -213,6 +224,14 @@ function ProjectDetail({ id }: { id: number }) {
               {formatNumber(project.data_version_count)}
             </span>
           </TabsTrigger>
+          <TabsTrigger value="training-jobs" className="px-3">
+            训练任务
+            {trainingJobs.data && (
+              <span className="text-xs text-muted-foreground tabular-nums">
+                {formatNumber(trainingJobs.data.total)}
+              </span>
+            )}
+          </TabsTrigger>
           <TabsTrigger value="models" className="px-3">
             模型
             <span className="text-xs text-muted-foreground tabular-nums">
@@ -235,6 +254,12 @@ function ProjectDetail({ id }: { id: number }) {
         </TabsContent>
         <TabsContent value="data-versions">
           <ProjectDataVersions
+            projectId={project.id}
+            projectName={project.name}
+          />
+        </TabsContent>
+        <TabsContent value="training-jobs">
+          <ProjectTrainingJobs
             projectId={project.id}
             projectName={project.name}
           />

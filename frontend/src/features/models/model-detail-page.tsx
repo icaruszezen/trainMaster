@@ -19,6 +19,7 @@ import {
   Layers,
   ListTree,
   Pencil,
+  Rocket,
   Ruler,
   Search,
   Tags,
@@ -116,6 +117,10 @@ import {
 } from "@/features/reviews/model-review-entry"
 import { RECYCLE_BIN_PATH } from "@/features/recycle-bin/recycle-format"
 import { CopyButton } from "@/features/training/command-block"
+import {
+  newTrainingJobPath,
+  trainingJobDetailPath,
+} from "@/features/training/paths"
 import { useMediaQuery } from "@/hooks/use-media-query"
 import { usePageTitle } from "@/hooks/use-page-title"
 import { ApiError } from "@/lib/api"
@@ -222,6 +227,24 @@ function ModelDetail({ id }: { id: number }) {
           description={model.description || undefined}
           actions={
             <>
+              {!model.file_missing && (
+                <Button variant="outline" asChild>
+                  <Link
+                    to={newTrainingJobPath({
+                      projectId: model.project.id,
+                      baseModelId: model.id,
+                      initMode: model.info.training_checkpoint
+                        ? "resume"
+                        : "finetune",
+                    })}
+                  >
+                    <Rocket />
+                    {model.info.training_checkpoint
+                      ? "断点续训 / 微调"
+                      : "微调训练"}
+                  </Link>
+                </Button>
+              )}
               <ReviewWithModelButton model={model} />
               <Button
                 variant="outline"
@@ -511,7 +534,14 @@ function TrainingInfo({ model }: { model: Model }) {
               </Fact>
               {model.source === "training" &&
                 model.training_job_id !== null && (
-                  <Fact label="训练任务">#{model.training_job_id}</Fact>
+                  <Fact label="训练任务">
+                    <Link
+                      to={trainingJobDetailPath(model.training_job_id)}
+                      className="font-medium underline-offset-4 hover:underline"
+                    >
+                      训练任务 #{model.training_job_id}
+                    </Link>
+                  </Fact>
                 )}
             </Section>
             {info.training_checkpoint && (

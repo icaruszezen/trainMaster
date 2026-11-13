@@ -20,6 +20,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/review"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 	"github.com/icaruszezen/trainmaster/backend/internal/trainerpkg"
+	"github.com/icaruszezen/trainmaster/backend/internal/training"
 )
 
 // Database is what the handlers need from the database layer;
@@ -61,6 +62,10 @@ type Options struct {
 	// sets of a project) and their restore from the recycle bin (with
 	// Datasets). If nil, those routes are not mounted.
 	DataVersions *dataversion.Service
+	// Training serves /api/v1/training (YOLO training jobs) and their
+	// compute-node callbacks under /api/v1/compute/agent/training-jobs.
+	// If nil, those routes are not mounted.
+	Training *training.Service
 	// Reviews serves /api/v1/reviews (model reviews) and the review
 	// records of a dataset (/api/v1/datasets/{id}/reviews, with Datasets).
 	// The inference calls of the training nodes
@@ -94,7 +99,6 @@ type Options struct {
 var plannedModules = []string{
 	"/annotation/tasks",
 	"/annotation/labels",
-	"/training/jobs",
 	"/evaluations",
 }
 
@@ -107,6 +111,7 @@ type server struct {
 	compute   *compute.Service
 	models    *model.Service
 	reviews   *review.Service
+	training  *training.Service
 	host      *hostinfo.Host
 	nodeToken string
 	startedAt time.Time
@@ -123,8 +128,8 @@ type server struct {
 // NewHandler returns the root HTTP handler.
 func NewHandler(o Options) http.Handler {
 	s := &server{log: o.Logger, db: o.DB, storage: o.Storage, datasets: o.Datasets, compute: o.Compute,
-		models: o.Models, reviews: o.Reviews, reviewerTool: o.ReviewerTool, host: o.Host, nodeToken: o.NodeToken,
-		localTrainerMode: o.LocalTrainerMode, startedAt: o.StartedAt,
+		models: o.Models, reviews: o.Reviews, training: o.Training, reviewerTool: o.ReviewerTool, host: o.Host,
+		nodeToken: o.NodeToken, localTrainerMode: o.LocalTrainerMode, startedAt: o.StartedAt,
 		trainerPackage: trainerpkg.New(o.TrainerPackageDir), dataVersions: o.DataVersions}
 	if o.Datasets != nil {
 		s.projects = o.Projects
@@ -169,6 +174,9 @@ func NewHandler(o Options) http.Handler {
 			}
 			if s.dataVersions != nil {
 				r.Route("/data-versions", s.dataVersionRoutes)
+			}
+			if s.training != nil {
+				r.Route("/training", s.trainingRoutes)
 			}
 			if s.datasets != nil {
 				r.Route("/recycle-bin", s.recycleBinRoutes)

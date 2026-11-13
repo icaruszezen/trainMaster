@@ -26,13 +26,17 @@ import { datasetsQuery } from "@/features/datasets/api"
 import { modelsQuery } from "@/features/models/api"
 import { projectsQuery } from "@/features/projects/api"
 import { SystemStatusCard } from "@/features/system/system-status-card"
+import { isActiveTrainingJob, trainingJobsQuery } from "@/features/training/api"
 import { ComputeSummaryLink } from "@/features/training/compute-summary-link"
+import {
+  newTrainingJobPath,
+  TRAINING_JOBS_PATH,
+} from "@/features/training/paths"
 import { formatNumber, formatPercent, percentOf } from "@/lib/format"
 
 /** 尚未开发的模块的统计项：对应模块完成后再接入真实数据。 */
 const plannedStats: { title: string; icon: LucideIcon }[] = [
   { title: "标注任务", icon: ListChecks },
-  { title: "训练任务", icon: Rocket },
 ]
 
 const workflow: { moduleId: ModuleId; title: string; description: string }[] = [
@@ -80,6 +84,7 @@ export function DashboardPage() {
         <ProjectStat />
         <DatasetStats />
         <ModelStat />
+        <TrainingStat />
         {plannedStats.map((stat) => (
           <StatCard
             key={stat.title}
@@ -193,6 +198,40 @@ function ModelStat() {
         className="inline-flex items-center gap-1 self-start underline-offset-4 hover:text-foreground hover:underline"
       >
         {data.total > 0 ? "查看全部" : "上传模型"}
+        <ArrowRight className="size-3" />
+      </Link>
+    </StatCard>
+  )
+}
+
+/** 训练任务数量与活跃状态，数据来自训练任务列表。 */
+function TrainingStat() {
+  const { data, isPending } = useQuery(trainingJobsQuery())
+
+  if (data === undefined) {
+    return (
+      <StatCard
+        title="训练任务"
+        icon={Rocket}
+        value={isPending ? <Skeleton className="h-8 w-16" /> : "—"}
+      >
+        {isPending ? "正在加载…" : "无法获取数据"}
+      </StatCard>
+    )
+  }
+
+  const activeCount = data.items.filter(isActiveTrainingJob).length
+  return (
+    <StatCard title="训练任务" icon={Rocket} value={formatNumber(data.total)}>
+      <Link
+        to={data.total > 0 ? TRAINING_JOBS_PATH : newTrainingJobPath()}
+        className="inline-flex items-center gap-1 self-start underline-offset-4 hover:text-foreground hover:underline"
+      >
+        {activeCount > 0
+          ? `${formatNumber(activeCount)} 个进行中`
+          : data.total > 0
+            ? "查看全部"
+            : "发起训练"}
         <ArrowRight className="size-3" />
       </Link>
     </StatCard>

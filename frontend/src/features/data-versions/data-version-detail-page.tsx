@@ -19,6 +19,7 @@ import {
   HardDrive,
   Images,
   Layers,
+  Rocket,
   RotateCcw,
   Shapes,
   SquareDashed,
@@ -113,6 +114,7 @@ import {
   RECYCLE_BIN_PATH,
   RECYCLE_RETENTION_DAYS,
 } from "@/features/recycle-bin/recycle-format"
+import { newTrainingJobPath } from "@/features/training/paths"
 import { useMediaQuery } from "@/hooks/use-media-query"
 import { usePageTitle } from "@/hooks/use-page-title"
 import { ApiError } from "@/lib/api"
@@ -260,6 +262,17 @@ function DataVersionDetail({ id }: { id: number }) {
             <>
               {ready && (
                 <>
+                  <Button variant="outline" asChild>
+                    <Link
+                      to={newTrainingJobPath({
+                        projectId: version.project_id,
+                        dataVersionId: version.id,
+                      })}
+                    >
+                      <Rocket />
+                      发起训练
+                    </Link>
+                  </Button>
                   <Button variant="outline" asChild>
                     <Link
                       to={newDataVersionPath({

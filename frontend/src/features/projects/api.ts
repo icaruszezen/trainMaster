@@ -253,7 +253,11 @@ export function updateProject(
  */
 export function deleteProject(
   id: number,
-  { deleteModels = false, deleteDataVersions = false } = {}
+  {
+    deleteModels = false,
+    deleteDataVersions = false,
+    deleteTrainingJobs = false,
+  } = {}
 ) {
   const params = new URLSearchParams()
   if (deleteModels) {
@@ -261,6 +265,9 @@ export function deleteProject(
   }
   if (deleteDataVersions) {
     params.set("delete_data_versions", "true")
+  }
+  if (deleteTrainingJobs) {
+    params.set("delete_training_jobs", "true")
   }
   const query = params.toString()
   return apiSend<void>(

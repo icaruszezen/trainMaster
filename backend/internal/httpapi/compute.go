@@ -52,6 +52,9 @@ func (s *server) computeRoutes(r chi.Router) {
 		if s.reviews != nil {
 			s.agentReviewRoutes(r)
 		}
+		if s.training != nil {
+			s.agentTrainingRoutes(r)
+		}
 	})
 }
 

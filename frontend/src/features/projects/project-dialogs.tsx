@@ -69,6 +69,7 @@ import {
 import { validateProjectName } from "@/features/projects/naming"
 import { refreshAfterModelMove } from "@/features/recycle-bin/api"
 import { RECYCLE_RETENTION_DAYS } from "@/features/recycle-bin/recycle-format"
+import { projectTrainingJobsQuery, trainingKeys } from "@/features/training/api"
 import { ApiError } from "@/lib/api"
 import { formatBytes, formatNumber } from "@/lib/format"
 import { queryClient } from "@/lib/query-client"
@@ -223,11 +224,11 @@ function ProjectForm({
       if (isEdit) {
         queryClient.setQueryData(projectKeys.detail(saved.id), saved)
         if (saved.name !== project.name) {
-          // 数据集上的项目标记、模型（标题为“项目名 v3”）与数据版本（“项目名 ·
-          // 数据版本 v3”）显示项目名称。
+          // 数据集上的项目标记、模型（标题为“项目名 v3”）、数据版本与训练任务显示项目名称。
           refreshMembership()
           void queryClient.invalidateQueries({ queryKey: modelKeys.all })
           void queryClient.invalidateQueries({ queryKey: dataVersionKeys.all })
+          void queryClient.invalidateQueries({ queryKey: trainingKeys.all })
         } else {
           void queryClient.invalidateQueries({ queryKey: projectKeys.lists() })
         }
@@ -432,7 +433,8 @@ function DeleteProjectForm({
 }) {
   const modelsCheckboxId = useId()
   const dataVersionsCheckboxId = useId()
-  // 以项目的模型与数据版本列表为准（项目卡片上的数量可能是一会儿之前的）。
+  const trainingJobsCheckboxId = useId()
+  // 以项目的模型、数据版本与训练任务列表为准（项目卡片上的数量可能是一会儿之前的）。
   const models = useQuery(projectModelsQuery(project.id))
   const modelCount = models.data?.items.length ?? project.model_count
   const modelBytes = models.data?.items.reduce(
@@ -442,17 +444,21 @@ function DeleteProjectForm({
   const exportCount =
     models.data?.items.reduce((sum, model) => sum + model.export_count, 0) ?? 0
   const dataVersions = useQuery(dataVersionsQuery(project.id))
+  const trainingJobs = useQuery(projectTrainingJobsQuery(project.id))
   const dependants: ProjectDependants = {
     models: modelCount,
     dataVersions: dataVersions.data?.items.length ?? project.data_version_count,
     readyDataVersions:
       dataVersions.data?.items.filter((version) => version.status === "ready")
         .length ?? null,
+    trainingJobs: trainingJobs.data?.items.length ?? 0,
   }
   const hasModels = dependants.models > 0
   const hasDataVersions = dependants.dataVersions > 0
+  const hasTrainingJobs = (dependants.trainingJobs ?? 0) > 0
   const [deleteModels, setDeleteModels] = useState(false)
   const [deleteDataVersions, setDeleteDataVersions] = useState(false)
+  const [deleteTrainingJobs, setDeleteTrainingJobs] = useState(false)
   const dataVersionsText = dataVersionsCheckboxText(
     dependants,
     RECYCLE_RETENTION_DAYS
@@ -463,6 +469,7 @@ function DeleteProjectForm({
       deleteProject(project.id, {
         deleteModels: hasModels && deleteModels,
         deleteDataVersions: hasDataVersions && deleteDataVersions,
+        deleteTrainingJobs: hasTrainingJobs && deleteTrainingJobs,
       }),
     onSuccess: () => {
       queryClient.removeQueries({ queryKey: projectKeys.detail(project.id) })
@@ -472,9 +479,10 @@ function DeleteProjectForm({
       })
       // 数据集上的项目标记与按项目筛选的结果都会变化；模型与已生成的数据版本
       // 随项目移入回收站（回收站中已有这个项目的模型或数据版本时，项目也随它们
-      // 留在回收站中）；全部数据版本的列表中不再有这个项目的版本。
+      // 留在回收站中）；全部数据版本与训练任务的列表中不再有这个项目的记录。
       refreshAfterModelMove()
       void queryClient.invalidateQueries({ queryKey: dataVersionKeys.all })
+      void queryClient.invalidateQueries({ queryKey: trainingKeys.all })
       const description = deletedProjectDescription(
         dependants,
         RECYCLE_RETENTION_DAYS
@@ -487,13 +495,15 @@ function DeleteProjectForm({
     },
     onError: (error) => {
       if (error instanceof ApiError && error.status === 409) {
-        // 删除期间有新的模型上传到了项目、或生成了新的数据版本：刷新后显示
-        // 最新的数量。
+        // 删除期间有新的模型上传到了项目、生成了新的数据版本或发起了新的训练任务：刷新后显示最新的数量。
         void queryClient.invalidateQueries({
           queryKey: modelKeys.project(project.id),
         })
         void queryClient.invalidateQueries({
           queryKey: dataVersionKeys.list(project.id),
+        })
+        void queryClient.invalidateQueries({
+          queryKey: trainingKeys.lists(),
         })
         void queryClient.invalidateQueries({
           queryKey: projectKeys.detail(project.id),
@@ -504,7 +514,9 @@ function DeleteProjectForm({
   })
 
   const blocked =
-    (hasModels && !deleteModels) || (hasDataVersions && !deleteDataVersions)
+    (hasModels && !deleteModels) ||
+    (hasDataVersions && !deleteDataVersions) ||
+    (hasTrainingJobs && !deleteTrainingJobs)
   const notice = dependantsNotice(dependants)
 
   return (
@@ -551,6 +563,16 @@ function DeleteProjectForm({
           disabled={mutation.isPending}
           label={dataVersionsText.label}
           detail={dataVersionsText.detail}
+        />
+      )}
+      {hasTrainingJobs && (
+        <DependantsCheckbox
+          id={trainingJobsCheckboxId}
+          checked={deleteTrainingJobs}
+          onCheckedChange={setDeleteTrainingJobs}
+          disabled={mutation.isPending}
+          label={`同时删除 ${formatNumber(dependants.trainingJobs ?? 0)} 个训练任务（永久删除）`}
+          detail="正在运行的训练任务会立即终止，训练日志与任务目录下的未入库临时权重一并永久删除；已注册到模型仓库的模型按上方模型选项处理。"
         />
       )}
       {mutation.error && (

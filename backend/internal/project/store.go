@@ -280,6 +280,12 @@ func countModels(ctx context.Context, q querier, projectID int64) (live, trashed
 	return live, trashed, err
 }
 
+// countTrainingJobs returns the number of training jobs of a project.
+func countTrainingJobs(ctx context.Context, q querier, projectID int64) (count int, err error) {
+	err = q.QueryRow(ctx, `SELECT count(*) FROM training_jobs WHERE project_id = $1`, projectID).Scan(&count)
+	return count, err
+}
+
 func queryLabels(ctx context.Context, q querier, projectID int64) ([]Label, error) {
 	rows, err := q.Query(ctx, `SELECT l.key, sum(l.value::bigint)::bigint, count(*), count(DISTINCT i.dataset_id)
 		FROM project_datasets pd

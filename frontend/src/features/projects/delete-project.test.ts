@@ -24,17 +24,31 @@ describe("deleteProjectLabel", () => {
     expect(
       deleteProjectLabel({ models: 1, dataVersions: 3, readyDataVersions: 3 })
     ).toBe("删除项目、模型与数据版本")
+    expect(deleteProjectLabel({ ...none, trainingJobs: 2 })).toBe(
+      "删除项目与训练任务"
+    )
+    expect(
+      deleteProjectLabel({
+        models: 1,
+        dataVersions: 2,
+        readyDataVersions: 2,
+        trainingJobs: 3,
+      })
+    ).toBe("删除项目、模型、数据版本与训练任务")
   })
 })
 
 describe("dependantsNotice", () => {
-  it("explains why models and data versions go too", () => {
+  it("explains why models, data versions, and training jobs go too", () => {
     expect(dependantsNotice(none)).toBeNull()
     expect(dependantsNotice({ ...none, models: 2 })).toBe(
       "项目中有 2 个模型；模型只属于这个项目，需要一起删除。"
     )
     expect(dependantsNotice({ ...none, dataVersions: 1200 })).toBe(
       "项目中有 1,200 个数据版本；数据版本只属于这个项目，需要一起删除。"
+    )
+    expect(dependantsNotice({ ...none, trainingJobs: 3 })).toBe(
+      "项目中有 3 个训练任务；训练任务只属于这个项目，需要一起删除。"
     )
     expect(dependantsNotice({ ...none, models: 1, dataVersions: 4 })).toBe(
       "项目中有 1 个模型、4 个数据版本；它们只属于这个项目，需要一起删除。"

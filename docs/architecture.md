@@ -1,6 +1,6 @@
 # 架构说明
 
-本文描述 trainMaster 的整体结构与约定（平台框架 + 已实现的数据集、项目、标注、计算资源、模型仓库、模型审图、回收站与数据版本）。后续功能开发应遵循这里的约定；需要调整约定时，请同步更新本文。
+本文描述 trainMaster 的整体结构与约定（平台框架 + 已实现的数据集、项目、标注、计算资源、模型仓库、模型审图、回收站、数据版本与训练任务）。后续功能开发应遵循这里的约定；需要调整约定时，请同步更新本文。
 
 ## 1. 组件总览
 
@@ -29,12 +29,12 @@ flowchart LR
     trainer -- "注册 / 心跳 / 领取并执行任务（HTTP，可选令牌）" --> server
     remote -- "注册 / 心跳 / 任务" --> server
     trainer --- gpu
-    trainer -. "读数据集、写模型与运行产物（规划中）" .-> storage
+    trainer -- "零拷贝读取数据版本（共享 /data 时）" --> storage
     browser -. "审图包 / 审图结果（zip 文件）" .- reviewer
 ```
 
 - **单镜像**：Go 服务同时提供 `/api` 下的 JSON API 和前端构建产物（`/app/web`），部署只需 `app` 与 `postgres` 两个容器。
-- **训练节点是独立的服务**：Python 训练节点（`trainer/`）运行在有显卡的机器上，主动向平台注册并上报心跳（见第 9 节）。同一台机器上由 compose 的 profile 启用（`gpu` → `trainer`，`cpu` → `trainer-cpu`，`make setup` 自动选择），也可以运行在其它机器上；训练节点还执行平台的任务（目前是模型仓库的 ONNX 转换与模型审图的识别，见第 9–11 节），没有训练节点时转换与识别一直排队，平台的其它功能不受影响。
+- **训练节点是独立的服务**：Python 训练节点（`trainer/`）运行在有显卡的机器上，主动向平台注册并上报心跳（见第 9 节）。同一台机器上由 compose 的 profile 启用（`gpu` → `trainer`，`cpu` → `trainer-cpu`，`make setup` 自动选择），也可以运行在其它机器上；训练节点还执行平台的任务（模型仓库的 ONNX 转换、模型审图的识别与训练任务的模型训练，见第 9–11、14 节），没有训练节点时转换、识别与训练一直排队，平台的其它功能不受影响。
 - **本地审图程序**：`trainmaster-reviewer.exe`（`backend/cmd/trainmaster-reviewer`，Go）是在用户的 Windows 电脑上离线审图的单个程序，随平台镜像分发、在页面上下载；它与平台之间只交换文件：用户从平台下载审图包、在程序中审完后导出审图结果，再上传到平台（见第 11 节）。
 - **文件与元数据分离**：图片、模型权重等大文件以普通文件形式保存在宿主机目录；PostgreSQL 只保存元数据（记录、关系、状态）。两者都通过绑定挂载持久化。
 - **内网友好**：前端不依赖任何外部 CDN、在线字体或第三方服务。
@@ -52,15 +52,16 @@ flowchart LR
 | `internal/database` | pgxpool 连接池、启动时连接重试、内置迁移执行器 |
 | `internal/storage` | 数据目录布局、启动时创建与可写检查、磁盘用量、安全路径解析 |
 | `internal/dataset` | 数据集：命名规则、图片与 VOC 标注识别、压缩包解压、目录扫描、缩略图、导入任务执行器、下载打包；审图版本（`versions.go`：版本的生成、编号、修改与删除，下载时按所选版本组合标注，见第 11 节“审图版本”）；回收站（`recycle.go`：数据集与审图版本的移入、恢复与到期清理，见第 12 节）；为数据版本读取所选标注版本组合后的图片（`snapshot.go` 的 `OpenSnapshot`）与共用的文件格式、解码函数（`exported.go`，见第 13 节） |
-| `internal/project` | 项目：项目的增删改、项目与数据集的多对多关系、按数据集合计的统计与标签分布、项目的类别列表（训练时的类别顺序，标注时的候选类别）、项目的模型数与最新版本、数据版本数与最新的数据版本；删除项目前的检查（`CheckDelete`：模型与数据版本）与回收站中空项目的清理（`PurgeEmptyProjects`，模型与数据版本共用）。不引用 `dataversion`，直接查询 `data_versions` |
-| `internal/model` | 模型仓库：分块上传与提交、项目内的版本分配、模型文件夹与 `model.json`、下载；回收站（`recycle.go`：移入、恢复与到期清理，见第 12 节）；ONNX 转换的选项、缓存、任务队列（领取、租约、重试）与训练节点的任务接口；为平台训练预留的 `RegisterTrainedModel`（见第 10 节） |
+| `internal/project` | 项目：项目的增删改、项目与数据集的多对多关系、按数据集合计的统计与标签分布、项目的类别列表（训练时的类别顺序，标注时的候选类别）、项目的模型数与最新版本、数据版本数与最新的数据版本；删除项目前的检查（`CheckDelete` / `CheckDeleteAll`：模型、数据版本与训练任务）与回收站中空项目的清理（`PurgeEmptyProjects`，模型、数据版本与训练任务共用）。不引用 `dataversion` 与 `training`，直接查询 `data_versions` 与 `training_jobs` |
+| `internal/model` | 模型仓库：分块上传与提交、项目内的版本分配、模型文件夹与 `model.json`、下载；回收站（`recycle.go`：移入、恢复与到期清理，见第 12 节）；ONNX 转换的选项、缓存、任务队列（领取、租约、重试）与训练节点的任务接口；为平台训练提供的 `RegisterTrainedModel`（见第 10、14 节） |
 | `internal/recycle` | 回收站的保留期（`Retention`，7 天）与到期时间的计算，数据集、模型、审图与数据版本模块共用（见第 12 节） |
 | `internal/model/checkpoint` | 读取 Ultralytics `.pt` 的元数据：zip 中的 `data.pkl` 由只读的 pickle 解释器解析（不执行任何代码），得到任务、类别、输入尺寸、YOLO 版本、训练信息；纯函数，无数据库依赖 |
 | `internal/review` | 模型审图：审图任务的创建、修改与删除；识别任务（实现 `model.TaskSource`，通过训练节点的领取接口下发）、租约与识别结果的写入；审核状态与审图标注；审图包；上传审图结果；合并为数据集审图版本的后台任务（见第 11 节） |
 | `internal/reviewfile` | 审图包的文件格式，平台与本地审图程序共用：清单 `review.json` 的读写与校验、Windows 安全的路径（`SafeSegment`、`Layout`）、审图标注（VOC）的读写与原子替换 |
 | `internal/reviewer` | 本地审图程序的本机服务：打开与解压审图包、与平台形状相同的审图接口、审核进度 `review-progress.json`、缩略图、导出审图结果、访问控制 |
-| `internal/dataversion` | 数据版本：输入的校验与预览、编号与创建、重新生成、修改备注与删除（`create.go`）；划分（`split.go`，纯函数，预览与生成共用）；一次一个的后台生成与重启后的恢复（`build.go`：读取数据集快照、硬链接或复制原图、写 YOLO 标注与 `data.yaml`、增强）；版本文件夹（`folder.go`：`.pending` 标记、移开后在后台删除）；图片与缩略图（`images.go`）；YOLO / VOC / COCO 下载（`export.go`）；回收站与清理（`recycle.go`）。面向用户的错误为 `dataversion.Error`（见第 13 节） |
+| `internal/dataversion` | 数据版本：输入的校验与预览、编号与创建、重新生成、修改备注与删除（`create.go`）；划分（`split.go`，纯函数，预览与生成共用）；一次一个的后台生成与重启后的恢复（`build.go`：读取数据集快照、硬链接或复制原图、写 YOLO 标注与 `data.yaml`、增强）；版本文件夹（`folder.go`：`.pending` 标记、移开后在后台删除）；图片与缩略图（`images.go`）；YOLO / VOC / COCO 下载（`export.go`）；回收站与清理（`recycle.go`，删除前检查是否被训练任务引用）。面向用户的错误为 `dataversion.Error`（见第 13 节） |
 | `internal/augment` | 数据版本的离线增强：翻转与旋转（二面体群 D4 中的一个方向，框精确变换）、亮度 / 对比度、模糊、噪声，确定的增强计划，输出格式与编码；EXIF / TIFF 方向标记的识别与重置（`orientation.go`）。纯函数，没有数据库与文件 |
+| `internal/training` | 训练任务：Ultralytics YOLO 全量 86 项训练参数的规格、官方默认值与校验（`params.go`），训练任务的创建、修改、停止、重试、删除、日志增量读取、产物文件读取与权重注册到模型仓库（`jobs.go`），实现 `model.TaskSource` 的领取队列、租约续期、数据集与基础模型的流式下发、产物原子接收（`queue.go`）。面向用户的错误为 `training.Error`（见第 14 节） |
 | `internal/compute` | 计算资源：训练节点的注册与心跳、上报数据的规范化与校验、在线状态判定、删除与重新检测、内存中的指标历史 |
 | `internal/hostinfo` | 平台服务器自身的 CPU、内存、负载、cgroup 限制与 NVIDIA 显卡（读 `/proc`、`/sys`，根目录可替换以便测试）；后台每 5 秒采样一次 CPU 利用率 |
 | `internal/httpapi` | chi 路由、中间件、统一 JSON 响应与错误信封、各 handler |
@@ -72,8 +73,8 @@ flowchart LR
 2. 初始化存储目录：创建根目录和 7 个子目录（见第 5 节）并做可写探测，失败则退出并提示检查挂载目录权限 / PUID、PGID。
 3. 连接数据库：指数退避重试，最长约 60 秒（数据库容器还在启动时会等待），仍失败则以非 0 退出。
 4. `TM_DB_AUTO_MIGRATE=true`（默认）时执行待执行的迁移。
-5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），整理崩溃留下的回收站文件夹（见第 12 节“文件夹”），然后启动任务执行器（见第 6 节）；启动模型仓库的后台任务（见第 10 节“存储与版本号”）与模型审图的后台任务（先把上次运行中断的合并记为失败、删除它们没有生成完的审图版本，见第 11 节“存储”），以及数据版本的后台任务（先把上次运行中断的生成记为失败，再开始生成排队中的版本，见第 13 节“生成”）。
-6. 启动 HTTP 服务；收到 SIGINT / SIGTERM 后停止接收新请求，等待进行中的请求完成（最长 15 秒）；超时后强制关闭剩余连接（取消其请求的 context），最后关闭数据库连接池。还在等待数据库或迁移锁时收到信号，则直接正常退出。收到信号时会立即取消正在执行的导入 / 扫描任务并记为失败（“服务重启，导入被中断”），排队中的任务保留到下次启动执行；正在生成的数据版本同样被取消（关闭期间不清理它的文件夹），下次启动时记为失败，可以重新生成。HTTP 服务关闭后再等待任务执行器的 worker 退出。进程在写入结果前异常退出时，下次启动由恢复逻辑把任务标记为中断，并重新计算受影响数据集的统计数据。长连接 handler 应通过 `http.Server.RegisterOnShutdown` 在关闭开始时主动结束：训练节点领取任务的长轮询（最长 30 秒）就是这样立即返回 `{"task": null}` 的，以后的 SSE 推送（如训练日志）也应如此。
+5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），整理崩溃留下的回收站文件夹（见第 12 节“文件夹”），然后启动任务执行器（见第 6 节）；启动模型仓库的后台任务（见第 10 节“存储与版本号”）、模型审图的后台任务（先把上次运行中断的合并记为失败、删除它们没有生成完的审图版本，见第 11 节“存储”）、数据版本的后台任务（先把上次运行中断的生成记为失败，再开始生成排队中的版本，见第 13 节“生成”），以及训练任务的后台任务（租约过期恢复与临时上传清理，见第 14 节）。
+6. 启动 HTTP 服务；收到 SIGINT / SIGTERM 后停止接收新请求，等待进行中的请求完成（最长 15 秒）；超时后强制关闭剩余连接（取消其请求的 context），最后关闭数据库连接池。还在等待数据库或迁移锁时收到信号，则直接正常退出。收到信号时会立即取消正在执行的导入 / 扫描任务并记为失败（“服务重启，导入被中断”），排队中的任务保留到下次启动执行；正在生成的数据版本同样被取消（关闭期间不清理它的文件夹），下次启动时记为失败，可以重新生成。HTTP 服务关闭后再等待任务执行器的 worker 退出。进程在写入结果前异常退出时，下次启动由恢复逻辑把任务标记为中断，并重新计算受影响数据集的统计数据。长连接 handler 应通过 `http.Server.RegisterOnShutdown` 在关闭开始时主动结束：训练节点领取任务的长轮询（最长 30 秒）就是这样立即返回 `{"task": null}` 的，以后的 SSE 推送也应如此。
 
 ## 3. API 约定
 
@@ -106,19 +107,19 @@ flowchart LR
 | 404 | `not_found` | 接口或资源不存在（未设置 `TM_WEB_DIR` 时，非 `/api` 路径也返回它） |
 | 404 | `unknown_node` | 心跳或任务调用中的 `node_key`（`X-Node-Key`）尚未注册（或节点已被删除），训练节点收到后重新注册 |
 | 405 | `method_not_allowed` | 路径存在但不支持该方法（响应头 `Allow` 列出支持的方法） |
-| 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、下载 YOLO 时所选项目还没有类别列表、标注文件不能在平台中修改、删除在线的训练节点、重新检测离线的训练节点、删除有模型的项目、模型文件未上传完就提交、模型上传的临时文件已丢失、转换任务已不属于该训练节点、审图图片还没有识别完成、审图任务正在合并时删除或再次合并、修改或删除正在生成的审图版本、所选版本中没有可以导出的图片、删除有数据版本的项目、新建数据版本时项目还没有类别或类别列表已被修改、划分后训练集或验证集没有图片、数据版本还没有生成完成、重新生成不是失败的数据版本或来源已不能使用等） |
+| 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、下载 YOLO 时所选项目还没有类别列表、标注文件不能在平台中修改、删除在线的训练节点、重新检测离线的训练节点、删除有模型/数据版本/训练任务的项目、删除被训练任务引用的数据版本、模型文件未上传完就提交、模型上传的临时文件已丢失、转换/识别/训练任务已不属于该训练节点、审图图片还没有识别完成、审图任务正在合并时删除或再次合并、修改或删除正在生成的审图版本、所选版本中没有可以导出的图片、新建数据版本时项目还没有类别或类别列表已被修改、划分后训练集或验证集没有图片、数据版本还没有生成完成、重新生成不是失败的数据版本或来源已不能使用、停止已结束的训练任务、重试未失败/取消的训练任务等） |
 | 409 | `name_taken` | 从回收站恢复时名称已被占用：恢复数据集时有同名的数据集（或文件夹名已被使用），恢复模型或数据版本时一并恢复的项目有同名的项目。带新名称再次恢复即可（数据集为 `name`，模型与数据版本为 `project_name`），见“回收站接口” |
 | 409 | `annotation_conflict` | 保存 / 删除标注时，标注文件在 `base_version` 之后已被修改（他人在另一个窗口保存，或用其它工具改了文件）。客户端应重新读取图片详情，或带 `force: true` 覆盖 |
 | 409 | `annotation_unpatchable` | 保存标注时，已有的标注文件无法在保留其中平台不编辑的内容的情况下修改（极少见）；带 `regenerate: true` 时按平台的格式重新生成整个文件（`force: true` 只跳过版本检查，不会重新生成） |
 | 409 | `upload_offset_mismatch` | 分块上传（数据集压缩包、模型文件）的 `offset` 与服务端已接收的字节数不一致，客户端应重新获取任务或上传后从 `received_bytes` 续传 |
-| 413 | `payload_too_large` | 请求体超过限制（单个分块 64 MiB，单次文件夹批量上传 256 MiB，训练节点的 JSON 请求 1 MiB、上传的转换结果 4 GiB，上传前的进度上报按同样的上限预检；保存标注 8 MiB，上传的审图结果 4 GiB） |
-| 422 | `validation_failed` | 字段校验失败，`message` 说明具体问题（如数据集名称不合法、ONNX 转换选项不允许） |
+| 413 | `payload_too_large` | 请求体超过限制（单个分块 64 MiB，单次文件夹批量上传 256 MiB，训练节点的 JSON 请求 1 MiB、上传的转换结果与训练产物 4 GiB，上传前的进度上报按同样的上限预检；保存标注 8 MiB，上传的审图结果 4 GiB） |
+| 422 | `validation_failed` | 字段校验失败，`message` 说明具体问题（如数据集名称不合法、ONNX 转换选项不允许、YOLO 训练参数超出合法范围） |
 | 422 | `unsupported_image` | 无法为该图片生成缩略图（格式不支持、文件损坏或像素过大），前端回退为原图或占位图 |
 | 422 | `invalid_model` | 提交的模型文件不是平台支持的 YOLO 模型（不是 PyTorch 文件、旧格式、损坏、不是 Ultralytics 检查点、原版 YOLOv5 仓库、RT-DETR、引用了安全加载不允许的对象等），`message` 说明原因；上传随之失败 |
 | 422 | `yolo_version_mismatch` | 模型文件中识别出的 YOLO 版本与所选的不同；上传保留，带识别出的版本（上传的 `detected_yolo_version`）再次提交即可 |
 | 500 | `internal_error` | 未预期的错误（handler panic 会被恢复并返回此错误） |
 | 501 | `not_implemented` | 规划中的功能模块 |
-| 507 | `insufficient_storage` | 存储空间不足，无法接收该上传（数据集与模型的上传、训练节点上传的转换结果及其预检、上传的审图结果） |
+| 507 | `insufficient_storage` | 存储空间不足，无法接收该上传（数据集与模型的上传、训练节点上传的转换结果/训练产物及其预检、上传的审图结果） |
 
 新增功能需要其它错误码时，在 `internal/httpapi/respond.go` 中集中定义，并补充到本表。
 
@@ -134,9 +135,10 @@ flowchart LR
 | 模型仓库相关接口 | 见下方“模型仓库接口” |
 | 模型审图相关接口 | 见下方“模型审图接口” |
 | 数据版本相关接口 | 见下方“数据版本接口” |
+| 训练任务相关接口 | 见下方“训练任务接口” |
 | 计算资源相关接口（含训练节点的任务接口） | 见下方“计算资源接口” |
 | 回收站相关接口 | 见下方“回收站接口” |
-| `/api/v1/annotation/tasks`、`/api/v1/annotation/labels`、`/api/v1/training/jobs`、`/api/v1/evaluations` 及其子路径 | 预留给规划中的模块，任意方法均返回 `501 not_implemented` |
+| `/api/v1/annotation/tasks`、`/api/v1/annotation/labels`、`/api/v1/evaluations` 及其子路径 | 预留给规划中的模块，任意方法均返回 `501 not_implemented` |
 
 `/api/readyz` 示例：
 
@@ -223,7 +225,7 @@ flowchart LR
 | `POST /api/v1/projects` | `{name, description?, dataset_ids?}` 新建项目，可同时纳入数据集，返回 201。名称不区分大小写唯一（重名 409 `conflict`），最长 64 个字符，不能含控制字符；描述最长 500 个字符，除换行与制表符外不能含控制字符；不合规时返回 422。所选数据集不存在时返回 422，不创建项目 |
 | `GET /api/v1/projects/{id}` | 项目详情（字段同列表项） |
 | `PATCH /api/v1/projects/{id}` | 修改名称和描述（规则同上） |
-| `DELETE /api/v1/projects/{id}?delete_models=&delete_data_versions=` | 删除项目，返回 204。其中的数据集保留，只是不再属于该项目；进行中的模型上传随项目删除（临时文件由清理任务删除）。项目中有模型时返回 409 `conflict`（“项目中有 N 个模型，请先删除模型，或选择同时删除模型”）；没有模型（或带了 `delete_models=true`）而有数据版本（不在回收站中的，任何状态）时返回 409 `conflict`（“项目中有 N 个数据版本，请先删除数据版本，或选择同时删除数据版本”）。先按同样的规则检查（`project.CheckDelete`），被拒绝的删除不做任何修改；然后 `?delete_data_versions=true` 时处理其数据版本（同 `DELETE /api/v1/data-versions/{id}`：已生成的移入回收站，生成失败的删除，排队中与生成中的停止并删除），`?delete_models=true` 时把其模型移入回收站（同 `DELETE /api/v1/models/{modelID}`），最后删除项目。项目中有模型或数据版本在回收站中时，项目随它们留在回收站中（不显示，名称可以再用），恢复其中任何一个时一并恢复，最后一个模型与数据版本永久删除时项目才删除（见第 12 节）；否则直接删除项目，并删除它的 `models/project-<ID>/` 与 `exports/data-versions/project-<ID>/` 文件夹。`delete_models`、`delete_data_versions` 不是布尔值时返回 400 |
+| `DELETE /api/v1/projects/{id}?delete_models=&delete_data_versions=&delete_training_jobs=` | 删除项目，返回 204。其中的数据集保留，只是不再属于该项目；进行中的模型上传随项目删除（临时文件由清理任务删除）。项目中有模型时返回 409 `conflict`（“项目中有 N 个模型，请先删除模型，或选择同时删除模型”）；没有模型（或带了 `delete_models=true`）而有数据版本（不在回收站中的，任何状态）时返回 409 `conflict`（“项目中有 N 个数据版本，请先删除数据版本，或选择同时删除数据版本”）；还有训练任务（且未带 `delete_training_jobs=true`）时返回 409 `conflict`（“项目中有 N 个训练任务，请先删除训练任务，或选择同时删除训练任务”）。先按同样的规则检查（`project.CheckDeleteAll`），被拒绝的删除不做任何修改；然后 `?delete_training_jobs=true` 时先删除项目的全部训练任务及其 `runs/training/job-<ID>/` 产物目录（避免阻塞数据版本删除），`?delete_data_versions=true` 时处理其数据版本（同 `DELETE /api/v1/data-versions/{id}`：已生成的移入回收站，生成失败的删除，排队中与生成中的停止并删除），`?delete_models=true` 时把其模型移入回收站（同 `DELETE /api/v1/models/{modelID}`），最后删除项目。项目中有模型或数据版本在回收站中时，项目随它们留在回收站中（不显示，名称可以再用），恢复其中任何一个时一并恢复，最后一个模型与数据版本永久删除（且没有训练任务引用）时项目才删除（见第 12 节）；否则直接删除项目，并删除它的 `models/project-<ID>/` 与 `exports/data-versions/project-<ID>/` 文件夹。`delete_models`、`delete_data_versions`、`delete_training_jobs` 不是布尔值时返回 400 |
 | `GET /api/v1/projects/{id}/datasets` | 项目中的数据集，格式同数据集列表。项目不存在时返回 404（`GET /api/v1/datasets?project_id=` 则返回空列表） |
 | `POST /api/v1/projects/{id}/datasets` | `{dataset_ids: [...]}` 把数据集纳入项目（已在项目中的忽略），返回更新后的项目；`dataset_ids` 为空或有数据集不存在时返回 422，不做任何修改 |
 | `DELETE /api/v1/projects/{id}/datasets/{datasetId}` | 把数据集移出项目，返回 204（数据集本身不受影响；本来就不在项目中也返回 204） |
@@ -233,7 +235,7 @@ flowchart LR
 | `POST /api/v1/projects/{id}/classes` | `{name, color?}` 在列表末尾追加一个类别（`color` 为 `""` 或 `#rrggbb`）；已有同名类别（去掉首尾空白后完全相同）时列表不变。校验同 PUT（超过 1000 个时返回 422），返回列表（格式同 GET）。读取与写入在同一事务中并锁定项目行，并发追加不会互相覆盖 |
 | `GET /api/v1/projects/{id}/models` | 项目中的模型（格式同模型列表），按版本号倒序；项目不存在时返回 404 |
 
-一次最多提交 1000 个 ID。增减数据集（包括删除其中的数据集）和修改类别列表会更新项目的 `updated_at`（提交的类别列表与原来相同时不更新）；项目与数据集之间的写操作都按“先数据集、后项目，各自按 ID 顺序”加行锁，修改类别列表只锁定项目这一行，并发修改同一关系时不会死锁或丢失更新。数据集或项目进入回收站时，它们之间的关联移到 `recycled_project_datasets`，恢复时（另一方仍在使用时）放回，永久删除时随之删除（见第 12 节）。一个模型只属于一个项目（`models.project_id`，`ON DELETE RESTRICT`：数据库不会在模型文件夹还在时删掉模型记录）；删除项目时在事务中锁定项目行并检查其中的模型数（包括回收站中的），与分配模型版本号使用同一把行锁，正在提交的模型不会漏删。数据版本同样只属于一个项目（`data_versions.project_id`，`ON DELETE RESTRICT`），按项目编号（`projects.data_version_seq`），删除项目时用同样的方式检查（见第 13 节）。训练任务上线后也将归属到项目。
+一次最多提交 1000 个 ID。增减数据集（包括删除其中的数据集）和修改类别列表会更新项目的 `updated_at`（提交的类别列表与原来相同时不更新）；项目与数据集之间的写操作都按“先数据集、后项目，各自按 ID 顺序”加行锁，修改类别列表只锁定项目这一行，并发修改同一关系时不会死锁或丢失更新。数据集或项目进入回收站时，它们之间的关联移到 `recycled_project_datasets`，恢复时（另一方仍在使用时）放回，永久删除时随之删除（见第 12 节）。一个模型只属于一个项目（`models.project_id`，`ON DELETE RESTRICT`：数据库不会在模型文件夹还在时删掉模型记录）；删除项目时在事务中锁定项目行并检查其中的模型数（包括回收站中的），与分配模型版本号使用同一把行锁，正在提交的模型不会漏删。数据版本同样只属于一个项目（`data_versions.project_id`，`ON DELETE RESTRICT`），按项目编号（`projects.data_version_seq`），删除项目时用同样的方式检查（见第 13 节）。训练任务也归属到项目（`training_jobs.project_id`，`ON DELETE RESTRICT`，见第 14 节）。
 
 ### 模型仓库接口
 
@@ -302,7 +304,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `POST /api/v1/data-versions` | 新建：`CreateInput`（见下），返回 201 与排队中的数据版本（`status: queued`），并唤醒后台生成（见第 13 节“生成”）。项目不存在或在回收站中时 422（“项目不存在（可能已被删除）”）；数据集不存在、不在项目中，所选审图版本不存在、不属于该数据集或在回收站中时 422；字段不合规时 422（如比例、种子、备注、`ignore_labels` 中的标签在类别列表中（“忽略的标签“…”在类别列表中”）、增强的方法或份数（“所选增强方式最多能生成 N 份不同的副本”）、增强图片超过 100 000 张）。项目还没有类别（“项目还没有类别，请先在项目中添加类别”）、`class_version` 与项目当前的类别列表不同（“项目的类别列表已经修改，请检查后重新生成”）、所选审图版本还没有生成完成（“审图版本“…”还没有生成完成”）、按预览没有可以放进数据版本的图片、划分后验证集或训练集没有图片时 409 |
 | `GET /api/v1/data-versions/{id}` | 单个数据版本（字段同列表项）；在回收站中时 404 |
 | `PATCH /api/v1/data-versions/{id}` | `{note}` 修改备注（必填，去掉首尾空白后 1–500 个字符，规则同审图版本的备注），任何状态都可以，返回数据版本；已生成的版本同时原子地改写文件夹中的 `version.json`。在回收站中时 404 |
-| `DELETE /api/v1/data-versions/{id}` | 返回 204：已生成的版本移入回收站，7 天内可以恢复（`POST /api/v1/recycle-bin/data-versions/{id}/restore`），之后自动永久删除；生成失败的直接删除（连同文件夹与缩略图）；排队中的直接删除，生成中的停止生成并删除（文件夹由后台的生成任务清理）。编号不会再分配。不存在或已在回收站中时 404；从不返回 409（见第 13 节“删除、停止与重新生成”） |
+| `DELETE /api/v1/data-versions/{id}` | 返回 204：已生成的版本移入回收站，7 天内可以恢复（`POST /api/v1/recycle-bin/data-versions/{id}/restore`），之后自动永久删除；生成失败的直接删除（连同文件夹与缩略图）；排队中的直接删除，生成中的停止生成并删除（文件夹由后台的生成任务清理）。编号不会再分配。被训练任务引用的版本返回 409 `conflict`（“该数据版本已被训练任务使用，请先删除相关训练任务后再删除该数据版本”）；不存在或已在回收站中时 404（见第 13 节“删除、停止与重新生成”） |
 | `POST /api/v1/data-versions/{id}/retry` | 重新生成失败的版本，返回 200 与排队中的版本（排在队列末尾）：类别列表、设置与来源不变，图片按数据集现在的内容重新取。不是 `failed` 时 409（“只有生成失败的数据版本可以重新生成”）；来源的数据集在回收站中、已不在项目中或已被永久删除，所选审图版本不存在、在回收站中或还没有生成完成时 409，`message` 说明原因与处理方法（见第 13 节“来源的校验”） |
 | `GET /api/v1/data-versions/{id}/images` | 已生成的版本中的图片 `{items, total}`，按版本中的顺序（`position`）。筛选：`split`（`train` / `val` / `test`）、`label`（有这个类别的目标）、`dataset_id`、`augmented`（`true` 只看增强图片，`false` 只看原图）、`q`（版本中的路径或数据集中的路径包含，不区分大小写，规则同其它列表的 `q`），`offset`（≥ 0）、`limit`（1–200，默认 60），参数值非法时 400。还没有生成完成时 409（“数据版本还没有生成完成”），在回收站中时 404。每项见下方“图片” |
 | `GET /api/v1/data-versions/{id}/images/{imageID}` | 单张图片：列表项的字段加上 `objects`（`[{name, xmin, ymin, xmax, ymax, difficult, truncated}]`，负样本为 `[]`）；不存在或不属于这个版本时 404 |
@@ -316,6 +318,24 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - **新建的请求体 `CreateInput`**（服务器要求每个字段都带上；页面的默认值为 80/20/0、种子 42、沿用文件夹、按文件名分组、纳入负样本、不增强）：`{project_id, note, class_version, sources: [{dataset_id, include_base, version_ids, scope}], split: {train, val, test, seed, use_folders, group_by}, scope, include_empty, ignore_labels, augmentation: null | {methods, copies, only_with_objects}}`。`scope` 是数据集默认的参与训练的图片（`annotated` / `background` / `all`，页面默认 `annotated`，其它值 422），`sources[].scope` 为空字符串时使用它，否则是这个数据集单独的设置（规则见第 13 节“过滤”）。`class_version` 是页面显示的类别列表的版本（来自预览）。`sources` 为 1–1000 个数据集，每个只能出现一次，每个最多 100 个审图版本，规则同数据集下载的 `include_base` / `version_ids`；服务器按项目中数据集的顺序（纳入项目的先后，`project_datasets.created_at, dataset_id`）与审图版本从新到旧排列它们，这也是版本中图片的顺序。`split`、`ignore_labels` 与 `augmentation` 的规则见第 13 节“划分”“过滤”“增强”。
 - **`Preview`**：`classes` 与 `class_version`（项目当前的类别列表，新建时带回 `class_version`）、`image_count` 与 `object_count`（将取用的原图）、`augmented_count`（估计）、`sources`（`[{dataset_id, dataset_name, scope, selected_count, from_versions, image_count, negatives, by_folder}]`：使用的参与训练的图片，所选组合中的图片数、其中用审图版本标注的、将取用的、其中没有目标的、其中按文件夹划分的）、`skipped`（同 `stats.skipped`；`missing`、`changed`、`augment_skipped` 只有生成时才知道，为 0）、`dropped_objects`、`degenerate_objects`（按索引中的尺寸尽量估计，可能为 0）、`splits`（`train` / `val` / `test` 各自的 `{images, objects, negatives, by_folder}`）、`labels`（同 `stats.labels`）、`unlisted_labels`（`[{name, objects, images, other_project}]`：所选图片中不在类别列表中的标签，按目标数从多到少、再按名称；`other_project` 表示这个标签在另一个使用中的、与所选数据集共用数据集的项目的类别列表中）、`compare`（与项目最新的已生成版本比较；索引中没有框，`annotation_changed` 可能为 0）。
 - **图片**：`{id, position, split, split_by, path, file_name, width, height, size_bytes, object_count, labels, dataset_id, dataset_name, source_path, annotation_source, augmented_from, augment, stored, thumbnail_url, file_url}`：`split_by` 为 `ratio` / `folder`；`path` 是版本文件夹中的路径（如 `images/line_a/NG/0001.jpg`）；`labels` 为 `[{name, count}]`（按数量从多到少、再按名称）；`dataset_name` 与 `annotation_source`（`{id, name}`，标注来自的审图版本，基础标注为 null）的名称取自版本的来源快照，不随数据集与审图版本的删除而消失；`source_path` 是数据集中的路径；`augmented_from` 是增强图片的原图 ID（原图为 null），`augment` 是应用的增强方法（原图为 `[]`）；`stored` 为 `link` / `copy` / `generated`。
+
+### 训练任务接口
+
+训练任务（`internal/httpapi/training.go`，业务逻辑在 `internal/training`）的设计见第 14 节。字段定义以前端 `frontend/src/features/training/api.ts` 中的类型为准，与后端 `internal/training/types.go`、`params.go` 的 json tag 保持一致。`{id}` 必须是正整数，否则返回 404。
+
+| 方法与路径 | 说明 |
+|---|---|
+| `GET /api/v1/training/params-schema` | Ultralytics YOLO 全量 86 项训练参数的元数据与官方默认值：`{groups, specs, defaults, scales}`。涵盖 4 个分组（`train` 基础训练设置、`hyperparameters` 优化器与损失超参数、`augmentation` 数据增强、`val` 验证与可视化），每项带键名、中文名称、类型（15 种）、官方默认值、范围、步长、枚举选项与说明；`scales` 为各 YOLO 版本支持的模型网络规模（如 `n/s/m/l/x`） |
+| `GET /api/v1/training/jobs` | 训练任务列表 `{items, total}`，新的在前（`id DESC`）。筛选：`project_id`、`data_version_id`、`status`（`queued` / `running` / `succeeded` / `failed` / `canceled`）、`yolo_version`、`q`（名称、说明、项目名、架构，不区分大小写）。列表项带项目、数据版本快照 `data_version` 与 `data_version_live`、初始化方式 `init_mode`（`scratch` / `finetune` / `resume`）、基础模型快照 `base_model`、YOLO 版本与规模、规范化后的全量参数 `params`、状态与阶段、轮次进度（`current_epoch` / `total_epochs`）、汇总指标 `metrics`（含 `best_epoch`、`best_map50`、`best_map50_95`、`best_fitness`）、队列位置 `queue_position`、`workers_online`、已注册的模型引用（`best_model` / `last_model`）及时间 |
+| `POST /api/v1/training/jobs` | `{project_id, data_version_id, name?, description?, init_mode, yolo_version?, model_scale?, base_model_id?, params?, auto_register?}` 新建训练任务并入队（`status: queued`），返回 201。合并官方默认值并逐项校验全部 86 个 YOLO 参数（不支持未知键名，非法范围返回 422）；校验数据版本属于该项目且已生成（`ready`）、基础模型存在且文件未缺失（`resume` 还要求含优化器状态 `training_checkpoint`） |
+| `GET /api/v1/training/jobs/{id}` | 训练任务详情：列表项字段加上全部已完成的轮次指标曲线数组 `epochs`（按 `epoch` 升序）与 `runs/job-<id>/` 下的产物文件列表 `artifacts`（名称、相对路径、类别、大小） |
+| `PATCH /api/v1/training/jobs/{id}` | `{name?, description?}` 修改任务名称和备注说明 |
+| `POST /api/v1/training/jobs/{id}/cancel` | 停止训练任务：`queued` 与 `running` 任务置为 `canceled`（运行中任务清空租约，节点在下一次心跳/日志上报时收到 409 并立即向训练子进程发送 `SIGTERM` 平滑终止），已结束的任务返回 409 |
+| `POST /api/v1/training/jobs/{id}/retry` | 重新排队已失败（`failed`）或已取消（`canceled`）的训练任务：清零尝试次数、错误、轮次记录与旧产物目录，重置为 `queued` 并唤醒训练节点，返回 202；数据版本或基础模型已不可用时返回 409 |
+| `DELETE /api/v1/training/jobs/{id}` | 删除训练任务记录、轮次明细与 `runs/job-<id>/` 产物文件夹（已入库到模型仓库的模型不受影响），返回 204；排队中或运行中的任务也可以直接删除，训练节点随后的上报收到 404 后自动终止子进程 |
+| `GET /api/v1/training/jobs/{id}/logs?offset=&limit=` | 按字节偏移增量读取 `train.log`：`offset=-1` 读取尾部最多 `limit`（默认 128 KiB，上限 256 KiB）字节并保证合法 UTF-8；返回 `{content, offset, next_offset, total_bytes, truncated}` |
+| `GET /api/v1/training/jobs/{id}/artifacts/{path}` | 查看或下载训练产物文件（如 `results.png`、`confusion_matrix.png`、`args.yaml`、`results.csv`、`weights/best.pt`，支持 Range，`?download=1` 时作为附件下载）；路径通过安全校验，禁止越界 |
+| `POST /api/v1/training/jobs/{id}/register-model` | `{variant: "best" \| "last", description?}` 手动将训练产出的最佳权重（`weights/best.pt`）或最新检查点（`weights/last.pt`）注册到所属项目的模型仓库（复用 `model.Service.RegisterTrainedModel`），返回 201 与新模型；该变体已注册且模型仍在仓库中时返回 409 |
 
 ### 回收站接口
 
@@ -331,7 +351,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 ### 计算资源接口
 
-“计算资源”页面使用的接口与训练节点的注册 / 心跳（`/agent/*`）都在 `/api/v1/compute` 下（`internal/httpapi/compute.go`，业务逻辑在 `internal/compute`）。字段定义以前端 `frontend/src/features/training/` 中的类型为准，与后端 `internal/compute/types.go`、训练节点 `trainmaster_trainer` 保持一致。`{nodeID}` 必须是正整数，否则返回 404。
+“计算资源”页面使用的接口与训练节点的注册 / 心跳（`/agent/*`）都在 `/api/v1/compute` 下（`internal/httpapi/compute.go`、`training_agent.go`，业务逻辑在 `internal/compute`、`internal/model`、`internal/review`、`internal/training`）。字段定义以前端 `frontend/src/features/training/` 中的类型为准，与后端及训练节点 `trainmaster_trainer` 保持一致。`{nodeID}` 必须是正整数，否则返回 404。
 
 | 方法与路径 | 说明 |
 |---|---|
@@ -342,7 +362,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `POST /api/v1/compute/nodes/{nodeID}/probe` | 请求节点重新检测硬件与 CUDA 环境，返回 202 与 `probe_pending: true` 的节点；节点离线时 409 `conflict` |
 | `POST /api/v1/compute/agent/register` | 节点注册：`{node_key, name, hostname?, agent_version?, hardware, environment?, metrics?}`，按 `node_key`（1–64 个 `A-Z a-z 0-9 . _ -` 字符）新建或更新，返回 `{node_id, heartbeat_interval_seconds, server_time}` |
 | `POST /api/v1/compute/agent/heartbeat` | 节点心跳：`{node_key, metrics?, environment?, hardware?}`，返回 `{node_id, heartbeat_interval_seconds, probe_requested}`；`node_key` 未注册时 404 `unknown_node` |
-| `POST /api/v1/compute/agent/tasks/claim` | 领取任务（长轮询）：`{node_key, kinds: ["model_export", "review_inference"], wait_seconds}`（`wait_seconds` 0–30，超出时 422），返回 `{"task": null \| Task}`（`Task` 的结构按 `kind`：转换任务见下方，审图识别见第 11 节“识别任务”）。没有任务时最多等待 `wait_seconds`，期间有任务入队（或重新排队）立即返回；服务关闭时立即返回 `{"task": null}`。`node_key` 未注册时 404 `unknown_node`；`kinds` 中不认识的类型忽略 |
+| `POST /api/v1/compute/agent/tasks/claim` | 领取任务（长轮询）：`{node_key, kinds: ["model_export", "review_inference", "training_job"], wait_seconds}`（`wait_seconds` 0–30，超出时 422），返回 `{"task": null \| Task}`（`Task` 的结构按 `kind`：转换任务见下方，审图识别见第 11 节“识别任务”，模型训练见第 14 节）。没有任务时最多等待 `wait_seconds`，期间有任务入队（或重新排队）立即返回；服务关闭时立即返回 `{"task": null}`。`node_key` 未注册时 404 `unknown_node`；`kinds` 中不认识的类型忽略 |
 | `GET /api/v1/compute/agent/model-exports/{exportID}/input` | 下载要转换的 `model.pt`（支持 Range）；读取期间每 15 秒续租一次 |
 | `POST /api/v1/compute/agent/model-exports/{exportID}/progress` | `{stage: "downloading" \| "converting" \| "uploading", message?, size_bytes?}` 上报进度并续租，返回 `{"lease_seconds": 60}`。`stage` 为 `uploading` 且 `size_bytes` > 0（即将上传的结果大小）时是上传前的预检，按上传的规则依次检查：转换已删除 404，不属于该节点或已结束 409，超过 4 GiB 413，剩余空间不足 507（“磁盘剩余空间不足：可用 X，至少需要 Y”）；`size_bytes` 为负数时 422，省略或为 0 时只续租 |
 | `PUT /api/v1/compute/agent/model-exports/{exportID}/output` | 上传转换结果（ONNX 原始字节，≤ 4 GiB），必须带 `Content-Length` 与 `X-Content-Sha256`（十六进制）；暂存为 `tmp/model-exports/<exportID>/output.onnx.part`，大小或 SHA256 不一致时丢弃（大小不符 400，SHA256 不符 422），剩余空间不足时 507；成功返回 `{"received_bytes": N}` 并续租，再次上传会替换。因任务状态或磁盘被拒绝（404、409、507）时平台先读掉最多 64 MiB 的请求体再回应，更大的结果由上传前的预检得知会被拒绝（平台在读取之前就拒绝时，还在发送的客户端只能看到连接被重置） |
@@ -355,10 +375,18 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `POST /api/v1/compute/agent/review-inferences/{reviewID}/results` | 上报一批识别结果：`{results: [{id, ok, width, height, boxes: [{name, class_id, confidence, xmin, ymin, xmax, ymax}], error}]}`（每批最多 500 张），在一个事务中写入并续租，返回 `{lease_seconds, accepted, remaining}`；已经识别过的、不属于任务的图片忽略（可以安全重发） |
 | `POST /api/v1/compute/agent/review-inferences/{reviewID}/complete` | `{result: {...}}` 结束识别，任务为 `ready`，返回审图任务；还有没识别的图片时 409（“还有 N 张图片没有识别”），任务不再属于该节点：重新排队，领取满 3 次时失败（见第 11 节“识别任务”） |
 | `POST /api/v1/compute/agent/review-inferences/{reviewID}/fail` | `{error, detail?, retryable?}` 报告失败，规则同转换任务的 `fail`（领取次数少于 3 次且可重试时重新排队），返回审图任务 |
+| `GET /api/v1/compute/agent/training-jobs/{jobID}/dataset` | 流式下载数据版本的训练压缩包（zip，供未挂载共享 `/data` 的远程节点使用），下载期间自动续租 |
+| `GET /api/v1/compute/agent/training-jobs/{jobID}/base-model` | 下载微调或断点续训所用的基础模型 `model.pt`（支持 Range），下载期间自动续租 |
+| `POST /api/v1/compute/agent/training-jobs/{jobID}/progress` | `{stage, current_epoch?, total_epochs?, size_bytes?}` 上报训练阶段与轮次进度并续租，返回 `{lease_seconds, cancel_requested}`；`size_bytes` > 0 时同时预检磁盘空间（≤ 4 GiB） |
+| `POST /api/v1/compute/agent/training-jobs/{jobID}/epochs` | `{epochs: [...]}` 上报完成的训练轮次损失、验证精度与学习率明细（按 `(job_id, epoch)` 幂等更新），同步更新任务的最佳精度指标并续租，返回 `{lease_seconds, cancel_requested}` |
+| `POST /api/v1/compute/agent/training-jobs/{jobID}/logs` | `{offset, content}` 追加训练控制台输出到 `runs/training/job-<jobID>/train.log` 并续租，返回 `{lease_seconds, next_offset, cancel_requested}` |
+| `PUT /api/v1/compute/agent/training-jobs/{jobID}/artifacts/{path}` | 上传训练产物文件（如 `weights/best.pt`、`weights/last.pt`、`results.csv`、`args.yaml`、评估图表，≤ 4 GiB，必须带 `Content-Length` 与 `X-Content-Sha256`）：先写入 `tmp/training-uploads/` 核对大小与哈希，再原子替换到 `runs/training/job-<jobID>/{path}` 并续租 |
+| `POST /api/v1/compute/agent/training-jobs/{jobID}/complete` | `{result: {...}}` 完成训练：保存汇总指标；若任务开启 `auto_register` 且上传了 `weights/best.pt`，自动调用 `RegisterTrainedModel` 入库为所属项目的新模型版本 |
+| `POST /api/v1/compute/agent/training-jobs/{jobID}/fail` | `{error, detail?, retryable?, canceled?}` 报告失败或响应用户取消：`canceled: true` 时任务置为 `canceled`；否则按 `retryable` 与领取次数（< 3）决定重新排队或置为 `failed` |
 
 - 配置了 `TM_NODE_TOKEN` 时，`/agent/*` 必须带 `Authorization: Bearer <令牌>`，否则返回 401 `unauthorized`（常量时间比较）；浏览器使用的其它接口不需要令牌（平台目前没有登录）。
-- `model-exports/{exportID}/*` 与 `review-inferences/{reviewID}/*` 还必须带请求头 `X-Node-Key: <node_key>`（缺少时 400，未注册时 404 `unknown_node`），且该任务正由这个节点执行（`running`）：任务已被删除时返回 404 `not_found`，不属于该节点或已结束时返回 409 `conflict`，节点收到这两种响应后放弃该任务。协议见第 9 节“任务协议”。
-- 请求体上限 1 MiB（413 `payload_too_large`；上传转换结果除外，见上表）。上报的 JSON 允许未知字段（新版节点配旧版平台）；数值为 NaN、无穷或负数时置为 null，过长的字符串与数组截断，不认识的枚举值归为保守的值（如 `status` → `error`、`accelerator` → `cpu`），偶尔异常的指标不会让心跳失败。存入数据库（表 `compute_nodes`，`hardware`、`environment`、`metrics` 为 jsonb）和返回的都是规范化之后的结构。
+- `model-exports/{exportID}/*`、`review-inferences/{reviewID}/*` 与 `training-jobs/{jobID}/*` 还必须带请求头 `X-Node-Key: <node_key>`（缺少时 400，未注册时 404 `unknown_node`），且该任务正由这个节点执行（`running`）：任务已被删除时返回 404 `not_found`，不属于该节点或已结束时返回 409 `conflict`，节点收到这两种响应后放弃该任务。协议见第 9 节“任务协议”。
+- 请求体上限 1 MiB（413 `payload_too_large`；上传转换结果与训练产物除外，见上表）。上报的 JSON 允许未知字段（新版节点配旧版平台）；数值为 NaN、无穷或负数时置为 null，过长的字符串与数组截断，不认识的枚举值归为保守的值（如 `status` → `error`、`accelerator` → `cpu`），偶尔异常的指标不会让心跳失败。存入数据库（表 `compute_nodes`，`hardware`、`environment`、`metrics` 为 jsonb）和返回的都是规范化之后的结构。
 - 注册请求中的 `environment` / `metrics` 为 null 时保留原值（节点重启后先上报硬件，CUDA 环境检测完成后再随心跳上报，页面不会闪烁）。`environment` 为 null 的注册同时记下重新检测的请求（`probe_pending` 为 true）：节点重启后正在检测，页面在上次的结果上显示“正在重新检测”，而不是把上次的结果当作当前的。心跳带有 `environment` 时清除重新检测的请求。
 - 节点的 `address` 是平台看到的客户端 IP（见“中间件”中的客户端 IP），可能为 `""`。
 
@@ -392,7 +420,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - `src/features/<领域>/` 下每个模块有独立的页面文件；规划中的模块渲染通用占位组件 `ModulePlaceholder`，实现功能时直接替换该文件内容即可。
 - `src/lib/api.ts` 提供 `apiGet<T>()` 和 `apiSend<T>(method, path, body)`，非 2xx 时解析错误信封并抛出 `ApiError(status, code, message)`；网络错误转换为 `code = "network_error"`。
 - 服务端状态用 TanStack Query 管理，界面组件来自 `src/components/ui/`（shadcn/ui）。
-- 项目模块位于 `src/features/projects/`：项目列表页（卡片 / 列表视图）、项目详情页（数据集 / 类别 / 模型 / 数据版本，当前标签页记在 URL 的 `?tab=`，以前“标签分布”的链接 `?tab=labels` 打开“类别”；标签页在窄屏上横向滚动，使用与数据集详情页共用的 `ScrollingTabsList`）、类别列表的编辑对话框（列表的增删、改名、颜色、顺序与按 `classes.txt` 排列是 `class-edit.ts` 中与界面无关的纯函数，有单元测试）、新建 / 编辑 / 删除对话框（项目中有模型或数据版本时需要勾选“同时删除 N 个模型”“同时删除 N 个数据版本”）、添加数据集对话框，以及数据集页使用的“纳入项目”对话框和项目标记。数据集页的项目筛选记在 URL 的 `?project=<项目ID|none>`。
+- 项目模块位于 `src/features/projects/`：项目列表页（卡片 / 列表视图）、项目详情页（数据集 / 类别 / 模型 / 数据版本 / 训练任务，当前标签页记在 URL 的 `?tab=`，以前“标签分布”的链接 `?tab=labels` 打开“类别”；标签页在窄屏上横向滚动，使用与数据集详情页共用的 `ScrollingTabsList`）、类别列表的编辑对话框（列表的增删、改名、颜色、顺序与按 `classes.txt` 排列是 `class-edit.ts` 中与界面无关的纯函数，有单元测试）、新建 / 编辑 / 删除对话框（项目中有模型、数据版本或训练任务时需要勾选对应的同时删除确认项）、添加数据集对话框，以及数据集页使用的“纳入项目”对话框和项目标记。数据集页的项目筛选记在 URL 的 `?project=<项目ID|none>`。
 - 标注模块位于 `src/features/annotation/`：工作台首页（选择数据集）与标注编辑器（`/annotation/workspace/:datasetId`，路由带 `handle.fullBleed`，占满内容区且默认收起侧边栏）。几何计算（`geometry.ts`）、框列表与撤销历史（`document.ts`）、自动保存（`autosave.ts`）、快捷键映射（`shortcuts.ts`）、候选类别与类别配色（`classes.ts`）都是与界面无关的纯函数 / 类，有单元测试；画布（`annotation-canvas.tsx`）用一张 `<img>` 加屏幕坐标的 SVG 叠加层绘制，指针事件统一处理鼠标、触控笔与触屏（双指缩放；触屏与触控笔的按下取消默认行为，不再产生松开之后才派发的兼容鼠标事件，否则短拖动画好框后弹出的类别选择框会被随后的 mousedown 关掉），macOS Safari 的触控板捏合通过 `gesture*` 事件处理；画布容器为 `overflow: clip`（不可滚动），类别选择框等浮层放在画布内，其中的滚轮不缩放图片；类别选择框的高度不超过画布，画布较矮时其中的列表变短（可以滚动）。打开图片时如果焦点不在任何元素上（刚进入编辑器、用快捷键切换图片后），画布获得焦点，Tab 随即可以依次选中框；焦点在输入框、对话框、图片列表等处时不移动焦点。类别选择框关闭（选好类别、Esc）时焦点还在其中、快捷键说明 / 离开与删除的确认对话框关闭、点击提示中的按钮（载入最新版本、仍然保存、重试等）或提示条中的操作（放弃修改并切换）后，焦点也回到画布，不会落到页面上；用户已点到别的控件上、按钮在窄屏时弹出的面板中时不移动，对话框关闭时面板还开着则焦点回到面板中。未保存的修改由 react-router 的 `useBlocker` 守护：切换图片（包括浏览器后退 / 前进）或离开工作台前先保存。
 - 数据集模块位于 `src/features/datasets/`：列表页、详情页（图片 / 标签分布 / 导入记录 / 审核记录 / 审图版本，记在 URL 的 `?tab=`）、新建与导入对话框、图片查看器（叠加 VOC 标注框）、下载对话框（选择版本与格式）。“审图版本”标签页（`dataset-review-versions.tsx`）列出基础版本与各审图版本，可以修改备注、删除，或打开选好版本的下载对话框；版本的组合方式与说明文字在 `versions.ts`（纯函数，有单元测试）。上传由全局的上传管理器（`upload-manager.ts`，`useSyncExternalStore`）执行，切换页面不会中断；右下角的上传面板显示进度，上传中关闭页面会弹出提醒。
 - 模型审图位于 `src/features/reviews/`：列表页（`/datasets/reviews`，项目与模型的筛选记在 URL 的 `?project=`、`?model=`）、详情页（`/datasets/reviews/:reviewId`：进度、各数据集、本地审图的步骤、上传与合并记录）、审图编辑器（`/datasets/reviews/:reviewId/workspace?image=`，`handle.fullBleed`，筛选记在 URL 中），以及新建、下载审图包、上传审图结果、合并到数据集的对话框；模型详情页的“用这个模型审图”与数据集详情页的“审核记录”（`?tab=reviews`）也在这里。审图编辑器与标注工作台共用画布、框编辑（`features/annotation/box-editing.tsx`）、工具栏部件（`toolbar-parts.tsx`）、保存守护（`save-guard.tsx`）、快捷键（`use-editor-keys.ts`、`shortcuts.ts` 的 `review` 模式）与跨图片的视图设置（`editor-common.ts`），只通过 `ReviewSource`（接口前缀与查询键）读写，所以本地审图程序直接复用它。`review-status.ts`、`review-format.ts`、`params.ts` 是与界面无关的纯函数，有单元测试。
@@ -400,6 +428,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 模型仓库位于 `src/features/models/`：列表页（`/models`，桌面为表格、窄屏为卡片）、模型详情页（`/models/:modelId`）、上传对话框与下载对话框（PT / ONNX，ONNX 转换的进度与失败原因）。`yolo-versions.ts`（版本表、各模型允许的与默认的后处理方式、转换选项的范围、输出形状说明、下载文件名）与 `naming.ts`（上传文件名与说明的规则）是与后端 `internal/model` 规则一致的纯函数，有单元测试。模型上传由 `features/models/upload-manager.ts` 执行（做法同数据集，复用 `upload-plan.ts` 的分块与重试，进度显示在同一个上传面板中）。
 - 回收站位于 `src/features/recycle-bin/`：回收站页（`/system/recycle-bin`，系统管理分组；桌面为表格、窄屏为卡片，按类型与关键字筛选，显示到期倒计时；数据版本的类型为 `data_version`，恢复时同模型一样可能需要给项目换名）、恢复操作（`restore-actions.tsx`：一键恢复，名称被占用（409 `name_taken`）时打开换名对话框）、删除之后带“撤销”的提示（`recycle-toast.ts`，数据集、模型、审图版本的删除对话框共用）。各类内容合成一个列表、搜索、倒计时与建议的新名称是 `recycle-format.ts` 中的纯函数，有单元测试；删除与恢复后要刷新的查询集中在 `api.ts`（`refreshAfterDatasetMove` 等）。
 - 数据版本位于 `src/features/data-versions/`：列表页（`/datasets/versions`，项目筛选记在 URL 的 `?project=`；桌面为表格（宽度 ≥ 48rem 时）、窄屏为卡片；页面说明中写明数据版本与审图版本的区别）、新建页（`/datasets/versions/new?project=<项目ID>&from=<数据版本ID>`：项目；类别（只读，带 YOLO 编号与“在项目中修改”，没有类别时不能继续）；数据集与标注来源；划分（比例预设与自定义、沿用文件夹只在预览发现文件夹划分时显示、“高级”中的种子与分组方式、“换一种划分”）；过滤（不在类别列表中的标签逐个选择忽略框或跳过图片）；增强；备注。桌面右侧是吸顶的实时预览，窄屏为底部栏（划分的数量、提示数与“生成”）；预览请求防抖 300 毫秒，输入不合法时不发请求。`from` 指定的版本、默认为项目最新的版本作为模板；生成后跳到详情页）、详情页（`/datasets/versions/:versionId`：排队位置、阶段与进度、失败原因与“重新生成”；“概览”与“图片”标签页，图片查看器用 `image-orientation: none` 显示原图并叠加框）、下载对话框（`download-data-version-dialog.tsx`：YOLO / VOC / COCO，有增强图片时可选“包含增强图片”）、按状态提供的操作（`data-version-actions.tsx`：已生成的可以下载、修改备注、以此为模板新建、移入回收站（提示中可以撤销）；失败的可以重新生成、修改备注、删除（确认后永久删除）；排队中与生成中的可以修改备注、停止并删除）与项目详情页的“数据版本”标签页（`project-data-versions.tsx`）。`build-watch.ts` 在模块级别轮询提交过的版本（同 `datasets/import-watch.ts`），生成完成时提示“外观检测 · 数据版本 v4 已生成”并带链接，失败时提示错误。`api.ts` 是与后端的类型契约；`format.ts`（标题“数据版本 v4”与“外观检测 · 数据版本 v4”、状态、划分摘要、比例预设与校验、跳过原因、“新增占用”）是纯函数，有单元测试；`augmentations.ts` 是增强方法的名称、说明（含风险）与是否为几何变换，与后端 `internal/augment` 一致。
+- 计算资源与训练任务位于 `src/features/training/`：计算资源页（`/training/compute`，监控平台服务器与各训练节点硬件、CUDA 环境、实时利用率曲线与接入命令）、训练任务列表页（`/training/jobs`，支持项目、状态、YOLO 版本与关键字筛选，桌面表格 / 窄屏卡片）、新建训练任务页（`/training/jobs/new?project=&data_version=&base_model=&init_mode=&from=`：支持从头训练、预训练微调、断点续训与克隆已有任务参数，内嵌覆盖全部 86 项 Ultralytics YOLO 参数、15 种参数类型的可搜索分组编辑器 `training-params-editor.tsx`，支持仅看已修改项、单项/按组/全部恢复官方默认值与 `args.yaml` 预览）、训练任务详情页（`/training/jobs/:jobId`：监控与零依赖响应式 SVG 多序列训练曲线 `training-curves.tsx`、按字节偏移增量刷新的实时日志、评估图表画廊与产物下载、全量参数与官方默认值对比）、操作菜单与权重入库对话框（`training-job-actions.tsx`：停止、重试、将 `best.pt` / `last.pt` 注册到模型仓库、修改信息、复制参数新建、删除）以及项目详情页的“训练任务”标签页（`project-training-jobs.tsx`）。纯函数 `training-params.ts`、`format.ts`、`compute-status.ts`、`compute-format.ts` 均有单元测试。
 
 开发时由 Vite（:5173）托管前端并把 `/api` 代理到 Go 服务（:8080）；生产环境由 Go 服务托管 `frontend/dist`。
 
@@ -412,7 +441,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 | `datasets` | `datasets/` | 数据集文件夹：每个数据集一个子目录，图片与 VOC 标注直接以文件保存（见第 6 节） |
 | `models` | `models/` | 模型仓库：每个模型一个文件夹 `project-<项目ID>/v<版本号>/`，其中有 `model.pt`、`model.json` 与转换缓存 `onnx/`（见第 10 节） |
 | `reviews` | `reviews/` | 模型审图：每个审图任务一个文件夹 `review-<任务ID>/`，其中有任务说明 `review.json` 与审图标注（VOC），目录结构与审图包相同（见第 11 节） |
-| `runs` | `runs/` | 训练 / 评估运行产物（日志、曲线、中间权重） |
+| `runs` | `runs/` | 训练运行产物：每个训练任务一个文件夹 `job-<任务ID>/`（含实时日志 `train.log`、轮次汇总 `results.csv`、`args.yaml`、评估曲线图与权重 `weights/best.pt`、`weights/last.pt`；上传中先写同目录下的临时文件 `.upload-*` 再原子改名，见第 14 节） |
 | `exports` | `exports/` | 数据版本：每个版本一个文件夹 `data-versions/project-<项目ID>/v<版本号>/`，Ultralytics 布局的训练集（`images/`、`labels/`、`data.yaml`、`train.txt` / `val.txt` / `test.txt`、`classes.txt`、`version.json`；生成中带 `.pending` 标记），原图为数据集文件的硬链接（不能硬链接时为副本）；删除中的版本文件夹 `data-versions/.deleting-<数据版本ID>-<纳秒>/`（见第 13 节“存储”）。下载的压缩包边打包边下载，不保存在这里 |
 | `cache` | `cache/` | 缩略图等可再生的缓存（数据集的 `thumbs/<数据集ID>/`，数据版本的 `data-versions/<数据版本ID>/`），可随时删除，不需要备份 |
 | `tmp` | `tmp/` | 上传、解压等临时文件：数据集导入 `imports/`，模型上传 `model-uploads/<上传ID>/`，训练节点上传中的转换结果 `model-exports/<转换ID>/`，平台训练的模型入库前的副本 `model-registrations/`，上传中的审图结果 `review-uploads/` |
@@ -557,7 +586,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 因此迁移文件中**不要写 `BEGIN` / `COMMIT`**，也不能包含无法在事务中执行的语句（如 `CREATE INDEX CONCURRENTLY`）。
 - 迁移只向前：**已发布的迁移文件不要修改，也不要改名**，需要变更就新增一个文件。
 - 同一个版本号只能对应一个文件。执行器会比对 `schema_migrations` 中记录的文件名：数据库里已执行过的版本号在当前代码中对应另一个文件名时（典型情况是两个分支各自新增了 `0002_*.sql`，又共用一个开发数据库），启动直接失败并给出两个文件名，而不是悄悄跳过。此时给后合入的那个文件换一个新编号；开发数据库可以删掉 `data/postgres` 重建。
-- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）；`0008_create_models.sql` 建立模型仓库的 `models`、`model_uploads`、`model_exports`（转换任务，同时是转换结果的缓存），并为 `projects` 增加 `model_version_seq`（见第 10 节）；`0009_project_classes.sql` 把类别列表从数据集移到项目（`projects.classes`），带上每个项目中数据集原有的列表，然后删除 `datasets.classes`（见第 6 节“类别列表”）；`0010_create_reviews.sql` 建立模型审图的 `reviews`、`review_datasets`、`review_images`、`review_uploads`、`review_merges`（见第 11 节）；`0011_dataset_versions.sql` 建立数据集的审图版本 `dataset_versions`、`dataset_version_images`，为 `datasets` 增加 `review_version_seq`，为 `review_merges` 增加 `note` 并允许 `on_existing` 为空（见第 11 节“审图版本”）；`0012_recycle_bin.sql` 为 `datasets`、`dataset_versions`、`models`、`projects` 增加 `deleted_at`（回收站），为 `datasets` 增加 `delete_files`，把名称的唯一索引改为只约束使用中的记录，并建立 `recycled_project_datasets`、`recycled_review_datasets`、`recycled_review_images`（见第 12 节）；`0013_data_versions.sql` 建立数据版本的 `data_versions`、`data_version_images`，并为 `projects` 增加 `data_version_seq`（见第 13 节）；`0014_dataset_status.sql` 为 `datasets` 增加状态 `status` 与 `status_updated_at`（见“数据集接口”）；`0015_import_renames.sql` 为 `dataset_imports` 增加 `rename_images`，并建立导入时同名图片的明细表 `dataset_import_renames`（见第 6 节“同名图片”）。其它业务表（标注、训练任务等）随对应功能一起以新迁移加入，不预先设计。
+- `0001_init.sql` 只建了基础设施表 `app_settings(key, value jsonb, updated_at)`；`0002_create_datasets.sql` 建立数据集相关的 `datasets`、`dataset_images`、`dataset_imports`；`0003_create_projects.sql` 建立 `projects` 和项目与数据集的关联表 `project_datasets`；`0004_import_annotation_format.sql` 记录导入的标注格式与 YOLO 类别顺序；`0005_image_sort_key.sql` 为图片增加排序键（见第 6 节“图片顺序”）；`0006_dataset_classes.sql` 为数据集增加类别列表；`0007_compute_nodes.sql` 建立训练节点表 `compute_nodes`（见第 9 节）；`0008_create_models.sql` 建立模型仓库的 `models`、`model_uploads`、`model_exports`（转换任务，同时是转换结果的缓存），并为 `projects` 增加 `model_version_seq`（见第 10 节）；`0009_project_classes.sql` 把类别列表从数据集移到项目（`projects.classes`），带上每个项目中数据集原有的列表，然后删除 `datasets.classes`（见第 6 节“类别列表”）；`0010_create_reviews.sql` 建立模型审图的 `reviews`、`review_datasets`、`review_images`、`review_uploads`、`review_merges`（见第 11 节）；`0011_dataset_versions.sql` 建立数据集的审图版本 `dataset_versions`、`dataset_version_images`，为 `datasets` 增加 `review_version_seq`，为 `review_merges` 增加 `note` 并允许 `on_existing` 为空（见第 11 节“审图版本”）；`0012_recycle_bin.sql` 为 `datasets`、`dataset_versions`、`models`、`projects` 增加 `deleted_at`（回收站），为 `datasets` 增加 `delete_files`，把名称的唯一索引改为只约束使用中的记录，并建立 `recycled_project_datasets`、`recycled_review_datasets`、`recycled_review_images`（见第 12 节）；`0013_data_versions.sql` 建立数据版本的 `data_versions`、`data_version_images`，并为 `projects` 增加 `data_version_seq`（见第 13 节）；`0014_dataset_status.sql` 为 `datasets` 增加状态 `status` 与 `status_updated_at`（见“数据集接口”）；`0015_import_renames.sql` 为 `dataset_imports` 增加 `rename_images`，并建立导入时同名图片的明细表 `dataset_import_renames`（见第 6 节“同名图片”）；`0016_training_jobs.sql` 建立训练任务的 `training_jobs` 与轮次指标明细表 `training_job_epochs`（见第 14 节）。其它业务表随对应功能一起以新迁移加入，不预先设计。
 
 ## 8. 日志
 
@@ -567,7 +596,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 ## 9. 训练节点
 
-训练需要 GPU 和 Python 生态（PyTorch / Ultralytics），因此作为**独立的服务**接入，而不是放进 Go 服务：训练节点（`trainer/`，Python 包 `trainmaster_trainer`）运行在每台 GPU 机器上，主动向平台注册并上报心跳，并领取、执行平台的任务（目前是模型仓库的 ONNX 转换与模型审图的识别，见下方“任务协议”“模型转换”与第 11 节）。平台不连接节点，也不调度容器。
+训练需要 GPU 和 Python 生态（PyTorch / Ultralytics），因此作为**独立的服务**接入，而不是放进 Go 服务：训练节点（`trainer/`，Python 包 `trainmaster_trainer`）运行在每台 GPU 机器上，主动向平台注册并上报心跳，并领取、执行平台的任务（模型仓库的 ONNX 转换、模型审图的识别与训练任务的模型训练，见下方“任务协议”“模型转换”与第 11、14 节）。平台不连接节点，也不调度容器。
 
 ### 部署形态
 
@@ -613,12 +642,12 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 ### 任务协议
 
-节点主动向平台领取任务，平台从不连接节点（接口见第 3 节“计算资源接口”）。任务记录在 PostgreSQL 中，目前有两种：`model_export`（表 `model_exports`，模型仓库的 pt → ONNX 转换）与 `review_inference`（表 `reviews`，模型审图的识别，见第 11 节“识别任务”）。下面以转换为例；审图识别使用同样的领取、身份、租约、重试与停止规则，接口与结果的上报方式不同。
+节点主动向平台领取任务，平台从不连接节点（接口见第 3 节“计算资源接口”）。任务记录在 PostgreSQL 中，目前有三种：`model_export`（表 `model_exports`，模型仓库的 pt → ONNX 转换）、`review_inference`（表 `reviews`，模型审图的识别，见第 11 节“识别任务”）与 `training_job`（表 `training_jobs`，模型训练，见第 14 节）。下面以转换为例；审图识别与模型训练使用同样的领取、身份、租约、重试与停止规则，接口与结果的上报方式不同。
 
-1. **能力**：任务线程（`trainmaster_trainer/tasks.py`）在第一次注册成功后启动。本机能找到每类任务需要的模块（`REQUIRED_MODULES`，`importlib.util.find_spec`，常驻进程不导入它们）时才在 `kinds` 中带上这类任务：`model_export` 需要 `torch`、`ultralytics` 与 `onnx`，`review_inference` 需要 `torch` 与 `ultralytics`；缺少时记录一条日志，之后每 5 分钟重新检查（裸机节点可能随后补装了依赖）。
-2. **领取（长轮询）**：`POST …/agent/tasks/claim`，`wait_seconds=25`（平台最多等 30 秒，客户端超时为等待时间 + 15 秒），返回 `{"task": null}` 时立即再领。平台用 `UPDATE … WHERE id = (SELECT id FROM model_exports WHERE status = 'queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)` 取最早排队的转换，一个任务只会交给一个节点；节点同时提供几种类型时先取转换，没有转换时再按注册顺序问其它任务来源（`model.TaskSource`，目前是审图识别）；任务入队或重新排队时通过进程内的通知唤醒正在等待的领取。平台关闭时（`http.Server.RegisterOnShutdown`）正在等待的领取立即返回 `{"task": null}`，节点在平台重启后再领。领取时 404 `unknown_node` → 请主循环重新注册；其它 404 / 405 / 501（旧版平台没有任务接口）→ 每 5 分钟重试一次，只记录一次日志；网络错误与 5xx → 与心跳相同的指数退避。
+1. **能力**：任务线程（`trainmaster_trainer/tasks.py`）在第一次注册成功后启动。本机能找到每类任务需要的模块（`REQUIRED_MODULES`，`importlib.util.find_spec`，常驻进程不导入它们）时才在 `kinds` 中带上这类任务：`model_export` 需要 `torch`、`ultralytics` 与 `onnx`，`review_inference` 与 `training_job` 需要 `torch` 与 `ultralytics`；缺少时记录一条日志，之后每 5 分钟重新检查（裸机节点可能随后补装了依赖）。
+2. **领取（长轮询）**：`POST …/agent/tasks/claim`，`wait_seconds=25`（平台最多等 30 秒，客户端超时为等待时间 + 15 秒），返回 `{"task": null}` 时立即再领。平台用 `UPDATE … WHERE id = (SELECT id FROM model_exports WHERE status = 'queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)` 取最早排队的转换，一个任务只会交给一个节点；节点同时提供几种类型时先取转换，没有转换时再按注册顺序问其它任务来源（`model.TaskSource`，依次是审图识别与训练任务）；任务入队或重新排队时通过进程内的通知唤醒正在等待的领取。平台关闭时（`http.Server.RegisterOnShutdown`）正在等待的领取立即返回 `{"task": null}`，节点在平台重启后再领。领取时 404 `unknown_node` → 请主循环重新注册；其它 404 / 405 / 501（旧版平台没有任务接口）→ 每 5 分钟重试一次，只记录一次日志；网络错误与 5xx → 与心跳相同的指数退避。
 3. **身份**：领取的请求体带 `node_key`；之后关于这个任务的每个调用（任务中给出的 `input_url`、`progress_url`、`output_url`、`complete_url`、`fail_url`）都带请求头 `X-Node-Key`。平台只接受领取它的节点、且任务仍在执行中的调用：任务被删除（用户删除了转换或模型）时返回 404，已不属于该节点或已结束时返回 409，节点收到后结束子进程、放弃任务，不再上报。
-4. **租约**：领取后任务为 `running`，租约 60 秒（`lease_seconds`）。每次上报进度、下载输入与上传结果的过程中（每 15 秒）、结果上传完成时都会续租；节点在执行期间每 15 秒上报一次进度。平台每 15 秒检查一次：租约过期（节点崩溃、断网或被强制停止）的任务在领取次数少于 3 次时重新排队，否则失败（“训练节点在转换过程中失去联系（已尝试 3 次）”）。
+4. **租约**：领取后任务为 `running`，租约 60 秒（`lease_seconds`；训练任务为 90 秒）。每次上报进度、下载输入与上传结果的过程中（每 15 秒）、结果上传完成时都会续租；节点在执行期间每 15 秒上报一次进度。平台每 15 秒检查一次：租约过期（节点崩溃、断网或被强制停止）的任务在领取次数少于 3 次时重新排队，否则失败（“训练节点在转换过程中失去联系（已尝试 3 次）”）。
 5. **失败与重试**：`fail` 带 `retryable`：网络错误、下载的文件大小或 SHA256 不一致、节点磁盘空间不足、平台返回 5xx（507 除外）或 401 等可能下次成功的失败为 true，领取次数少于 3 次时重新排队；转换本身的失败（模型无法加载、后处理方式不适用、超时、ONNX Runtime 验证失败等）与平台拒绝接收结果（上传前的预检或上传返回 413、507）为 false，直接失败，`error` 为中文说明，`error_detail` 为节点上的错误输出（截断到 8 KiB）。用户再次请求同样的转换时重新排队，尝试次数清零。
 6. **结果**：节点先计算结果文件的 SHA256，以 `{"stage": "uploading", "size_bytes": N}` 上报一次进度（预检，见第 3 节：404 / 409 放弃任务，413 / 507 为不可重试的失败，带平台的说明；不认识 `size_bytes` 的旧版平台照常续租），再用 `PUT output` 一次上传（带 `Content-Length` 与 `X-Content-Sha256`），平台边接收边计算并核对大小与 SHA256，不一致时丢弃（节点把 422 视为传输错误，可以重试）。上传中连接被重置时，节点再上报一次不带大小的进度来区分原因：404 / 409 放弃，507 不可重试，其它情况按网络错误重试；再 `POST complete`，平台把文件从 `tmp/model-exports/` 移入模型文件夹，转换成功。
 7. **停止**：节点停止（`docker stop`、`systemctl stop`）时结束正在运行的转换子进程，以 `retryable: true` 上报失败（超时 5 秒，不拖慢停止），任务立即重新排队（领取次数已满 3 次时为失败）；没能上报时由租约过期处理。空闲时停在长轮询中的领取不等待，直接退出。
@@ -639,17 +668,10 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 `python -m trainmaster_trainer export --weights x.pt [--imgsz 640] [--postprocess raw|nms|end2end] [--dynamic] [--opset N] [--output out.onnx] [--json]` 用同一个子进程在本机转换，不连接平台，便于排障；训练节点镜像构建时也用它离线转换一次 YOLO11n（320×320），保证镜像中的 ONNX 依赖完整、安全加载可用。
 
-### 为平台训练预留
+### 平台训练与后续工作
 
-- **模型来源**：`models.source` 区分用户上传（`upload`）与平台训练（`training`）；`training` 的模型必须有 `training_job_id`（数据库约束；训练任务表上线后再加外键）。
-- **入库接口**：`model.Service.RegisterTrainedModel(ctx, TrainedModelInput{ProjectID, TrainingJobID, YOLOVersion, Description, WeightsPath, FileName})` 把训练任务产出的权重（`WeightsPath` 是 `runs/` 下的相对路径，如 `job-7/weights/best.pt`）**复制**到 `tmp/model-registrations/` 后，与上传的提交走同一条路径（SHA256、解析、版本校验、分配版本号、移入模型文件夹、写 `model.json`），成为项目的下一个版本，`runs/` 中的文件保留。目前只有测试调用它。
-- **任务协议**：训练任务将复用上面的领取协议：节点在 `kinds` 中加入训练任务的类型，平台按同样的 `FOR UPDATE SKIP LOCKED`、租约与重试规则交给一个节点，进度、日志与指标通过任务中的 URL 上报。
-
-### 后续工作
-
-- **训练任务调度**：训练任务记录在 PostgreSQL 中，训练一个数据版本（第 13 节），按上面的任务协议由节点领取并上报进度、日志与指标，训练完成后通过 `RegisterTrainedModel` 把最终权重存入模型仓库。训练任务表将带 `training_jobs.data_version_id`（引用 `data_versions`，`ON DELETE RESTRICT`）：被训练任务使用的数据版本不能删除，模型因此可以追溯到训练它的数据。`/api/v1/training/jobs` 目前仍返回 501。
-- **数据交换**：节点与 app 挂载同一个存储目录（compose 中训练节点已把它挂载为 `/data`），从 `exports/` 中的数据版本文件夹读取训练集（Ultralytics 布局，`data.yaml` 可以直接使用，见第 13 节“存储”），把运行产物写入 `runs/`；其它机器上的节点通过 NFS 等共享存储挂载同一目录。（模型转换与审图识别都不需要共享存储：节点通过 HTTP 下载 pt 与图片，上传 ONNX 与识别结果。）
-- 模型审图的识别已经复用了这套协议（第 11 节）；评估、预标注、TensorRT 等其它格式的转换等耗时任务也将复用同一套训练节点与任务协议。
+- **模型来源与入库**：`models.source` 区分用户上传（`upload`）与平台训练（`training`）；`model.Service.RegisterTrainedModel` 把训练任务产出的权重（`runs/training/job-<ID>/weights/best.pt` 或 `last.pt`）复制到 `tmp/model-registrations/` 后，与上传的提交走同一条路径（SHA256、解析、版本校验、分配版本号、移入模型文件夹、写 `model.json`），成为项目的下一个版本，`runs/` 中的文件保留。训练任务的完整设计见第 14 节。
+- **后续扩展**：评估、预标注、TensorRT 等其它格式的转换等耗时任务也将复用同一套训练节点与任务协议。
 
 ## 10. 模型仓库
 
@@ -960,7 +982,7 @@ exports/data-versions/
 └── .deleting-<数据版本ID>-<纳秒>/            # 正在删除的版本文件夹
 ```
 
-- **可以直接训练**：文件夹就是 Ultralytics 的布局：图片的标注在 `dataset.UltralyticsLabelPath(图片路径)`（路径中最后一个 `images` 换成 `labels`、扩展名换成 `.txt`），列表中的行以 `./` 开头（Ultralytics 把这样的行解析为相对于列表文件的路径），`data.yaml` 不写 `path`。（规划中的）训练任务直接读取它，不需要转换。VOC 的 `.xml` 不保存在文件夹中：框在数据库中，下载 VOC 时生成。
+- **可以直接训练**：文件夹就是 Ultralytics 的布局：图片的标注在 `dataset.UltralyticsLabelPath(图片路径)`（路径中最后一个 `images` 换成 `labels`、扩展名换成 `.txt`），列表中的行以 `./` 开头（Ultralytics 把这样的行解析为相对于列表文件的路径），`data.yaml` 不写 `path`。共享 `/data` 存储的训练节点直接读取它，远程节点下载按此目录打包的压缩包（见第 14 节），都不需要转换。VOC 的 `.xml` 不保存在文件夹中：框在数据库中，下载 VOC 时生成。
 - **`version.json`**：`{format: "trainmaster-data-version", format_version: 1, project: {id, name}, version, note, classes, config, sources, counts: {images, objects, train, val, test, augmented}, created_at, finished_at}`，生成完成时写入，没有数据库也能看懂文件夹。修改已生成的版本的备注时，在锁定版本行（`FOR UPDATE`）的事务中原子地改写它（临时文件 + 改名）；生成完成的事务同样锁定这一行，两者不会交错。
 - **名称不重复**：版本中图片的路径去掉扩展名后不区分大小写不重复，标注路径（`UltralyticsLabelPath`）也不重复，所以每种下载格式中每张图片只有一个标注文件。名称已被占用时后来的图片存为 `<名称>~2<扩展名>`（再是 `~3`…），增强图片使用原图最终的名称（`<名称>~2-aug1.jpg`）；按 `position` 的顺序分配，结果是确定的。
 - **硬链接**：原图通过数据集的 `os.Root` 打开并确认是普通文件，再 `os.Link` 到版本文件夹，并用 `os.SameFile` 确认链接到的就是打开的文件；任何一步失败（如 `datasets/` 与 `exports/` 不在同一个文件系统上的 `EXDEV`、`protected_hardlinks` 下的 `EPERM`）时删除链接，改为从打开的文件复制（同一文件夹中的临时文件 + 改名）。Go 1.24 的 `os.Root` 没有 `Link`、`Rename`、`MkdirAll`，版本文件夹一侧按路径操作。硬链接不占用额外的空间；导入与覆盖导入用改名替换数据集中的文件（新的 inode），删除数据集或其中的文件也只是删除一个链接，都不影响数据版本。
@@ -1062,16 +1084,16 @@ exports/data-versions/
 
 ### 删除、停止与重新生成
 
-- **删除**（`DELETE /api/v1/data-versions/{id}`）：先 `DELETE FROM data_versions WHERE id = $1 AND status IN ('queued', 'building') AND deleted_at IS NULL RETURNING status`：删除了生成中的版本时取消它的生成（生成任务还没来得及登记时，它的下一次带条件的写入会失败而停止），返回 204，文件夹与缩略图由生成任务清理。没有删除时锁定版本行（`FOR UPDATE`）：已生成的移入回收站（`deleted_at = now()`）；生成失败的删除记录（级联删除图片记录），移开文件夹、删除缩略图；期间恰好又变成排队中或生成中的，再从第一步来一次。不存在或在回收站中时 404，从不返回 409。
+- **删除**（`DELETE /api/v1/data-versions/{id}`）：先 `DELETE FROM data_versions WHERE id = $1 AND status IN ('queued', 'building') AND deleted_at IS NULL RETURNING status`：删除了生成中的版本时取消它的生成（生成任务还没来得及登记时，它的下一次带条件的写入会失败而停止），返回 204，文件夹与缩略图由生成任务清理。没有删除时锁定版本行（`FOR UPDATE`）：已生成的版本若未被任何训练任务引用（`NOT EXISTS (SELECT 1 FROM training_jobs WHERE data_version_id = $1)`）则移入回收站（`deleted_at = now()`），已被训练任务使用的返回 409 `conflict`（“该数据版本已被 N 个训练任务使用，请先删除相关训练任务”）；生成失败的删除记录（级联删除图片记录），移开文件夹、删除缩略图；期间恰好又变成排队中或生成中的，再从第一步来一次。不存在或在回收站中时 404。
 - **重新生成**（只有 `failed` 的版本，否则 409 “只有生成失败的数据版本可以重新生成”）：校验来源（见“来源的校验”），然后 `UPDATE … WHERE id = $1 AND status = 'failed'`：置为 `queued`，清空错误、阶段与进度，`started_at`、`finished_at` 为空，`queued_at = now()`（排到队列末尾），计数清零、`stats` 为默认值，唤醒生成任务。类别列表、设置与来源不变，图片按数据集现在的内容重新取。
 - **修改备注**：任何状态（不在回收站中）都可以；已生成的版本同时改写 `version.json`（见“存储”）。
-- **删除项目**（`DELETE /api/v1/projects/{id}?delete_data_versions=true`）：`dataversion.Service.DeleteProjectVersions` 对项目的每个版本做同样的事（已生成的移入回收站，失败的删除，排队中与生成中的删除并取消），从不返回 409；之后才删除模型与项目，规则见第 3 节“项目接口”。
+- **删除项目**（`DELETE /api/v1/projects/{id}`）：勾选 `delete_training_jobs=true` 时先由 `training.Service.DeleteProjectJobs` 删除项目下所有训练任务及其 `runs/job-<ID>/` 目录（解除对数据版本的外键引用），随后 `delete_data_versions=true` 时 `dataversion.Service.DeleteProjectVersions` 处理项目的每个数据版本（已生成的移入回收站，失败的删除，排队中与生成中的删除并取消），最后才处理模型与项目，规则见第 3 节“项目接口”。
 
 ### 清理
 
 启动时与之后每 30 分钟：
 
-- 永久删除在回收站中满 7 天（`recycle.Retention`）的版本：逐个在事务中锁定（`FOR UPDATE`）并再次确认，删除记录（级联删除图片记录），提交后移开并删除文件夹、删除缩略图。然后调用 `project.PurgeEmptyProjects` 删除回收站中已经没有模型与数据版本的项目，并删除它们的 `exports/data-versions/project-<ID>/`。
+- 永久删除在回收站中满 7 天（`recycle.Retention`）且未被训练任务引用的版本：逐个在事务中锁定（`FOR UPDATE`）并再次确认，删除记录（级联删除图片记录），提交后移开并删除文件夹、删除缩略图。然后调用 `project.PurgeEmptyProjects` 删除回收站中已经没有模型、数据版本与训练任务的项目，并删除它们的 `exports/data-versions/project-<ID>/`。
 - 删除 `exports/data-versions/.deleting-*`、没有对应版本记录的 `cache/data-versions/<ID>/`，以及项目已不存在的空文件夹 `exports/data-versions/project-<ID>/`。没有对应记录、也没有 `.pending` 的 `v<n>` 文件夹**从不删除**（可能来自备份），之后新建的版本会跳过这个编号。
 
 ### 下载
@@ -1086,7 +1108,56 @@ exports/data-versions/
 
 ### 项目、数据集与训练任务
 
-- **项目**：数据版本属于且只属于一个项目（`ON DELETE RESTRICT`）。项目接口带 `data_version_count`（不在回收站中的，任何状态）与 `latest_data_version`（版本号最大的、不在回收站中的）。删除有数据版本的项目返回 409（模型先检查，原来的消息不变）；勾选“同时删除 N 个数据版本”时先处理数据版本，再处理模型、删除项目，删除前先用 `project.CheckDelete` 检查，被拒绝的删除不做任何修改（见第 3 节“项目接口”）。项目中有模型或数据版本在回收站中时项目被软删除，否则直接删除，并删除 `models/project-<ID>/` 与 `exports/data-versions/project-<ID>/`。`project` 包不引用 `dataversion`：计数、检查与 `PurgeEmptyProjects` 直接查询 `data_versions`。
+- **项目**：数据版本属于且只属于一个项目（`ON DELETE RESTRICT`）。项目接口带 `data_version_count`（不在回收站中的，任何状态）、`latest_data_version`（版本号最大的、不在回收站中的）与 `training_job_count`。删除有模型、数据版本或训练任务的项目返回 409；按勾选项依次先删除训练任务、再处理数据版本、最后处理模型与项目，删除前先用 `project.CheckDelete` 统一检查，被拒绝的删除不做任何修改（见第 3 节“项目接口”）。项目中有模型或数据版本在回收站中时项目被软删除，否则直接删除，并删除 `models/project-<ID>/` 与 `exports/data-versions/project-<ID>/`。`project` 包不引用 `dataversion` 与 `training`：计数、检查与 `PurgeEmptyProjects` 直接查询 `data_versions` 与 `training_jobs`。
 - **数据集**：删除数据集不检查数据版本：版本有自己的文件（硬链接或副本），`sources[].dataset_deleted` 在读取时计算。数据集被永久删除后，已生成的版本仍可以查看、下载与从回收站恢复（生成失败的版本则不能再重新生成，见“来源的校验”）。
 - **回收站**：见第 12 节。
-- **训练任务（规划中）**：训练任务将训练一个数据版本，直接读取它在 `exports/` 中的文件夹（第 9 节“后续工作”）。训练任务表将带 `training_jobs.data_version_id`（引用 `data_versions`，`ON DELETE RESTRICT`）：删除被训练任务使用的数据版本将被拒绝，从模型可以一直追溯到训练它的数据。
+- **训练任务**：见第 14 节。
+
+## 14. 训练任务
+
+训练任务（`internal/training`、`internal/httpapi/training.go` 与 `training_agent.go`、`trainer/trainmaster_trainer/training.py`、`frontend/src/features/training/`）基于项目中一个已生成（`status = ready`）的数据版本训练 Ultralytics YOLO 目标检测模型，并将全量 YOLO 训练参数（对齐 Ultralytics 8.4.198 `cfg/default.yaml`，共 86 项）按官方默认值向用户完整开放编辑。训练计算全部在训练节点（`trainer`）的隔离子进程中离线完成，Web 服务不安装 Python、PyTorch 或 Ultralytics。
+
+### 数据模型与溯源
+
+- `0016_training_jobs.sql` 定义两张表：
+  - `training_jobs`：所属项目 `project_id`（`ON DELETE RESTRICT`）、数据版本 `data_version_id`（`ON DELETE RESTRICT`）及新建时的快照 `data_version_ref`（版本号、目录名、类别列表、各划分张数）、名称与描述、初始化方式 `init_mode`（`scratch` / `finetune` / `resume`）、`yolo_version`、`model_scale`、`task`（固定 `detect`）、可选基础模型 `base_model_id`（`ON DELETE SET NULL`）及快照 `base_model_ref`、规范化后的全量参数 `params`（`jsonb`）、`auto_register`、状态 `status`（`queued` / `running` / `succeeded` / `failed` / `canceled`）、运行阶段 `stage`（`preparing` / `downloading` / `training` / `uploading`）、领取节点 `node_id`、尝试次数 `attempts`、租约到期时间 `lease_expires_at`、当前轮次/批进度与预计剩余秒数、汇总指标 `metrics`、已落盘产物列表 `artifacts`、已注册到模型仓库的 `best_model_id` / `last_model_id`（`ON DELETE SET NULL`）、错误与结果摘要。
+  - `training_job_epochs`：按 `(job_id, epoch)` 主键保存每一轮完成的训练损失、验证损失、Precision、Recall、mAP@0.5、mAP@0.5:0.95、Fitness、学习率、显存占用与耗时（`ON DELETE CASCADE`）。
+- **数据血缘保护**：`data_version_id` 使用 `ON DELETE RESTRICT` 且 `dataversion` 删除时显式检查 `training_jobs` 引用（返回 409），保证训练任务存在期间其训练数据版本不会被移入回收站或永久删除；基础模型与产出模型被移入回收站或永久删除时仅置空外键，任务仍保留新建时的 `base_model_ref` 快照。
+
+### 初始化方式
+
+| 方式 | `init_mode` | 模型构建与权重加载 | 校验规则 |
+|---|---|---|---|
+| 从头训练 | `scratch` | 用 Ultralytics 内置网络结构配置 `<yolo_version><model_scale>.yaml`（如 `yolo11n.yaml`、`yolov8s.yaml`）随机初始化权重，并强制覆写 `pretrained=false`，离线环境不联网下载任何预训练权重 | 校验 `yolo_version`（平台支持的各代检测模型，不含仅支持旧版外部仓库或非原生 YAML 构建的条目时按 `SupportsScratch` 判断）与 `model_scale`（`n` / `s` / `m` / `l` / `x`） |
+| 预训练微调 | `finetune` | 从模型仓库中已就绪（不在回收站中、`task = detect`）的 `.pt` 模型加载预训练权重，自动适配当前数据版本的类别数 `nc` | `base_model_id` 必填（允许跨项目复用预训练底模）；`yolo_version` 与 `model_scale` 自动继承自基础模型 |
+| 断点续训 | `resume` | 从包含优化器与轮次状态的检查点模型（如入库的 `last.pt`）恢复未完成的训练，强制开启 `resume=true` | `base_model_id` 必填且其 `metadata.training_checkpoint` 必须为 `true`，否则返回 422（提示改用“预训练微调”） |
+
+### 全量 YOLO 参数与官方默认值
+
+后端 `internal/training/params.go` 与前端 `frontend/src/features/training/training-params.ts` 维护完全一致的参数注册表（86 项参数，对齐 Ultralytics 8.4.198 官方 `ultralytics/cfg/default.yaml`），分为 4 个分组：
+
+- **`train`（基础训练，36 项）**：`epochs`（100）、`time`（`null`）、`patience`（100）、`batch`（16，支持 `-1` 自动批大小与小数显存占比）、`imgsz`（640，支持整数或 `[高, 宽]`）、`save`（`true`）、`save_period`（`-1`）、`cache`（`false`，支持布尔值或 `"ram"` / `"disk"`）、`device`（`null`，自动选择空闲 GPU 或填写 `"0"` / `"0,1"` / `"cpu"`）、`workers`（8）、`pretrained`（`true`，`scratch` 模式自动置为 `false`）、`optimizer`（`"auto"`，可选 `SGD` / `Adam` / `Adamax` / `AdamW` / `NAdam` / `RAdam` / `RMSProp`）、`seed`（0）、`deterministic`（`true`）、`single_cls`（`false`）、`classes`（`null` 或类别编号数组）、`rect`（`false`）、`cos_lr`（`false`）、`close_mosaic`（10）、`resume`（`false`，`resume` 模式自动置为 `true`）、`amp`（`true`）、`fraction`（1.0）、`profile`（`false`）、`freeze`（`null`，支持整数层数或层号数组）、`multi_scale`（0.0）、`compile`（`false`，支持布尔值或 `"default"` / `"reduce-overhead"` / `"max-autotune-no-cudagraphs"`）、`quantize`（`null`）以及日志/保存选项（`verbose`、`plots`、`save_frames`、`save_txt`、`save_conf`、`save_crop`、`show_labels`、`show_conf`、`show_boxes`、`line_width`）等。
+- **`hyperparameters`（优化器与损失超参，16 项）**：`lr0`（0.01）、`lrf`（0.01）、`momentum`（0.937）、`weight_decay`（0.0005）、`warmup_epochs`（3.0）、`warmup_momentum`（0.8）、`warmup_bias_lr`（0.1）、`box`（7.5）、`cls`（0.5）、`dfl`（1.5）、`pose`（12.0）、`kobj`（1.0）、`rle`（1.0）、`angle`（1.0）、`nbs`（64）、`dropout`（0.0）。
+- **`augmentation`（在线数据增强，19 项）**：`hsv_h`（0.015）、`hsv_s`（0.7）、`hsv_v`（0.4）、`degrees`（0.0）、`translate`（0.1）、`scale`（0.5）、`shear`（0.0）、`perspective`（0.0）、`flipud`（0.0）、`fliplr`（0.5）、`bgr`（0.0）、`mosaic`（1.0）、`mixup`（0.0）、`cutmix`（0.0）、`copy_paste`（0.0）、`copy_paste_mode`（`"flip"`）、`auto_augment`（`"randaugment"`，允许清空以关闭）、`erasing`（0.4）、`overlap_mask` / `mask_ratio`。
+- **`val`（验证与后处理，15 项）**：`val`（`true`）、`split`（`"val"`）、`save_json`（`false`）、`conf`（`null`）、`iou`（0.7）、`max_det`（300）、`half`（`false`）、`dnn`（`false`）、`augment`（`false`）、`agnostic_nms`（`false`）、`retina_masks`（`false`）、`embed`（`null`）、`visualize`（`false`）等。
+
+**归一化与安全边界**：
+- 新建任务时以官方默认表为基底合并用户传入的 `params`：未知参数键一律返回 422（防止拼写错误静默失效或注入平台管理字段）；平台托管的路径与运行目录键（`model`、`data`、`project`、`name`、`exist_ok`、`mode`、`task`）禁止在 `params` 中传入，由执行器在运行目录内生成确定值。
+- 15 种值类型（布尔、整数、非负浮点、区间浮点、`imgsz`、`batch`、`cache`、`device`、`freeze`、`compile`、枚举、可空数值、整数数组等）在前后端双向严格校验范围与类型，持久化到 `training_jobs.params` 的始终是完整的 86 项规范化 JSON。
+
+### 队列调度、节点执行与产物存储
+
+- **任务领取**：`training.Service` 实现 `model.TaskSource`（`Kind() = "training_job"`），接入第 9 节统一的长轮询领取接口 `POST /api/v1/compute/agent/tasks/claim`（`tasks` 含 `"training_job"` 时按 `queued_at, id` 顺序 `FOR UPDATE SKIP LOCKED` 领取）。`training.Service.Start` 每 15 秒扫描租约过期（`lease_expires_at <= now()`，租约时长 90 秒）的 `running` 任务：尝试次数未满 3 次的自动退回 `queued` 重新排队，满 3 次的标记为 `failed`。
+- **存储布局**（`runs/job-<任务ID>/`）：
+  - `train.log`：节点实时流式追加的标准输出与训练日志（上限 32 MiB，超出截断保护磁盘），前端通过 `GET /api/v1/training/jobs/{id}/logs?offset=&limit=` 按字节偏移增量拉取（首次可传 `offset=-1` 读取末尾 128 KiB）。
+  - `weights/best.pt`、`weights/last.pt`、评估图表（`results.png`、`confusion_matrix.png`、`confusion_matrix_normalized.png`、`PR_curve.png` / `BoxPR_curve.png`、`F1_curve.png` / `BoxF1_curve.png`、`P_curve.png`、`R_curve.png`、`labels.jpg`、`val_batch*_labels.jpg`、`val_batch*_pred.jpg`）、`results.csv`、`args.yaml`：训练结束时由节点通过 `PUT .../artifacts/{relPath}` 上传，服务端先写入目标目录旁边的 `.upload-*` 临时文件、`fsync` 并再次核验租约后原子改名落盘，读写均受 `cleanArtifactRel` 白名单与 `os.OpenRoot` 约束。
+- **训练节点执行**（`trainer/trainmaster_trainer/training.py`）：
+  1. **数据准备（零拷贝优先）**：若节点挂载了平台共享数据目录且 `exports/<dir_name>/data.yaml` 可读，直接原位读取图片与标注，仅在节点本地临时目录生成带绝对 `path` 的轻量 `data.yaml`，零磁盘复制；否则通过 `GET .../dataset` 流式下载打包压缩包解压到本地临时目录。`finetune` / `resume` 模式通过 `GET .../base-model` 下载 `.pt` 并校验 `X-Content-Sha256`。
+  2. **离线安全子进程**：以独立 Python 子进程启动训练，强制注入 `YOLO_OFFLINE=1`、`ULTRALYTICS_OFFLINE=1`、`YOLO_AUTOINSTALL=False`、`ULTRALYTICS_SAFE_LOAD=1`、`MPLBACKEND=Agg`，杜绝外网请求、自动 `pip install` 与不安全反序列化，同时确保训练结束后完整释放 CUDA 显存。
+  3. **实时回调与平滑停止**：注册 Ultralytics 生命周期回调（`on_train_start`、`on_train_batch_end`、`on_fit_epoch_end`、`on_train_end`），通过本地 JSONL 进度管道向父进程汇报批次进度、ETA 与每轮训练/验证指标，父进程连同增量日志每数秒调用 `POST .../progress` 续期并落库。若用户在页面点击“停止训练”（任务置为 `canceled`）或删除任务，`POST .../progress` 返回 409 / 404，节点立即向训练子进程发送 `SIGTERM`（超时后 `SIGKILL`）快速终止并回收显存。
+
+### 模型仓库自动与手动入库
+
+- **自动入库**：`auto_register = true`（默认开启）时，`POST .../complete` 在标记任务成功后自动调用 `model.Service.RegisterTrainedModel`，将 `runs/job-<ID>/weights/best.pt` 注册进所属项目的模型仓库（记录 `models.training_job_id = job.id`，更新 `training_jobs.best_model_id`）；若项目此时已被移入回收站或权重校验失败，任务本身仍保持 `succeeded`，日志记录原因，用户可在恢复后手动入库。
+- **手动入库**：对已有权重产物的任务（包括成功任务，以及中途停止或失败但已产出 `best.pt` / `last.pt` 的任务），用户可通过 `POST /api/v1/training/jobs/{id}/register-model` 选择 `variant = best` 或 `last` 并填写说明，将对应权重注册为模型仓库的新版本（已注册且仍在模型仓库中时返回 409；若此前注册的模型已被移入回收站或删除，允许重新入库）。模型详情页展示来源训练任务链接，训练任务详情页展示已入库模型的版本链接，形成“数据集 / 审图版本 → 数据版本 → 训练任务 → 模型仓库 → 模型审图 / ONNX 导出”的完整闭环。
+

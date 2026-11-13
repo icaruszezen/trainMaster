@@ -26,6 +26,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/review"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 	"github.com/icaruszezen/trainmaster/backend/internal/trainerpkg"
+	"github.com/icaruszezen/trainmaster/backend/internal/training"
 	"github.com/icaruszezen/trainmaster/backend/internal/web"
 )
 
@@ -90,29 +91,32 @@ func run() error {
 	// the pool closes.
 	models := model.NewService(model.Options{DB: db.Pool, Storage: store, Logger: log})
 	projects := project.NewService(project.Options{DB: db.Pool, Logger: log})
-	// Model reviews. NewService registers the reviews as a source of tasks
-	// (review_inference) with the model service, before it starts. The
-	// background work (reviews whose training node stopped reporting are
-	// queued again, leftovers of deletes are removed) and merges run until
-	// shutdown; Stop runs before the model service's.
+	// Data versions (frozen training sets of a project). Start fails the
+	// builds a previous run left (they can be retried), then builds queued
+	// versions one at a time and purges the recycle bin until shutdown; Stop
+	// runs before the services whose data it reads.
+	dataVersions := dataversion.NewService(dataversion.Options{DB: db.Pool, Storage: store, Logger: log,
+		Datasets: datasets, Projects: projects})
+	// Model reviews and YOLO training jobs register themselves as task sources
+	// with the model service before models.Start begins serving claims.
 	reviews := review.NewService(review.Options{DB: db.Pool, Storage: store, Logger: log, Datasets: datasets,
 		Models: models, Projects: projects})
+	trainingJobs := training.NewService(training.Options{DB: db.Pool, Storage: store, Logger: log,
+		Projects: projects, DataVersions: dataVersions, Models: models})
 	models.Start(ctx)
 	defer models.Stop()
 	if err := reviews.Start(ctx); err != nil {
 		return interrupted(ctx, log, err)
 	}
 	defer reviews.Stop()
-	// Data versions (frozen training sets of a project). Start fails the
-	// builds a previous run left (they can be retried), then builds queued
-	// versions one at a time and purges the recycle bin until shutdown; Stop
-	// runs first, before the services whose data it reads.
-	dataVersions := dataversion.NewService(dataversion.Options{DB: db.Pool, Storage: store, Logger: log,
-		Datasets: datasets, Projects: projects})
 	if err := dataVersions.Start(ctx); err != nil {
 		return interrupted(ctx, log, err)
 	}
 	defer dataVersions.Stop()
+	if err := trainingJobs.Start(ctx); err != nil {
+		return interrupted(ctx, log, err)
+	}
+	defer trainingJobs.Stop()
 
 	// CPU utilization of this machine for the compute page, sampled in the
 	// background until shutdown.
@@ -137,6 +141,7 @@ func run() error {
 		Models:            models,
 		Reviews:           reviews,
 		DataVersions:      dataVersions,
+		Training:          trainingJobs,
 		ReviewerTool:      cfg.ReviewerTool,
 		TrainerPackageDir: cfg.TrainerPackageDir,
 		Host:              host,

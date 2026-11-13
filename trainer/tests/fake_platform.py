@@ -19,6 +19,7 @@ HEARTBEAT = "/api/v1/compute/agent/heartbeat"
 CLAIM = "/api/v1/compute/agent/tasks/claim"
 EXPORTS = "/api/v1/compute/agent/model-exports/"
 REVIEWS = "/api/v1/compute/agent/review-inferences/"
+TRAINING_JOBS = "/api/v1/compute/agent/training-jobs/"
 LEASE_SECONDS = 60
 MAX_ATTEMPTS = 3
 STAGES = ("downloading", "converting", "uploading")
@@ -33,7 +34,12 @@ _REVIEW_PATH = re.compile(
     r"/api/v1/compute/agent/review-inferences/(\d+)/"
     r"(model|images|images/(\d+)/file|progress|results|complete|fail)"
 )
+_TRAINING_PATH = re.compile(
+    r"/api/v1/compute/agent/training-jobs/(\d+)/"
+    r"(dataset|base-model|progress|artifacts|complete|fail)"
+)
 REVIEW_STAGES = ("downloading", "inferring")
+TRAINING_STAGES = ("preparing", "downloading", "training", "uploading")
 MAX_RESULTS_BODY = 1 << 20
 MAX_RESULTS = 500
 
@@ -103,6 +109,9 @@ class FakePlatform:
         # 审图识别任务（review_inference）
         self.reviews: dict[int, dict[str, Any]] = {}
         self._next_review = 12
+        # 模型训练任务（training_job）
+        self.trainings: dict[int, dict[str, Any]] = {}
+        self._next_training = 31
         self.task_changed = threading.Condition(self.lock)
         self.closed = False
         self._wakeups = 0
@@ -178,6 +187,7 @@ class FakePlatform:
                     self.path == CLAIM
                     or self.path.startswith(EXPORTS)
                     or self.path.startswith(REVIEWS)
+                    or self.path.startswith(TRAINING_JOBS)
                 ):
                     response = platform.task_request(method, request)
                     if response == DROP:
@@ -362,6 +372,8 @@ class FakePlatform:
             return self._claim(request)
         if path.startswith(REVIEWS):
             return self.review_request(method, request)
+        if path.startswith(TRAINING_JOBS):
+            return self.training_request(method, request)
         m = _EXPORT_PATH.fullmatch(path)
         if m is None:
             return _error(404, "not_found", "接口不存在")
@@ -419,6 +431,12 @@ class FakePlatform:
                             review.update(status="running", node_key=key, stage="downloading")
                             review["attempts"] += 1
                             return 200, {"task": self._review_task_json(review)}
+                if "training_job" in (body.get("kinds") or []):
+                    for job in self.trainings.values():
+                        if job["status"] == "queued":
+                            job.update(status="running", node_key=key, stage="preparing")
+                            job["attempts"] += 1
+                            return 200, {"task": self._training_task_json(job)}
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or self.closed or self._wakeups != wakeups:
                     return 200, {"task": None}
@@ -698,6 +716,212 @@ class FakePlatform:
         else:
             review.update(status="failed", stage="")
         return 200, self._review_view(review)
+
+    # ---- 模型训练（training_job）----
+
+    def add_training_job(
+        self,
+        dataset_zip: bytes,
+        *,
+        init_mode: str = "scratch",
+        yolo_version: str = "yolo11",
+        model_scale: str = "n",
+        arch_yaml: str | None = "yolo11n.yaml",
+        task_type: str = "detect",
+        dir_name: str = "proj-1/v1",
+        base_model_data: bytes | None = None,
+        base_sha256: str | None = None,
+        params: dict[str, Any] | None = None,
+        task: dict[str, Any] | None = None,
+    ) -> int:
+        with self.lock:
+            job_id = self._next_training
+            self._next_training += 1
+            base_model = None
+            if base_model_data is not None:
+                base_model = {
+                    "id": 9,
+                    "version": 1,
+                    "yolo_version": yolo_version,
+                    "task": task_type,
+                    "file_name": "best.pt",
+                    "size_bytes": len(base_model_data),
+                    "sha256": base_sha256 or hashlib.sha256(base_model_data).hexdigest(),
+                }
+            self.trainings[job_id] = {
+                "id": job_id,
+                "project_id": 1,
+                "status": "queued",
+                "stage": "",
+                "attempts": 0,
+                "node_key": None,
+                "init_mode": init_mode,
+                "yolo_version": yolo_version,
+                "model_scale": model_scale,
+                "arch_yaml": arch_yaml if init_mode == "scratch" else None,
+                "task": task_type,
+                "data_version": {
+                    "id": 4,
+                    "version": 1,
+                    "name": "v1",
+                    "dir_name": dir_name,
+                    "class_names": ["person", "helmet"],
+                    "train_count": 8,
+                    "val_count": 2,
+                },
+                "dataset_zip": dataset_zip,
+                "base_model": base_model,
+                "base_model_data": base_model_data,
+                "params": {"epochs": 2, "batch": 4, "imgsz": 640, **(params or {})},
+                "task_overrides": task or {},
+                "progress": [],
+                "epochs": [],
+                "logs": "",
+                "artifacts": {},
+                "result": None,
+                "fails": [],
+            }
+            self.task_changed.notify_all()
+            return job_id
+
+    def training_job(self, job_id: int) -> dict[str, Any] | None:
+        with self.lock:
+            return self.trainings.get(job_id)
+
+    def cancel_training_job(self, job_id: int) -> None:
+        with self.lock:
+            job = self.trainings.get(job_id)
+            if job is not None:
+                job.update(status="canceled", stage="", node_key=None)
+
+    def delete_training_job(self, job_id: int) -> None:
+        with self.lock:
+            self.trainings.pop(job_id, None)
+
+    def _training_task_json(self, job: dict[str, Any]) -> dict[str, Any]:
+        base = f"{TRAINING_JOBS}{job['id']}"
+        payload: dict[str, Any] = {
+            "kind": "training_job",
+            "id": job["id"],
+            "lease_seconds": LEASE_SECONDS,
+            "project_id": job["project_id"],
+            "init_mode": job["init_mode"],
+            "yolo_version": job["yolo_version"],
+            "model_scale": job["model_scale"],
+            "arch_yaml": job["arch_yaml"],
+            "task": job["task"],
+            "data_version": dict(job["data_version"]),
+            "base_model": dict(job["base_model"]) if job["base_model"] else None,
+            "params": dict(job["params"]),
+            "dataset_url": f"{base}/dataset",
+            "base_model_url": f"{base}/base-model" if job["base_model"] else None,
+            "progress_url": f"{base}/progress",
+            "artifacts_url": f"{base}/artifacts",
+            "complete_url": f"{base}/complete",
+            "fail_url": f"{base}/fail",
+        }
+        payload.update(job["task_overrides"])
+        return payload
+
+    def _training_view(self, job: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": job["id"],
+            "status": job["status"],
+            "stage": job["stage"],
+            "attempts": job["attempts"],
+            "error": job.get("error", ""),
+        }
+
+    def training_request(self, method: str, request: dict[str, Any]) -> tuple[int, Any] | str:
+        parts = urllib.parse.urlsplit(request["path"])
+        m = _TRAINING_PATH.fullmatch(parts.path)
+        if m is None:
+            return _error(404, "not_found", "接口不存在")
+        job_id, action = int(m.group(1)), m.group(2)
+        allowed = {"dataset": "GET", "base-model": "GET", "artifacts": "PUT"}.get(action, "POST")
+        if method != allowed:
+            return _error(405, "method_not_allowed", "不支持该请求方法")
+        with self.lock:
+            job = self.trainings.get(job_id)
+            hook = self.hooks.get(f"training:{action}")
+        if hook is not None:
+            override = hook(job, request)
+            if override is not None:
+                return override
+        key = request["headers"].get("X-Node-Key")
+        with self.lock:
+            if key not in self.nodes:
+                return _error(404, "unknown_node", "节点未注册，请重新注册")
+            job = self.trainings.get(job_id)
+            if job is None:
+                return _error(404, "not_found", "训练任务不存在")
+            if job["status"] != "running" or job["node_key"] != key:
+                return _error(409, "conflict", "训练任务不属于该节点或已取消")
+            query = dict(urllib.parse.parse_qsl(parts.query))
+            handler_name = f"_training_{action.replace('-', '_')}"
+            return getattr(self, handler_name)(job, request, query)
+
+    def _training_dataset(
+        self, job: dict[str, Any], request: dict[str, Any], query: dict[str, str]
+    ) -> tuple[int, Any]:
+        return 200, job["dataset_zip"]
+
+    def _training_base_model(
+        self, job: dict[str, Any], request: dict[str, Any], query: dict[str, str]
+    ) -> tuple[int, Any]:
+        if job["base_model_data"] is None:
+            return _error(404, "not_found", "没有基础模型")
+        return 200, job["base_model_data"]
+
+    def _training_progress(
+        self, job: dict[str, Any], request: dict[str, Any], query: dict[str, str]
+    ) -> tuple[int, Any]:
+        body = request["body"]
+        stage = body.get("stage") if isinstance(body, dict) else None
+        if stage not in TRAINING_STAGES:
+            return _error(422, "validation_failed", "stage 不合法")
+        job["stage"] = stage
+        job["progress"].append(dict(body))
+        if body.get("epochs"):
+            job["epochs"].extend(body["epochs"])
+        if body.get("log_chunk"):
+            job["logs"] += body["log_chunk"]
+        return 200, {"lease_seconds": LEASE_SECONDS}
+
+    def _training_artifacts(
+        self, job: dict[str, Any], request: dict[str, Any], query: dict[str, str]
+    ) -> tuple[int, Any]:
+        rel = query.get("path", "")
+        if not rel or ".." in rel or rel.startswith("/"):
+            return _error(422, "validation_failed", "path 不合法")
+        data = request["raw"] or b""
+        sha = request["headers"].get("X-Content-Sha256") or ""
+        if sha.lower() != hashlib.sha256(data).hexdigest():
+            return _error(422, "validation_failed", "上传的文件与 X-Content-Sha256 不一致")
+        job["artifacts"][rel] = data
+        return 200, {"path": rel, "size_bytes": len(data)}
+
+    def _training_complete(
+        self, job: dict[str, Any], request: dict[str, Any], query: dict[str, str]
+    ) -> tuple[int, Any]:
+        if "weights/best.pt" not in job["artifacts"] and "weights/last.pt" not in job["artifacts"]:
+            return _error(422, "validation_failed", "尚未上传模型权重")
+        body = request["body"]
+        job.update(status="succeeded", stage="", result=(body or {}).get("result"))
+        return 200, self._training_view(job)
+
+    def _training_fail(
+        self, job: dict[str, Any], request: dict[str, Any], query: dict[str, str]
+    ) -> tuple[int, Any]:
+        body = request["body"] if isinstance(request["body"], dict) else {}
+        job["fails"].append(body)
+        job["error"] = body.get("error", "")
+        if body.get("retryable") is True and job["attempts"] < MAX_ATTEMPTS:
+            job.update(status="queued", stage="", node_key=None)
+            self.task_changed.notify_all()
+        else:
+            job.update(status="failed", stage="")
+        return 200, self._training_view(job)
 
 
 def wait_until(predicate: Callable[[], Any], timeout: float = 10.0, interval: float = 0.01) -> Any:

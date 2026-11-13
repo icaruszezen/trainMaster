@@ -72,6 +72,7 @@ def default_task_worker(agent: Agent) -> TaskWorker:
         registration=agent,
         state_dir=cfg.state_dir,
         node_name=cfg.node_name,
+        data_dir=cfg.data_dir,
         export_timeout=cfg.export_timeout,
         inference_image_timeout=cfg.inference_image_timeout,
     )

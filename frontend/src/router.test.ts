@@ -13,6 +13,10 @@ import { ProjectDetailPage } from "@/features/projects/project-detail-page"
 import { ReviewDetailPage } from "@/features/reviews/review-detail-page"
 import { ReviewWorkspacePage } from "@/features/reviews/review-workspace-page"
 import { ReviewsPage } from "@/features/reviews/reviews-page"
+import { ComputePage } from "@/features/training/compute-page"
+import { NewTrainingJobPage } from "@/features/training/new-training-job-page"
+import { TrainingJobDetailPage } from "@/features/training/training-job-detail-page"
+import { TrainingJobsPage } from "@/features/training/training-jobs-page"
 import { NotFoundPage } from "@/pages/not-found-page"
 import { pages, routes } from "@/router"
 
@@ -76,6 +80,17 @@ describe("routes", () => {
     expect(leafComponent("/models/inference")).toBe(InferencePage)
     expect(leafComponent("/models/5/extra")).toBe(NotFoundPage)
     expect(leaf("/models/5")?.handle).toBeUndefined()
+  })
+
+  it("routes training jobs without shadowing compute", () => {
+    expect(leafComponent("/training/jobs")).toBe(TrainingJobsPage)
+    expect(leafComponent("/training/jobs/new")).toBe(NewTrainingJobPage)
+    expect(leafComponent("/training/jobs/9")).toBe(TrainingJobDetailPage)
+    expect(leafComponent("/training/jobs/9/extra")).toBe(NotFoundPage)
+    expect(leafComponent("/training/compute")).toBe(ComputePage)
+    for (const path of ["/training/jobs/new", "/training/jobs/9"]) {
+      expect(leaf(path)?.handle, path).toBeUndefined()
+    }
   })
 
   it("routes reviews under the datasets", () => {
