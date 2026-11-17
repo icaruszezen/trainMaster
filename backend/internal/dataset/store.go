@@ -26,7 +26,7 @@ const upsertBatchSize = 500
 
 const datasetColumns = `id, name, description, dir_name, origin, status, status_updated_at, image_count,
 	annotated_count, empty_count, invalid_count, object_count, label_count, total_bytes, scanned_at, created_at,
-	updated_at`
+	updated_at, storage_node_id, recycled_in_place`
 
 func scanDataset(row pgx.Row) (Dataset, error) { return scanDatasetWith(row) }
 
@@ -35,7 +35,7 @@ func scanDatasetWith(row pgx.Row, extra ...any) (Dataset, error) {
 	var d Dataset
 	err := row.Scan(append([]any{&d.ID, &d.Name, &d.Description, &d.DirName, &d.Origin, &d.Status,
 		&d.StatusUpdatedAt, &d.ImageCount, &d.AnnotatedCount, &d.EmptyCount, &d.InvalidCount, &d.ObjectCount,
-		&d.LabelCount, &d.TotalBytes, &d.ScannedAt, &d.CreatedAt, &d.UpdatedAt}, extra...)...)
+		&d.LabelCount, &d.TotalBytes, &d.ScannedAt, &d.CreatedAt, &d.UpdatedAt, &d.StorageNodeID, &d.RecycledInPlace}, extra...)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return d, errDatasetNotFound
 	}
@@ -117,7 +117,7 @@ func checkNameFree(ctx context.Context, q querier, name string, exceptID int64) 
 type dirOwner struct {
 	ID      int64
 	Name    string
-	Deleted bool // the dataset is in the recycle bin (deleted without its files, which stay in place)
+	Deleted bool // the dataset is in the recycle bin (deleted without its files, or recycled in place on S3)
 }
 
 // String describes the owner in messages: “<name>” or “<name>”（在回收站中）.
@@ -128,15 +128,16 @@ func (o dirOwner) String() string {
 	return "“" + o.Name + "”"
 }
 
-// datasetUsingDir returns the dataset registered for dirName (ignoring
-// case), nil if none. A dataset in the recycle bin keeps its folder unless
-// it was deleted with its files (the unique index datasets_dir_name_key
-// has the same condition). exceptID is left out.
-func datasetUsingDir(ctx context.Context, q querier, dirName string, exceptID int64) (*dirOwner, error) {
+// datasetUsingDir returns the dataset registered for dirName on storageNodeID
+// (ignoring case), nil if none. A dataset in the recycle bin keeps its folder
+// unless it was deleted with its files AND moved out of dirName (the unique
+// index datasets_dir_name_key has the same condition). exceptID is left out.
+func datasetUsingDir(ctx context.Context, q querier, storageNodeID int64, dirName string, exceptID int64) (*dirOwner, error) {
 	var o dirOwner
 	err := q.QueryRow(ctx, `SELECT id, name, deleted_at IS NOT NULL FROM datasets
-		WHERE lower(dir_name) = lower($1) AND (deleted_at IS NULL OR NOT delete_files) AND id <> $2`,
-		dirName, exceptID).Scan(&o.ID, &o.Name, &o.Deleted)
+		WHERE storage_node_id = $1 AND lower(dir_name) = lower($2)
+			AND (deleted_at IS NULL OR NOT delete_files OR recycled_in_place) AND id <> $3`,
+		storageNodeID, dirName, exceptID).Scan(&o.ID, &o.Name, &o.Deleted)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -146,9 +147,9 @@ func datasetUsingDir(ctx context.Context, q querier, dirName string, exceptID in
 	return &o, nil
 }
 
-func insertDataset(ctx context.Context, q querier, name, dirName, description, origin string) (Dataset, error) {
-	d, err := scanDataset(q.QueryRow(ctx, `INSERT INTO datasets (name, dir_name, description, origin)
-		VALUES ($1, $2, $3, $4) RETURNING `+datasetColumns, name, dirName, description, origin))
+func insertDataset(ctx context.Context, q querier, storageNodeID int64, name, dirName, description, origin string) (Dataset, error) {
+	d, err := scanDataset(q.QueryRow(ctx, `INSERT INTO datasets (storage_node_id, name, dir_name, description, origin)
+		VALUES ($1, $2, $3, $4, $5) RETURNING `+datasetColumns, storageNodeID, name, dirName, description, origin))
 	return d, uniqueViolation(err, dirName)
 }
 

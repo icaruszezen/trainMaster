@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 const (
@@ -58,12 +59,19 @@ func (s *Service) CreateImport(ctx context.Context, datasetID int64, in CreateIm
 	if err != nil {
 		return Import{}, err
 	}
+	if err := s.checkNotMigrating(datasetID); err != nil {
+		return Import{}, err
+	}
 	d, err := queryDataset(ctx, s.db, datasetID, false)
 	if err != nil {
 		return Import{}, err
 	}
-	if !s.dirExists(d.DirName) {
-		return Import{}, errDatasetDirMissing(s.datasetDir(d.DirName))
+	_, vol, err := s.volumeFor(ctx, d.StorageNodeID)
+	if err != nil {
+		return Import{}, err
+	}
+	if err := vol.IsPlainDir(ctx, storagenode.SpaceDatasets, d.DirName); err != nil {
+		return Import{}, errDatasetDirMissing(vol.DisplayPath(storagenode.SpaceDatasets, d.DirName))
 	}
 	// An archive needs room for itself and its extracted content; a folder
 	// is staged once and then moved.
@@ -73,6 +81,11 @@ func (s *Service) CreateImport(ctx context.Context, datasetID int64, in CreateIm
 	}
 	if err := s.checkFreeSpace(need); err != nil {
 		return Import{}, err
+	}
+	if !vol.IsBuiltin() {
+		if err := s.checkVolumeFreeSpace(ctx, vol, n.FileSize); err != nil {
+			return Import{}, err
+		}
 	}
 	job, err := insertImport(ctx, s.db, n)
 	if err != nil {
@@ -136,6 +149,22 @@ func (s *Service) checkFreeSpace(need int64) error {
 	want := uint64(need) + reserveBytes
 	if u.FreeBytes < want {
 		return newError(ErrInsufficientStorage, "磁盘剩余空间不足：可用 %s，至少需要 %s",
+			formatBytes(u.FreeBytes), formatBytes(want))
+	}
+	return nil
+}
+
+func (s *Service) checkVolumeFreeSpace(ctx context.Context, vol storagenode.Volume, need int64) error {
+	u, err := vol.Usage(ctx)
+	if err != nil {
+		if !errors.Is(err, storage.ErrUsageUnsupported) {
+			s.log.Warn("check storage node free space", "node_id", vol.NodeID(), "err", err)
+		}
+		return nil
+	}
+	want := uint64(need) + reserveBytes
+	if u.FreeBytes < want {
+		return newError(ErrInsufficientStorage, "目标存储节点剩余空间不足：可用 %s，至少需要 %s",
 			formatBytes(u.FreeBytes), formatBytes(want))
 	}
 	return nil
@@ -547,6 +576,9 @@ func (s *Service) CancelImport(ctx context.Context, datasetID, importID int64) (
 // StartScan queues a scan job that re-synchronizes the index with the
 // dataset folder.
 func (s *Service) StartScan(ctx context.Context, datasetID int64) (Import, error) {
+	if err := s.checkNotMigrating(datasetID); err != nil {
+		return Import{}, err
+	}
 	var job Import
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		d, err := queryDataset(ctx, tx, datasetID, true)

@@ -14,7 +14,7 @@ const Name = "trainMaster"
 var (
 	// Version is the release version. This default is the single source of
 	// truth for development builds; releases override it via -ldflags.
-	Version = "0.1.0-dev"
+	Version = "0.5.0"
 	// Commit is the git commit the binary was built from.
 	Commit = "unknown"
 	// BuildTime is the build timestamp (RFC 3339, UTC).

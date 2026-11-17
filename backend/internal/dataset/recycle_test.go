@@ -15,7 +15,12 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/recycle"
+	"github.com/icaruszezen/trainmaster/backend/internal/storage"
 )
+
+func (s *Service) recycleDir(id int64) string {
+	return filepath.Join(s.storage.Dir(storage.Datasets), recyclePrefix+strconv.FormatInt(id, 10))
+}
 
 // expire makes the rows of table (datasets or dataset_versions) look as if
 // they had been in the recycle bin for longer than recycle.Retention.

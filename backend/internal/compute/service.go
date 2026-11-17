@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // DefaultHeartbeatInterval is the heartbeat interval when none is set
@@ -30,8 +32,9 @@ const offlineGrace = 5 * time.Second
 
 // Options are the dependencies of a Service.
 type Options struct {
-	DB     *pgxpool.Pool
-	Logger *slog.Logger
+	DB           *pgxpool.Pool
+	StorageNodes *storagenode.Service
+	Logger       *slog.Logger
 	// HeartbeatInterval is how often nodes are told to send heartbeats;
 	// zero means DefaultHeartbeatInterval.
 	HeartbeatInterval time.Duration
@@ -43,16 +46,23 @@ type Options struct {
 // Service implements the compute node operations used by the HTTP
 // handlers.
 type Service struct {
-	db       *pgxpool.Pool
-	log      *slog.Logger
-	interval time.Duration
-	clock    func() time.Time
-	history  *History
+	db           *pgxpool.Pool
+	storageNodes *storagenode.Service
+	log          *slog.Logger
+	interval     time.Duration
+	clock        func() time.Time
+	history      *History
 }
 
 // NewService creates a Service.
 func NewService(o Options) *Service {
-	s := &Service{db: o.DB, log: o.Logger, interval: o.HeartbeatInterval, clock: o.Now}
+	s := &Service{
+		db:           o.DB,
+		storageNodes: o.StorageNodes,
+		log:          o.Logger,
+		interval:     o.HeartbeatInterval,
+		clock:        o.Now,
+	}
 	if s.interval <= 0 {
 		s.interval = DefaultHeartbeatInterval
 	}
@@ -174,7 +184,16 @@ func (s *Service) Heartbeat(ctx context.Context, in HeartbeatInput, address stri
 	if env != nil {
 		s.log.Debug("compute node reported its environment", "node_id", id)
 	}
-	return HeartbeatResult{NodeID: id, HeartbeatIntervalSeconds: s.interval.Seconds(), ProbeRequested: probeRequested}, nil
+	res := HeartbeatResult{NodeID: id, HeartbeatIntervalSeconds: s.interval.Seconds(), ProbeRequested: probeRequested}
+	if s.storageNodes != nil {
+		if policy, perr := s.storageNodes.GetTrainerCachePolicy(ctx); perr == nil {
+			payload := policy.TaskPayload()
+			res.DatasetCache = &payload
+		} else {
+			s.log.Warn("load trainer dataset cache policy", "err", perr)
+		}
+	}
+	return res, nil
 }
 
 func encodeSections(h *Hardware, e *Environment, m *Metrics) (hw, env, metrics []byte, err error) {

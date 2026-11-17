@@ -19,6 +19,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/review"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 	"github.com/icaruszezen/trainmaster/backend/internal/trainerpkg"
 	"github.com/icaruszezen/trainmaster/backend/internal/training"
 )
@@ -44,6 +45,10 @@ type Options struct {
 	// X-Forwarded-For header determines the client IP. Empty: the header
 	// is ignored and the TCP peer is the client.
 	TrustedProxies []string
+	// StorageNodes serves /api/v1/storage (local/remote storage nodes,
+	// trainer dataset cache policy, and cross-node migrations). If nil,
+	// those routes are not mounted.
+	StorageNodes *storagenode.Service
 	// Datasets serves /api/v1/datasets. If nil, those routes are not
 	// mounted (tests of other areas need no database).
 	Datasets *dataset.Service
@@ -103,18 +108,19 @@ var plannedModules = []string{
 }
 
 type server struct {
-	log       *slog.Logger
-	db        Database
-	storage   *storage.Storage
-	datasets  *dataset.Service
-	projects  *project.Service // nil unless datasets is set
-	compute   *compute.Service
-	models    *model.Service
-	reviews   *review.Service
-	training  *training.Service
-	host      *hostinfo.Host
-	nodeToken string
-	startedAt time.Time
+	log          *slog.Logger
+	db           Database
+	storage      *storage.Storage
+	storageNodes *storagenode.Service
+	datasets     *dataset.Service
+	projects     *project.Service // nil unless datasets is set
+	compute      *compute.Service
+	models       *model.Service
+	reviews      *review.Service
+	training     *training.Service
+	host         *hostinfo.Host
+	nodeToken    string
+	startedAt    time.Time
 	// localTrainerMode is Options.LocalTrainerMode.
 	localTrainerMode string
 	// reviewerTool is Options.ReviewerTool.
@@ -127,7 +133,8 @@ type server struct {
 
 // NewHandler returns the root HTTP handler.
 func NewHandler(o Options) http.Handler {
-	s := &server{log: o.Logger, db: o.DB, storage: o.Storage, datasets: o.Datasets, compute: o.Compute,
+	s := &server{log: o.Logger, db: o.DB, storage: o.Storage, storageNodes: o.StorageNodes,
+		datasets: o.Datasets, compute: o.Compute,
 		models: o.Models, reviews: o.Reviews, training: o.Training, reviewerTool: o.ReviewerTool, host: o.Host,
 		nodeToken: o.NodeToken, localTrainerMode: o.LocalTrainerMode, startedAt: o.StartedAt,
 		trainerPackage: trainerpkg.New(o.TrainerPackageDir), dataVersions: o.DataVersions}
@@ -157,6 +164,9 @@ func NewHandler(o Options) http.Handler {
 
 		r.Route("/v1", func(r chi.Router) {
 			r.Get("/system/info", s.systemInfo)
+			if s.storageNodes != nil {
+				r.Route("/storage", s.storageRoutes)
+			}
 			if s.datasets != nil {
 				r.Route("/datasets", s.datasetRoutes)
 			}

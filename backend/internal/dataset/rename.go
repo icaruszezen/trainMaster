@@ -12,13 +12,14 @@ import (
 	"maps"
 	"os"
 	"path"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // Renaming images that share a name (同名图片重命名). Images in different
@@ -560,15 +561,23 @@ func numberedStem(stem, ext string, k int) string {
 // the same bytes. A file that cannot be read counts as different (the image
 // is then renamed, which is always safe).
 func sameContent(ctx context.Context, a, b string, sa, sb int64) (bool, error) {
+	return sameContentOpen(ctx,
+		func() (io.ReadCloser, error) { return os.Open(a) },
+		func() (io.ReadCloser, error) { return os.Open(b) },
+		sa, sb,
+	)
+}
+
+func sameContentOpen(ctx context.Context, openA, openB func() (io.ReadCloser, error), sa, sb int64) (bool, error) {
 	if sa != sb {
 		return false, nil
 	}
-	fa, err := os.Open(a)
+	fa, err := openA()
 	if err != nil {
 		return false, nil
 	}
 	defer fa.Close()
-	fb, err := os.Open(b)
+	fb, err := openB()
 	if err != nil {
 		return false, nil
 	}
@@ -597,9 +606,13 @@ func sameContent(ctx context.Context, a, b string, sa, sb int64) (bool, error) {
 // fileDigest returns the SHA-256 of the file at name. A file that cannot be
 // read gets a digest of its own (it equals no other file, see sameContent).
 func fileDigest(ctx context.Context, name string) (string, error) {
-	f, err := os.Open(name)
+	return fileDigestOpen(ctx, name, func() (io.ReadCloser, error) { return os.Open(name) })
+}
+
+func fileDigestOpen(ctx context.Context, key string, open func() (io.ReadCloser, error)) (string, error) {
+	f, err := open()
 	if err != nil {
-		return "unreadable:" + name, nil
+		return "unreadable:" + key, nil
 	}
 	defer f.Close()
 	h := sha256.New()
@@ -614,7 +627,7 @@ func fileDigest(ctx context.Context, name string) (string, error) {
 			return string(h.Sum(nil)), nil
 		}
 		if err != nil {
-			return "unreadable:" + name, nil
+			return "unreadable:" + key, nil
 		}
 	}
 }
@@ -649,7 +662,7 @@ func planRenames(pl *namePlanner, images map[string]diskFile, pairs map[string]s
 // and their VOC files, whose names other images of the dataset in root or
 // of the upload have (see the top of this file). It returns the plans of
 // the renamed and identical images, in image order.
-func (s *Service) renameStaged(ctx context.Context, root *os.Root, staged, onConflict string,
+func (s *Service) renameStaged(ctx context.Context, root storagenode.Dir, staged, onConflict string,
 	p *progressTracker) ([]*renamePlan, error) {
 	p.setStage(ctx, stageRenaming, unitFiles, 0)
 	in, err := walkFiles(ctx, s.log, staged, nil)
@@ -663,29 +676,37 @@ func (s *Service) renameStaged(ctx context.Context, root *os.Root, staged, onCon
 		return nil, nil
 	}
 	var walked int64
-	have, err := walkFiles(ctx, s.log, root.Name(), func() {
+	have, err := walkDirFiles(ctx, s.log, root, func() {
 		walked++
 		p.set(ctx, walked, 0)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("walk dataset folder: %w", err)
 	}
-	src, err := os.OpenRoot(staged)
+	src, err := storagenode.OpenLocalDir(staged)
 	if err != nil {
 		return nil, err
 	}
 	defer src.Close()
 
-	file := func(r nameRef) string {
+	openRef := func(r nameRef) func() (io.ReadCloser, error) {
 		if r.staged {
-			return filepath.Join(staged, filepath.FromSlash(r.rel))
+			return func() (io.ReadCloser, error) { return src.Open(r.rel) }
 		}
-		return filepath.Join(root.Name(), filepath.FromSlash(r.rel))
+		return func() (io.ReadCloser, error) { return root.Open(r.rel) }
+	}
+	keyOf := func(r nameRef) string {
+		if r.staged {
+			return "staged:" + r.rel
+		}
+		return "dataset:" + r.rel
 	}
 	same := func(ctx context.Context, a, b nameRef) (bool, error) {
-		return sameContent(ctx, file(a), file(b), a.size, b.size)
+		return sameContentOpen(ctx, openRef(a), openRef(b), a.size, b.size)
 	}
-	digest := func(ctx context.Context, r nameRef) (string, error) { return fileDigest(ctx, file(r)) }
+	digest := func(ctx context.Context, r nameRef) (string, error) {
+		return fileDigestOpen(ctx, keyOf(r), openRef(r))
+	}
 	pl := newNamePlanner(ctx, have.Images, have.xmlPaths(), in.Images, in.xmlPaths(), onConflict, same, digest)
 	cache := newAnnotationCache(src)
 	pairs := pairAnnotations(in.imagePaths(), in.xmlPaths(), cache.filename)
@@ -715,23 +736,27 @@ func (s *Service) renameStaged(ctx context.Context, root *os.Root, staged, onCon
 // list. It stops at the next image when ctx ends. An image the file system
 // does not let it rename (a read-only folder, a full disk) keeps its name
 // and is counted as failed; the job goes on.
-func (s *Service) renameInPlace(ctx context.Context, root *os.Root, p *progressTracker,
+func (s *Service) renameInPlace(ctx context.Context, root storagenode.Dir, p *progressTracker,
 	record func([]*renamePlan)) (renameResult, error) {
 	var res renameResult
 	p.setStage(ctx, stageRenaming, unitFiles, 0)
 	var walked int64
-	set, err := walkFiles(ctx, s.log, root.Name(), func() {
+	set, err := walkDirFiles(ctx, s.log, root, func() {
 		walked++
 		p.set(ctx, walked, 0)
 	})
 	if err != nil {
 		return res, fmt.Errorf("walk dataset folder: %w", err)
 	}
-	file := func(r nameRef) string { return filepath.Join(root.Name(), filepath.FromSlash(r.rel)) }
-	same := func(ctx context.Context, a, b nameRef) (bool, error) {
-		return sameContent(ctx, file(a), file(b), a.size, b.size)
+	openRef := func(r nameRef) func() (io.ReadCloser, error) {
+		return func() (io.ReadCloser, error) { return root.Open(r.rel) }
 	}
-	digest := func(ctx context.Context, r nameRef) (string, error) { return fileDigest(ctx, file(r)) }
+	same := func(ctx context.Context, a, b nameRef) (bool, error) {
+		return sameContentOpen(ctx, openRef(a), openRef(b), a.size, b.size)
+	}
+	digest := func(ctx context.Context, r nameRef) (string, error) {
+		return fileDigestOpen(ctx, "dataset:"+r.rel, openRef(r))
+	}
 	pl := newNamePlanner(ctx, nil, nil, set.Images, set.xmlPaths(), ConflictSkip, same, digest)
 	cache := newAnnotationCache(root)
 	pairs := pairAnnotations(set.imagePaths(), set.xmlPaths(), cache.filename)
@@ -784,7 +809,7 @@ const renameRecordBatch = 500
 // renamed VOC file like a saved annotation (with the permissions of the old
 // one, synced to disk before the old one is removed): the folder holds the
 // user's only copy, unlike the staging folder of an upload.
-func renameImageFiles(root *os.Root, plan *renamePlan, durable bool) error {
+func renameImageFiles(root storagenode.Dir, plan *renamePlan, durable bool) error {
 	if existsIn(root, plan.To) {
 		return fmt.Errorf("%s: %w", plan.To, fs.ErrExist)
 	}
@@ -819,28 +844,19 @@ func renameImageFiles(root *os.Root, plan *renamePlan, durable bool) error {
 			return err
 		}
 		if err := renameIn(root, tmp, plan.XMLTo); err != nil {
-			_ = root.Remove(filepath.FromSlash(tmp))
+			_ = root.RemoveFile(context.Background(), tmp)
 			return err
 		}
 	} else {
-		f, err := root.OpenFile(filepath.FromSlash(plan.XMLTo), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-		if err != nil {
-			return err
-		}
-		_, err = f.Write(data)
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-		if err != nil {
-			_ = root.Remove(filepath.FromSlash(plan.XMLTo))
+		if err := root.CreateExclusive(context.Background(), plan.XMLTo, data, 0o644); err != nil {
 			return err
 		}
 	}
 	if err := renameIn(root, plan.From, plan.To); err != nil {
-		_ = root.Remove(filepath.FromSlash(plan.XMLTo))
+		_ = root.RemoveFile(context.Background(), plan.XMLTo)
 		return err
 	}
-	if err := root.Remove(filepath.FromSlash(plan.XMLFrom)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := root.RemoveFile(context.Background(), plan.XMLFrom); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return &leftoverError{path: plan.XMLFrom, err: err}
 	}
 	return nil
@@ -858,21 +874,21 @@ func (e *leftoverError) Unwrap() error { return e.err }
 
 // renameIn renames the file at from to to inside root (to must not exist;
 // the caller checked).
-func renameIn(root *os.Root, from, to string) error {
-	return os.Rename(filepath.Join(root.Name(), filepath.FromSlash(from)), filepath.Join(root.Name(), filepath.FromSlash(to)))
+func renameIn(root storagenode.Dir, from, to string) error {
+	return root.RenameFile(context.Background(), from, to, false)
 }
 
 // existsIn reports whether anything is at rel in root (without following a
 // symbolic link there).
-func existsIn(root *os.Root, rel string) bool {
-	_, err := root.Lstat(filepath.FromSlash(rel))
+func existsIn(root storagenode.Dir, rel string) bool {
+	_, err := root.Lstat(rel)
 	return err == nil
 }
 
 // readSmallFile reads the file at rel in root, failing when it is larger
 // than limit bytes.
-func readSmallFile(root *os.Root, rel string, limit int64) ([]byte, error) {
-	f, err := root.Open(filepath.FromSlash(rel))
+func readSmallFile(root storagenode.Dir, rel string, limit int64) ([]byte, error) {
+	f, err := root.Open(rel)
 	if err != nil {
 		return nil, err
 	}

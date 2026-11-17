@@ -7,12 +7,15 @@ import (
 	"io/fs"
 	"log/slog"
 	"maps"
-	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // diskFile is an image or annotation file found on disk.
@@ -116,9 +119,72 @@ func walkFiles(ctx context.Context, log *slog.Logger, root string, tick func()) 
 	return set, nil
 }
 
+// walkDirFiles lists the images and XML files below dir across local or
+// remote storage nodes.
+func walkDirFiles(ctx context.Context, log *slog.Logger, dir storagenode.Dir, tick func()) (*fileSet, error) {
+	if local := dir.LocalDir(); local != "" {
+		return walkFiles(ctx, log, local, tick)
+	}
+	set := &fileSet{Images: map[string]diskFile{}, XMLs: map[string]diskFile{}}
+	err := dir.WalkFiles(ctx, func(rel string, info fs.FileInfo, isDir bool) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if tick != nil {
+			tick()
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		name := path.Base(rel)
+		if isDir {
+			if isJunkSegment(name) {
+				return filepath.SkipDir
+			}
+			if !utf8.ValidString(name) {
+				log.Warn("skipping folder with a name that is not valid UTF-8", "path", strconv.Quote(rel))
+				set.NamesInvalid++
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		// Ensure none of the parent segments on object stores were junk or invalid UTF-8.
+		for seg := range strings.SplitSeq(rel, "/") {
+			if isJunkSegment(seg) {
+				set.Ignored++
+				return nil
+			}
+			if !utf8.ValidString(seg) {
+				log.Warn("skipping file with a name that is not valid UTF-8", "path", strconv.Quote(rel))
+				set.NamesInvalid++
+				return nil
+			}
+		}
+		kind := classify(rel)
+		if kind == kindIgnored {
+			set.Ignored++
+			return nil
+		}
+		f := diskFile{Size: info.Size(), ModTime: dbTime(info.ModTime())}
+		if kind == kindImage {
+			set.Images[rel] = f
+		} else {
+			set.XMLs[rel] = f
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return set, nil
+}
+
 // annotationCache parses each annotation file at most once per job.
 type annotationCache struct {
-	root   *os.Root
+	root   storagenode.Dir
 	parsed map[string]annotationResult
 }
 
@@ -127,7 +193,7 @@ type annotationResult struct {
 	err error
 }
 
-func newAnnotationCache(root *os.Root) *annotationCache {
+func newAnnotationCache(root storagenode.Dir) *annotationCache {
 	return &annotationCache{root: root, parsed: map[string]annotationResult{}}
 }
 
@@ -141,7 +207,7 @@ func (c *annotationCache) get(rel string) (*vocAnnotation, error) {
 }
 
 func (c *annotationCache) parse(rel string) (*vocAnnotation, error) {
-	f, err := c.root.Open(filepath.FromSlash(rel))
+	f, err := c.root.Open(rel)
 	if err != nil {
 		return nil, err
 	}
@@ -195,18 +261,38 @@ func errDatasetDirMissing(dir string) error {
 	return newError(ErrConflict, "数据集文件夹不存在：%s", dir)
 }
 
-// openDatasetRoot opens the folder of d for reading and writing. The
-// folder itself must be a real directory, not a symbolic link.
-func (s *Service) openDatasetRoot(d Dataset) (*os.Root, error) {
-	dir := s.datasetDir(d.DirName)
-	if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
-		return nil, errDatasetDirMissing(dir)
-	}
-	root, err := os.OpenRoot(dir)
+// openDatasetRoot opens the folder of d on its storage node for reading and
+// writing. The folder itself must be a real directory, not a symbolic link.
+func (s *Service) openDatasetRoot(ctx context.Context, d Dataset) (storagenode.Dir, error) {
+	_, vol, err := s.volumeFor(ctx, d.StorageNodeID)
 	if err != nil {
+		return nil, err
+	}
+	disp := vol.DisplayPath(storagenode.SpaceDatasets, d.DirName)
+	if err := vol.IsPlainDir(ctx, storagenode.SpaceDatasets, d.DirName); err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, storagenode.ErrNotDirectory) {
+			return nil, errDatasetDirMissing(disp)
+		}
+		return nil, fmt.Errorf("check dataset folder: %w", err)
+	}
+	root, err := vol.OpenDir(ctx, storagenode.SpaceDatasets, d.DirName)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, storagenode.ErrNotDirectory) {
+			return nil, errDatasetDirMissing(disp)
+		}
 		return nil, fmt.Errorf("open dataset folder: %w", err)
 	}
 	return root, nil
+}
+
+// OpenDatasetDir opens the live dataset's directory handle on whichever
+// storage node owns it (used by review package building).
+func (s *Service) OpenDatasetDir(ctx context.Context, datasetID int64) (storagenode.Dir, error) {
+	d, err := queryDataset(ctx, s.db, datasetID, false)
+	if err != nil {
+		return nil, err
+	}
+	return s.openDatasetRoot(ctx, d)
 }
 
 // syncIndex makes dataset_images match the files in the dataset folder
@@ -215,7 +301,7 @@ func (s *Service) openDatasetRoot(d Dataset) (*os.Root, error) {
 // under the stage "scanning".
 func (s *Service) syncIndex(ctx context.Context, d Dataset, p *progressTracker) (scanResult, error) {
 	var res scanResult
-	root, err := s.openDatasetRoot(d)
+	root, err := s.openDatasetRoot(ctx, d)
 	if err != nil {
 		return res, err
 	}
@@ -224,7 +310,7 @@ func (s *Service) syncIndex(ctx context.Context, d Dataset, p *progressTracker) 
 	// While walking, the total is unknown (0) and done counts entries.
 	p.setStage(ctx, stageScanning, unitFiles, 0)
 	var walked int64
-	set, err := walkFiles(ctx, s.log, root.Name(), func() {
+	set, err := walkDirFiles(ctx, s.log, root, func() {
 		walked++
 		p.set(ctx, walked, 0)
 	})
@@ -327,9 +413,9 @@ func unchanged(old indexedImage, img diskFile, xmlRel string, xml *diskFile) boo
 }
 
 // indexImage reads the dimensions of an image and parses its annotation.
-func (s *Service) indexImage(root *os.Root, cache *annotationCache, rel string, img diskFile, xmlRel string, xml *diskFile) imageRecord {
+func (s *Service) indexImage(root storagenode.Dir, cache *annotationCache, rel string, img diskFile, xmlRel string, xml *diskFile) imageRecord {
 	rec := imageRecord{RelPath: rel, Size: img.Size, ModTime: img.ModTime, State: annotationNone}
-	if f, err := root.Open(filepath.FromSlash(rel)); err == nil {
+	if f, err := root.Open(rel); err == nil {
 		rec.Width, rec.Height = imageDimensions(f)
 		f.Close()
 	}

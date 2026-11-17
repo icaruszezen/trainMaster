@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 func TestNormalizeObjects(t *testing.T) {
@@ -77,7 +79,7 @@ func TestNormalizeObjects(t *testing.T) {
 	}
 }
 
-func openTestRoot(t *testing.T, files map[string][]byte, dirs ...string) *os.Root {
+func openTestRoot(t *testing.T, files map[string][]byte, dirs ...string) storagenode.Dir {
 	t.Helper()
 	dir := t.TempDir()
 	writeFiles(t, dir, files)
@@ -86,7 +88,7 @@ func openTestRoot(t *testing.T, files map[string][]byte, dirs ...string) *os.Roo
 			t.Fatal(err)
 		}
 	}
-	root, err := os.OpenRoot(dir)
+	root, err := storagenode.OpenLocalDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +129,7 @@ func TestDefaultAnnotationPath(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		// A symbolic link named Annotations is not a folder to write into.
 		linked := openTestRoot(t, nil, "set/JPEGImages", "elsewhere")
-		if err := os.Symlink(filepath.Join(linked.Name(), "elsewhere"), filepath.Join(linked.Name(), "set", "Annotations")); err != nil {
+		if err := os.Symlink(filepath.Join(linked.LocalDir(), "elsewhere"), filepath.Join(linked.LocalDir(), "set", "Annotations")); err != nil {
 			t.Fatal(err)
 		}
 		if got := defaultAnnotationPath(linked, "set/JPEGImages/a.jpg"); got != "set/JPEGImages/a.xml" {
@@ -144,7 +146,7 @@ func TestAnnotationCandidate(t *testing.T) {
 		"other/JPEGImagesX/g.jpg": nil, "other/Annotations/g.xml": nil, // not a VOC image folder
 		"dir/h.xml/x": nil, // a folder named like the file does not count
 	}, "VOC/JPEGImages", "empty")
-	check := func(root *os.Root, cases map[string]string) {
+	check := func(root storagenode.Dir, cases map[string]string) {
 		t.Helper()
 		for rel, want := range cases {
 			if got := annotationCandidate(root, rel); got != want {
@@ -183,10 +185,10 @@ func TestAnnotationCandidate(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		// A scan does not follow symbolic links.
 		linked := openTestRoot(t, map[string][]byte{"set/real/a.xml": nil, "set/JPEGImages/b.xml": nil}, "set/JPEGImages")
-		if err := os.Symlink(filepath.Join(linked.Name(), "set", "real"), filepath.Join(linked.Name(), "set", "Annotations")); err != nil {
+		if err := os.Symlink(filepath.Join(linked.LocalDir(), "set", "real"), filepath.Join(linked.LocalDir(), "set", "Annotations")); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(filepath.Join(linked.Name(), "set", "JPEGImages", "b.xml"), filepath.Join(linked.Name(), "set", "JPEGImages", "c.xml")); err != nil {
+		if err := os.Symlink(filepath.Join(linked.LocalDir(), "set", "JPEGImages", "b.xml"), filepath.Join(linked.LocalDir(), "set", "JPEGImages", "c.xml")); err != nil {
 			t.Fatal(err)
 		}
 		for rel, want := range map[string]string{"set/JPEGImages/a.jpg": "", "set/JPEGImages/c.jpg": ""} {
@@ -209,7 +211,7 @@ func caseSensitive(t *testing.T) bool {
 func TestAnnotationFileChangeUndo(t *testing.T) {
 	log := slog.New(slog.DiscardHandler)
 	root := openTestRoot(t, map[string][]byte{"a.xml": []byte("old"), "d.xml": []byte("doomed")})
-	dir := root.Name()
+	dir := root.LocalDir()
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(filepath.Join(dir, "d.xml"), 0o600); err != nil {
 			t.Fatal(err)
@@ -308,7 +310,7 @@ func TestAnnotationFileChangeUndo(t *testing.T) {
 
 func TestWriteAnnotationFile(t *testing.T) {
 	root := openTestRoot(t, map[string][]byte{"NG/a.xml": []byte("old")}, "OK")
-	dir := root.Name()
+	dir := root.LocalDir()
 	if err := os.Chmod(filepath.Join(dir, "NG", "a.xml"), 0o664); err != nil {
 		t.Fatal(err)
 	}

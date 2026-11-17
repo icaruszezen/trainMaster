@@ -119,7 +119,7 @@ func wantKeys(t *testing.T, what string, obj map[string]any, keys ...string) {
 }
 
 var (
-	datasetKeys = []string{"id", "name", "description", "dir_name", "path", "origin", "status", "status_updated_at", "directory_missing",
+	datasetKeys = []string{"id", "name", "description", "dir_name", "path", "storage_node", "origin", "status", "status_updated_at", "directory_missing",
 		"image_count", "annotated_count", "empty_count", "invalid_count", "object_count", "label_count", "total_bytes",
 		"covers", "projects", "version_count", "active_import", "scanned_at", "created_at", "updated_at"}
 	importKeys = []string{"id", "dataset_id", "source", "status", "on_conflict", "annotation_format", "classes", "file_name", "file_size",
@@ -619,7 +619,7 @@ func TestDatasetAPIDirectoriesAndJobs(t *testing.T) {
 	if rawDirs["total"] != float64(2) {
 		t.Fatalf("directories = %v", rawDirs)
 	}
-	wantKeys(t, "directory", rawDirs["items"].([]any)[0].(map[string]any), "name", "path", "registered", "dataset_id",
+	wantKeys(t, "directory", rawDirs["items"].([]any)[0].(map[string]any), "name", "path", "storage_node", "registered", "dataset_id",
 		"in_recycle_bin", "image_count", "annotation_count", "total_bytes", "approximate", "modified_at")
 	dirs := want[List[dataset.Directory]](t, e.do("GET", "/api/v1/datasets/directories", nil), 200).Items
 	if dirs[0].Name != "existing" || dirs[0].ImageCount != 2 || dirs[0].AnnotationCount != 1 || dirs[0].Registered ||

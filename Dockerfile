@@ -12,7 +12,7 @@
 # 内网镜像仓库可替换基础镜像：--build-arg NODE_IMAGE=registry.example.com/node:22-alpine 等。
 
 ARG NODE_IMAGE=node:22-alpine
-ARG GO_IMAGE=golang:1.24-alpine
+ARG GO_IMAGE=golang:1.25-alpine
 ARG RUNTIME_IMAGE=alpine:3.23
 
 # ---- 1. 前端 ----

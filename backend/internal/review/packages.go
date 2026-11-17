@@ -23,7 +23,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 	"github.com/icaruszezen/trainmaster/backend/internal/model"
 	"github.com/icaruszezen/trainmaster/backend/internal/reviewfile"
-	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // Review packages (审图包): the images of a review with their review VOC
@@ -260,7 +260,7 @@ type Package struct {
 
 type packageDataset struct {
 	name, dirName string
-	root          *os.Root // nil: the folder cannot be opened
+	root          storagenode.Dir // nil: the folder cannot be opened
 }
 
 // packedImage is what Write records about an image it packed, for the
@@ -327,7 +327,7 @@ func (s *Service) OpenPackage(ctx context.Context, reviewID int64, token string)
 		}
 		// The layout of the dataset folders is the storage contract:
 		// datasets/<dir_name>/<image path>.
-		root, err := os.OpenRoot(filepath.Join(s.storage.Dir(storage.Datasets), d.dirName))
+		root, err := s.datasets.OpenDatasetDir(ctx, id)
 		if err != nil {
 			p.log.Warn("review package: dataset folder cannot be opened; its images are left out", "dataset_id", id,
 				"err", err)
@@ -463,7 +463,7 @@ func (p *Package) copyImage(zw *zip.Writer, datasetID int64, rel, name string) (
 	if d == nil || d.root == nil {
 		return false, nil
 	}
-	f, err := d.root.Open(filepath.FromSlash(rel))
+	f, err := d.root.Open(rel)
 	if err != nil {
 		p.log.Debug("review package: leaving out an image that cannot be opened", "path", rel, "err", err)
 		return false, nil

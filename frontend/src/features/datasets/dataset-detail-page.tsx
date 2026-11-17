@@ -23,6 +23,7 @@ import { toast } from "sonner"
 import { PageHeader } from "@/components/page-header"
 import { ScrollingTabsList } from "@/components/scrolling-tabs-list"
 import { StatCard } from "@/components/stat-card"
+import { StorageNodeBadge } from "@/components/storage-node-badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -452,6 +453,7 @@ function DatasetMeta({
       >
         <DatasetStatusPicker dataset={dataset} />
       </span>
+      <StorageNodeBadge node={dataset.storage_node} />
       <Badge variant="outline" className="font-normal">
         {originLabels[dataset.origin]}
       </Badge>

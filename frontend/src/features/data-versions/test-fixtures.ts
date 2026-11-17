@@ -6,6 +6,7 @@ import type {
   DataVersionSkipped,
   DataVersionStats,
 } from "@/features/data-versions/api"
+import { BUILTIN_STORAGE_NODE_REF } from "@/features/system/storage-api"
 
 export const NO_SKIPPED: DataVersionSkipped = {
   unannotated: 0,
@@ -45,6 +46,7 @@ export function dataVersion(changes: Partial<DataVersion> = {}): DataVersion {
     project_name: "外观检测",
     version: 4,
     note: "补充夜班数据",
+    storage_node: BUILTIN_STORAGE_NODE_REF,
     status: "ready",
     error: "",
     progress: null,
@@ -103,6 +105,7 @@ export function dataset(changes: Partial<Dataset> = {}): Dataset {
     description: "",
     dir_name: "line_a",
     path: "/data/datasets/line_a",
+    storage_node: BUILTIN_STORAGE_NODE_REF,
     origin: "directory",
     status: "",
     status_updated_at: null,

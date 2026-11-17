@@ -10,8 +10,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // Downloads: YOLO, Pascal VOC and COCO zip archives streamed from the
@@ -146,7 +145,7 @@ type Export struct {
 
 	db               querier
 	log              *slog.Logger
-	root             *os.Root // the version folder
+	root             storagenode.Dir // the version folder
 	version          DataVersion
 	format           string
 	includeAugmented bool
@@ -194,12 +193,20 @@ func (s *Service) OpenExport(ctx context.Context, id int64, token string) (*Expo
 	}); err != nil {
 		return nil, err
 	}
-	root, err := os.OpenRoot(s.versionDir(dirName))
+	root, err := s.openVersionDir(ctx, v.StorageNodeID, dirName)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, newError(ErrConflict, "数据版本的文件夹不存在（可能已被移走），无法下载")
 		}
 		return nil, fmt.Errorf("open data version folder: %w", err)
+	}
+	// On object stores (S3), OpenDir succeeds without checking object existence;
+	// check version.json so a missing prefix still returns ErrConflict.
+	if root.LocalDir() == "" {
+		if _, err := root.Lstat(manifestFile); errors.Is(err, fs.ErrNotExist) {
+			_ = root.Close()
+			return nil, newError(ErrConflict, "数据版本的文件夹不存在（可能已被移走），无法下载")
+		}
 	}
 	return &Export{FileName: r.fileName, db: s.db, root: root, version: v, format: r.format,
 		includeAugmented: r.includeAugmented, top: r.top, splits: splits, entries: map[uint64]bool{},
@@ -335,7 +342,7 @@ func (e *Export) header(name string, method uint16, modTime time.Time) (h *zip.F
 // (and nothing is written) when the file is missing in the version folder
 // or the name is taken.
 func (e *Export) copyImage(zw *zip.Writer, img exportImage, name string) (ok bool, err error) {
-	f, err := e.root.Open(filepath.FromSlash(img.path))
+	f, err := e.root.Open(img.path)
 	if err != nil {
 		e.log.Warn("data version export: leaving out an image whose file cannot be opened", "path", img.path, "err", err)
 		e.missing++

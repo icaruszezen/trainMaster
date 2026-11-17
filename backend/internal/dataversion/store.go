@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // querier is implemented by *pgxpool.Pool and pgx.Tx.
@@ -24,7 +25,7 @@ func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
 // versionColumns are the columns scanVersion reads, from data_versions v
 // joined with projects p.
-const versionColumns = `v.id, v.project_id, p.name, v.version, v.note, v.status, v.error, v.stage,
+const versionColumns = `v.id, v.project_id, p.name, v.storage_node_id, v.version, v.note, v.status, v.error, v.stage,
 	v.progress_done, v.progress_total, v.classes, v.config, v.sources, v.image_count, v.object_count,
 	v.train_count, v.val_count, v.test_count, v.augmented_count, v.total_bytes, v.stats,
 	v.created_at, v.updated_at, v.started_at, v.finished_at`
@@ -47,7 +48,7 @@ func scanVersionWith(row pgx.Row, extra ...any) (DataVersion, error) {
 	var v DataVersion
 	var stage string
 	var done, total int
-	err := row.Scan(append([]any{&v.ID, &v.ProjectID, &v.ProjectName, &v.Version, &v.Note, &v.Status, &v.Error,
+	err := row.Scan(append([]any{&v.ID, &v.ProjectID, &v.ProjectName, &v.StorageNodeID, &v.Version, &v.Note, &v.Status, &v.Error,
 		&stage, &done, &total, &v.Classes, &v.Config, &v.Sources, &v.ImageCount, &v.ObjectCount,
 		&v.TrainCount, &v.ValCount, &v.TestCount, &v.AugmentedCount, &v.TotalBytes, &v.Stats,
 		&v.CreatedAt, &v.UpdatedAt, &v.StartedAt, &v.FinishedAt}, extra...)...)
@@ -170,14 +171,22 @@ func (s *Service) Get(ctx context.Context, id int64) (DataVersion, error) {
 // use.
 func (s *Service) decorate(ctx context.Context, q querier, versions []DataVersion) error {
 	var datasetIDs []int64
+	var nodeIDs []int64
 	queued := false
 	for _, v := range versions {
 		queued = queued || v.Status == StatusQueued
+		if v.StorageNodeID > 0 && !slices.Contains(nodeIDs, v.StorageNodeID) {
+			nodeIDs = append(nodeIDs, v.StorageNodeID)
+		}
 		for _, src := range v.Sources {
 			if !slices.Contains(datasetIDs, src.DatasetID) {
 				datasetIDs = append(datasetIDs, src.DatasetID)
 			}
 		}
+	}
+	nodeRefs, err := s.storageNodes.NodeRefs(ctx, nodeIDs)
+	if err != nil {
+		return err
 	}
 	live := map[int64]bool{}
 	if len(datasetIDs) > 0 {
@@ -211,6 +220,16 @@ func (s *Service) decorate(ctx context.Context, q querier, versions []DataVersio
 	}
 	for i := range versions {
 		v := &versions[i]
+		if ref, ok := nodeRefs[v.StorageNodeID]; ok {
+			v.StorageNode = ref
+		} else {
+			v.StorageNode = storagenode.NodeRef{
+				ID:        storagenode.BuiltinID,
+				Name:      storagenode.BuiltinName,
+				Kind:      storagenode.KindLocal,
+				IsBuiltin: true,
+			}
+		}
 		for j := range v.Sources {
 			v.Sources[j].DatasetDeleted = !live[v.Sources[j].DatasetID]
 		}

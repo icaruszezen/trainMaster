@@ -61,6 +61,11 @@ type Config struct {
 	// a missing or incomplete directory only makes the downloads
 	// unavailable.
 	TrainerPackageDir string
+	// SecretKey is an optional master secret (TM_SECRET_KEY) used to derive
+	// the AES-256-GCM key for encrypting remote storage node credentials.
+	// Empty: the platform auto-generates and persists a key in the data
+	// directory / app_settings.
+	SecretKey string
 }
 
 // Limits of the training node settings.
@@ -207,6 +212,14 @@ func Load(getenv func(string) string) (*Config, error) {
 			mode = "auto"
 		}
 		cfg.TrainerMode = mode
+	}
+
+	if secret := getenv("TM_SECRET_KEY"); secret != "" {
+		if len(secret) < minNodeTokenLength || len(secret) > maxNodeTokenLength {
+			fail("TM_SECRET_KEY", "must be %d to %d characters long (got %d)", minNodeTokenLength, maxNodeTokenLength, len(secret))
+		} else {
+			cfg.SecretKey = secret
+		}
 	}
 
 	if len(problems) > 0 {

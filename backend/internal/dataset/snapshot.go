@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // OWNER: backend-core agent (data versions). A snapshot is the composed
@@ -31,7 +32,7 @@ type SnapshotOptions struct {
 type Snapshot struct {
 	Dataset  Dataset
 	Versions []Version       // the selected review versions, newest first
-	Root     *os.Root        // the dataset folder; nil with IndexOnly
+	Root     storagenode.Dir // the dataset folder; nil with IndexOnly
 	Images   []SnapshotImage // in ImageOrder
 }
 
@@ -110,7 +111,6 @@ func (s *Service) OpenSnapshot(ctx context.Context, datasetID int64, sel Version
 			if err != nil {
 				return err
 			}
-			d.Path = s.datasetDir(d.DirName)
 			snap.Dataset = d
 			if snap.Versions, err = snapshotVersions(ctx, tx, datasetID, sel, opts.AllowTrashedVersions); err != nil {
 				return err
@@ -125,13 +125,19 @@ func (s *Service) OpenSnapshot(ctx context.Context, datasetID int64, sel Version
 	if err != nil {
 		return nil, err
 	}
+	if ref, vol, verr := s.volumeFor(ctx, snap.Dataset.StorageNodeID); verr == nil {
+		snap.Dataset.StorageNode = ref
+		snap.Dataset.Path = vol.DisplayPath(storagenode.SpaceDatasets, snap.Dataset.DirName)
+	} else {
+		snap.Dataset.StorageNode = storagenode.BuiltinRef()
+	}
 	if opts.IndexOnly {
 		return snap, nil
 	}
 	if err := s.loadSnapshotObjects(ctx, snap); err != nil {
 		return nil, err
 	}
-	if snap.Root, err = s.openSnapshotRoot(snap.Dataset); err != nil {
+	if snap.Root, err = s.openSnapshotRoot(ctx, snap.Dataset); err != nil {
 		return nil, err
 	}
 	return snap, nil
@@ -272,8 +278,8 @@ func snapshotVersionPurged(versions []Version, id int64) error {
 
 // openSnapshotRoot opens the folder of d like openDatasetRoot, with an
 // error that names the dataset instead of the server path.
-func (s *Service) openSnapshotRoot(d Dataset) (*os.Root, error) {
-	root, err := s.openDatasetRoot(d)
+func (s *Service) openSnapshotRoot(ctx context.Context, d Dataset) (storagenode.Dir, error) {
+	root, err := s.openDatasetRoot(ctx, d)
 	var ue *Error
 	if errors.As(err, &ue) && errors.Is(err, ErrConflict) {
 		return nil, newError(ErrConflict, "数据集“%s”的文件夹不存在", d.Name)

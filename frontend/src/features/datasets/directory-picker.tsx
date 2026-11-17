@@ -21,9 +21,10 @@ import {
 import { LoadError } from "@/features/datasets/load-error"
 import { RECYCLE_BIN_PATH } from "@/features/recycle-bin/recycle-format"
 import { formatBytes, formatNumber, formatRelativeTime } from "@/lib/format"
+import { useActiveStorageNode } from "@/features/system/storage-api"
 import { cn } from "@/lib/utils"
 
-/** 数据集根目录在服务器与宿主机上的位置说明。 */
+/** 数据集根目录在当前存储节点上的位置说明。 */
 export function DatasetsRootHint({
   root,
   className,
@@ -31,6 +32,22 @@ export function DatasetsRootHint({
   root: string | null
   className?: string
 }) {
+  const activeNode = useActiveStorageNode()
+  if (activeNode && !activeNode.is_builtin) {
+    const sep = activeNode.kind === "smb" ? "\\" : "/"
+    const target = `${activeNode.display_target.replace(/[\\/]+$/, "")}${sep}datasets${sep}`
+    return (
+      <p className={cn("text-xs text-muted-foreground", className)}>
+        当前存储节点{" "}
+        <span className="font-medium text-foreground">{activeNode.name}</span>{" "}
+        目录{" "}
+        <code className="rounded bg-muted px-1 py-0.5 font-mono text-foreground">
+          {target}
+        </code>
+      </p>
+    )
+  }
+
   return (
     <p className={cn("text-xs text-muted-foreground", className)}>
       服务器目录{" "}

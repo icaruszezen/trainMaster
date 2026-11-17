@@ -17,6 +17,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/model"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 const (
@@ -47,6 +48,7 @@ type querier interface {
 type Options struct {
 	DB           *pgxpool.Pool
 	Storage      *storage.Storage
+	StorageNodes *storagenode.Service
 	Logger       *slog.Logger
 	Projects     *project.Service
 	DataVersions *dataversion.Service
@@ -58,6 +60,7 @@ type Options struct {
 type Service struct {
 	db           *pgxpool.Pool
 	storage      *storage.Storage
+	storageNodes *storagenode.Service
 	log          *slog.Logger
 	projects     *project.Service
 	dataVersions *dataversion.Service
@@ -78,6 +81,7 @@ func NewService(opts Options) *Service {
 	svc := &Service{
 		db:           opts.DB,
 		storage:      opts.Storage,
+		storageNodes: opts.StorageNodes,
 		log:          log.With("component", "training"),
 		projects:     opts.Projects,
 		dataVersions: opts.DataVersions,

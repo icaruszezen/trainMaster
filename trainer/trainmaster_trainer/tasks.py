@@ -115,6 +115,7 @@ class TaskWorker:
         inference_image_timeout: float = DEFAULT_INFERENCE_IMAGE_TIMEOUT,
         inference_command: Sequence[str] | None = None,
         training_command: Sequence[str] | None = None,
+        dataset_cache: training_mod.DatasetCacheManager | None = None,
     ) -> None:
         self.client = client
         self.node_key = node_key
@@ -128,6 +129,7 @@ class TaskWorker:
         self.inference_image_timeout = inference_image_timeout
         self.inference_command = list(inference_command) if inference_command else None
         self.training_command = list(training_command) if training_command else None
+        self.dataset_cache = dataset_cache or training_mod.DatasetCacheManager(state_dir)
         self._find_spec = find_spec
         self._wait_fn = wait
         self._clock = clock
@@ -342,6 +344,7 @@ class TaskWorker:
                 state_dir=self.state_dir,
                 node_name=self.node_name,
                 data_dir=self.data_dir,
+                dataset_cache=self.dataset_cache,
                 command=self.training_command,
                 progress_interval=self.progress_interval,
             )

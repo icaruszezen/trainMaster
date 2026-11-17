@@ -5,10 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"runtime/debug"
 	"slices"
 	"sync"
@@ -18,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
+	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // OWNER: backend-core agent. The builder: one build at a time, oldest
@@ -115,13 +114,14 @@ func (b *builder) cancelBuild(id int64) {
 // left building fail as interrupted and their folders are emptied.
 func (s *Service) recoverBuilds(ctx context.Context) error {
 	type interrupted struct {
-		ID      int64
-		DirName string
-		Sources []Source
+		ID            int64
+		StorageNodeID int64
+		DirName       string
+		Sources       []Source
 	}
 	var list []interrupted
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT id, dir_name, sources FROM data_versions WHERE status = 'building'
+		rows, err := tx.Query(ctx, `SELECT id, storage_node_id, dir_name, sources FROM data_versions WHERE status = 'building'
 			ORDER BY id FOR UPDATE`)
 		if err != nil {
 			return err
@@ -147,7 +147,7 @@ func (s *Service) recoverBuilds(ctx context.Context) error {
 		return fmt.Errorf("recover data version builds: %w", err)
 	}
 	for _, v := range list {
-		s.discardOwned(v.ID, s.versionDir(v.DirName))
+		s.discardOwned(ctx, v.ID, v.StorageNodeID, v.DirName)
 		s.discardThumbnails(v.ID)
 	}
 	if len(list) > 0 {
@@ -208,14 +208,15 @@ func (s *Service) buildNext(ctx context.Context) (built bool, err error) {
 
 // buildJob is a claimed version.
 type buildJob struct {
-	ID        int64
-	ProjectID int64
-	Version   int
-	DirName   string
-	Classes   []Class
-	Config    Config
-	Sources   []Source
-	CreatedAt time.Time
+	ID            int64
+	ProjectID     int64
+	StorageNodeID int64
+	Version       int
+	DirName       string
+	Classes       []Class
+	Config        Config
+	Sources       []Source
+	CreatedAt     time.Time
 }
 
 // claim marks the oldest queued version building and returns it (nil when
@@ -226,8 +227,8 @@ func (s *Service) claim(ctx context.Context) (*buildJob, error) {
 			progress_done = 0, progress_total = 0, started_at = now(), updated_at = now()
 		WHERE id = (SELECT id FROM data_versions WHERE status = 'queued' AND deleted_at IS NULL
 			ORDER BY queued_at, id FOR UPDATE SKIP LOCKED LIMIT 1)
-		RETURNING id, project_id, version, dir_name, classes, config, sources, created_at`).
-		Scan(&j.ID, &j.ProjectID, &j.Version, &j.DirName, &j.Classes, &j.Config, &j.Sources, &j.CreatedAt)
+		RETURNING id, project_id, storage_node_id, version, dir_name, classes, config, sources, created_at`).
+		Scan(&j.ID, &j.ProjectID, &j.StorageNodeID, &j.Version, &j.DirName, &j.Classes, &j.Config, &j.Sources, &j.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -245,7 +246,7 @@ func (s *Service) runBuild(parent context.Context, job buildJob) {
 	s.builder.register(job.ID, cancel)
 	defer s.builder.unregister(job.ID)
 
-	log := s.log.With("version_id", job.ID, "project_id", job.ProjectID, "version", job.Version)
+	log := s.log.With("version_id", job.ID, "project_id", job.ProjectID, "version", job.Version, "storage_node_id", job.StorageNodeID)
 	log.Info("data version build started")
 	start := time.Now()
 	b := newBuild(s, job, log)
@@ -271,11 +272,12 @@ func (s *Service) runBuild(parent context.Context, job buildJob) {
 
 // build is the state of one build.
 type build struct {
-	s   *Service
-	job buildJob
-	log *slog.Logger
-	ctx context.Context
-	dir string // the version folder
+	s      *Service
+	job    buildJob
+	log    *slog.Logger
+	ctx    context.Context
+	vol    storagenode.Volume
+	verDir storagenode.Dir // the version folder
 	// owned: the folder is this build's (it wrote .pending): it is cleared
 	// when the build does not complete.
 	owned bool
@@ -298,7 +300,7 @@ type build struct {
 	labels  labelStatsList
 	written int64 // bytes of all stored files
 
-	crossDevice map[int]bool // sources on another file system (links fail with EXDEV)
+	crossDevice map[int]bool // sources on another file system or storage node
 	linkWarned  map[int]bool
 }
 
@@ -341,13 +343,19 @@ type buildCopy struct {
 }
 
 func newBuild(s *Service, job buildJob, log *slog.Logger) *build {
-	b := &build{s: s, job: job, log: log, dir: s.versionDir(job.DirName), dirs: map[string]bool{},
+	b := &build{s: s, job: job, log: log, dirs: map[string]bool{},
 		crossDevice: map[int]bool{}, linkWarned: map[int]bool{}, perSrc: make([]int, len(job.Sources)),
 		filter: newLabelFilter(job.Classes, job.Config), labels: newLabelStats(job.Classes), stride: 1}
 	if a := job.Config.Augmentation; a != nil {
 		b.stride = 1 + a.Copies
 	}
-	b.space = spaceGuard{usage: s.usage, warn: func(err error) { log.Warn("data version: check free disk space", "err", err) }}
+	usageFn := func() (storage.Usage, error) {
+		if b.vol == nil || b.vol.NodeID() == storagenode.BuiltinID {
+			return s.usage()
+		}
+		return b.vol.Usage(b.ctx)
+	}
+	b.space = spaceGuard{usage: usageFn, warn: func(err error) { log.Warn("data version: check free disk space", "err", err) }}
 	b.stats = emptyStats(job.Classes)
 	return b
 }
@@ -366,7 +374,15 @@ func (b *build) runSafe(ctx context.Context) (err error) {
 		}
 	}()
 	defer b.closeSnapshots()
+	defer b.closeVersionDir()
 	return b.run(ctx)
+}
+
+func (b *build) closeVersionDir() {
+	if b.verDir != nil {
+		_ = b.verDir.Close()
+		b.verDir = nil
+	}
 }
 
 func (b *build) run(ctx context.Context) error {
@@ -455,20 +471,38 @@ func isForeignKeyViolation(err error) bool {
 // without the marker is not ours (a finished version restored from a
 // backup?) and is never touched.
 func (b *build) makeFolder() error {
-	if _, err := os.Lstat(b.dir); err == nil {
-		if !hasPending(b.dir) {
-			return newError(ErrConflict, "数据版本文件夹 %s 已经存在（可能来自备份），请先移走它", "exports/"+b.job.DirName)
-		}
-		if err := b.s.discard(b.job.ID, b.dir); err != nil {
-			return fmt.Errorf("clear the data version folder: %w", err)
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
+	_, vol, err := b.s.volumeFor(b.ctx, b.job.StorageNodeID)
+	if err != nil {
+		return err
+	}
+	b.vol = vol
+
+	exists, _, err := vol.DirExists(b.ctx, storagenode.SpaceExports, b.job.DirName)
+	if err != nil {
 		return fmt.Errorf("check the data version folder: %w", err)
 	}
-	if err := os.MkdirAll(b.dir, 0o755); err != nil {
+	if exists {
+		existing, openErr := vol.OpenDir(b.ctx, storagenode.SpaceExports, b.job.DirName)
+		pending := openErr == nil && dirHasPending(existing)
+		if existing != nil {
+			_ = existing.Close()
+		}
+		if !pending {
+			return newError(ErrConflict, "数据版本文件夹 %s 已经存在（可能来自备份），请先移走它", "exports/"+b.job.DirName)
+		}
+		if err := b.s.discardOnVolume(b.ctx, b.job.ID, vol, b.job.DirName); err != nil {
+			return fmt.Errorf("clear the data version folder: %w", err)
+		}
+	}
+	if err := vol.MkdirDir(b.ctx, storagenode.SpaceExports, b.job.DirName, false); err != nil {
 		return fmt.Errorf("create the data version folder: %w", err)
 	}
-	if err := writePending(b.dir, b.job.ID); err != nil {
+	verDir, err := vol.OpenDir(b.ctx, storagenode.SpaceExports, b.job.DirName)
+	if err != nil {
+		return fmt.Errorf("open the data version folder: %w", err)
+	}
+	b.verDir = verDir
+	if err := dirWritePending(b.ctx, b.verDir, b.job.ID); err != nil {
 		return err
 	}
 	b.owned = true
@@ -477,8 +511,10 @@ func (b *build) makeFolder() error {
 
 // cleanup removes what a build of a deleted version wrote.
 func (b *build) cleanup() {
-	if b.owned {
-		if err := b.s.discard(b.job.ID, b.dir); err != nil {
+	b.closeVersionDir()
+	if b.owned && b.vol != nil {
+		ctx := context.WithoutCancel(b.s.base)
+		if err := b.s.discardOnVolume(ctx, b.job.ID, b.vol, b.job.DirName); err != nil {
 			b.log.Warn("data version: clear the folder of a deleted version", "err", err)
 		}
 	}
@@ -625,7 +661,7 @@ func (b *build) prepareImage(source int, snap *dataset.Snapshot, img dataset.Sna
 		return nil, nil
 	}
 
-	f, err := snap.Root.Open(filepath.FromSlash(img.RelPath))
+	f, err := snap.Root.Open(img.RelPath)
 	if err != nil {
 		skipped.Missing++
 		return nil, nil
@@ -668,8 +704,8 @@ func (b *build) prepareImage(source int, snap *dataset.Snapshot, img dataset.Sna
 
 // readVOC reads and parses a base annotation file through the dataset's
 // root.
-func readVOC(root *os.Root, rel string) (dataset.VOCFile, error) {
-	f, err := root.Open(filepath.FromSlash(rel))
+func readVOC(root storagenode.Dir, rel string) (dataset.VOCFile, error) {
+	f, err := root.Open(rel)
 	if err != nil {
 		return dataset.VOCFile{}, err
 	}
@@ -783,11 +819,11 @@ func (b *build) classIDs() map[string]int { return b.filter.classes }
 // writeLabels writes the YOLO label file of the image at the version path
 // p (empty for a negative sample).
 func (b *build) writeLabels(p string, objects []dataset.AnnotationObject, width, height int, ids map[string]int) error {
-	name := filepath.Join(b.dir, filepath.FromSlash(dataset.UltralyticsLabelPath(p)))
-	if err := b.mkdirFor(name); err != nil {
+	rel := dataset.UltralyticsLabelPath(p)
+	if err := b.mkdirFor(rel); err != nil {
 		return err
 	}
-	if err := os.WriteFile(name, labelFileLines(objects, width, height, ids), 0o644); err != nil {
+	if err := b.verDir.PutBytes(b.ctx, rel, labelFileLines(objects, width, height, ids), 0o644); err != nil {
 		return fmt.Errorf("write label file: %w", err)
 	}
 	return nil
@@ -970,11 +1006,11 @@ func (b *build) finish() error {
 			if !ok {
 				continue
 			}
-			if err := os.WriteFile(filepath.Join(b.dir, name), data, 0o644); err != nil {
+			if err := b.verDir.PutBytes(ctx, name, data, 0o644); err != nil {
 				return fmt.Errorf("write %s: %w", name, err)
 			}
 		}
-		if err := writeManifest(b.dir, newManifest(v)); err != nil {
+		if err := writeManifest(ctx, b.verDir, newManifest(v)); err != nil {
 			return err
 		}
 		tag, err := tx.Exec(ctx, `UPDATE data_versions SET status = 'ready', stage = '', progress_done = 0,
@@ -999,7 +1035,7 @@ func (b *build) finish() error {
 	// (the removal failed) is harmless: nothing clears a ready version's
 	// folder.
 	b.owned = false
-	if err := os.Remove(filepath.Join(b.dir, pendingMarker)); err != nil {
+	if err := b.verDir.RemoveFile(b.ctx, pendingMarker); err != nil {
 		b.log.Warn("data version: remove the .pending marker", "err", err)
 	}
 	return nil

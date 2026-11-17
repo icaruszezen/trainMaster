@@ -14,6 +14,7 @@ import (
 
 	"github.com/icaruszezen/trainmaster/backend/internal/augment"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // Storing the originals: a hard link to the dataset file when possible
@@ -118,14 +119,26 @@ type storedFile struct {
 	modTime          time.Time
 }
 
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	k, err := c.r.Read(p)
+	c.n += int64(k)
+	return k, err
+}
+
 // storeOriginal stores the original img at its version path: opened
 // through the dataset's root, checked against what was prepared, then
-// linked (verified to be the same file) or copied. errSourceChanged or
-// errSourceMissing: the file is no longer what was prepared.
+// linked (verified to be the same file), server-side copied, or streamed.
+// errSourceChanged or errSourceMissing: the file is no longer what was prepared.
 func (b *build) storeOriginal(img *buildImage) (storedFile, error) {
 	var out storedFile
-	root := b.snaps[img.source].Root
-	src, err := root.Open(filepath.FromSlash(img.rel))
+	snap := b.snaps[img.source]
+	root := snap.Root
+	src, err := root.Open(img.rel)
 	if err != nil {
 		return out, errSourceMissing
 	}
@@ -137,8 +150,7 @@ func (b *build) storeOriginal(img *buildImage) (storedFile, error) {
 	case fi.Size() != img.sourceSize || !sameFileTime(fi.ModTime(), img.sourceMod):
 		return out, errSourceChanged
 	}
-	dst := filepath.Join(b.dir, filepath.FromSlash(img.path))
-	if err := b.mkdirFor(dst); err != nil {
+	if err := b.mkdirFor(img.path); err != nil {
 		return out, err
 	}
 
@@ -152,19 +164,42 @@ func (b *build) storeOriginal(img *buildImage) (storedFile, error) {
 			orientation = &o
 		}
 	}
-	if orientation == nil {
-		linkErr := b.s.link(filepath.Join(root.Name(), filepath.FromSlash(img.rel)), dst)
-		if linkErr == nil {
-			if li, err := os.Lstat(dst); err == nil && os.SameFile(fi, li) {
-				out.stored, out.size, out.modTime = StoredLink, li.Size(), li.ModTime()
-				return out, nil
+
+	sameNode := snap.Dataset.StorageNodeID == b.job.StorageNodeID
+	if !sameNode {
+		b.crossDevice[img.source] = true
+	}
+
+	if orientation == nil && sameNode {
+		if b.verDir.LocalDir() != "" && root.LocalDir() != "" {
+			dst := filepath.Join(b.verDir.LocalDir(), filepath.FromSlash(img.path))
+			linkErr := b.s.link(filepath.Join(root.LocalDir(), filepath.FromSlash(img.rel)), dst)
+			if linkErr == nil {
+				if li, err := os.Lstat(dst); err == nil && os.SameFile(fi, li) {
+					out.stored, out.size, out.modTime = StoredLink, li.Size(), li.ModTime()
+					return out, nil
+				}
+				linkErr = errors.New("the link is not the dataset file")
 			}
-			linkErr = errors.New("the link is not the dataset file")
+			if err := os.Remove(dst); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return out, fmt.Errorf("remove failed link: %w", err)
+			}
+			b.linkFailed(img, linkErr)
+		} else {
+			if err := b.space.before(fi.Size()); err != nil {
+				return out, err
+			}
+			st, _, copyErr := b.vol.CopyFileWithin(
+				b.ctx,
+				storagenode.SpaceDatasets, snap.Dataset.DirName+"/"+img.rel,
+				storagenode.SpaceExports, b.job.DirName+"/"+img.path,
+				nil,
+			)
+			if copyErr == nil {
+				b.space.wrote(st.Size())
+				return storedFile{stored: StoredCopy, copied: st.Size(), size: st.Size(), modTime: st.ModTime()}, nil
+			}
 		}
-		if err := os.Remove(dst); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return out, fmt.Errorf("remove failed link: %w", err)
-		}
-		b.linkFailed(img, linkErr)
 	}
 
 	need := fi.Size()
@@ -174,18 +209,74 @@ func (b *build) storeOriginal(img *buildImage) (storedFile, error) {
 	if err := b.space.before(need); err != nil {
 		return out, err
 	}
-	n, err := copyFileFrom(src, fi.Size(), dst, orientation)
-	if err != nil {
-		return out, err
+
+	if b.verDir.LocalDir() != "" {
+		dst := filepath.Join(b.verDir.LocalDir(), filepath.FromSlash(img.path))
+		n, err := copyFileFrom(src, fi.Size(), dst, orientation)
+		if err != nil {
+			return out, err
+		}
+		b.space.wrote(n)
+		st, err := os.Lstat(dst)
+		if err != nil {
+			return out, err
+		}
+		return storedFile{stored: StoredCopy, orientationFixed: orientation != nil, copied: n, size: st.Size(),
+			modTime: st.ModTime()}, nil
 	}
-	b.space.wrote(n)
-	st, err := os.Lstat(dst)
-	if err != nil {
-		return out, err
+
+	if orientation == nil {
+		cr := &countingReader{r: io.NewSectionReader(src, 0, fi.Size())}
+		st, err := b.verDir.PutFile(b.ctx, img.path, cr, fi.Size(), 0o644)
+		if err != nil {
+			return out, fmt.Errorf("copy image: %w", err)
+		}
+		if cr.n != fi.Size() {
+			_ = b.verDir.RemoveFile(b.ctx, img.path)
+			return out, errSourceChanged
+		}
+		b.space.wrote(cr.n)
+		return storedFile{stored: StoredCopy, copied: cr.n, size: st.Size(), modTime: st.ModTime()}, nil
 	}
-	out = storedFile{stored: StoredCopy, orientationFixed: orientation != nil, copied: n, size: st.Size(),
-		modTime: st.ModTime()}
-	return out, nil
+
+	tmpDir := b.s.storage.Dir(storage.Tmp)
+	_ = os.MkdirAll(tmpDir, 0o755)
+	tmp, err := os.CreateTemp(tmpDir, ".dv-orient-*")
+	if err != nil {
+		return out, fmt.Errorf("copy image: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+	n, err := io.Copy(tmp, io.NewSectionReader(src, 0, fi.Size()))
+	if err == nil && n != fi.Size() {
+		err = errSourceChanged
+	}
+	if err == nil {
+		err = augment.NeutralizeOrientation(tmp, *orientation)
+	}
+	if err == nil {
+		_, err = tmp.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		if errors.Is(err, errSourceChanged) {
+			return out, err
+		}
+		return out, fmt.Errorf("copy image: %w", err)
+	}
+	tmpInfo, err := tmp.Stat()
+	if err != nil {
+		return out, fmt.Errorf("copy image: %w", err)
+	}
+	st, err := b.verDir.PutFile(b.ctx, img.path, tmp, tmpInfo.Size(), 0o644)
+	if err != nil {
+		return out, fmt.Errorf("copy image: %w", err)
+	}
+	b.space.wrote(tmpInfo.Size())
+	return storedFile{stored: StoredCopy, orientationFixed: true, copied: tmpInfo.Size(), size: st.Size(),
+		modTime: st.ModTime()}, nil
 }
 
 // linkFailed records why a link failed (logged once per source).
@@ -214,7 +305,7 @@ func (b *build) remainingBytes(img *buildImage) int64 {
 
 // copyFileFrom copies size bytes of src to a temporary file next to dst,
 // resets the orientation tag in it (when o is set) and renames it to dst.
-func copyFileFrom(src *os.File, size int64, dst string, o *augment.Orientation) (int64, error) {
+func copyFileFrom(src io.ReaderAt, size int64, dst string, o *augment.Orientation) (int64, error) {
 	tmp, err := os.CreateTemp(filepath.Dir(dst), ".copy-*")
 	if err != nil {
 		return 0, fmt.Errorf("copy image: %w", err)
@@ -249,13 +340,13 @@ func copyFileFrom(src *os.File, size int64, dst string, o *augment.Orientation) 
 	return n, nil
 }
 
-// mkdirFor creates the folder of the file at p (once per folder).
-func (b *build) mkdirFor(p string) error {
-	dir := filepath.Dir(p)
-	if b.dirs[dir] {
+// mkdirFor creates the folder of the file at rel (once per folder).
+func (b *build) mkdirFor(rel string) error {
+	dir := path.Dir(rel)
+	if dir == "." || dir == "" || b.dirs[dir] {
 		return nil
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := b.verDir.EnsureDir(dir); err != nil {
 		return fmt.Errorf("create folder in the data version: %w", err)
 	}
 	b.dirs[dir] = true

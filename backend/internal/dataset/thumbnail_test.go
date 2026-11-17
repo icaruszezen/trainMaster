@@ -17,6 +17,8 @@ import (
 
 	"golang.org/x/image/bmp"
 	"golang.org/x/image/tiff"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 func encodeImage(t *testing.T, format string, img image.Image) []byte {
@@ -78,7 +80,7 @@ func TestThumbnailGenerate(t *testing.T) {
 				t.Fatal(err)
 			}
 			dst := filepath.Join(t.TempDir(), "cache", "1-sm-v.jpg")
-			if err := th.generate(dir, "img", tt.side, dst); err != nil {
+			if err := th.generate(func() (storagenode.Dir, error) { return storagenode.OpenLocalDir(dir) }, "img", tt.side, dst); err != nil {
 				t.Fatalf("generate: %v", err)
 			}
 			f, err := os.Open(dst)
@@ -137,7 +139,7 @@ func TestThumbnailUnsupported(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "img"), tc.data, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := th.generate(dir, "img", 320, filepath.Join(dir, "out.jpg")); err != tc.want {
+		if err := th.generate(func() (storagenode.Dir, error) { return storagenode.OpenLocalDir(dir) }, "img", 320, filepath.Join(dir, "out.jpg")); err != tc.want {
 			t.Errorf("%s: err = %v, want %v", name, err, tc.want)
 		}
 	}

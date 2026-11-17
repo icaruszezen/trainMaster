@@ -6,6 +6,7 @@ import type { MouseEvent } from "react"
 import { Layers } from "lucide-react"
 import { Link, useNavigate } from "react-router"
 
+import { StorageNodeBadge } from "@/components/storage-node-badge"
 import {
   Table,
   TableBody,
@@ -87,6 +88,7 @@ function DataVersionTable({
               <TableHead className="hidden lg:table-cell">项目</TableHead>
             )}
             <TableHead>状态</TableHead>
+            <TableHead className="hidden md:table-cell">存储节点</TableHead>
             <TableHead className="hidden lg:table-cell">图片</TableHead>
             <TableHead className="hidden text-right xl:table-cell">
               类别
@@ -154,6 +156,9 @@ function DataVersionTable({
                   )}
                 </div>
               </TableCell>
+              <TableCell className="hidden md:table-cell">
+                <StorageNodeBadge node={version.storage_node} />
+              </TableCell>
               <TableCell className="hidden whitespace-nowrap text-muted-foreground tabular-nums lg:table-cell">
                 {countsText(version)}
               </TableCell>
@@ -214,6 +219,7 @@ export function DataVersionCards({
             </div>
             <div className="flex flex-wrap items-center gap-1.5">
               <DataVersionStatusBadge version={version} />
+              <StorageNodeBadge node={version.storage_node} />
             </div>
             {version.status === "failed" && version.error && (
               <p className="line-clamp-2 text-xs break-words text-destructive">

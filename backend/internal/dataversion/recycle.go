@@ -16,6 +16,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/recycle"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // The recycle bin (回收站) of data versions. Deleting a ready version moves
@@ -72,6 +73,9 @@ var errProjectDeletedMeanwhile = errors.New("project deleted meanwhile")
 // version whose datasets were purged meanwhile is restored all the same:
 // its folder holds everything.
 func (s *Service) Restore(ctx context.Context, id int64, in RestoreInput) (DataVersion, error) {
+	if err := s.checkNotMigrating(id); err != nil {
+		return DataVersion{}, err
+	}
 	for range maxRestoreRetries {
 		projectRestored, err := s.restore(ctx, id, in)
 		if errors.Is(err, errProjectDeletedMeanwhile) {
@@ -243,13 +247,14 @@ func (s *Service) purgeExpired(ctx context.Context) error {
 // restored meanwhile is left alone.
 func (s *Service) purgeVersion(ctx context.Context, id int64) error {
 	ctx = context.WithoutCancel(ctx) // a short transaction; the folder is moved after it
+	var storageNodeID int64
 	var dirName string
 	purged := false
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		err := tx.QueryRow(ctx, `SELECT dir_name FROM data_versions
+		err := tx.QueryRow(ctx, `SELECT storage_node_id, dir_name FROM data_versions
 			WHERE id = $1 AND deleted_at <= now() - $2 * interval '1 second'
 				AND NOT EXISTS (SELECT 1 FROM training_jobs WHERE data_version_id = $1) FOR UPDATE`,
-			id, recycle.RetentionSeconds).Scan(&dirName)
+			id, recycle.RetentionSeconds).Scan(&storageNodeID, &dirName)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil // restored meanwhile
 		}
@@ -265,9 +270,9 @@ func (s *Service) purgeVersion(ctx context.Context, id int64) error {
 	if err != nil || !purged {
 		return err
 	}
-	s.log.Info("data version purged from the recycle bin", "data_version_id", id, "dir", dirName)
+	s.log.Info("data version purged from the recycle bin", "data_version_id", id, "storage_node_id", storageNodeID, "dir", dirName)
 	s.discardThumbnails(id)
-	if err := s.discard(id, s.versionDir(dirName)); err != nil {
+	if err := s.discard(ctx, id, storageNodeID, dirName); err != nil {
 		// Its row is gone and it has no .pending: nothing removes it later.
 		return fmt.Errorf("move the folder of purged data version %d aside: %w", id, err)
 	}
@@ -278,9 +283,17 @@ func (s *Service) purgeVersion(ctx context.Context, id int64) error {
 const projectDirPrefix = "project-"
 
 // RemoveProjectFolder removes the folder of a project from
-// exports/data-versions if it is empty (a deleted project's; the folder of
-// a project in the recycle bin still holds its versions and stays).
+// exports/data-versions across local storage nodes if it is empty (a deleted
+// project's; the folder of a project in the recycle bin still holds its
+// versions and stays).
 func (s *Service) RemoveProjectFolder(projectID int64) {
+	rel := "data-versions/" + projectDirPrefix + strconv.FormatInt(projectID, 10)
+	if vols, err := s.storageNodes.LocalVolumes(s.base); err == nil && len(vols) > 0 {
+		for _, vol := range vols {
+			_ = vol.RemoveEmptyDir(s.base, storagenode.SpaceExports, rel)
+		}
+		return
+	}
 	_ = os.Remove(filepath.Join(s.rootDir(), projectDirPrefix+strconv.FormatInt(projectID, 10)))
 }
 
@@ -297,47 +310,65 @@ const deletingGrace = 10 * time.Minute
 // (and Create skips its number).
 func (s *Service) reconcile(ctx context.Context) error {
 	var errs []error
-	entries, err := os.ReadDir(s.rootDir())
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	vols, err := s.storageNodes.LocalVolumes(ctx)
+	if err != nil {
 		errs = append(errs, err)
 	}
 	var projectIDs []int64
-	pending := map[string]string{} // dir_name -> path of version folders with .pending
-	for _, e := range entries {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		name := e.Name()
-		path := filepath.Join(s.rootDir(), name)
-		if isDeletingName(name) {
-			if deletingAge(name) < deletingGrace {
-				continue
-			}
-			if err := removeTreeCtx(ctx, path); err != nil && ctx.Err() == nil {
-				errs = append(errs, fmt.Errorf("remove %s: %w", path, err))
-			}
+	seenProjects := map[int64]bool{}
+	for _, lv := range vols {
+		localVol, ok := lv.(*storagenode.LocalVolume)
+		if !ok {
 			continue
 		}
-		id, ok := parseFolderID(name, projectDirPrefix)
-		if !ok || !e.IsDir() {
-			continue
-		}
-		projectIDs = append(projectIDs, id)
-		versions, err := os.ReadDir(path)
+		rootDir := filepath.Join(localVol.Root(), storagenode.SpaceExports, "data-versions")
+		entries, err := os.ReadDir(rootDir)
 		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				errs = append(errs, err)
+			}
 			continue
 		}
-		for _, v := range versions {
-			if _, ok := parseFolderID(v.Name(), "v"); !ok || !v.IsDir() {
+		pending := map[string]bool{} // dir_name of version folders with .pending on lv
+		for _, e := range entries {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			name := e.Name()
+			path := filepath.Join(rootDir, name)
+			if isDeletingName(name) {
+				if deletingAge(name) < deletingGrace {
+					continue
+				}
+				if err := removeTreeCtx(ctx, path); err != nil && ctx.Err() == nil {
+					errs = append(errs, fmt.Errorf("remove %s: %w", path, err))
+				}
 				continue
 			}
-			if _, err := os.Lstat(filepath.Join(path, v.Name(), pendingMarker)); err == nil {
-				pending["data-versions/"+name+"/"+v.Name()] = filepath.Join(path, v.Name())
+			id, ok := parseFolderID(name, projectDirPrefix)
+			if !ok || !e.IsDir() {
+				continue
+			}
+			if !seenProjects[id] {
+				seenProjects[id] = true
+				projectIDs = append(projectIDs, id)
+			}
+			versions, err := os.ReadDir(path)
+			if err != nil {
+				continue
+			}
+			for _, v := range versions {
+				if _, ok := parseFolderID(v.Name(), "v"); !ok || !v.IsDir() {
+					continue
+				}
+				if _, err := os.Lstat(filepath.Join(path, v.Name(), pendingMarker)); err == nil {
+					pending["data-versions/"+name+"/"+v.Name()] = true
+				}
 			}
 		}
-	}
-	if err := s.discardPendingOrphans(ctx, pending); err != nil {
-		errs = append(errs, err)
+		if err := s.discardPendingOrphans(ctx, lv, pending); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if err := s.removeGoneProjects(ctx, projectIDs); err != nil {
 		errs = append(errs, err)
@@ -349,11 +380,11 @@ func (s *Service) reconcile(ctx context.Context) error {
 }
 
 // discardPendingOrphans clears the version folders still marked .pending
-// (by dir_name) that have no version: a build interrupted by a crash
+// (by dir_name on vol) that have no version: a build interrupted by a crash
 // after its version was deleted. The folder exists before the query, and
 // a version's folder is made only after its row, so a missing row is gone
 // for good.
-func (s *Service) discardPendingOrphans(ctx context.Context, pending map[string]string) error {
+func (s *Service) discardPendingOrphans(ctx context.Context, vol storagenode.Volume, pending map[string]bool) error {
 	if len(pending) == 0 {
 		return nil
 	}
@@ -361,7 +392,8 @@ func (s *Service) discardPendingOrphans(ctx context.Context, pending map[string]
 	for name := range pending {
 		names = append(names, name)
 	}
-	rows, err := s.db.Query(ctx, "SELECT dir_name FROM data_versions WHERE dir_name = ANY($1)", names)
+	rows, err := s.db.Query(ctx, "SELECT dir_name FROM data_versions WHERE storage_node_id = $1 AND dir_name = ANY($2)",
+		vol.NodeID(), names)
 	if err != nil {
 		return err
 	}
@@ -373,9 +405,9 @@ func (s *Service) discardPendingOrphans(ctx context.Context, pending map[string]
 		delete(pending, name)
 	}
 	var errs []error
-	for name, path := range pending {
-		s.log.Info("data version: clearing the folder of an interrupted build", "dir", name)
-		if err := s.discard(0, path); err != nil {
+	for name := range pending {
+		s.log.Info("data version: clearing the folder of an interrupted build", "storage_node_id", vol.NodeID(), "dir", name)
+		if err := s.discardOnVolume(ctx, 0, vol, name); err != nil {
 			errs = append(errs, err)
 		}
 	}

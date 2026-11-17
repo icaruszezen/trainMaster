@@ -442,3 +442,125 @@ def test_platform_cancel_kills_running_training_subprocess(platform: FakePlatfor
     assert job is not None
     assert job["status"] == "canceled"
     assert job["fails"] == []  # 主动取消的任务不会再上报 /fail
+
+
+def test_remote_storage_skips_shared_dir_and_honors_dataset_cache(
+    platform: FakePlatform, tmp_path: Path, monkeypatch
+):
+    ml_dir = tmp_path / "fake-train-ml"
+    _write_fake_train_ml(ml_dir)
+    monkeypatch.setenv("PYTHONPATH", str(ml_dir))
+
+    # 即使本地 data_dir 存在同名目录，当 shared_local=False（数据版本位于远程存储节点）时也必须走平台流式下载
+    shared_data = tmp_path / "shared-data"
+    stale_dv = shared_data / "exports" / "proj-1" / "v1"
+    stale_dv.mkdir(parents=True)
+    (stale_dv / "data.yaml").write_text("stale: true\n", encoding="utf-8")
+
+    cache_enabled = {"enabled": True, "max_versions": 2, "ttl_seconds": 600}
+
+    job1_id = platform.add_training_job(
+        _make_dataset_zip(),
+        dir_name="proj-1/v1",
+        params={"epochs": 1},
+        task={
+            "data_version": {
+                "id": 41,
+                "version": 1,
+                "dir_name": "proj-1/v1",
+                "shared_local": False,
+                "class_names": ["person", "helmet"],
+            },
+            "dataset_cache": cache_enabled,
+        },
+    )
+
+    with Run(tmp_path, platform, data_dir=shared_data, progress_interval=0.2) as run:
+        j1 = wait_until(
+            lambda: (j := platform.training_job(job1_id)) and j["status"] == "succeeded" and j,
+            timeout=30,
+        )
+        assert j1["status"] == "succeeded"
+        wait_until(lambda: run.worker.tasks_run == 1)
+
+        # 第一轮训练走网络下载，工作目录已立即删除，而短期缓存目录保留了 dv-41
+        gets_j1 = [r for r in platform.requests if r["path"].endswith(f"/{job1_id}/dataset")]
+        assert len(gets_j1) == 1
+        assert not (run.state_dir / "work" / f"training-job-{job1_id}").exists()
+        assert (run.state_dir / "dataset-cache" / "dv-41" / "data.yaml").is_file()
+
+        # 第二轮使用同一远程数据版本（即使平台 zip 损坏也不会请求网络，直接命中本地短期缓存）
+        job2_id = platform.add_training_job(
+            b"CORRUPT_SHOULD_HIT_LOCAL_CACHE",
+            dir_name="proj-1/v1",
+            params={"epochs": 1},
+            task={
+                "data_version": {
+                    "id": 41,
+                    "version": 1,
+                    "dir_name": "proj-1/v1",
+                    "shared_local": False,
+                    "class_names": ["person", "helmet"],
+                },
+                "dataset_cache": cache_enabled,
+            },
+        )
+        j2 = wait_until(
+            lambda: (j := platform.training_job(job2_id)) and j["status"] == "succeeded" and j,
+            timeout=30,
+        )
+        assert j2["status"] == "succeeded"
+        gets_j2 = [r for r in platform.requests if r["path"].endswith(f"/{job2_id}/dataset")]
+        assert gets_j2 == []
+        assert "命中训练节点短期数据集缓存" in j2["logs"]
+
+        # 关闭缓存策略后执行新任务，训练结束应立即清空整个 dataset-cache 目录
+        job3_id = platform.add_training_job(
+            _make_dataset_zip(),
+            params={"epochs": 1},
+            task={
+                "data_version": {
+                    "id": 42,
+                    "version": 2,
+                    "dir_name": "proj-1/v2",
+                    "shared_local": False,
+                    "class_names": ["person", "helmet"],
+                },
+                "dataset_cache": {"enabled": False, "max_versions": 2, "ttl_seconds": 600},
+            },
+        )
+        j3 = wait_until(
+            lambda: (j := platform.training_job(job3_id)) and j["status"] == "succeeded" and j,
+            timeout=30,
+        )
+        assert j3["status"] == "succeeded"
+        wait_until(lambda: run.worker.tasks_run == 3)
+        assert not (run.state_dir / "dataset-cache").exists()
+
+
+def test_dataset_cache_manager_lru_and_ttl(tmp_path: Path):
+    now = [1000.0]
+    mgr = training.DatasetCacheManager(tmp_path / "state", wall_clock=lambda: now[0])
+    src = tmp_path / "src"
+    sample_zip = tmp_path / "sample.zip"
+    sample_zip.write_bytes(_make_dataset_zip())
+    training.safe_extract_zip(sample_zip, src)
+
+    policy = training.DatasetCachePolicy(enabled=True, max_versions=2, ttl_seconds=60)
+    mgr.store(1, src, policy)
+    now[0] += 10
+    mgr.store(2, src, policy)
+    now[0] += 10
+    # 访问 dv-1 使其成为最近使用，随后写入 dv-3 应淘汰 dv-2
+    assert mgr.materialize(1, tmp_path / "mat1", policy) is not None
+    now[0] += 5
+    mgr.store(3, src, policy)
+
+    assert (mgr.cache_root / "dv-1").is_dir()
+    assert not (mgr.cache_root / "dv-2").exists()
+    assert (mgr.cache_root / "dv-3").is_dir()
+
+    # 超过 TTL 后自动清理
+    now[0] += 120
+    mgr.apply_policy(policy)
+    assert list(mgr.cache_root.iterdir()) == []

@@ -77,10 +77,14 @@ func (s *server) datasetError(w http.ResponseWriter, r *http.Request, err error)
 }
 
 // unexpectedError logs an error that is not the client's fault and
-// answers 500.
+// answers 500. Structured storagenode errors bubbling up from dataset,
+// data version, or review operations are mapped to their HTTP status first.
 func (s *server) unexpectedError(w http.ResponseWriter, r *http.Request, err error) {
 	if r.Context().Err() != nil && errors.Is(err, context.Canceled) {
 		return // the client went away; nobody reads the response
+	}
+	if writeStorageNodeError(w, err) {
+		return
 	}
 	s.log.Error("request failed", "method", r.Method, "path", r.URL.Path,
 		"request_id", RequestID(r.Context()), "err", err)

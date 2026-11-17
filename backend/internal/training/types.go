@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"io"
 	"time"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // TaskKind is the compute node claim kind of training jobs.
@@ -37,6 +39,7 @@ type DataVersionRef struct {
 	ID             int64    `json:"id"`
 	Version        int      `json:"version"`
 	DirName        string   `json:"dir_name"`
+	SharedLocal    *bool    `json:"shared_local,omitempty"`
 	ClassNames     []string `json:"class_names"`
 	ImageCount     int      `json:"image_count"`
 	TrainCount     int      `json:"train_count"`
@@ -235,24 +238,25 @@ func (f *ArtifactFile) Close() error {
 
 // Task is returned to a compute node when it claims a training_job task.
 type Task struct {
-	Kind         string         `json:"kind"`
-	ID           int64          `json:"id"`
-	LeaseSeconds int            `json:"lease_seconds"`
-	ProjectID    int64          `json:"project_id"`
-	InitMode     string         `json:"init_mode"`
-	YOLOVersion  string         `json:"yolo_version"`
-	ModelScale   string         `json:"model_scale"`
-	ArchYAML     string         `json:"arch_yaml"` // e.g. "yolo11n.yaml" when scratch
-	Task         string         `json:"task"`
-	DataVersion  DataVersionRef `json:"data_version"`
-	BaseModel    *BaseModelRef  `json:"base_model,omitempty"`
-	Params       map[string]any `json:"params"`
-	DatasetURL   string         `json:"dataset_url"`
-	BaseModelURL string         `json:"base_model_url,omitempty"`
-	ProgressURL  string         `json:"progress_url"`
-	ArtifactsURL string         `json:"artifacts_url"`
-	CompleteURL  string         `json:"complete_url"`
-	FailURL      string         `json:"fail_url"`
+	Kind         string                               `json:"kind"`
+	ID           int64                                `json:"id"`
+	LeaseSeconds int                                  `json:"lease_seconds"`
+	ProjectID    int64                                `json:"project_id"`
+	InitMode     string                               `json:"init_mode"`
+	YOLOVersion  string                               `json:"yolo_version"`
+	ModelScale   string                               `json:"model_scale"`
+	ArchYAML     string                               `json:"arch_yaml"` // e.g. "yolo11n.yaml" when scratch
+	Task         string                               `json:"task"`
+	DataVersion  DataVersionRef                       `json:"data_version"`
+	DatasetCache *storagenode.TrainerCacheTaskPayload `json:"dataset_cache,omitempty"`
+	BaseModel    *BaseModelRef                        `json:"base_model,omitempty"`
+	Params       map[string]any                       `json:"params"`
+	DatasetURL   string                               `json:"dataset_url"`
+	BaseModelURL string                               `json:"base_model_url,omitempty"`
+	ProgressURL  string                               `json:"progress_url"`
+	ArtifactsURL string                               `json:"artifacts_url"`
+	CompleteURL  string                               `json:"complete_url"`
+	FailURL      string                               `json:"fail_url"`
 }
 
 // ProgressInput is posted periodically by the compute node during training.

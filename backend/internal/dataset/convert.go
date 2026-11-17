@@ -21,6 +21,8 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // Conversion of X-AnyLabeling / LabelMe JSON and YOLO txt annotations to
@@ -61,10 +63,10 @@ type imageInfo struct {
 	Depth         int // channels for <size><depth>
 }
 
-// stagedImageInfo reads the dimensions and color depth of a staged image.
-func stagedImageInfo(root *os.Root, rel string) imageInfo {
+// stagedImageInfo reads the dimensions and color depth of an image in root.
+func stagedImageInfo(root storagenode.Dir, rel string) imageInfo {
 	info := imageInfo{Depth: 3}
-	f, err := root.Open(filepath.FromSlash(rel))
+	f, err := root.Open(rel)
 	if err != nil {
 		return info
 	}
@@ -86,20 +88,29 @@ func stagedImageInfo(root *os.Root, rel string) imageInfo {
 // holds the images whose annotation file could not be converted.
 func (s *Service) convertStaged(ctx context.Context, staged string, job Import, sum *importSummary,
 	p *progressTracker) (unconverted map[string]bool, err error) {
-	root, err := os.OpenRoot(staged)
+	localRoot, err := storagenode.OpenLocalDir(staged)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil // nothing was staged
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer root.Close()
+	defer localRoot.Close()
+
+	osRoot, err := os.OpenRoot(staged)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer osRoot.Close()
 
 	images, sources, err := listStaged(ctx, staged, job.AnnotationFormat)
 	if err != nil {
 		return nil, fmt.Errorf("list staged files: %w", err)
 	}
-	c := &converter{root: root, format: job.AnnotationFormat, classes: job.Classes, imagePaths: map[string]string{}}
+	c := &converter{root: osRoot, format: job.AnnotationFormat, classes: job.Classes, imagePaths: map[string]string{}}
 	pairs := c.pair(images, sources)
 	sum.Orphaned += len(sources) - len(pairs)
 
@@ -116,7 +127,7 @@ func (s *Service) convertStaged(ctx context.Context, staged string, job Import, 
 		}
 		src := pairs[img]
 		dir, base := path.Split(img)
-		info := stagedImageInfo(root, img)
+		info := stagedImageInfo(localRoot, img)
 		a, err := c.read(src, info)
 		var rangeErr *classRangeError
 		if errors.As(err, &rangeErr) {
@@ -128,7 +139,7 @@ func (s *Service) convertStaged(ctx context.Context, staged string, job Import, 
 			}
 			// Fails for the second of a.jpg and a.png when both are paired
 			// (JSON imagePath): VOC keeps one annotation per stem.
-			err = writeStagedVOC(root, dir+strings.TrimSuffix(base, path.Ext(base))+".xml", base, info, a.Objects)
+			err = writeStagedVOC(osRoot, dir+strings.TrimSuffix(base, path.Ext(base))+".xml", base, info, a.Objects)
 		}
 		switch {
 		case err == nil:
@@ -146,7 +157,7 @@ func (s *Service) convertStaged(ctx context.Context, staged string, job Import, 
 	// The sources stay out of the dataset; moveStaged would count them as
 	// ignored files.
 	for _, src := range sources {
-		if err := root.Remove(filepath.FromSlash(src)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := osRoot.Remove(filepath.FromSlash(src)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("remove converted annotation: %w", err)
 		}
 	}

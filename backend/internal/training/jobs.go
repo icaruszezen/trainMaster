@@ -251,10 +251,12 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Job, error) {
 	for i, c := range dv.Classes {
 		classNames[i] = c.Name
 	}
+	sharedLocal := dv.StorageNode.ID == 0 || dv.StorageNode.IsBuiltin
 	dvRef := DataVersionRef{
 		ID:             dv.ID,
 		Version:        dv.Version,
 		DirName:        dirName,
+		SharedLocal:    &sharedLocal,
 		ClassNames:     classNames,
 		ImageCount:     dv.ImageCount,
 		TrainCount:     dv.TrainCount,

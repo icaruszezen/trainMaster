@@ -1,13 +1,14 @@
 package dataversion
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // The files at the top of a version folder: version.json (the manifest),
@@ -83,37 +84,15 @@ func newManifest(v DataVersion) manifest {
 	return m
 }
 
-// writeManifest writes version.json into the folder dir atomically (a
-// temporary file renamed over it).
-func writeManifest(dir string, m manifest) error {
+// writeManifest writes version.json into verDir atomically (PutBytes stages a
+// temporary file and renames it on local/SMB, or issues an atomic PutObject on S3).
+func writeManifest(ctx context.Context, verDir storagenode.Dir, m manifest) error {
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", manifestFile, err)
 	}
-	return writeFileAtomic(filepath.Join(dir, manifestFile), append(data, '\n'))
-}
-
-// writeFileAtomic writes data to a temporary file next to name and renames
-// it over name.
-func writeFileAtomic(name string, data []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(name), "."+filepath.Base(name)+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("write %s: %w", filepath.Base(name), err)
-	}
-	tmp := f.Name()
-	err = f.Chmod(0o644) // CreateTemp makes it 0600, like copyFileFrom
-	if err == nil {
-		_, err = f.Write(data)
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = os.Rename(tmp, name)
-	}
-	if err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("write %s: %w", filepath.Base(name), err)
+	if err := verDir.PutBytes(ctx, manifestFile, append(data, '\n'), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", manifestFile, err)
 	}
 	return nil
 }

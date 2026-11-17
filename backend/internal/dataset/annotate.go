@@ -14,7 +14,6 @@ import (
 	"math"
 	"os"
 	"path"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -22,6 +21,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // Annotation editing (the annotation workspace). An image's boxes are read
@@ -51,8 +52,8 @@ func annotationVersion(data []byte) string {
 // readAnnotationFile reads the file at rel, up to one byte more than
 // parseVOC reads, so an oversized file still fails to parse and gets a
 // version different from its first 16 MiB.
-func readAnnotationFile(root *os.Root, rel string) ([]byte, error) {
-	f, err := root.Open(filepath.FromSlash(rel))
+func readAnnotationFile(root storagenode.Dir, rel string) ([]byte, error) {
+	f, err := root.Open(rel)
 	if err != nil {
 		return nil, err
 	}
@@ -64,7 +65,7 @@ func readAnnotationFile(root *os.Root, rel string) ([]byte, error) {
 // version (and the content) is returned whenever the file could be read,
 // also when it cannot be parsed (so a broken file can be replaced on
 // purpose).
-func readVersionedAnnotation(root *os.Root, rel string) (a *vocAnnotation, version string, data []byte, err error) {
+func readVersionedAnnotation(root storagenode.Dir, rel string) (a *vocAnnotation, version string, data []byte, err error) {
 	data, err = readAnnotationFile(root, rel)
 	if err != nil {
 		return nil, "", nil, err
@@ -110,7 +111,7 @@ type annotationTarget struct {
 // and a.png both want a.xml, see claimOwner). Owner then names that image,
 // and the annotation of img can neither be shown nor saved. A new file is
 // put where a scan gives it to img (see newFileTarget).
-func resolveAnnotationTarget(ctx context.Context, q querier, root *os.Root, img Image) (annotationTarget, error) {
+func resolveAnnotationTarget(ctx context.Context, q querier, root storagenode.Dir, img Image) (annotationTarget, error) {
 	var t annotationTarget
 	if img.AnnotationPath != nil {
 		t = annotationTarget{Path: *img.AnnotationPath, Paired: true}
@@ -136,7 +137,7 @@ func resolveAnnotationTarget(ctx context.Context, q querier, root *os.Root, img 
 // file to img (see annotationsFolderRival), or when it would make the file
 // of another image go elsewhere (see newFileTaker); img cannot be saved
 // then, so that the boxes of the other image stay with it.
-func newFileTarget(ctx context.Context, q querier, root *os.Root, img Image, gone string) (annotationTarget, error) {
+func newFileTarget(ctx context.Context, q querier, root storagenode.Dir, img Image, gone string) (annotationTarget, error) {
 	t := annotationTarget{Path: defaultAnnotationPath(root, img.Path)}
 	var err error
 	if t.Owner, t.StaleOwner, err = indexedOwner(ctx, q, root, img, t.Path); err != nil || t.Owner != "" {
@@ -161,7 +162,7 @@ func newFileTarget(ctx context.Context, q querier, root *os.Root, img Image, gon
 // c, with the boxes of S, would go to another image (annotations/a.jpg) or
 // to none. Only a file that a scan gives S counts (see claimOwner): an image
 // that loses c to another one now keeps no file either way.
-func newFileTaker(ctx context.Context, q querier, root *os.Root, img Image, rel, gone string) (string, error) {
+func newFileTaker(ctx context.Context, q querier, root storagenode.Dir, img Image, rel, gone string) (string, error) {
 	others, err := possibleClaimants(ctx, q, root, img, rel)
 	if err != nil {
 		return "", err
@@ -187,7 +188,7 @@ func newFileTaker(ctx context.Context, q querier, root *os.Root, img Image, rel,
 // date (see stalePairing). A path that differs in case only counts when it
 // names the same file (on a file system that ignores case), not another
 // file such as Annotations/a.xml for annotations/a.xml.
-func indexedOwner(ctx context.Context, q querier, root *os.Root, img Image, rel string) (owner string, stale bool, err error) {
+func indexedOwner(ctx context.Context, q querier, root storagenode.Dir, img Image, rel string) (owner string, stale bool, err error) {
 	rows, err := q.Query(ctx, `SELECT rel_path, annotation_path FROM dataset_images
 		WHERE dataset_id = $1 AND id <> $2 AND lower(annotation_path) = lower($3)
 		ORDER BY `+ImageOrder, img.DatasetID, img.ID, rel)
@@ -218,7 +219,7 @@ func indexedOwner(ctx context.Context, q querier, root *os.Root, img Image, rel 
 // file elsewhere (see resolveAnnotationTarget), or the <filename> recorded
 // in rel names img and not owner (see claimOwner). It takes a few stats and
 // one read, and only runs for an image that another one blocks.
-func stalePairing(root *os.Root, img Image, owner, ownerPath, rel string) bool {
+func stalePairing(root storagenode.Dir, img Image, owner, ownerPath, rel string) bool {
 	if !isRegularFile(root, owner) || !isRegularFile(root, ownerPath) {
 		return true
 	}
@@ -239,7 +240,7 @@ func stalePairing(root *os.Root, img Image, owner, ownerPath, rel string) bool {
 // <filename>, or that image lost a file of its own), the edit is refused
 // until a rescan. A paired file that is gone, with no other file found, is
 // written anew (create) where a new file of an image without one goes.
-func checkPairedTarget(ctx context.Context, q querier, root *os.Root, img Image, t annotationTarget, create bool) (annotationTarget, error) {
+func checkPairedTarget(ctx context.Context, q querier, root storagenode.Dir, img Image, t annotationTarget, create bool) (annotationTarget, error) {
 	if !t.Paired {
 		return t, nil // t is what a scan would pick (see resolveAnnotationTarget)
 	}
@@ -267,16 +268,34 @@ func checkPairedTarget(ctx context.Context, q querier, root *os.Root, img Image,
 
 // sameFile reports whether the paths a and b name the same file (on a file
 // system that ignores case, a.xml and A.XML do).
-func sameFile(root *os.Root, a, b string) bool {
+func sameFile(root storagenode.Dir, a, b string) bool {
 	if a == b {
 		return true
 	}
-	fa, err := root.Lstat(filepath.FromSlash(a))
+	fa, err := root.Lstat(a)
 	if err != nil {
 		return false
 	}
-	fb, err := root.Lstat(filepath.FromSlash(b))
-	return err == nil && os.SameFile(fa, fb)
+	fb, err := root.Lstat(b)
+	if err != nil {
+		return false
+	}
+	if os.SameFile(fa, fb) {
+		return true
+	}
+	if root.LocalDir() == "" && strings.EqualFold(a, b) && fa.Size() == fb.Size() && fa.ModTime().Equal(fb.ModTime()) {
+		dir := strings.TrimSuffix(path.Dir(a), ".")
+		if dir == "/" {
+			dir = ""
+		}
+		if names, nerr := root.ReadDirNames(dir); nerr == nil {
+			baseA, baseB := path.Base(a), path.Base(b)
+			if !(slices.Contains(names, baseA) && slices.Contains(names, baseB)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // claimOwner decides, like pairAnnotations, which image a scan gives the
@@ -286,7 +305,7 @@ func sameFile(root *os.Root, a, b string) bool {
 // <filename> recorded in the file decides; without a match, the first image
 // in byte order of the path gets it. The file gone ("" for none) counts as
 // removed. It returns that image, or "" if it is img.
-func claimOwner(ctx context.Context, q querier, root *os.Root, img Image, rel, gone string) (string, error) {
+func claimOwner(ctx context.Context, q querier, root storagenode.Dir, img Image, rel, gone string) (string, error) {
 	others, err := possibleClaimants(ctx, q, root, img, rel)
 	if err != nil {
 		return "", err
@@ -316,7 +335,7 @@ func claimOwner(ctx context.Context, q querier, root *os.Root, img Image, rel, g
 // their candidate (see annotationCandidate): the images of its stem
 // (ignoring case) in its folder and, for a file in an "Annotations" folder,
 // in the VOC image folders next to it.
-func possibleClaimants(ctx context.Context, q querier, root *os.Root, img Image, rel string) ([]Image, error) {
+func possibleClaimants(ctx context.Context, q querier, root storagenode.Dir, img Image, rel string) ([]Image, error) {
 	dir, base := path.Split(rel)
 	stem := strings.TrimSuffix(base, path.Ext(base))
 	patterns := []string{likePrefix(dir+stem) + ".%"}
@@ -352,20 +371,20 @@ func likePrefix(s string) string {
 // "Annotations" folder. Like a scan it only takes regular files, and it
 // does not consider other images claiming the file (see claimOwner). It
 // returns "" when there is none.
-func annotationCandidate(root *os.Root, rel string) string {
+func annotationCandidate(root storagenode.Dir, rel string) string {
 	return annotationCandidateWithout(root, rel, "")
 }
 
 // annotationCandidateWithout is annotationCandidate as if the file gone
 // ("" for none) had been removed.
-func annotationCandidateWithout(root *os.Root, rel, gone string) string {
+func annotationCandidateWithout(root storagenode.Dir, rel, gone string) string {
 	return annotationCandidateAfter(root, rel, gone, "")
 }
 
 // annotationCandidateAfter is annotationCandidate as if the file gone ("" for
 // none) had been removed and then the file added ("" for none) created, in a
 // folder that exists.
-func annotationCandidateAfter(root *os.Root, rel, gone, added string) string {
+func annotationCandidateAfter(root storagenode.Dir, rel, gone, added string) string {
 	ok := func(p string) bool {
 		return (added != "" && p == added) || (isRegularFile(root, p) && (gone == "" || !sameFile(root, p, gone)))
 	}
@@ -412,7 +431,7 @@ func exactAnnotationPath(rel string) string {
 	return strings.TrimSuffix(rel, path.Ext(rel)) + ".xml"
 }
 
-func isRegularFile(root *os.Root, rel string) bool {
+func isRegularFile(root storagenode.Dir, rel string) bool {
 	ok, _ := regularFileExists(root, rel)
 	return ok
 }
@@ -429,34 +448,18 @@ func vocImageFolder(dir string) (parent string, ok bool) {
 	return parent, d == "jpegimages" || d == "images"
 }
 
-// folderPath turns a folder ("" for the top level, else slash-terminated)
-// into a name for os.Root.
-func folderPath(dir string) string {
-	if dir = strings.TrimSuffix(dir, "/"); dir == "" {
-		return "."
-	}
-	return filepath.FromSlash(dir)
-}
-
 // namesIn returns the names in the folder dir ("" for the top level, else
 // slash-terminated) that are want in lower case and valid UTF-8, sorted.
 // It reads names only, so a folder of many images is listed quickly.
-func namesIn(root *os.Root, dir, want string) []string {
-	f, err := root.Open(folderPath(dir))
+func namesIn(root storagenode.Dir, dir, want string) []string {
+	names, err := root.ReadDirNames(strings.TrimSuffix(dir, "/"))
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
 	var found []string
-	for {
-		names, err := f.Readdirnames(1024)
-		for _, name := range names {
-			if strings.ToLower(name) == want && utf8.ValidString(name) {
-				found = append(found, name)
-			}
-		}
-		if err != nil { // io.EOF at the end
-			break
+	for _, name := range names {
+		if strings.ToLower(name) == want && utf8.ValidString(name) {
+			found = append(found, name)
 		}
 	}
 	slices.Sort(found)
@@ -466,11 +469,11 @@ func namesIn(root *os.Root, dir, want string) []string {
 // annotationsDirs returns the names of the real folders called
 // "Annotations" (any case) in the folder parent ("" for the top level,
 // else slash-terminated), sorted.
-func annotationsDirs(root *os.Root, parent string) []string {
+func annotationsDirs(root storagenode.Dir, parent string) []string {
 	var dirs []string
 	for _, name := range namesIn(root, parent, "annotations") {
 		// Lstat does not follow symbolic links, like a scan.
-		if fi, err := root.Lstat(filepath.FromSlash(parent + name)); err == nil && fi.IsDir() {
+		if fi, err := root.Lstat(parent + name); err == nil && fi.IsDir() {
 			dirs = append(dirs, name)
 		}
 	}
@@ -491,7 +494,7 @@ func annotationsDirs(root *os.Root, parent string) []string {
 // instead, which no image of another folder claims. (An image in an
 // "Annotations" folder itself has no other place: see
 // annotationsFolderRival.)
-func defaultAnnotationPath(root *os.Root, rel string) string {
+func defaultAnnotationPath(root storagenode.Dir, rel string) string {
 	dir, base := path.Split(rel)
 	stem := strings.TrimSuffix(base, path.Ext(base))
 	if parent, ok := vocImageFolder(dir); ok {
@@ -505,7 +508,7 @@ func defaultAnnotationPath(root *os.Root, rel string) string {
 // hasNamesake reports whether another VOC image folder ("JPEGImages" or
 // "images", any case) or an "Annotations" folder in the folder parent holds
 // an image of the same file name as the image at rel.
-func hasNamesake(root *os.Root, parent, rel string) bool {
+func hasNamesake(root storagenode.Dir, parent, rel string) bool {
 	base := path.Base(rel)
 	for _, folder := range []string{"jpegimages", "images", "annotations"} {
 		for _, name := range namesIn(root, parent, folder) {
@@ -526,7 +529,7 @@ func hasNamesake(root *os.Root, parent, rel string) bool {
 // annotationCandidate), the <filename> recorded in rel cannot tell the two
 // apart, and the first in byte order of the path gets it (see claimOwner).
 // The file gone ("" for none) counts as removed.
-func annotationsFolderRival(root *os.Root, img Image, rel, gone string) string {
+func annotationsFolderRival(root storagenode.Dir, img Image, rel, gone string) string {
 	dir, base := path.Split(img.Path)
 	parent, name := path.Split(strings.TrimSuffix(dir, "/"))
 	if dir == "" || strings.ToLower(name) != "annotations" {
@@ -552,7 +555,7 @@ func annotationsFolderRival(root *os.Root, img Image, rel, gone string) string {
 // siblingAnnotationsDir returns the name of the real folder called
 // "Annotations" (any case) in the folder parent ("" for the top level),
 // the first in byte order if there are several, or "" if there is none.
-func siblingAnnotationsDir(root *os.Root, parent string) string {
+func siblingAnnotationsDir(root storagenode.Dir, parent string) string {
 	if dirs := annotationsDirs(root, parent); len(dirs) > 0 {
 		return dirs[0]
 	}
@@ -563,7 +566,7 @@ func siblingAnnotationsDir(root *os.Root, parent string) string {
 func (s *Service) imageDetail(ctx context.Context, d Dataset, img Image) (ImageDetail, error) {
 	detail := ImageDetail{Image: img, Objects: []AnnotationObject{}}
 	detail.Annotation = nil
-	root, err := s.openDatasetRoot(d)
+	root, err := s.openDatasetRoot(ctx, d)
 	if err != nil {
 		var ue *Error
 		if errors.As(err, &ue) { // the dataset folder is gone
@@ -732,7 +735,7 @@ func (s *Service) DeleteAnnotation(ctx context.Context, datasetID, imageID int64
 
 // annotationEdit is the state an annotation change works on.
 type annotationEdit struct {
-	root    *os.Root
+	root    storagenode.Dir
 	img     Image
 	target  annotationTarget
 	exists  bool           // the target file exists
@@ -771,7 +774,7 @@ func otherImage(img Image, other string) string {
 // too. The removal is refused when a file the index pairs with another
 // image would then go to img or to one of those images: the boxes of that
 // image would move with it at the next scan.
-func remainingAnnotation(ctx context.Context, q querier, root *os.Root, img Image, gone string) (annotationTarget, error) {
+func remainingAnnotation(ctx context.Context, q querier, root storagenode.Dir, img Image, gone string) (annotationTarget, error) {
 	others, err := possibleClaimants(ctx, q, root, img, gone)
 	if err != nil {
 		return annotationTarget{}, err
@@ -881,6 +884,9 @@ func updateAnnotationIndex(ctx context.Context, tx pgx.Tx, img Image, annPath *s
 // remainingAnnotation), usually none.
 func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, baseVersion string, force bool,
 	change func(e *annotationEdit) ([]byte, error)) (ImageDetail, error) {
+	if err := s.checkNotMigrating(datasetID); err != nil {
+		return ImageDetail{}, err
+	}
 	unlock, err := s.annotationLocks.lock(ctx, imageID)
 	if err != nil {
 		return ImageDetail{}, err
@@ -891,7 +897,7 @@ func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, 
 	if err != nil {
 		return ImageDetail{}, err
 	}
-	root, err := s.openDatasetRoot(d)
+	root, err := s.openDatasetRoot(ctx, d)
 	if err != nil {
 		return ImageDetail{}, err
 	}
@@ -986,7 +992,7 @@ func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, 
 		var restVersion string
 		var restErr error
 		if data == nil && rest.Path != "" && rest.Owner == "" {
-			if fi, err := root.Lstat(filepath.FromSlash(rest.Path)); err == nil {
+			if fi, err := root.Lstat(rest.Path); err == nil {
 				restRead, restVersion, _, restErr = readVersionedAnnotation(root, rest.Path)
 				if !errors.Is(restErr, fs.ErrNotExist) { // not removed meanwhile
 					restInfo = fi
@@ -1047,7 +1053,7 @@ func (s *Service) editAnnotation(ctx context.Context, datasetID, imageID int64, 
 
 // annotationUnchanged reports whether the file at rel still has the given
 // version ("" for no file).
-func annotationUnchanged(root *os.Root, rel, version string) bool {
+func annotationUnchanged(root storagenode.Dir, rel, version string) bool {
 	exists, err := regularFileExists(root, rel)
 	if err != nil || !exists {
 		return err == nil && version == ""
@@ -1062,7 +1068,7 @@ func annotationUnchanged(root *os.Root, rel, version string) bool {
 // place or moves the old file aside, and finish (after the commit) or undo
 // (when anything failed) tidies up.
 type annotationFileChange struct {
-	root     *os.Root
+	root     storagenode.Dir
 	rel      string
 	data     []byte // the new content, nil to remove the file
 	existed  bool   // the file existed before
@@ -1079,7 +1085,7 @@ func (c *annotationFileChange) stage() (fs.FileInfo, error) {
 		return nil, err
 	}
 	c.tmp = tmp
-	fi, err := c.root.Lstat(filepath.FromSlash(tmp))
+	fi, err := c.root.Lstat(tmp)
 	if err != nil {
 		return nil, fmt.Errorf("stat saved annotation: %w", err)
 	}
@@ -1121,7 +1127,7 @@ func (c *annotationFileChange) finish(log *slog.Logger) {
 	if c.tmp == "" {
 		return
 	}
-	if err := c.root.Remove(filepath.FromSlash(c.tmp)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := c.root.RemoveFile(context.Background(), c.tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		log.Warn("could not remove a deleted annotation file", "path", c.tmp, "err", err)
 	}
 }
@@ -1133,7 +1139,7 @@ func (c *annotationFileChange) undo(log *slog.Logger) {
 	switch {
 	case !c.applied:
 		if c.tmp != "" {
-			err = c.root.Remove(filepath.FromSlash(c.tmp))
+			err = c.root.RemoveFile(context.Background(), c.tmp)
 		}
 	case c.data == nil: // a removal: move the file back
 		if exists, lerr := regularFileExists(c.root, c.rel); lerr == nil && !exists {
@@ -1144,7 +1150,7 @@ func (c *annotationFileChange) undo(log *slog.Logger) {
 	case !fileHolds(c.root, c.rel, c.data):
 		// Changed again meanwhile: leave it.
 	case !c.existed:
-		err = c.root.Remove(filepath.FromSlash(c.rel))
+		err = c.root.RemoveFile(context.Background(), c.rel)
 	case len(c.previous) > maxAnnotationBytes:
 		err = errors.New("the previous file is too large to restore")
 	default:
@@ -1156,8 +1162,8 @@ func (c *annotationFileChange) undo(log *slog.Logger) {
 }
 
 // fileHolds reports whether the file at rel has exactly the content data.
-func fileHolds(root *os.Root, rel string, data []byte) bool {
-	f, err := root.Open(filepath.FromSlash(rel))
+func fileHolds(root storagenode.Dir, rel string, data []byte) bool {
+	f, err := root.Open(rel)
 	if err != nil {
 		return false
 	}
@@ -1176,7 +1182,7 @@ func tempAnnotationName(dir string) string {
 // folder of the annotation file rel (creating the folder if needed), with
 // the permissions of the file at rel if there is one, and returns its
 // name.
-func writeTempAnnotation(root *os.Root, rel string, data []byte) (string, error) {
+func writeTempAnnotation(root storagenode.Dir, rel string, data []byte) (string, error) {
 	dir := path.Dir(rel)
 	if err := ensureDirs(root, dir); err != nil {
 		if errors.Is(err, errUnsafeTarget) {
@@ -1185,26 +1191,11 @@ func writeTempAnnotation(root *os.Root, rel string, data []byte) (string, error)
 		return "", err
 	}
 	perm := fs.FileMode(0o644)
-	if fi, err := root.Lstat(filepath.FromSlash(rel)); err == nil && fi.Mode().IsRegular() {
+	if fi, err := root.Lstat(rel); err == nil && fi.Mode().IsRegular() {
 		perm = fi.Mode().Perm()
 	}
 	tmp := tempAnnotationName(dir)
-	f, err := root.OpenFile(filepath.FromSlash(tmp), os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
-	if err != nil {
-		return "", fmt.Errorf("create annotation: %w", err)
-	}
-	_, err = f.Write(data)
-	if err == nil {
-		err = f.Chmod(perm) // not reduced by the umask
-	}
-	if err == nil {
-		err = f.Sync()
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		_ = root.Remove(filepath.FromSlash(tmp))
+	if err := root.CreateExclusive(context.Background(), tmp, data, perm); err != nil {
 		return "", fmt.Errorf("write annotation: %w", err)
 	}
 	return tmp, nil
@@ -1212,24 +1203,21 @@ func writeTempAnnotation(root *os.Root, rel string, data []byte) (string, error)
 
 // renameInRoot renames the file from to the name to, replacing it; both
 // are slash-separated paths in root.
-func renameInRoot(root *os.Root, from, to string) error {
-	// os.Root has no Rename in Go 1.24. Both names are inside root and
-	// their folder was checked by ensureDirs; rename never follows a
-	// symbolic link at the target, it replaces the link itself.
-	return os.Rename(filepath.Join(root.Name(), filepath.FromSlash(from)), filepath.Join(root.Name(), filepath.FromSlash(to)))
+func renameInRoot(root storagenode.Dir, from, to string) error {
+	return root.RenameFile(context.Background(), from, to, true)
 }
 
 // writeAnnotationFile replaces the file at rel with data: it writes a
 // hidden temporary file in the same folder and renames it over the target,
 // so readers (and a crash) never see half a file. The permissions of an
 // existing file are kept.
-func writeAnnotationFile(root *os.Root, rel string, data []byte) error {
+func writeAnnotationFile(root storagenode.Dir, rel string, data []byte) error {
 	tmp, err := writeTempAnnotation(root, rel, data)
 	if err != nil {
 		return err
 	}
 	if err := renameInRoot(root, tmp, rel); err != nil {
-		_ = root.Remove(filepath.FromSlash(tmp))
+		_ = root.RemoveFile(context.Background(), tmp)
 		return fmt.Errorf("write annotation: %w", err)
 	}
 	return nil
