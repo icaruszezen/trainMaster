@@ -42,12 +42,26 @@ func (s *Service) notifyMigrator() {
 }
 
 func (s *Service) recoverMigrations(ctx context.Context) error {
-	if _, err := s.db.Exec(ctx, `UPDATE storage_migrations
-		SET status = 'failed',
-			error = '服务重启导致迁移中断，原节点文件完好，可重新发起迁移',
+	if _, err := s.db.Exec(ctx, `UPDATE storage_migrations sm
+		SET status = CASE
+				WHEN (sm.target_type = 'dataset' AND EXISTS (
+					SELECT 1 FROM datasets d WHERE d.id = sm.target_id AND d.storage_node_id = sm.to_node_id
+				)) OR (sm.target_type = 'data_version' AND EXISTS (
+					SELECT 1 FROM data_versions v WHERE v.id = sm.target_id AND v.storage_node_id = sm.to_node_id
+				)) THEN 'succeeded'
+				ELSE 'failed'
+			END,
+			error = CASE
+				WHEN (sm.target_type = 'dataset' AND EXISTS (
+					SELECT 1 FROM datasets d WHERE d.id = sm.target_id AND d.storage_node_id = sm.to_node_id
+				)) OR (sm.target_type = 'data_version' AND EXISTS (
+					SELECT 1 FROM data_versions v WHERE v.id = sm.target_id AND v.storage_node_id = sm.to_node_id
+				)) THEN ''
+				ELSE '服务重启导致迁移中断，原节点文件完好，可重新发起迁移'
+			END,
 			finished_at = now(),
 			updated_at = now()
-		WHERE status = 'running'`); err != nil {
+		WHERE sm.status = 'running'`); err != nil {
 		return fmt.Errorf("recover running storage migrations: %w", err)
 	}
 
@@ -462,6 +476,20 @@ func (s *Service) CancelMigration(ctx context.Context, id int64) (Migration, err
 			return nil
 
 		case MigrationRunning:
+			var alreadySwitched bool
+			switch mr.m.TargetType {
+			case TargetDataset:
+				_ = tx.QueryRow(ctx,
+					"SELECT EXISTS (SELECT 1 FROM datasets WHERE id = $1 AND storage_node_id = $2)",
+					mr.m.TargetID, mr.toNodeID).Scan(&alreadySwitched)
+			case TargetDataVersion:
+				_ = tx.QueryRow(ctx,
+					"SELECT EXISTS (SELECT 1 FROM data_versions WHERE id = $1 AND storage_node_id = $2)",
+					mr.m.TargetID, mr.toNodeID).Scan(&alreadySwitched)
+			}
+			if alreadySwitched {
+				return newError(ErrConflict, "数据已完成节点切换，正在清理原节点文件，无法取消")
+			}
 			mr, scanErr = scanMigrationRow(tx.QueryRow(ctx, `UPDATE storage_migrations
 				SET status = 'canceled', error = '用户已取消', finished_at = now(), updated_at = now()
 				WHERE id = $1
@@ -515,7 +543,10 @@ func (s *Service) WaitMigrationsIdle(ctx context.Context) error {
 			"SELECT COUNT(*) FROM storage_migrations WHERE status IN ('queued', 'running')").Scan(&active); err != nil {
 			return err
 		}
-		if active == 0 {
+		s.migMu.Lock()
+		inMem := len(s.activeMig)
+		s.migMu.Unlock()
+		if active == 0 && inMem == 0 {
 			return nil
 		}
 		select {
@@ -873,8 +904,7 @@ func (s *Service) executeMigration(ctx context.Context, mr migrationRow) {
 		}
 
 		_, err := tx.Exec(ctx, `UPDATE storage_migrations
-			SET status = 'succeeded', files_done = $2, bytes_done = $3, error = '',
-				finished_at = now(), updated_at = now()
+			SET files_done = $2, bytes_done = $3, updated_at = now()
 			WHERE id = $1`, mr.m.ID, filesDone, bytesDone)
 		return err
 	})
@@ -883,15 +913,26 @@ func (s *Service) executeMigration(ctx context.Context, mr migrationRow) {
 		return
 	}
 
-	// Database now points to the destination node. Optionally delete source files!
+	// Database now points to the destination node. Delete source files BEFORE
+	// flipping migration status to 'succeeded', so both API callers and UI
+	// capacity bars immediately see reclaimed disk space once status='succeeded'.
 	if mr.m.DeleteSource {
 		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cleanCancel()
 		if err := fromVol.RemoveDirAll(cleanCtx, space, srcDirName); err != nil {
 			s.log.Warn("remove migrated source directory failed",
 				"migration_id", mr.m.ID, "from_node_id", mr.fromNodeID,
 				"space", space, "dir", srcDirName, "err", err)
 		}
+		cleanCancel()
+	}
+
+	finCtx, finCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer finCancel()
+	if _, err := s.db.Exec(finCtx, `UPDATE storage_migrations
+		SET status = 'succeeded', files_done = $2, bytes_done = $3, error = '',
+			finished_at = now(), updated_at = now()
+		WHERE id = $1`, mr.m.ID, filesDone, bytesDone); err != nil {
+		s.log.Warn("mark storage migration succeeded failed", "migration_id", mr.m.ID, "err", err)
 	}
 }
 
