@@ -114,12 +114,23 @@ describe("navigation config", () => {
     ])
   })
 
-  it("lists the recycle bin under system management", () => {
+  it("lists storage and recycle bin as implemented under system management", () => {
+    expect(getNavItem("storage")).toMatchObject({
+      status: "ready",
+      title: "存储管理",
+      path: "/system/storage",
+      apiPath: "/api/v1/storage",
+    })
     expect(getNavItem("recycle-bin")).toMatchObject({
       status: "ready",
       title: "回收站",
       path: "/system/recycle-bin",
       apiPath: "/api/v1/recycle-bin",
+    })
+    expect(findActiveNavItem("/system/storage")).toMatchObject({
+      group: { id: "system" },
+      item: { id: "storage" },
+      exact: true,
     })
     expect(findActiveNavItem("/system/recycle-bin")).toMatchObject({
       group: { id: "system" },

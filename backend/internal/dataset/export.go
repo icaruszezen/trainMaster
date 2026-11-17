@@ -10,9 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"path"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -22,6 +20,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/klauspost/compress/flate"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // Dataset downloads: the images and their annotations as a zip archive in
@@ -117,8 +117,12 @@ func (s *Service) CreateExport(ctx context.Context, datasetID int64, in ExportIn
 			return ExportTicket{}, err
 		}
 	}
-	if !s.dirExists(d.DirName) {
-		return ExportTicket{}, errDatasetDirMissing(s.datasetDir(d.DirName))
+	_, vol, err := s.volumeFor(ctx, d.StorageNodeID)
+	if err != nil {
+		return ExportTicket{}, err
+	}
+	if err := vol.IsPlainDir(ctx, storagenode.SpaceDatasets, d.DirName); err != nil {
+		return ExportTicket{}, errDatasetDirMissing(vol.DisplayPath(storagenode.SpaceDatasets, d.DirName))
 	}
 	if d.ImageCount == 0 {
 		return ExportTicket{}, &Error{Kind: ErrConflict, Message: "数据集中没有图片，无法下载"}
@@ -172,7 +176,7 @@ type Export struct {
 	FileName string
 
 	db      querier
-	root    *os.Root
+	root    storagenode.Dir
 	top     string // the folder everything is in: the dataset's folder name (and the versions)
 	format  string
 	classes []string
@@ -256,7 +260,7 @@ func (s *Service) OpenExport(ctx context.Context, datasetID int64, token string)
 	if len(images) == 0 && !r.includeBase {
 		return nil, &Error{Kind: ErrConflict, Message: "所选版本中已没有可以导出的图片，请重新下载"}
 	}
-	root, err := s.openDatasetRoot(d)
+	root, err := s.openDatasetRoot(ctx, d)
 	if err != nil {
 		return nil, err
 	}
@@ -336,7 +340,7 @@ var storedExtensions = map[string]bool{
 // (and nothing is written) when the file cannot be opened, e.g. it was
 // deleted since the last scan, or an earlier file took the name.
 func (e *Export) copyFile(zw *zip.Writer, rel, name string) (ok bool, err error) {
-	f, err := e.root.Open(filepath.FromSlash(rel))
+	f, err := e.root.Open(rel)
 	if err != nil {
 		e.log.Warn("export: skipping file that cannot be opened", "path", rel, "err", err)
 		return false, nil

@@ -5,14 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"maps"
-	"os"
 	"slices"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // OWNER: backend-core agent. Validating inputs, previews, creating,
@@ -350,6 +349,11 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (DataVersion, erro
 			maxAugmented, p.AugmentedCount)
 	}
 
+	activeRef, vol, err := s.activeVolume(ctx)
+	if err != nil {
+		return DataVersion{}, err
+	}
+
 	datasetIDs := make([]int64, len(req.sources))
 	for i, src := range req.sources {
 		datasetIDs[i] = src.DatasetID
@@ -372,7 +376,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (DataVersion, erro
 		}
 		var classes []Class
 		var dirName string
-		if version, classes, dirName, err = s.allocateNumber(ctx, tx, req.projectID); err != nil {
+		if version, classes, dirName, err = s.allocateNumber(ctx, tx, vol, req.projectID); err != nil {
 			return err
 		}
 		if err := checkClasses(classes, req.classVersion); err != nil {
@@ -386,25 +390,25 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (DataVersion, erro
 		if err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx, `INSERT INTO data_versions (project_id, version, dir_name, note, status, classes,
+		return tx.QueryRow(ctx, `INSERT INTO data_versions (project_id, storage_node_id, version, dir_name, note, status, classes,
 				config, sources)
-			VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7) RETURNING id`,
-			req.projectID, version, dirName, req.note, classes, req.config, sources).Scan(&id)
+			VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7, $8) RETURNING id`,
+			req.projectID, activeRef.ID, version, dirName, req.note, classes, req.config, sources).Scan(&id)
 	})
 	if err != nil {
 		return DataVersion{}, err
 	}
 	s.builder.notify()
-	s.log.Info("data version queued", "version_id", id, "project_id", req.projectID, "version", version,
-		"sources", len(req.sources), "images", p.ImageCount)
+	s.log.Info("data version queued", "version_id", id, "project_id", req.projectID, "storage_node_id", activeRef.ID,
+		"version", version, "sources", len(req.sources), "images", p.ImageCount)
 	return s.Get(ctx, id)
 }
 
 // allocateNumber gives the next number of the project, in the caller's
 // transaction (the UPDATE locks the project row until it ends). Numbers
-// whose folder exists (a database restored from an older backup gives
+// whose folder exists on vol (a database restored from an older backup gives
 // them again) are skipped.
-func (s *Service) allocateNumber(ctx context.Context, tx pgx.Tx, projectID int64) (int, []Class, string, error) {
+func (s *Service) allocateNumber(ctx context.Context, tx pgx.Tx, vol storagenode.Volume, projectID int64) (int, []Class, string, error) {
 	for skips := 0; ; skips++ {
 		var version int
 		var classes []Class
@@ -417,14 +421,15 @@ func (s *Service) allocateNumber(ctx context.Context, tx pgx.Tx, projectID int64
 			return 0, nil, "", err
 		}
 		dirName := versionDirName(projectID, version)
-		dir := s.versionDir(dirName)
-		if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
+		exists, _, err := vol.DirExists(ctx, storagenode.SpaceExports, dirName)
+		if err != nil {
+			return 0, nil, "", fmt.Errorf("check data version folder: %w", err)
+		}
+		if !exists {
 			if classes == nil {
 				classes = []Class{}
 			}
 			return version, classes, dirName, nil
-		} else if err != nil {
-			return 0, nil, "", fmt.Errorf("check data version folder: %w", err)
 		}
 		s.log.Warn("data version folder already exists; skipping its number", "project_id", projectID,
 			"version", version, "dir_name", dirName)
@@ -436,6 +441,9 @@ func (s *Service) allocateNumber(ctx context.Context, tx pgx.Tx, projectID int64
 
 // Retry queues a failed version again, with the same configuration.
 func (s *Service) Retry(ctx context.Context, id int64) (DataVersion, error) {
+	if err := s.checkNotMigrating(id); err != nil {
+		return DataVersion{}, err
+	}
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		v, err := queryVersion(ctx, tx, id, true)
 		if err != nil {
@@ -472,6 +480,9 @@ func (s *Service) Retry(ctx context.Context, id int64) (DataVersion, error) {
 // of a ready version is rewritten while its row is locked, so that it
 // cannot interleave with another edit (or the end of the build).
 func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (DataVersion, error) {
+	if err := s.checkNotMigrating(id); err != nil {
+		return DataVersion{}, err
+	}
 	if in.Note != nil {
 		note, err := dataset.NormalizeVersionNote(*in.Note)
 		if err != nil {
@@ -493,7 +504,12 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (DataVer
 			if err := tx.QueryRow(ctx, "SELECT dir_name FROM data_versions WHERE id = $1", id).Scan(&dirName); err != nil {
 				return err
 			}
-			return writeManifest(s.versionDir(dirName), newManifest(v))
+			verDir, err := s.openVersionDir(ctx, v.StorageNodeID, dirName)
+			if err != nil {
+				return err
+			}
+			defer verDir.Close()
+			return writeManifest(ctx, verDir, newManifest(v))
 		})
 		if err != nil {
 			return DataVersion{}, err
@@ -505,6 +521,9 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (DataVer
 // Delete moves a ready version to the recycle bin (moveToBin) and removes
 // a failed or queued one for good; a building one is canceled first.
 func (s *Service) Delete(ctx context.Context, id int64) error {
+	if err := s.checkNotMigrating(id); err != nil {
+		return err
+	}
 	for attempt := 0; ; attempt++ {
 		// A version not built yet: deleting the row is all it takes. The
 		// builder owns the folder of a building one; it stops at its next
@@ -546,7 +565,7 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 			}
 			continue
 		case StatusFailed:
-			s.discardOwned(id, s.versionDir(dirName))
+			s.discardOwned(ctx, id, v.StorageNodeID, dirName)
 			s.discardThumbnails(id)
 			s.log.Info("failed data version deleted", "version_id", id)
 			return nil

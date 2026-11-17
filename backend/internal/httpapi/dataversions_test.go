@@ -185,7 +185,7 @@ func (e *dataVersionEnv) trashDataVersion(t *testing.T, id int64) {
 
 var (
 	dataVersionKeys = []string{"id", "project_id", "project_name", "version", "note", "status", "error", "progress",
-		"queue_position", "classes", "class_version", "config", "sources", "image_count", "object_count", "train_count",
+		"queue_position", "storage_node", "classes", "class_version", "config", "sources", "image_count", "object_count", "train_count",
 		"val_count", "test_count", "augmented_count", "total_bytes", "stats", "created_at", "updated_at", "started_at",
 		"finished_at"}
 	dataVersionImageKeys = []string{"id", "position", "split", "split_by", "path", "file_name", "width", "height",

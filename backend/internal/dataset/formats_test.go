@@ -16,6 +16,8 @@ import (
 	"testing"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 func TestNormalizeClasses(t *testing.T) {
@@ -390,7 +392,7 @@ func TestExportUniqueEntryNames(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	root, err := os.OpenRoot(dir)
+	root, err := storagenode.OpenLocalDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

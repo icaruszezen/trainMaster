@@ -1,6 +1,10 @@
 package compute
 
-import "time"
+import (
+	"time"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
+)
 
 // The JSON field names of the types in this file are the contract between
 // the server, the node agent (trainer/trainmaster_trainer) and the
@@ -261,5 +265,6 @@ type HeartbeatResult struct {
 	// true after a registration without an environment, until a heartbeat
 	// brings one; a node that is still detecting its environment (or has a
 	// result it has not sent yet) ignores it.
-	ProbeRequested bool `json:"probe_requested"`
+	ProbeRequested bool                                 `json:"probe_requested"`
+	DatasetCache   *storagenode.TrainerCacheTaskPayload `json:"dataset_cache,omitempty"`
 }

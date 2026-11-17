@@ -9,8 +9,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strings"
 	"syscall"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // execute runs a claimed job and returns its summary. A user cancel makes
@@ -47,7 +48,7 @@ func (s *Service) execute(ctx context.Context, job Import, p *progressTracker) (
 // renameScanned renames the images of a folder just added as a dataset
 // whose name another image of it has (rename.go), and records the list.
 func (s *Service) renameScanned(ctx context.Context, d Dataset, job Import, res *scanResult, p *progressTracker) error {
-	root, err := s.openDatasetRoot(d)
+	root, err := s.openDatasetRoot(ctx, d)
 	if err != nil {
 		return err
 	}
@@ -125,7 +126,7 @@ func (s *Service) runImport(ctx context.Context, d Dataset, job Import, p *progr
 	sum := &importSummary{archive: job.Source == SourceArchive, converted: job.AnnotationFormat != FormatVOC,
 		renaming: job.RenameImages}
 	// Fail early, before extracting a large archive for nothing.
-	root, err := s.openDatasetRoot(d)
+	root, err := s.openDatasetRoot(ctx, d)
 	if err != nil {
 		return sum.summary(), err
 	}
@@ -309,7 +310,7 @@ func createStagedFile(dst string) (*os.File, error) {
 func isPathConflict(err error) bool {
 	return errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) ||
 		errors.Is(err, syscall.ENAMETOOLONG) || errors.Is(err, syscall.EINVAL) ||
-		errors.Is(err, fs.ErrExist)
+		errors.Is(err, fs.ErrExist) || errors.Is(err, storagenode.ErrNotDirectory)
 }
 
 // singleTopDir strips one common top-level folder: an archive batch1.zip
@@ -340,7 +341,7 @@ const (
 // replaced image's annotation, so it ends up unannotated as reported.
 // renames are the plans of renamed and identical images (by their staged
 // path): those moved in are marked placed and counted.
-func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConflict string, unconverted map[string]bool,
+func (s *Service) moveStaged(ctx context.Context, dst storagenode.Dir, staged, onConflict string, unconverted map[string]bool,
 	renames map[string]*renamePlan, sum *importSummary, p *progressTracker, record func([]*renamePlan)) (int, error) {
 	var batch []*renamePlan
 	defer func() { record(batch) }()
@@ -351,7 +352,7 @@ func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConfli
 	if err != nil {
 		return 0, fmt.Errorf("list staged files: %w", err)
 	}
-	src, err := os.OpenRoot(staged)
+	src, err := storagenode.OpenLocalDir(staged)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, nil
 	}
@@ -378,9 +379,9 @@ func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConfli
 			_, perr := cache.get(xmlRel) // parse before the file is moved
 			valid = perr == nil
 		}
-		res, err := placeImage(dst, staged, rel, xmlRel, onConflict)
+		res, err := placeImage(ctx, dst, staged, rel, xmlRel, onConflict)
 		if err == nil && res == placedReplaced && xmlRel == "" && unconverted[rel] {
-			err = removeSidecarXML(dst, rel)
+			err = removeSidecarXML(ctx, dst, rel)
 		}
 		if err != nil {
 			return moved, err
@@ -426,7 +427,7 @@ func (s *Service) moveStaged(ctx context.Context, dst *os.Root, staged, onConfli
 // Existing files are kept (skip) or replaced (overwrite); an existing
 // annotation is only replaced in overwrite mode. Paths that would pass
 // through a symbolic link inside the dataset folder are refused.
-func placeImage(dst *os.Root, staged, rel, xmlRel, onConflict string) (placement, error) {
+func placeImage(ctx context.Context, dst storagenode.Dir, staged, rel, xmlRel, onConflict string) (placement, error) {
 	if err := ensureDirs(dst, path.Dir(rel)); err != nil {
 		return placementFor(err)
 	}
@@ -437,7 +438,7 @@ func placeImage(dst *os.Root, staged, rel, xmlRel, onConflict string) (placement
 	if exists && onConflict != ConflictOverwrite {
 		return placedSkipped, nil
 	}
-	if err := moveFile(filepath.Join(staged, filepath.FromSlash(rel)), filepath.Join(dst.Name(), filepath.FromSlash(rel))); err != nil {
+	if err := placeStagedFile(ctx, dst, filepath.Join(staged, filepath.FromSlash(rel)), rel); err != nil {
 		return 0, err
 	}
 	result := placedAdded
@@ -462,15 +463,38 @@ func placeImage(dst *os.Root, staged, rel, xmlRel, onConflict string) (placement
 	case xmlExists && onConflict != ConflictOverwrite:
 		return result, nil
 	}
-	if err := moveFile(filepath.Join(staged, filepath.FromSlash(xmlRel)), filepath.Join(dst.Name(), filepath.FromSlash(xmlRel))); err != nil {
+	if err := placeStagedFile(ctx, dst, filepath.Join(staged, filepath.FromSlash(xmlRel)), xmlRel); err != nil {
 		return 0, err
 	}
 	return result, nil
 }
 
+func placeStagedFile(ctx context.Context, dst storagenode.Dir, stagedSrc, rel string) error {
+	if local := dst.LocalDir(); local != "" {
+		return moveFile(stagedSrc, filepath.Join(local, filepath.FromSlash(rel)))
+	}
+	in, err := os.Open(stagedSrc)
+	if err != nil {
+		return err
+	}
+	fi, err := in.Stat()
+	if err != nil {
+		in.Close()
+		return err
+	}
+	_, err = dst.PutFile(ctx, rel, in, fi.Size(), 0o644)
+	if cerr := in.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Remove(stagedSrc)
+}
+
 // removeSidecarXML removes <stem>.xml next to the dataset image rel, the
 // file a converted annotation would have replaced.
-func removeSidecarXML(dst *os.Root, rel string) error {
+func removeSidecarXML(ctx context.Context, dst storagenode.Dir, rel string) error {
 	xmlRel := sidecarPath(rel, ".xml")
 	exists, err := regularFileExists(dst, xmlRel)
 	switch {
@@ -481,7 +505,7 @@ func removeSidecarXML(dst *os.Root, rel string) error {
 	case !exists:
 		return nil
 	}
-	if err := dst.Remove(filepath.FromSlash(xmlRel)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := dst.RemoveFile(ctx, xmlRel); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("remove replaced annotation: %w", err)
 	}
 	return nil
@@ -507,8 +531,8 @@ var errOccupied = errors.New("target path is occupied")
 
 // regularFileExists reports whether rel is an existing regular file in
 // root, without following a symbolic link at rel.
-func regularFileExists(root *os.Root, rel string) (bool, error) {
-	fi, err := root.Lstat(filepath.FromSlash(rel))
+func regularFileExists(root storagenode.Dir, rel string) (bool, error) {
+	fi, err := root.Lstat(rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return false, nil
@@ -525,28 +549,15 @@ func regularFileExists(root *os.Root, rel string) (bool, error) {
 // ensureDirs creates the folders of the slash-separated path dir inside
 // root one level at a time, refusing to pass through anything that is not
 // a real directory (in particular symbolic links).
-func ensureDirs(root *os.Root, dir string) error {
+func ensureDirs(root storagenode.Dir, dir string) error {
 	if dir == "." || dir == "" {
 		return nil
 	}
-	cur := ""
-	for _, seg := range strings.Split(dir, "/") {
-		cur = path.Join(cur, seg)
-		name := filepath.FromSlash(cur)
-		fi, err := root.Lstat(name)
-		if errors.Is(err, fs.ErrNotExist) {
-			if err := root.Mkdir(name, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
-				return err
-			}
-			if fi, err = root.Lstat(name); err != nil {
-				return err
-			}
-		} else if err != nil {
-			return err
-		}
-		if !fi.IsDir() { // symbolic links included: Lstat does not follow them
+	if err := root.EnsureDir(dir); err != nil {
+		if errors.Is(err, storagenode.ErrNotDirectory) {
 			return errUnsafeTarget
 		}
+		return err
 	}
 	return nil
 }

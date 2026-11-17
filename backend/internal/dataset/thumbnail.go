@@ -26,6 +26,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // Thumbnail sizes: the longer side fits in the given number of pixels.
@@ -104,13 +105,11 @@ func (s *Service) OpenThumbnail(ctx context.Context, datasetID, imageID int64, s
 	if !ok {
 		return nil, &Error{Kind: ErrBadRequest, Message: "size 参数只能是 sm 或 lg"}
 	}
-	img, root, err := s.imageRoot(ctx, datasetID, imageID)
+	img, d, root, err := s.imageDatasetRoot(ctx, datasetID, imageID)
 	if err != nil {
 		return nil, err
 	}
-	rel := filepath.FromSlash(img.Path)
-	fi, err := root.Stat(rel)
-	srcDir := root.Name()
+	fi, err := root.Stat(img.Path)
 	root.Close()
 	if err != nil {
 		return nil, imageFileError(err)
@@ -128,7 +127,10 @@ func (s *Service) OpenThumbnail(ctx context.Context, datasetID, imageID int64, s
 	// The generation is shared by concurrent requests and continues when
 	// this one gives up, so the result lands in the cache either way.
 	ch := s.thumbs.group.DoChan(cachePath, func() (any, error) {
-		err := s.thumbs.generate(srcDir, rel, side, cachePath)
+		openSrc := func() (storagenode.Dir, error) {
+			return s.openDatasetRoot(context.Background(), d)
+		}
+		err := s.thumbs.generate(openSrc, img.Path, side, cachePath)
 		if err == nil {
 			removeOtherVersions(filepath.Dir(cachePath), prefix, filepath.Base(cachePath))
 		}
@@ -159,12 +161,12 @@ func openThumb(p string, img Image, version string) (*ImageFile, error) {
 	return &ImageFile{File: f, Name: name, ContentType: "image/jpeg", ModTime: fi.ModTime(), Version: version}, nil
 }
 
-// generate renders the thumbnail of dir/rel into dst.
-func (t *thumbnailer) generate(dir, rel string, side int, dst string) error {
+// generate renders the thumbnail of openSrc()/rel into dst.
+func (t *thumbnailer) generate(openSrc func() (storagenode.Dir, error), rel string, side int, dst string) error {
 	t.slots <- struct{}{}
 	defer func() { <-t.slots }()
 
-	root, err := os.OpenRoot(dir)
+	root, err := openSrc()
 	if err != nil {
 		return imageFileError(err)
 	}

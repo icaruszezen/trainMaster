@@ -28,13 +28,15 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // Options are the dependencies of a Service.
 type Options struct {
-	DB      *pgxpool.Pool
-	Storage *storage.Storage
-	Logger  *slog.Logger
+	DB           *pgxpool.Pool
+	Storage      *storage.Storage
+	StorageNodes *storagenode.Service
+	Logger       *slog.Logger
 	// Workers is the number of jobs processed in parallel (default 2).
 	Workers int
 }
@@ -42,13 +44,14 @@ type Options struct {
 // Service implements the dataset operations used by the HTTP handlers.
 // Start must be called before jobs are processed.
 type Service struct {
-	db      *pgxpool.Pool
-	storage *storage.Storage
-	log     *slog.Logger
-	runner  *runner
-	thumbs  *thumbnailer
-	uploads keyedMutex // serializes writes to one import's staging data
-	exports exportTickets
+	db           *pgxpool.Pool
+	storage      *storage.Storage
+	storageNodes *storagenode.Service
+	log          *slog.Logger
+	runner       *runner
+	thumbs       *thumbnailer
+	uploads      keyedMutex // serializes writes to one import's staging data
+	exports      exportTickets
 
 	// annotationLocks serializes the annotation edits of an image (by ID).
 	annotationLocks keyedMutex
@@ -70,13 +73,22 @@ type Service struct {
 
 // NewService creates a Service. It does not touch the database yet.
 func NewService(o Options) *Service {
+	sn := o.StorageNodes
+	if sn == nil {
+		sn = storagenode.NewService(storagenode.Options{
+			DB:      o.DB,
+			Storage: o.Storage,
+			Logger:  o.Logger,
+		})
+	}
 	s := &Service{
-		db:        o.DB,
-		storage:   o.Storage,
-		log:       o.Logger,
-		thumbs:    newThumbnailer(),
-		base:      context.Background(),
-		removeAll: os.RemoveAll,
+		db:           o.DB,
+		storage:      o.Storage,
+		storageNodes: sn,
+		log:          o.Logger,
+		thumbs:       newThumbnailer(),
+		base:         context.Background(),
+		removeAll:    os.RemoveAll,
 	}
 	workers := o.Workers
 	if workers <= 0 {
@@ -84,6 +96,37 @@ func NewService(o Options) *Service {
 	}
 	s.runner = newRunner(s, workers)
 	return s
+}
+
+func (s *Service) checkNotMigrating(id int64) error {
+	if err := s.storageNodes.CheckNotMigrating(storagenode.TargetDataset, id); err != nil {
+		return &Error{Kind: ErrConflict, Message: err.Error()}
+	}
+	return nil
+}
+
+func mapStorageNodeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, storagenode.ErrInvalid):
+		return &Error{Kind: ErrInvalid, Message: err.Error()}
+	case errors.Is(err, storagenode.ErrNotFound), errors.Is(err, storagenode.ErrConflict), errors.Is(err, storagenode.ErrUnavailable):
+		return &Error{Kind: ErrConflict, Message: err.Error()}
+	default:
+		return err
+	}
+}
+
+func (s *Service) activeVolume(ctx context.Context) (storagenode.NodeRef, storagenode.Volume, error) {
+	ref, vol, err := s.storageNodes.ActiveNode(ctx)
+	return ref, vol, mapStorageNodeError(err)
+}
+
+func (s *Service) volumeFor(ctx context.Context, nodeID int64) (storagenode.NodeRef, storagenode.Volume, error) {
+	ref, vol, err := s.storageNodes.VolumeForNode(ctx, nodeID)
+	return ref, vol, mapStorageNodeError(err)
 }
 
 // Start recovers jobs interrupted by a previous shutdown and brings the
@@ -120,13 +163,6 @@ func (s *Service) Stop() {
 }
 
 // ---- paths ----
-
-func (s *Service) datasetsDir() string { return s.storage.Dir(storage.Datasets) }
-
-// datasetDir returns the folder of a dataset. Dir names are validated
-// before they are stored (validDirName), so the result stays inside
-// datasets/.
-func (s *Service) datasetDir(dirName string) string { return filepath.Join(s.datasetsDir(), dirName) }
 
 func (s *Service) stagingRoot() string { return filepath.Join(s.storage.Dir(storage.Tmp), "imports") }
 
@@ -174,12 +210,6 @@ func (s *Service) cleanStaging(ctx context.Context) error {
 	return nil
 }
 
-// dirExists reports whether a dataset folder exists as a real directory.
-func (s *Service) dirExists(dirName string) bool {
-	fi, err := os.Lstat(s.datasetDir(dirName))
-	return err == nil && fi.IsDir()
-}
-
 // ---- datasets ----
 
 // ListDatasets returns the datasets selected by q, most recently updated
@@ -210,8 +240,10 @@ func (s *Service) decorate(ctx context.Context, ds []Dataset) error {
 		return nil
 	}
 	ids := make([]int64, len(ds))
+	nodeIDs := make([]int64, len(ds))
 	for i, d := range ds {
 		ids[i] = d.ID
+		nodeIDs[i] = d.StorageNodeID
 	}
 	covers, err := queryCovers(ctx, s.db, ids)
 	if err != nil {
@@ -229,10 +261,39 @@ func (s *Service) decorate(ctx context.Context, ds []Dataset) error {
 	if err != nil {
 		return fmt.Errorf("load dataset versions: %w", err)
 	}
+	refs, err := s.storageNodes.NodeRefs(ctx, nodeIDs)
+	if err != nil {
+		return fmt.Errorf("load dataset storage nodes: %w", err)
+	}
+	vols := make(map[int64]storagenode.Volume)
+	volFailed := make(map[int64]bool)
 	for i := range ds {
 		d := &ds[i]
-		d.Path = s.datasetDir(d.DirName)
-		d.DirectoryMissing = !s.dirExists(d.DirName)
+		nid := d.StorageNodeID
+		if nid <= 0 {
+			nid = storagenode.BuiltinID
+		}
+		if ref, ok := refs[nid]; ok {
+			d.StorageNode = ref
+		} else {
+			d.StorageNode = storagenode.BuiltinRef()
+		}
+		vol, ok := vols[nid]
+		if !ok && !volFailed[nid] {
+			if _, v, verr := s.storageNodes.VolumeForNode(ctx, nid); verr == nil {
+				vol = v
+				vols[nid] = v
+			} else {
+				volFailed[nid] = true
+			}
+		}
+		if vol != nil {
+			d.Path = vol.DisplayPath(storagenode.SpaceDatasets, d.DirName)
+			d.DirectoryMissing = vol.IsPlainDir(ctx, storagenode.SpaceDatasets, d.DirName) != nil
+		} else {
+			d.Path = d.DirName
+			d.DirectoryMissing = true
+		}
 		if c := covers[d.ID]; c != nil {
 			d.Covers = c
 		}
@@ -279,40 +340,43 @@ func (s *Service) CreateDataset(ctx context.Context, in CreateDatasetInput) (Dat
 }
 
 func (s *Service) createFolderDataset(ctx context.Context, name, desc string) (int64, error) {
+	activeRef, vol, err := s.activeVolume(ctx)
+	if err != nil {
+		return 0, err
+	}
 	var id int64
-	var created string
-	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+	created := false
+	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		if err := checkNameFree(ctx, tx, name, 0); err != nil {
 			return err
 		}
-		if owner, err := datasetUsingDir(ctx, tx, name, 0); err != nil {
+		if owner, err := datasetUsingDir(ctx, tx, activeRef.ID, name, 0); err != nil {
 			return err
 		} else if owner != nil {
 			return newError(ErrConflict, "文件夹“%s”已被数据集%s使用", name, owner)
 		}
 		// Compare ignoring case so the data directory stays usable on
 		// case-insensitive file systems (Windows, macOS).
-		if existing, err := s.findDirEntry(name); err != nil {
+		if existing, err := findDirEntry(ctx, vol, name); err != nil {
 			return err
 		} else if existing != "" {
 			return folderExists(existing)
 		}
-		d, err := insertDataset(ctx, tx, name, name, desc, OriginUpload)
+		d, err := insertDataset(ctx, tx, activeRef.ID, name, name, desc, OriginUpload)
 		if err != nil {
 			return err
 		}
-		dir := s.datasetDir(name)
-		if err := os.Mkdir(dir, 0o755); err != nil {
+		if err := vol.MkdirDir(ctx, storagenode.SpaceDatasets, name, true); err != nil {
 			if errors.Is(err, fs.ErrExist) {
 				return folderExists(name)
 			}
 			return fmt.Errorf("create dataset folder: %w", err)
 		}
-		id, created = d.ID, dir
+		id, created = d.ID, true
 		return nil
 	})
-	if err != nil && created != "" {
-		_ = os.Remove(created) // the commit failed; the folder is still empty
+	if err != nil && created {
+		_ = vol.RemoveEmptyDir(context.WithoutCancel(ctx), storagenode.SpaceDatasets, name) // the commit failed; the folder is still empty
 	}
 	return id, err
 }
@@ -321,16 +385,28 @@ func folderExists(name string) error {
 	return newError(ErrConflict, "数据目录中已存在同名文件夹“%s”，可通过“选择已有目录”直接添加为数据集", name)
 }
 
-// findDirEntry returns the name of the entry in datasets/ that equals name
-// ignoring case, or "".
-func (s *Service) findDirEntry(name string) (string, error) {
-	entries, err := os.ReadDir(s.datasetsDir())
+// findDirEntry returns the name of the entry in datasets/ on vol that equals
+// name ignoring case, or "".
+func findDirEntry(ctx context.Context, vol storagenode.Volume, name string) (string, error) {
+	if vol.Kind() == storagenode.KindLocal {
+		entries, err := os.ReadDir(vol.DisplayPath(storagenode.SpaceDatasets, ""))
+		if err != nil {
+			return "", fmt.Errorf("read datasets folder: %w", err)
+		}
+		for _, e := range entries {
+			if strings.EqualFold(e.Name(), name) {
+				return e.Name(), nil
+			}
+		}
+		return "", nil
+	}
+	dirs, err := vol.ListTopDirs(ctx, storagenode.SpaceDatasets, "")
 	if err != nil {
 		return "", fmt.Errorf("read datasets folder: %w", err)
 	}
-	for _, e := range entries {
-		if strings.EqualFold(e.Name(), name) {
-			return e.Name(), nil
+	for _, d := range dirs {
+		if strings.EqualFold(d.Name, name) {
+			return d.Name, nil
 		}
 	}
 	return "", nil
@@ -344,16 +420,31 @@ func (s *Service) registerDirectory(ctx context.Context, name, desc, dirName str
 	if !validDirName(dirName) {
 		return 0, notFound
 	}
-	fi, err := os.Lstat(s.datasetDir(dirName))
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return 0, notFound
-	case err != nil:
-		return 0, fmt.Errorf("stat dataset folder: %w", err)
-	case fi.Mode()&fs.ModeSymlink != 0:
-		return 0, newError(ErrNotFound, "“%s”是符号链接，不能作为数据集目录", dirName)
-	case !fi.IsDir():
-		return 0, newError(ErrNotFound, "“%s”不是文件夹", dirName)
+	activeRef, vol, err := s.activeVolume(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if vol.Kind() == storagenode.KindLocal {
+		fi, err := os.Lstat(vol.DisplayPath(storagenode.SpaceDatasets, dirName))
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return 0, notFound
+		case err != nil:
+			return 0, fmt.Errorf("stat dataset folder: %w", err)
+		case fi.Mode()&fs.ModeSymlink != 0:
+			return 0, newError(ErrNotFound, "“%s”是符号链接，不能作为数据集目录", dirName)
+		case !fi.IsDir():
+			return 0, newError(ErrNotFound, "“%s”不是文件夹", dirName)
+		}
+	} else {
+		switch err := vol.IsPlainDir(ctx, storagenode.SpaceDatasets, dirName); {
+		case errors.Is(err, fs.ErrNotExist):
+			return 0, notFound
+		case errors.Is(err, storagenode.ErrNotDirectory):
+			return 0, newError(ErrNotFound, "“%s”不是文件夹", dirName)
+		case err != nil:
+			return 0, fmt.Errorf("stat dataset folder: %w", err)
+		}
 	}
 
 	var id int64
@@ -361,12 +452,12 @@ func (s *Service) registerDirectory(ctx context.Context, name, desc, dirName str
 		if err := checkNameFree(ctx, tx, name, 0); err != nil {
 			return err
 		}
-		if owner, err := datasetUsingDir(ctx, tx, dirName, 0); err != nil {
+		if owner, err := datasetUsingDir(ctx, tx, activeRef.ID, dirName, 0); err != nil {
 			return err
 		} else if owner != nil {
 			return newError(ErrConflict, "目录“%s”已添加为数据集%s", dirName, owner)
 		}
-		d, err := insertDataset(ctx, tx, name, dirName, desc, OriginDirectory)
+		d, err := insertDataset(ctx, tx, activeRef.ID, name, dirName, desc, OriginDirectory)
 		if err != nil {
 			return err
 		}
@@ -398,6 +489,9 @@ type UpdateDatasetInput struct {
 // alone (the dataset list is ordered by it) and sets status_updated_at
 // when the status is a different one.
 func (s *Service) UpdateDataset(ctx context.Context, id int64, in UpdateDatasetInput) (Dataset, error) {
+	if err := s.checkNotMigrating(id); err != nil {
+		return Dataset{}, err
+	}
 	var status string
 	if in.Status != nil {
 		var err error
@@ -449,14 +543,25 @@ const deletingPrefix = ".deleting-"
 
 // cleanTrash removes folders left behind by deletes that failed midway.
 func (s *Service) cleanTrash() {
-	entries, err := os.ReadDir(s.datasetsDir())
+	ctx := s.base
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	vols, err := s.storageNodes.LocalVolumes(ctx)
 	if err != nil {
 		return
 	}
-	for _, e := range entries {
-		if e.IsDir() && strings.HasPrefix(e.Name(), deletingPrefix) {
-			if err := os.RemoveAll(filepath.Join(s.datasetsDir(), e.Name())); err != nil {
-				s.log.Warn("remove deleted dataset folder", "name", e.Name(), "err", err)
+	for _, vol := range vols {
+		baseDir := vol.DisplayPath(storagenode.SpaceDatasets, "")
+		entries, err := os.ReadDir(baseDir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() && strings.HasPrefix(e.Name(), deletingPrefix) {
+				if err := os.RemoveAll(filepath.Join(baseDir, e.Name())); err != nil {
+					s.log.Warn("remove deleted dataset folder", "name", e.Name(), "err", err)
+				}
 			}
 		}
 	}
@@ -495,20 +600,25 @@ const (
 	dirCountParallel   = 4
 )
 
-// ListDirectories lists the direct child folders of datasets/ (hidden
-// folders and symbolic links excluded) with a bounded count of their
-// images; unregistered folders first, then by name. Folders whose name is
-// not valid UTF-8 are left out (and logged): JSON would turn the name into
-// replacement characters, so they could not be registered anyway.
+// ListDirectories lists the direct child folders of datasets/ on the active
+// storage node (hidden folders and symbolic links excluded) with a bounded
+// count of their images; unregistered folders first, then by name. Folders
+// whose name is not valid UTF-8 are left out (and logged): JSON would turn
+// the name into replacement characters, so they could not be registered anyway.
 func (s *Service) ListDirectories(ctx context.Context) ([]Directory, error) {
-	entries, err := os.ReadDir(s.datasetsDir())
+	activeRef, vol, err := s.activeVolume(ctx)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := vol.ListTopDirs(ctx, storagenode.SpaceDatasets, "")
 	if err != nil {
 		return nil, fmt.Errorf("read datasets folder: %w", err)
 	}
 	// The folders of the datasets in use and of those in the recycle bin
-	// that kept their folder in place (deleted without their files).
+	// that kept their folder in place (deleted without their files, or
+	// recycled in place on S3).
 	rows, err := s.db.Query(ctx, `SELECT dir_name, id, deleted_at IS NOT NULL FROM datasets
-		WHERE deleted_at IS NULL OR NOT delete_files`)
+		WHERE storage_node_id = $1 AND (deleted_at IS NULL OR NOT delete_files OR recycled_in_place)`, activeRef.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -528,20 +638,20 @@ func (s *Service) ListDirectories(ctx context.Context) ([]Directory, error) {
 
 	var out []Directory
 	for _, e := range entries {
-		// ReadDir reports the type without following symbolic links.
-		if !e.IsDir() || isJunkSegment(e.Name()) {
+		if isJunkSegment(e.Name) {
 			continue
 		}
-		if !utf8.ValidString(e.Name()) {
-			s.log.Warn("not listing dataset folder with a name that is not valid UTF-8", "name", strconv.Quote(e.Name()))
+		if !utf8.ValidString(e.Name) {
+			s.log.Warn("not listing dataset folder with a name that is not valid UTF-8", "name", strconv.Quote(e.Name))
 			continue
 		}
-		info, err := e.Info()
-		if err != nil {
-			continue // removed meanwhile
+		d := Directory{
+			Name:        e.Name,
+			Path:        vol.DisplayPath(storagenode.SpaceDatasets, e.Name),
+			StorageNode: activeRef,
+			ModifiedAt:  e.ModifiedAt.UTC(),
 		}
-		d := Directory{Name: e.Name(), Path: s.datasetDir(e.Name()), ModifiedAt: info.ModTime().UTC()}
-		if o, ok := registered[e.Name()]; ok {
+		if o, ok := registered[e.Name]; ok {
 			d.Registered, d.DatasetID, d.InRecycleBin = true, &o.id, o.deleted
 		}
 		out = append(out, d)
@@ -557,7 +667,7 @@ func (s *Service) ListDirectories(ctx context.Context) ([]Directory, error) {
 				deadline = listDeadline
 			}
 			d := &out[i]
-			d.ImageCount, d.AnnotationCount, d.TotalBytes, d.Approximate = countFiles(gctx, d.Path, deadline)
+			d.ImageCount, d.AnnotationCount, d.TotalBytes, d.Approximate = countVolumeFiles(gctx, vol, d.Name, deadline)
 			return nil
 		})
 	}
@@ -578,6 +688,51 @@ func (s *Service) ListDirectories(ctx context.Context) ([]Directory, error) {
 }
 
 var errStopWalk = errors.New("stop walk")
+
+func countVolumeFiles(ctx context.Context, vol storagenode.Volume, dirName string, deadline time.Time) (images, xmls int, bytes int64, approximate bool) {
+	if vol.Kind() == storagenode.KindLocal {
+		return countFiles(ctx, vol.DisplayPath(storagenode.SpaceDatasets, dirName), deadline)
+	}
+	dir, err := vol.OpenDir(ctx, storagenode.SpaceDatasets, dirName)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	defer dir.Close()
+
+	entries := 0
+	_ = dir.WalkFiles(ctx, func(rel string, info fs.FileInfo, isDir bool) error {
+		entries++
+		if entries > dirCountMaxEntries || ctx.Err() != nil || (entries%64 == 0 && time.Now().After(deadline)) {
+			approximate = true
+			return errStopWalk
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		if isDir {
+			name := rel
+			if idx := strings.LastIndexByte(rel, '/'); idx >= 0 {
+				name = rel[idx+1:]
+			}
+			if isJunkSegment(name) || !utf8.ValidString(name) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !utf8.ValidString(rel) {
+			return nil
+		}
+		switch classify(rel) {
+		case kindImage:
+			images++
+			bytes += info.Size()
+		case kindAnnotation:
+			xmls++
+		}
+		return nil
+	})
+	return images, xmls, bytes, approximate
+}
 
 // countFiles counts images and XML files below dir, stopping early (and
 // reporting approximate) after dirCountMaxEntries entries or at deadline.
@@ -686,7 +841,7 @@ func (s *Service) ListLabels(ctx context.Context, datasetID int64) ([]Label, err
 // ImageFile is an open image or thumbnail to send to a client. The caller
 // closes File.
 type ImageFile struct {
-	File        *os.File
+	File        storagenode.File
 	Name        string // file name for Content-Disposition
 	ContentType string
 	ModTime     time.Time
@@ -696,7 +851,7 @@ type ImageFile struct {
 }
 
 // OpenImage opens the original file of an image. The file is opened
-// through an os.Root of the dataset folder, so symbolic links cannot lead
+// through the dataset's storagenode.Dir, so symbolic links cannot lead
 // outside of it.
 func (s *Service) OpenImage(ctx context.Context, datasetID, imageID int64) (*ImageFile, error) {
 	img, root, err := s.imageRoot(ctx, datasetID, imageID)
@@ -704,7 +859,7 @@ func (s *Service) OpenImage(ctx context.Context, datasetID, imageID int64) (*Ima
 		return nil, err
 	}
 	defer root.Close()
-	f, err := root.Open(filepath.FromSlash(img.Path))
+	f, err := root.Open(img.Path)
 	if err != nil {
 		return nil, imageFileError(err)
 	}
@@ -722,21 +877,27 @@ func (s *Service) OpenImage(ctx context.Context, datasetID, imageID int64) (*Ima
 	}, nil
 }
 
-// imageRoot loads an image row and opens the folder of its dataset.
-func (s *Service) imageRoot(ctx context.Context, datasetID, imageID int64) (Image, *os.Root, error) {
+// imageDatasetRoot loads an image row, its Dataset, and opens the folder of its dataset.
+func (s *Service) imageDatasetRoot(ctx context.Context, datasetID, imageID int64) (Image, Dataset, storagenode.Dir, error) {
 	d, err := queryDataset(ctx, s.db, datasetID, false)
 	if err != nil {
-		return Image{}, nil, err
+		return Image{}, Dataset{}, nil, err
 	}
 	img, err := queryImage(ctx, s.db, datasetID, imageID)
 	if err != nil {
-		return img, nil, err
+		return img, d, nil, err
 	}
-	root, err := s.openDatasetRoot(d)
+	root, err := s.openDatasetRoot(ctx, d)
 	if err != nil {
-		return img, nil, err
+		return img, d, nil, err
 	}
-	return img, root, nil
+	return img, d, root, nil
+}
+
+// imageRoot loads an image row and opens the folder of its dataset.
+func (s *Service) imageRoot(ctx context.Context, datasetID, imageID int64) (Image, storagenode.Dir, error) {
+	img, _, root, err := s.imageDatasetRoot(ctx, datasetID, imageID)
+	return img, root, err
 }
 
 func imageFileError(err error) error {

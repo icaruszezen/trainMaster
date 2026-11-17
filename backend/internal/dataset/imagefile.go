@@ -3,7 +3,6 @@ package dataset
 import (
 	"image/jpeg"
 	"io"
-	"os"
 )
 
 // Exported image helpers for other programs that show image files the way
@@ -18,7 +17,7 @@ func ImageContentType(name string) string { return imageContentType(name) }
 
 // ImageDimensions returns the dimensions of the image in f, or nil when
 // they cannot be determined (AVIF, a damaged file).
-func ImageDimensions(f *os.File) (width, height *int) { return imageDimensions(f) }
+func ImageDimensions(f RandomAccessReader) (width, height *int) { return imageDimensions(f) }
 
 // ThumbnailSide returns the longest side of the thumbnails of a size
 // (ThumbSmall or ThumbLarge).
@@ -35,7 +34,7 @@ func ThumbnailSide(size string) (int, bool) {
 // bytes before decoding (to bound concurrent generations) and its release
 // is called once the image is scaled. A file that cannot be decoded, or is
 // too large, is an *Error of kind ErrUnsupportedImage.
-func WriteThumbnail(w io.Writer, f *os.File, side int, reserve func(cost int64) (release func(), err error)) error {
+func WriteThumbnail(w io.Writer, f RandomAccessReader, side int, reserve func(cost int64) (release func(), err error)) error {
 	cfg, format, err := decodeImageConfig(f)
 	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
 		return errUnsupportedImage

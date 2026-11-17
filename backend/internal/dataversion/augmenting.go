@@ -1,9 +1,11 @@
 package dataversion
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"image/color"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -147,7 +149,7 @@ func (b *build) augmentImages() error {
 // return more than the header says), and 8 bytes per pixel for the result
 // (4) and the encoder and scratch buffers. Too many pixels count as more
 // than maxAugmentMemory.
-func augmentCost(f *os.File, format string, cfg image.Config) int64 {
+func augmentCost(f io.ReaderAt, format string, cfg image.Config) int64 {
 	w, h := int64(max(cfg.Width, 0)), int64(max(cfg.Height, 0))
 	if h > 0 && w > maxAugmentMemory/8/h {
 		return maxAugmentMemory + 1
@@ -174,7 +176,7 @@ func augmentCost(f *os.File, format string, cfg image.Config) int64 {
 // extension). An image that cannot be decoded, or would need too much
 // memory, gets no copies (skipped).
 func (b *build) augmentOne(img *buildImage, methods []augment.Method, stems []string) augmentResult {
-	f, err := os.Open(filepath.Join(b.dir, filepath.FromSlash(img.path)))
+	f, err := b.verDir.Open(img.path)
 	if err != nil {
 		return augmentResult{err: fmt.Errorf("open image to augment: %w", err)}
 	}
@@ -246,20 +248,38 @@ func (b *build) augmentOne(img *buildImage, methods []augment.Method, stems []st
 // writeImage encodes img in format at the version path p and returns the
 // file's size and modification time.
 func (b *build) writeImage(p string, img image.Image, format string) (int64, time.Time, error) {
-	name := filepath.Join(b.dir, filepath.FromSlash(p))
-	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
+	if b.verDir.LocalDir() != "" {
+		name := filepath.Join(b.verDir.LocalDir(), filepath.FromSlash(p))
+		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			return 0, time.Time{}, fmt.Errorf("write augmented image: %w", err)
+		}
+		err = augment.Encode(f, img, format)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			_ = os.Remove(name)
+			return 0, time.Time{}, fmt.Errorf("write augmented image: %w", err)
+		}
+		fi, err := os.Lstat(name)
+		if err != nil {
+			return 0, time.Time{}, err
+		}
+		return fi.Size(), dbTime(fi.ModTime()), nil
+	}
+
+	var buf bytes.Buffer
+	if err := augment.Encode(&buf, img, format); err != nil {
 		return 0, time.Time{}, fmt.Errorf("write augmented image: %w", err)
 	}
-	err = augment.Encode(f, img, format)
-	if cerr := f.Close(); err == nil {
-		err = cerr
+	if err := b.mkdirFor(p); err != nil {
+		return 0, time.Time{}, err
 	}
-	if err != nil {
-		_ = os.Remove(name)
+	if err := b.verDir.CreateExclusive(b.ctx, p, buf.Bytes(), 0o644); err != nil {
 		return 0, time.Time{}, fmt.Errorf("write augmented image: %w", err)
 	}
-	fi, err := os.Lstat(name)
+	fi, err := b.verDir.Lstat(p)
 	if err != nil {
 		return 0, time.Time{}, err
 	}

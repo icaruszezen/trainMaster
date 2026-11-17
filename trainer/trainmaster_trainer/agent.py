@@ -30,6 +30,7 @@ from .client import ApiError, Client, TransportError
 from .config import Config
 from .environment import EnvironmentDetector, deployment_from, failure_raw, utc_now
 from .tasks import TaskWorker
+from .training import DatasetCacheManager, DatasetCachePolicy
 
 __all__ = ["BACKOFF_BASE", "BACKOFF_CAP", "Agent", "Backoff", "check_heartbeat"]
 
@@ -75,6 +76,7 @@ def default_task_worker(agent: Agent) -> TaskWorker:
         data_dir=cfg.data_dir,
         export_timeout=cfg.export_timeout,
         inference_image_timeout=cfg.inference_image_timeout,
+        dataset_cache=agent.dataset_cache,
     )
 
 
@@ -119,6 +121,7 @@ class Agent:
         self._backoff = Backoff(rng=rng)
         self.node_key = node_key or node_key_mod.load_or_create(config.state_dir)
         self.hostname = hostname if hostname is not None else socket.gethostname()
+        self.dataset_cache = DatasetCacheManager(config.state_dir, wall_clock=wall_clock)
 
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -430,6 +433,14 @@ class Agent:
             self.interval = new_interval
             self._next_heartbeat = self._clock() + self.interval
         self._write_heartbeat_file()
+
+        raw_cache = resp.get("dataset_cache")
+        if isinstance(raw_cache, dict):
+            cache_policy = DatasetCachePolicy.from_json(raw_cache)
+            self.dataset_cache.record_policy(cache_policy)
+            tasks = self.tasks
+            if tasks is None or not tasks.busy:
+                self.dataset_cache.apply_policy(cache_policy)
 
         # 检测结果一旦上报就会清除服务端的检测请求。以下情况忽略 probe_requested，避免重复检测：
         # 这次心跳带着检测结果；发送时检测正在进行（结果随后上报）；检测结果已经产生但还没有上报。

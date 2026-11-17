@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/recycle"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // The recycle bin (回收站) of datasets and their review versions. Deleting
@@ -24,19 +25,21 @@ import (
 //
 // A dataset in the bin keeps its rows (images, imports, review versions).
 // Deleted with its files, its folder is renamed to datasets/.recycle-<id>
-// (hidden, so the name and the folder name can be used again) and removed
-// when it is purged; deleted without, the folder stays where it is and
-// still belongs to the dataset (it cannot be added again meanwhile, only
-// restored). The links other modules read move aside meanwhile: its
-// projects to recycled_project_datasets (here), its review tasks through
-// the RecycleHook (package review).
+// (hidden, so the name and the folder name can be used again) on volumes
+// with O(1) directory rename (local, SMB) or kept in place with
+// recycled_in_place = true on object stores (S3), and removed when it is
+// purged; deleted without, the folder stays where it is and still belongs
+// to the dataset (it cannot be added again meanwhile, only restored). The
+// links other modules read move aside meanwhile: its projects to
+// recycled_project_datasets (here), its review tasks through the
+// RecycleHook (package review).
 
 // recyclePrefix marks the folder of a dataset deleted with its files while
 // it is in the recycle bin. Being hidden, it never shows up as a directory.
 const recyclePrefix = ".recycle-"
 
-func (s *Service) recycleDir(datasetID int64) string {
-	return filepath.Join(s.datasetsDir(), recyclePrefix+strconv.FormatInt(datasetID, 10))
+func recycleRel(datasetID int64) string {
+	return recyclePrefix + strconv.FormatInt(datasetID, 10)
 }
 
 // RecycleHook moves the rows of another module that refer to a dataset out
@@ -65,6 +68,9 @@ var (
 // purged. Datasets with a queued or running job, or with a review version
 // being built, cannot be deleted; unfinished uploads are canceled.
 func (s *Service) DeleteDataset(ctx context.Context, id int64, deleteFiles bool) error {
+	if err := s.checkNotMigrating(id); err != nil {
+		return err
+	}
 	unlock, err := s.recycleLocks.lock(ctx, id)
 	if err != nil {
 		return err
@@ -72,15 +78,23 @@ func (s *Service) DeleteDataset(ctx context.Context, id int64, deleteFiles bool)
 	defer unlock()
 	ctx = context.WithoutCancel(ctx) // see commitUnknown
 	var canceled []int64
-	var dirName, moved string
+	var dirName string
+	var moved bool
+	var movedVol storagenode.Volume
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		d, err := queryDataset(ctx, tx, id, true)
 		if err != nil {
 			return err
 		}
 		dirName = d.DirName
-		if err := s.recoverRecycledFolder(id, dirName); err != nil {
-			return err
+		_, vol, verr := s.volumeFor(ctx, d.StorageNodeID)
+		if verr != nil && deleteFiles {
+			return verr
+		}
+		if vol != nil && vol.SupportsFastDirRename() {
+			if err := s.recoverRecycledFolder(ctx, vol, id, dirName); err != nil {
+				return err
+			}
 		}
 		busy, err := hasProcessingJob(ctx, tx, id)
 		if err != nil {
@@ -113,20 +127,22 @@ func (s *Service) DeleteDataset(ctx context.Context, id int64, deleteFiles bool)
 				return fmt.Errorf("detach dataset from reviews: %w", err)
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE datasets SET deleted_at = now(), delete_files = $2 WHERE id = $1`,
-			id, deleteFiles); err != nil {
+		recycledInPlace := deleteFiles && !vol.SupportsFastDirRename()
+		if _, err := tx.Exec(ctx, `UPDATE datasets SET deleted_at = now(), delete_files = $2, recycled_in_place = $3 WHERE id = $1`,
+			id, deleteFiles, recycledInPlace); err != nil {
 			return err
 		}
-		if deleteFiles {
+		if deleteFiles && vol.SupportsFastDirRename() {
 			// Renaming is atomic and quick, so the transaction can still roll
 			// back; the files are removed when the dataset is purged.
-			if moved, err = s.moveFolder(d.DirName, s.recycleDir(id)); err != nil {
+			if moved, err = moveFolderToRecycle(ctx, vol, d.DirName, recycleRel(id)); err != nil {
 				return err
 			}
+			movedVol = vol
 		}
 		return nil
 	})
-	if err != nil && moved != "" {
+	if err != nil && moved && movedVol != nil {
 		// The rename is the last step, so the commit failed.
 		switch inBin, known := s.commitUnknown(ctx, id, err); {
 		case !known:
@@ -136,8 +152,8 @@ func (s *Service) DeleteDataset(ctx context.Context, id int64, deleteFiles bool)
 		case inBin:
 			err = nil // recorded after all
 		default:
-			if rerr := os.Rename(moved, s.datasetDir(dirName)); rerr != nil {
-				s.log.Error("restore dataset folder after failed delete", "path", moved, "err", rerr)
+			if rerr := movedVol.RenameDir(ctx, storagenode.SpaceDatasets, recycleRel(id), dirName); rerr != nil {
+				s.log.Error("restore dataset folder after failed delete", "path", movedVol.DisplayPath(storagenode.SpaceDatasets, recycleRel(id)), "err", rerr)
 			}
 			return err
 		}
@@ -181,43 +197,81 @@ func (s *Service) commitUnknown(ctx context.Context, id int64, err error) (inBin
 // next start (commitUnknown, reconcileRecycleFolders): deleting the dataset
 // then keeps or sets aside its real folder, and a delete that keeps the
 // files never leaves them where the purge would remove them.
-func (s *Service) recoverRecycledFolder(id int64, dirName string) error {
-	aside := s.recycleDir(id)
-	if _, err := os.Lstat(aside); errors.Is(err, fs.ErrNotExist) {
+func (s *Service) recoverRecycledFolder(ctx context.Context, vol storagenode.Volume, id int64, dirName string) error {
+	asideRel := recycleRel(id)
+	if vol.Kind() == storagenode.KindLocal {
+		aside := vol.DisplayPath(storagenode.SpaceDatasets, asideRel)
+		if _, err := os.Lstat(aside); errors.Is(err, fs.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("stat recycled dataset folder: %w", err)
+		}
+		target := vol.DisplayPath(storagenode.SpaceDatasets, dirName)
+		if _, err := os.Lstat(target); !errors.Is(err, fs.ErrNotExist) {
+			return newError(ErrConflict, "数据集文件夹“%s”与回收站留下的文件夹“%s”同时存在，请先检查这两个文件夹（合并或移走其中一个）后再删除",
+				dirName, filepath.Base(aside))
+		}
+		if err := os.Rename(aside, target); err != nil {
+			return fmt.Errorf("move dataset folder back from the recycle bin: %w", err)
+		}
+		s.log.Warn("moved the folder of a dataset in use back from the recycle bin", "dataset_id", id, "dir_name", dirName)
 		return nil
-	} else if err != nil {
+	}
+	exists, _, err := vol.DirExists(ctx, storagenode.SpaceDatasets, asideRel)
+	if err != nil {
 		return fmt.Errorf("stat recycled dataset folder: %w", err)
 	}
-	if _, err := os.Lstat(s.datasetDir(dirName)); !errors.Is(err, fs.ErrNotExist) {
-		return newError(ErrConflict, "数据集文件夹“%s”与回收站留下的文件夹“%s”同时存在，请先检查这两个文件夹（合并或移走其中一个）后再删除",
-			dirName, filepath.Base(aside))
+	if !exists {
+		return nil
 	}
-	if err := os.Rename(aside, s.datasetDir(dirName)); err != nil {
+	targetExists, _, err := vol.DirExists(ctx, storagenode.SpaceDatasets, dirName)
+	if err != nil {
+		return fmt.Errorf("stat dataset folder: %w", err)
+	}
+	if targetExists {
+		return newError(ErrConflict, "数据集文件夹“%s”与回收站留下的文件夹“%s”同时存在，请先检查这两个文件夹（合并或移走其中一个）后再删除",
+			dirName, asideRel)
+	}
+	if err := vol.RenameDir(ctx, storagenode.SpaceDatasets, asideRel, dirName); err != nil {
 		return fmt.Errorf("move dataset folder back from the recycle bin: %w", err)
 	}
 	s.log.Warn("moved the folder of a dataset in use back from the recycle bin", "dataset_id", id, "dir_name", dirName)
 	return nil
 }
 
-// moveFolder renames the dataset folder dirName to the hidden path to and
-// returns to, or "" when there is no folder (nothing to set aside). It
-// refuses symbolic links, so the files removed later are never those a
-// link points to.
-func (s *Service) moveFolder(dirName, to string) (string, error) {
-	dir := s.datasetDir(dirName)
-	fi, err := os.Lstat(dir)
-	switch {
+// moveFolderToRecycle renames the dataset folder dirName to the hidden path
+// toRel and reports whether a folder was moved. It refuses symbolic links,
+// so the files removed later are never those a link points to.
+func moveFolderToRecycle(ctx context.Context, vol storagenode.Volume, dirName, toRel string) (bool, error) {
+	if vol.Kind() == storagenode.KindLocal {
+		dir := vol.DisplayPath(storagenode.SpaceDatasets, dirName)
+		to := vol.DisplayPath(storagenode.SpaceDatasets, toRel)
+		fi, err := os.Lstat(dir)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return false, nil
+		case err != nil:
+			return false, fmt.Errorf("stat dataset folder: %w", err)
+		case !fi.IsDir(): // includes symbolic links
+			return false, &Error{Kind: ErrConflict, Message: "数据集文件夹是符号链接或不是普通文件夹，无法删除其中的文件"}
+		}
+		if err := os.Rename(dir, to); err != nil {
+			return false, fmt.Errorf("move dataset folder aside: %w", err)
+		}
+		return true, nil
+	}
+	switch err := vol.IsPlainDir(ctx, storagenode.SpaceDatasets, dirName); {
 	case errors.Is(err, fs.ErrNotExist):
-		return "", nil
+		return false, nil
+	case errors.Is(err, storagenode.ErrNotDirectory):
+		return false, &Error{Kind: ErrConflict, Message: "数据集文件夹是符号链接或不是普通文件夹，无法删除其中的文件"}
 	case err != nil:
-		return "", fmt.Errorf("stat dataset folder: %w", err)
-	case !fi.IsDir(): // includes symbolic links
-		return "", &Error{Kind: ErrConflict, Message: "数据集文件夹是符号链接或不是普通文件夹，无法删除其中的文件"}
+		return false, fmt.Errorf("stat dataset folder: %w", err)
 	}
-	if err := os.Rename(dir, to); err != nil {
-		return "", fmt.Errorf("move dataset folder aside: %w", err)
+	if err := vol.RenameDir(ctx, storagenode.SpaceDatasets, dirName, toRel); err != nil {
+		return false, fmt.Errorf("move dataset folder aside: %w", err)
 	}
-	return to, nil
+	return true, nil
 }
 
 // detachProjects moves the project links of a dataset that goes to the
@@ -286,6 +340,7 @@ func (s *Service) RestoreDataset(ctx context.Context, id int64, in RestoreInput)
 	ctx = context.WithoutCancel(ctx) // see commitUnknown
 	var done, moveBack bool
 	var dirName string
+	var restoreVol storagenode.Volume
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		d, err := queryTrashedDataset(ctx, tx, id)
 		if err != nil {
@@ -303,9 +358,14 @@ func (s *Service) RestoreDataset(ctx context.Context, id int64, in RestoreInput)
 			return err
 		}
 		dirName = d.DirName
-		if d.DeleteFiles {
+		if d.DeleteFiles && !d.RecycledInPlace {
+			_, vol, verr := s.volumeFor(ctx, d.StorageNodeID)
+			if verr != nil {
+				return verr
+			}
+			restoreVol = vol
 			// The folder name was free while the dataset was in the bin.
-			if taken, err := s.dirTaken(ctx, tx, dirName, id); err != nil {
+			if taken, err := s.dirTaken(ctx, tx, d.StorageNodeID, vol, dirName, id); err != nil {
 				return err
 			} else if taken != "" {
 				if in.Name == nil || !validDirName(name) {
@@ -313,7 +373,7 @@ func (s *Service) RestoreDataset(ctx context.Context, id int64, in RestoreInput)
 						dirName, taken)
 				}
 				dirName = name
-				if taken, err := s.dirTaken(ctx, tx, dirName, id); err != nil {
+				if taken, err := s.dirTaken(ctx, tx, d.StorageNodeID, vol, dirName, id); err != nil {
 					return err
 				} else if taken != "" {
 					return newError(ErrNameTaken, "数据目录中的文件夹“%s”已%s，请换一个名称", dirName, taken)
@@ -328,12 +388,12 @@ func (s *Service) RestoreDataset(ctx context.Context, id int64, in RestoreInput)
 				return fmt.Errorf("attach dataset to reviews: %w", err)
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE datasets SET deleted_at = NULL, delete_files = false, name = $2, dir_name = $3,
-				updated_at = now()
+		if _, err := tx.Exec(ctx, `UPDATE datasets SET deleted_at = NULL, delete_files = false, recycled_in_place = false,
+				name = $2, dir_name = $3, updated_at = now()
 			WHERE id = $1`, id, name, dirName); err != nil {
 			return uniqueViolation(err, dirName)
 		}
-		moveBack, done = d.DeleteFiles, true
+		moveBack, done = d.DeleteFiles && !d.RecycledInPlace, true
 		return nil
 	})
 	if err != nil && done {
@@ -345,11 +405,11 @@ func (s *Service) RestoreDataset(ctx context.Context, id int64, in RestoreInput)
 	if err != nil {
 		return Dataset{}, err
 	}
-	if moveBack {
-		from := s.recycleDir(id)
-		if err := os.Rename(from, s.datasetDir(dirName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if moveBack && restoreVol != nil {
+		fromRel := recycleRel(id)
+		if err := restoreVol.RenameDir(ctx, storagenode.SpaceDatasets, fromRel, dirName); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			s.log.Error("move the folder of a restored dataset back; trying again at the next start",
-				"dataset_id", id, "path", from, "err", err)
+				"dataset_id", id, "path", restoreVol.DisplayPath(storagenode.SpaceDatasets, fromRel), "err", err)
 		}
 	}
 	s.log.Info("dataset restored from the recycle bin", "dataset_id", id)
@@ -359,13 +419,13 @@ func (s *Service) RestoreDataset(ctx context.Context, id int64, in RestoreInput)
 // dirTaken says why the folder name dirName cannot be used by the dataset
 // exceptID ("" if it can): another dataset uses it, or the data directory
 // has an entry of that name (ignoring case, like creating a dataset).
-func (s *Service) dirTaken(ctx context.Context, q querier, dirName string, exceptID int64) (string, error) {
-	if owner, err := datasetUsingDir(ctx, q, dirName, exceptID); err != nil {
+func (s *Service) dirTaken(ctx context.Context, q querier, storageNodeID int64, vol storagenode.Volume, dirName string, exceptID int64) (string, error) {
+	if owner, err := datasetUsingDir(ctx, q, storageNodeID, dirName, exceptID); err != nil {
 		return "", err
 	} else if owner != nil {
 		return "被数据集" + owner.String() + "使用", nil
 	}
-	if existing, err := s.findDirEntry(dirName); err != nil {
+	if existing, err := findDirEntry(ctx, vol, dirName); err != nil {
 		return "", err
 	} else if existing != "" {
 		return "存在", nil
@@ -424,8 +484,14 @@ func (s *Service) ListTrashedDatasets(ctx context.Context) ([]TrashedDataset, er
 		return []TrashedDataset{}, err
 	}
 	ids := make([]int64, len(out))
+	nodeIDs := make([]int64, len(out))
 	for i := range out {
 		ids[i] = out[i].ID
+		nodeIDs[i] = out[i].StorageNodeID
+	}
+	refs, err := s.storageNodes.NodeRefs(ctx, nodeIDs)
+	if err != nil {
+		return nil, err
 	}
 	versions, err := queryVersionCounts(ctx, s.db, ids)
 	if err != nil {
@@ -459,6 +525,8 @@ func (s *Service) ListTrashedDatasets(ctx context.Context) ([]TrashedDataset, er
 	}); err != nil {
 		return nil, err
 	}
+	vols := make(map[int64]storagenode.Volume)
+	volFailed := make(map[int64]bool)
 	for i := range out {
 		t := &out[i]
 		t.VersionCount = versions[t.ID]
@@ -466,67 +534,97 @@ func (s *Service) ListTrashedDatasets(ctx context.Context) ([]TrashedDataset, er
 		if p := projects[t.ID]; p != nil {
 			t.RestoreProjects = p
 		}
-		if t.DeleteFiles {
-			t.Path = s.recycleDir(t.ID)
-		} else {
-			t.Path = s.datasetDir(t.DirName)
+		nid := t.StorageNodeID
+		if nid <= 0 {
+			nid = storagenode.BuiltinID
 		}
-		fi, err := os.Lstat(t.Path)
-		t.DirectoryMissing = err != nil || !fi.IsDir()
+		if ref, ok := refs[nid]; ok {
+			t.StorageNode = ref
+		} else {
+			t.StorageNode = storagenode.BuiltinRef()
+		}
+		vol, ok := vols[nid]
+		if !ok && !volFailed[nid] {
+			if _, v, verr := s.storageNodes.VolumeForNode(ctx, nid); verr == nil {
+				vol = v
+				vols[nid] = v
+			} else {
+				volFailed[nid] = true
+			}
+		}
+		rel := t.DirName
+		if t.DeleteFiles && !t.RecycledInPlace {
+			rel = recycleRel(t.ID)
+		}
+		if vol != nil {
+			t.Path = vol.DisplayPath(storagenode.SpaceDatasets, rel)
+			t.DirectoryMissing = vol.IsPlainDir(ctx, storagenode.SpaceDatasets, rel) != nil
+		} else {
+			t.Path = rel
+			t.DirectoryMissing = true
+		}
 	}
 	return out, nil
 }
 
 // reconcileRecycleFolders repairs what a crash between renaming a folder
-// and the commit leaves in the data directory: the folder of a dataset in
-// use found under .recycle-<id> (its delete was rolled back, or it was
-// restored and its folder not moved back yet) goes back under its name, as
-// does one of a dataset in the bin deleted without its files, and one of a
-// dataset that is gone is left to the janitor (renamed to .deleting-<id>).
-// Start runs it before anything else uses the folders.
+// and the commit leaves in the local data directories: the folder of a
+// dataset in use found under .recycle-<id> (its delete was rolled back, or
+// it was restored and its folder not moved back yet) goes back under its
+// name, as does one of a dataset in the bin deleted without its files, and
+// one of a dataset that is gone is left to the janitor (renamed to
+// .deleting-<id>). Start runs it before anything else uses the folders.
 func (s *Service) reconcileRecycleFolders(ctx context.Context) error {
-	entries, err := os.ReadDir(s.datasetsDir())
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
+	vols, err := s.storageNodes.LocalVolumes(ctx)
 	if err != nil {
 		return err
 	}
-	for _, e := range entries {
-		rest, ok := strings.CutPrefix(e.Name(), recyclePrefix)
-		id, err := strconv.ParseInt(rest, 10, 64)
-		if !ok || err != nil || id <= 0 || strconv.FormatInt(id, 10) != rest {
+	for _, vol := range vols {
+		baseDir := vol.DisplayPath(storagenode.SpaceDatasets, "")
+		entries, err := os.ReadDir(baseDir)
+		if errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
-		path := filepath.Join(s.datasetsDir(), e.Name())
-		var dirName string
-		var trashed, deleteFiles bool
-		err = s.db.QueryRow(ctx, "SELECT dir_name, deleted_at IS NOT NULL, delete_files FROM datasets WHERE id = $1",
-			id).Scan(&dirName, &trashed, &deleteFiles)
-		switch {
-		case errors.Is(err, pgx.ErrNoRows):
-			trash := filepath.Join(s.datasetsDir(), deletingPrefix+rest)
-			if err := os.Rename(path, trash); err != nil {
-				s.log.Error("set aside the recycled folder of a purged dataset", "path", path, "err", err)
-			}
-		case err != nil:
+		if err != nil {
 			return err
-		case trashed && deleteFiles:
-			// In the bin, as it should be.
-		default:
-			// In use, or in the bin with its folder kept under its name.
-			target := s.datasetDir(dirName)
-			if _, err := os.Lstat(target); !errors.Is(err, fs.ErrNotExist) {
-				s.log.Error("dataset in use has a recycled folder and a folder under its name; left both alone",
-					"dataset_id", id, "recycled", path, "folder", target)
+		}
+		for _, e := range entries {
+			rest, ok := strings.CutPrefix(e.Name(), recyclePrefix)
+			id, err := strconv.ParseInt(rest, 10, 64)
+			if !ok || err != nil || id <= 0 || strconv.FormatInt(id, 10) != rest {
 				continue
 			}
-			if err := os.Rename(path, target); err != nil {
-				s.log.Error("move the folder of a dataset in use back from the recycle bin", "path", path, "err", err)
-				continue
+			path := filepath.Join(baseDir, e.Name())
+			var storageNodeID int64
+			var dirName string
+			var trashed, deleteFiles, recycledInPlace bool
+			err = s.db.QueryRow(ctx, `SELECT storage_node_id, dir_name, deleted_at IS NOT NULL, delete_files, recycled_in_place
+				FROM datasets WHERE id = $1`, id).Scan(&storageNodeID, &dirName, &trashed, &deleteFiles, &recycledInPlace)
+			switch {
+			case errors.Is(err, pgx.ErrNoRows), err == nil && storageNodeID != vol.NodeID():
+				trash := filepath.Join(baseDir, deletingPrefix+rest)
+				if err := os.Rename(path, trash); err != nil {
+					s.log.Error("set aside the recycled folder of a purged dataset", "path", path, "err", err)
+				}
+			case err != nil:
+				return err
+			case trashed && deleteFiles && !recycledInPlace:
+				// In the bin, as it should be.
+			default:
+				// In use, or in the bin with its folder kept under its name.
+				target := filepath.Join(baseDir, dirName)
+				if _, err := os.Lstat(target); !errors.Is(err, fs.ErrNotExist) {
+					s.log.Error("dataset in use has a recycled folder and a folder under its name; left both alone",
+						"dataset_id", id, "recycled", path, "folder", target)
+					continue
+				}
+				if err := os.Rename(path, target); err != nil {
+					s.log.Error("move the folder of a dataset in use back from the recycle bin", "path", path, "err", err)
+					continue
+				}
+				s.log.Warn("moved the folder of a dataset in use back from the recycle bin (an interrupted delete or restore)",
+					"dataset_id", id, "path", target)
 			}
-			s.log.Warn("moved the folder of a dataset in use back from the recycle bin (an interrupted delete or restore)",
-				"dataset_id", id, "path", target)
 		}
 	}
 	return nil
@@ -570,12 +668,22 @@ func (s *Service) purgeExpired(ctx context.Context) error {
 // deleted with its files, its folder. A dataset restored meanwhile is left
 // alone.
 func (s *Service) purgeDataset(ctx context.Context, id int64) error {
+	unlock, err := s.recycleLocks.lock(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	var trash, aside string
-	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		var deleteFiles bool
-		err := tx.QueryRow(ctx, `SELECT delete_files FROM datasets
+	var remoteVol storagenode.Volume
+	var remoteRel string
+	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		var storageNodeID int64
+		var dirName string
+		var deleteFiles, recycledInPlace bool
+		err := tx.QueryRow(ctx, `SELECT storage_node_id, dir_name, delete_files, recycled_in_place FROM datasets
 			WHERE id = $1 AND deleted_at <= now() - $2 * interval '1 second' FOR UPDATE`,
-			id, recycle.RetentionSeconds).Scan(&deleteFiles)
+			id, recycle.RetentionSeconds).Scan(&storageNodeID, &dirName, &deleteFiles, &recycledInPlace)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil // restored meanwhile
 		}
@@ -586,13 +694,27 @@ func (s *Service) purgeDataset(ctx context.Context, id int64) error {
 			return err
 		}
 		if deleteFiles {
-			aside = s.recycleDir(id)
-			trash = filepath.Join(s.datasetsDir(), deletingPrefix+strconv.FormatInt(id, 10))
-			if err := os.Rename(aside, trash); errors.Is(err, fs.ErrNotExist) {
-				aside, trash = "", ""
-			} else if err != nil {
-				aside, trash = "", ""
-				return fmt.Errorf("move recycled dataset folder: %w", err)
+			_, vol, verr := s.volumeFor(ctx, storageNodeID)
+			if verr != nil {
+				return verr
+			}
+			if vol.Kind() == storagenode.KindLocal && !recycledInPlace {
+				baseDir := vol.DisplayPath(storagenode.SpaceDatasets, "")
+				aside = filepath.Join(baseDir, recycleRel(id))
+				trash = filepath.Join(baseDir, deletingPrefix+strconv.FormatInt(id, 10))
+				if err := os.Rename(aside, trash); errors.Is(err, fs.ErrNotExist) {
+					aside, trash = "", ""
+				} else if err != nil {
+					aside, trash = "", ""
+					return fmt.Errorf("move recycled dataset folder: %w", err)
+				}
+			} else {
+				remoteVol = vol
+				if recycledInPlace {
+					remoteRel = dirName
+				} else {
+					remoteRel = recycleRel(id)
+				}
 			}
 		}
 		return nil
@@ -606,11 +728,16 @@ func (s *Service) purgeDataset(ctx context.Context, id int64) error {
 		return err
 	}
 	s.removeAllThumbnails(id)
-	s.log.Info("dataset purged from the recycle bin", "dataset_id", id, "delete_files", trash != "")
+	s.log.Info("dataset purged from the recycle bin", "dataset_id", id, "delete_files", trash != "" || remoteVol != nil)
 	if trash != "" {
 		if err := s.removeAll(trash); err != nil {
 			// The janitor tries again (cleanTrash).
 			s.log.Error("dataset folder only partly removed; will retry", "dataset_id", id, "path", trash, "err", err)
+		}
+	}
+	if remoteVol != nil && remoteRel != "" {
+		if err := remoteVol.RemoveDirAll(ctx, storagenode.SpaceDatasets, remoteRel); err != nil {
+			s.log.Error("remote dataset folder removal failed", "dataset_id", id, "path", remoteVol.DisplayPath(storagenode.SpaceDatasets, remoteRel), "err", err)
 		}
 	}
 	return nil

@@ -16,6 +16,8 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // planFor runs the planner over new images given by content (path →
@@ -603,7 +605,7 @@ func TestRenameImageFiles(t *testing.T) {
 		"g/1.jpg":      []byte("img"),
 		"g/1.xml":      vocFile("1.jpg"),
 	})
-	root, err := os.OpenRoot(dir)
+	root, err := storagenode.OpenLocalDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

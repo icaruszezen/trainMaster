@@ -30,6 +30,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router"
 
 import { PageHeader } from "@/components/page-header"
 import { StatCard } from "@/components/stat-card"
+import { StorageNodeBadge } from "@/components/storage-node-badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -387,6 +388,7 @@ function DetailMeta({ version }: { version: DataVersion }) {
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted-foreground">
       <DataVersionStatusBadge version={version} />
+      <StorageNodeBadge node={version.storage_node} />
       <Link
         to={projectDataVersionsPath(version.project_id)}
         className="inline-flex max-w-full min-w-0 items-center gap-1 text-foreground underline-offset-4 hover:underline"

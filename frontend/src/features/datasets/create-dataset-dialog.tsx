@@ -1,9 +1,10 @@
 import { useId, useMemo, useRef, useState, type FormEvent } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { FileArchive, FolderOpen, FolderUp } from "lucide-react"
-import { useNavigate } from "react-router"
+import { Link, useNavigate } from "react-router"
 import { toast } from "sonner"
 
+import { StorageNodeBadge } from "@/components/storage-node-badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -62,6 +63,7 @@ import {
   startFolderUpload,
 } from "@/features/datasets/upload-manager"
 import { useDatasetsRoot } from "@/features/datasets/use-datasets-root"
+import { useActiveStorageNode } from "@/features/system/storage-api"
 import { ApiError } from "@/lib/api"
 import { queryClient } from "@/lib/query-client"
 
@@ -84,6 +86,7 @@ export function CreateDatasetDialog({
 }: CreateDatasetDialogProps) {
   const navigate = useNavigate()
   const root = useDatasetsRoot()
+  const activeNode = useActiveStorageNode()
   const nameId = useId()
   const descriptionId = useId()
   const nameInputRef = useRef<HTMLInputElement>(null)
@@ -455,10 +458,29 @@ export function CreateDatasetDialog({
             <DialogTitle>新建数据集</DialogTitle>
             <DialogDescription>
               上传图片压缩包或整个文件夹（标注可以是 VOC、X-AnyLabeling 或 YOLO
-              格式，统一转换为 VOC 保存），也可以把服务器上已有的 VOC
+              格式，统一转换为 VOC 保存），也可以把存储节点上已有的 VOC
               数据集文件夹直接添加为数据集。
             </DialogDescription>
           </DialogHeader>
+
+          {activeNode && (
+            <div className="flex items-center justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2 text-xs">
+              <span className="flex min-w-0 flex-1 items-center gap-2 text-muted-foreground">
+                <span className="shrink-0">写入存储节点：</span>
+                <StorageNodeBadge node={activeNode} />
+                <code className="hidden min-w-0 truncate font-mono text-foreground sm:inline">
+                  {activeNode.display_target}
+                </code>
+              </span>
+              <Link
+                to="/system/storage"
+                onClick={close}
+                className="shrink-0 text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+              >
+                切换存储节点
+              </Link>
+            </div>
+          )}
 
           <Tabs
             value={tab}

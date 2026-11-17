@@ -1,6 +1,7 @@
 import { FolderX, Images } from "lucide-react"
 import { Link } from "react-router"
 
+import { StorageNodeBadge } from "@/components/storage-node-badge"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { Spinner } from "@/components/ui/spinner"
@@ -218,9 +219,12 @@ export function DatasetCard({
           <span className="truncate">
             更新于 {formatRelativeTime(dataset.updated_at)}
           </span>
-          <Badge variant="outline" className="font-normal">
-            {originLabels[dataset.origin]}
-          </Badge>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <StorageNodeBadge node={dataset.storage_node} />
+            <Badge variant="outline" className="font-normal">
+              {originLabels[dataset.origin]}
+            </Badge>
+          </div>
         </div>
       </div>
     </article>

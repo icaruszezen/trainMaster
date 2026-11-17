@@ -34,6 +34,7 @@ const (
 	codeYOLOVersionMismatch   = "yolo_version_mismatch"  // 422: the uploaded model is another YOLO version than the chosen one; commit again with that one
 	codeInternal              = "internal_error"         // 500
 	codeNotImplemented        = "not_implemented"        // 501: planned module
+	codeStorageUnavailable    = "storage_unavailable"    // 503: remote storage node unreachable or misconfigured
 	codeInsufficientStorage   = "insufficient_storage"   // 507: not enough free disk space
 )
 

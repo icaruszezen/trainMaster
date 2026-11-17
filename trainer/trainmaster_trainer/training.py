@@ -965,6 +965,230 @@ class TrainingProcess:
 
 
 # ---------------------------------------------------------------------------
+# 数据集短期缓存（DatasetCachePolicy & DatasetCacheManager）
+
+
+DATASET_CACHE_DIR = "dataset-cache"
+CACHE_META_FILE = ".cache-meta.json"
+
+
+@dataclass(frozen=True)
+class DatasetCachePolicy:
+    """平台下发的训练节点短期数据集缓存策略。默认关闭（训练结束立即清理）。"""
+
+    enabled: bool = False
+    max_versions: int = 2
+    ttl_seconds: int = 24 * 3600
+
+    @classmethod
+    def from_json(cls, raw: Any) -> DatasetCachePolicy:
+        if not isinstance(raw, Mapping):
+            return cls()
+        enabled = raw.get("enabled") is True
+        mv_raw = raw.get("max_versions")
+        mv = mv_raw if _positive_int(mv_raw) else 2
+        ttl_raw = raw.get("ttl_seconds")
+        ttl = ttl_raw if _positive_int(ttl_raw) else 24 * 3600
+        return cls(enabled=enabled, max_versions=mv, ttl_seconds=ttl)
+
+
+def _link_or_copy_tree(src_dir: Path, dst_dir: Path) -> tuple[int, Path | None]:
+    """把 src_dir 下的文件硬链接（不支持时退回复制）到 dst_dir，跳过缓存元数据文件。"""
+    total_bytes = 0
+    best_yaml: Path | None = None
+    for item in src_dir.rglob("*"):
+        if item.name == CACHE_META_FILE or item.is_symlink():
+            continue
+        rel = item.relative_to(src_dir)
+        target = dst_dir / rel
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if not item.is_file():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            target.unlink()
+        try:
+            os.link(item, target)
+        except OSError:
+            shutil.copy2(item, target)
+        with contextlib.suppress(OSError):
+            total_bytes += item.stat().st_size
+        if target.name == "data.yaml" and (
+            best_yaml is None or len(target.parts) < len(best_yaml.parts)
+        ):
+            best_yaml = target
+    return total_bytes, best_yaml
+
+
+class DatasetCacheManager:
+    """管理 STATE_DIR/dataset-cache 下的短期冻结数据版本缓存（LRU + TTL + 低磁盘驱逐）。"""
+
+    def __init__(
+        self,
+        state_dir: Path,
+        *,
+        wall_clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.state_dir = state_dir
+        self.cache_root = state_dir / DATASET_CACHE_DIR
+        self._wall_clock = wall_clock
+        self._lock = threading.Lock()
+        self._latest_policy: DatasetCachePolicy | None = None
+
+    @property
+    def latest_policy(self) -> DatasetCachePolicy | None:
+        with self._lock:
+            return self._latest_policy
+
+    def record_policy(self, policy: DatasetCachePolicy) -> None:
+        with self._lock:
+            self._latest_policy = policy
+
+    def apply_policy(self, policy: DatasetCachePolicy | None = None) -> None:
+        with self._lock:
+            if policy is not None:
+                self._latest_policy = policy
+            effective = self._latest_policy
+            if effective is None:
+                return
+            self._enforce_locked(effective)
+
+    def materialize(self, dv_id: int, dest_dir: Path, policy: DatasetCachePolicy) -> Path | None:
+        """若缓存命中且未过期，将缓存文件硬链接/复制到工作目录并返回 data.yaml。"""
+        with self._lock:
+            self._latest_policy = policy
+            if not policy.enabled:
+                self._clear_locked()
+                return None
+            self._enforce_locked(policy)
+            entry_dir = self.cache_root / f"dv-{dv_id}"
+            meta = self._read_meta_locked(entry_dir)
+            if meta is None:
+                return None
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                _, data_yaml = _link_or_copy_tree(entry_dir, dest_dir)
+            except OSError as exc:
+                log.warning("dataset cache materialize failed for dv-%s: %s", dv_id, exc)
+                shutil.rmtree(entry_dir, ignore_errors=True)
+                shutil.rmtree(dest_dir, ignore_errors=True)
+                return None
+            if data_yaml is None or not data_yaml.is_file():
+                shutil.rmtree(entry_dir, ignore_errors=True)
+                shutil.rmtree(dest_dir, ignore_errors=True)
+                return None
+            meta["last_used_at"] = self._wall_clock()
+            self._write_meta_locked(entry_dir, meta)
+            return data_yaml
+
+    def store(self, dv_id: int, extracted_dir: Path, policy: DatasetCachePolicy) -> None:
+        """在训练开始前把刚解压的数据集硬链接保存到短期缓存，并执行 LRU 与 TTL 淘汰。"""
+        with self._lock:
+            self._latest_policy = policy
+            if not policy.enabled:
+                self._clear_locked()
+                return
+            try:
+                self.cache_root.mkdir(parents=True, exist_ok=True)
+                now = self._wall_clock()
+                stage_dir = self.cache_root / f".tmp-dv-{dv_id}-{os.getpid()}-{int(now * 1000)}"
+                if stage_dir.exists():
+                    shutil.rmtree(stage_dir, ignore_errors=True)
+                stage_dir.mkdir(parents=True, exist_ok=True)
+                size_bytes, data_yaml = _link_or_copy_tree(extracted_dir, stage_dir)
+                if data_yaml is None:
+                    shutil.rmtree(stage_dir, ignore_errors=True)
+                    return
+                self._write_meta_locked(
+                    stage_dir,
+                    {
+                        "dv_id": dv_id,
+                        "cached_at": now,
+                        "last_used_at": now,
+                        "size_bytes": size_bytes,
+                    },
+                )
+                entry_dir = self.cache_root / f"dv-{dv_id}"
+                if entry_dir.exists():
+                    shutil.rmtree(entry_dir, ignore_errors=True)
+                stage_dir.replace(entry_dir)
+                self._enforce_locked(policy)
+            except OSError as exc:
+                log.warning("cannot populate trainer dataset cache for dv-%s: %s", dv_id, exc)
+
+    def evict_for_space(self, path_on_disk: Path, need_bytes: int) -> None:
+        """磁盘可用空间不足时按最久未使用顺序主动驱逐旧缓存版本。"""
+        with self._lock:
+            if not self.cache_root.is_dir():
+                return
+            entries = self._list_entries_locked()
+            for entry_dir, _ in entries:
+                try:
+                    if shutil.disk_usage(path_on_disk).free >= need_bytes:
+                        return
+                except OSError:
+                    return
+                shutil.rmtree(entry_dir, ignore_errors=True)
+
+    def _clear_locked(self) -> None:
+        if self.cache_root.exists():
+            shutil.rmtree(self.cache_root, ignore_errors=True)
+
+    def _read_meta_locked(self, entry_dir: Path) -> dict[str, Any] | None:
+        meta_path = entry_dir / CACHE_META_FILE
+        if not meta_path.is_file():
+            return None
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("last_used_at"), (int, float)):
+            return None
+        return data
+
+    def _write_meta_locked(self, entry_dir: Path, meta: Mapping[str, Any]) -> None:
+        meta_path = entry_dir / CACHE_META_FILE
+        with contextlib.suppress(OSError):
+            meta_path.write_text(json.dumps(dict(meta)) + "\n", encoding="utf-8")
+
+    def _list_entries_locked(self) -> list[tuple[Path, float]]:
+        """返回按 last_used_at 从旧到新排序的有效缓存目录列表，顺带清理残余临时目录。"""
+        if not self.cache_root.is_dir():
+            return []
+        entries: list[tuple[Path, float]] = []
+        for child in self.cache_root.iterdir():
+            if child.name.startswith(".tmp-") or not child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+                continue
+            meta = self._read_meta_locked(child)
+            if meta is None:
+                shutil.rmtree(child, ignore_errors=True)
+                continue
+            entries.append((child, float(meta["last_used_at"])))
+        entries.sort(key=lambda item: item[1])
+        return entries
+
+    def _enforce_locked(self, policy: DatasetCachePolicy) -> None:
+        if not policy.enabled:
+            self._clear_locked()
+            return
+        if not self.cache_root.is_dir():
+            return
+        now = self._wall_clock()
+        kept: list[tuple[Path, float]] = []
+        for entry_dir, last_used in self._list_entries_locked():
+            if now - last_used > policy.ttl_seconds:
+                shutil.rmtree(entry_dir, ignore_errors=True)
+            else:
+                kept.append((entry_dir, last_used))
+        while len(kept) > policy.max_versions:
+            oldest_dir, _ = kept.pop(0)
+            shutil.rmtree(oldest_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # 父进程：执行平台下发的 training_job 任务
 
 
@@ -979,7 +1203,10 @@ class TrainingTaskInfo:
     model_scale: str
     arch_yaml: str | None
     task: str
+    dv_id: int | None
     dv_dir_name: str | None
+    dv_shared_local: bool | None
+    dataset_cache: DatasetCachePolicy
     base_size_bytes: int | None
     base_sha256: str | None
     params: dict[str, Any]
@@ -1026,8 +1253,12 @@ class TrainingTaskInfo:
         dv = task.get("data_version")
         if not isinstance(dv, dict):
             raise ValueError("data_version")
+        dv_id = dv.get("id") if _positive_int(dv.get("id")) else None
         dv_dir = dv.get("dir_name")
         dv_dir_name = dv_dir if isinstance(dv_dir, str) and dv_dir else None
+        raw_shared = dv.get("shared_local")
+        dv_shared_local = raw_shared if isinstance(raw_shared, bool) else None
+        dataset_cache = DatasetCachePolicy.from_json(task.get("dataset_cache"))
 
         base_size: int | None = None
         base_sha: str | None = None
@@ -1057,7 +1288,10 @@ class TrainingTaskInfo:
             model_scale=model_scale,
             arch_yaml=arch_yaml,
             task=task_type,
+            dv_id=dv_id,
             dv_dir_name=dv_dir_name,
+            dv_shared_local=dv_shared_local,
+            dataset_cache=dataset_cache,
             base_size_bytes=base_size,
             base_sha256=base_sha,
             params=dict(params),
@@ -1133,6 +1367,7 @@ class TrainingJobTask:
         state_dir: Path,
         node_name: str,
         data_dir: Path | None = None,
+        dataset_cache: DatasetCacheManager | None = None,
         command: Sequence[str] | None = None,
         clock: Callable[[], float] = time.monotonic,
         progress_interval: float = PROGRESS_INTERVAL,
@@ -1143,6 +1378,7 @@ class TrainingJobTask:
         self.state_dir = state_dir
         self.node_name = node_name
         self.data_dir = data_dir
+        self.dataset_cache = dataset_cache or DatasetCacheManager(state_dir)
         self.clock = clock
         self.progress_interval = progress_interval
         self.process = TrainingProcess(state_dir=state_dir, command=command, clock=clock)
@@ -1272,7 +1508,9 @@ class TrainingJobTask:
 
     def _execute(self, info: TrainingTaskInfo) -> dict[str, Any]:
         work = self._prepare_work_dir(info)
-        self._check_disk(work, (info.base_size_bytes or 0) + MIN_FREE_DISK_BYTES)
+        need_bytes = (info.base_size_bytes or 0) + MIN_FREE_DISK_BYTES
+        self.dataset_cache.evict_for_space(work, need_bytes)
+        self._check_disk(work, need_bytes)
 
         self._set_stage(
             "preparing",
@@ -1369,8 +1607,8 @@ class TrainingJobTask:
             )
 
     def _prepare_dataset(self, info: TrainingTaskInfo, work: Path) -> Path:
-        """优先使用与服务端共享且可写的 /data/exports/<dir_name>/data.yaml；否则从平台流式下载 zip 解压。"""
-        if self.data_dir is not None and info.dv_dir_name:
+        """优先使用本机默认存储共享目录；远程存储节点则优先命中本地短期缓存，未命中时从平台流式下载解压。"""
+        if info.dv_shared_local is not False and self.data_dir is not None and info.dv_dir_name:
             rel = Path(*info.dv_dir_name.strip("/").split("/"))
             candidate_dir = self.data_dir / "exports" / rel
             candidate_yaml = candidate_dir / "data.yaml"
@@ -1384,6 +1622,31 @@ class TrainingJobTask:
                     "training job %s using shared dataset directory %s", info.id, candidate_dir
                 )
                 return candidate_yaml
+
+        dataset_dir = work / "dataset"
+        policy = self.dataset_cache.latest_policy or info.dataset_cache
+        if info.dataset_cache.enabled != policy.enabled or info.dataset_cache != policy:
+            # 任务刚下发时的策略最新，同步给缓存管理器
+            policy = info.dataset_cache
+
+        if policy.enabled and info.dv_id is not None:
+            cached_yaml = self.dataset_cache.materialize(info.dv_id, dataset_dir, policy)
+            if cached_yaml is not None:
+                log.info(
+                    "training job %s hit local dataset cache for data_version %s",
+                    info.id,
+                    info.dv_id,
+                )
+                self._send_progress(
+                    {
+                        "log_chunk": (
+                            f"[trainMaster] 命中训练节点短期数据集缓存（数据版本 #{info.dv_id}），跳过网络拉取\n"
+                        )
+                    }
+                )
+                return cached_yaml
+        else:
+            self.dataset_cache.apply_policy(policy)
 
         self._set_stage("downloading", log_chunk="[trainMaster] 正在从平台下载训练数据集归档...\n")
         zip_path = work / "dataset.zip"
@@ -1405,7 +1668,6 @@ class TrainingJobTask:
             raise TaskFailed(f"写入训练数据集压缩包失败：{exc}", retryable=True) from None
 
         self._check_interrupted()
-        dataset_dir = work / "dataset"
         dataset_dir.mkdir(parents=True, exist_ok=True)
         try:
             data_yaml = safe_extract_zip(zip_path, dataset_dir, abort=self._interrupted)
@@ -1419,6 +1681,9 @@ class TrainingJobTask:
         finally:
             with contextlib.suppress(OSError):
                 zip_path.unlink()
+
+        if policy.enabled and info.dv_id is not None:
+            self.dataset_cache.store(info.dv_id, dataset_dir, policy)
         return data_yaml
 
     def _download_base_model(self, info: TrainingTaskInfo, dest: Path) -> None:
@@ -1524,14 +1789,18 @@ class TrainingJobTask:
 
     def _cleanup(self) -> None:
         work = self.work_dir
-        if work is None:
-            return
-        try:
-            shutil.rmtree(work)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            log.warning("cannot remove training work directory %s: %s", work, exc)
+        if work is not None:
+            try:
+                shutil.rmtree(work)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.warning("cannot remove training work directory %s: %s", work, exc)
+        if self.info is not None:
+            latest = self.dataset_cache.latest_policy
+            self.dataset_cache.apply_policy(
+                latest if latest is not None else self.info.dataset_cache
+            )
 
 
 if __name__ == "__main__":

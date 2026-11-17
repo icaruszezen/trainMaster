@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // The images of a ready version: list, detail, files and thumbnails. A
@@ -54,17 +55,18 @@ func (t *thumbnails) release() { <-t.slots }
 
 // readyVersion is what the image operations need of a ready version.
 type readyVersion struct {
-	id      int64
-	dirName string
-	sources []Source
+	id            int64
+	storageNodeID int64
+	dirName       string
+	sources       []Source
 }
 
 // loadReady reads a version in use that must be ready.
 func (s *Service) loadReady(ctx context.Context, id int64) (readyVersion, error) {
 	rv := readyVersion{id: id}
 	var status string
-	err := s.db.QueryRow(ctx, "SELECT v.status, v.dir_name, v.sources"+versionFrom+" WHERE v.id = $1 AND "+versionLive,
-		id).Scan(&status, &rv.dirName, &rv.sources)
+	err := s.db.QueryRow(ctx, "SELECT v.status, v.storage_node_id, v.dir_name, v.sources"+versionFrom+" WHERE v.id = $1 AND "+versionLive,
+		id).Scan(&status, &rv.storageNodeID, &rv.dirName, &rv.sources)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return rv, errVersionNotFound
 	}
@@ -224,7 +226,7 @@ func (s *Service) GetImage(ctx context.Context, id, imageID int64) (ImageDetail,
 
 // ImageFile is an opened image or thumbnail file.
 type ImageFile struct {
-	File        *os.File
+	File        storagenode.File
 	ContentType string
 	Name        string
 }
@@ -253,12 +255,12 @@ func (s *Service) queryStoredImage(ctx context.Context, id, imageID int64) (read
 	return rv, img, err
 }
 
-// openStored opens the stored file of an image in the version folder dir.
-// A file whose size or time differ from those recorded when it was stored
-// was rewritten in place (through a hard link, see migration 0013): it is
-// served as it is, with a warning in the log.
-func (s *Service) openStored(dir string, versionID int64, img storedImage) (*os.File, error) {
-	root, err := os.OpenRoot(dir)
+// openStored opens the stored file of an image in the version folder on its
+// storage node. A file whose size or time differ from those recorded when it
+// was stored was rewritten in place (through a hard link, see migration 0013):
+// it is served as it is, with a warning in the log.
+func (s *Service) openStored(ctx context.Context, nodeID int64, dirName string, versionID int64, img storedImage) (storagenode.File, error) {
+	root, err := s.openVersionDir(ctx, nodeID, dirName)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, errImageFileMissing
@@ -266,7 +268,7 @@ func (s *Service) openStored(dir string, versionID int64, img storedImage) (*os.
 		return nil, fmt.Errorf("open data version folder: %w", err)
 	}
 	defer root.Close()
-	f, err := root.Open(filepath.FromSlash(img.path))
+	f, err := root.Open(img.path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, errImageFileMissing
@@ -298,7 +300,7 @@ func (s *Service) OpenImage(ctx context.Context, id, imageID int64) (*ImageFile,
 	if err != nil {
 		return nil, err
 	}
-	f, err := s.openStored(s.versionDir(rv.dirName), id, img)
+	f, err := s.openStored(ctx, rv.storageNodeID, rv.dirName, id, img)
 	if err != nil {
 		return nil, err
 	}
@@ -325,7 +327,7 @@ func (s *Service) OpenThumbnail(ctx context.Context, id, imageID int64, size str
 	// The generation is shared by concurrent requests and continues when
 	// this one gives up, so the result lands in the cache either way.
 	ch := s.thumbs.group.DoChan(cachePath, func() (any, error) {
-		return nil, s.generateThumbnail(s.versionDir(rv.dirName), id, img, side, cachePath)
+		return nil, s.generateThumbnail(s.base, rv.storageNodeID, rv.dirName, id, img, side, cachePath)
 	})
 	select {
 	case res := <-ch:
@@ -344,10 +346,10 @@ func (s *Service) OpenThumbnail(ctx context.Context, id, imageID int64, size str
 
 // generateThumbnail renders the thumbnail of a stored image into dst, with
 // the memory budget shared by all image decoding of the process.
-func (s *Service) generateThumbnail(dir string, versionID int64, img storedImage, side int, dst string) error {
+func (s *Service) generateThumbnail(ctx context.Context, nodeID int64, dirName string, versionID int64, img storedImage, side int, dst string) error {
 	s.thumbs.acquire()
 	defer s.thumbs.release()
-	f, err := s.openStored(dir, versionID, img)
+	f, err := s.openStored(ctx, nodeID, dirName, versionID, img)
 	if err != nil {
 		return err
 	}

@@ -11,6 +11,7 @@ import {
 } from "@tanstack/react-query"
 
 import type { ReviewImageStatus } from "@/features/reviews/api"
+import type { StorageNodeRef } from "@/features/system/storage-api"
 import { apiGet, apiSend, type ListResponse } from "@/lib/api"
 
 export type DatasetOrigin = "upload" | "directory"
@@ -40,8 +41,10 @@ export type Dataset = {
   description: string
   /** `datasets/` 下的文件夹名。 */
   dir_name: string
-  /** 服务器（容器）内的绝对路径，如 `/data/datasets/划痕-A`。 */
+  /** 存储位置显示路径，如 `/data/datasets/划痕-A` 或 `s3://bucket/prefix/datasets/划痕-A`。 */
   path: string
+  /** 数据集所在的存储节点。 */
+  storage_node: StorageNodeRef
   origin: DatasetOrigin
   status: DatasetStatus
   /** 最近一次修改状态的时间；从未设置过时为 null。只改状态不更新 `updated_at`。 */
@@ -262,6 +265,7 @@ export type DatasetDirectory = {
   /** `datasets/` 下的文件夹名。 */
   name: string
   path: string
+  storage_node?: StorageNodeRef
   registered: boolean
   dataset_id: number | null
   /**

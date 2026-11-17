@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"image"
 	"io"
-	"os"
 
 	// Decoders for the formats image.DecodeConfig/Decode recognize.
 	// AVIF has no pure-Go decoder: such images get no dimensions from the
@@ -20,11 +19,19 @@ import (
 	_ "golang.org/x/image/webp"
 )
 
+// RandomAccessReader is an image file stream supporting sequential reads,
+// seeking, and random range reads (implemented by *os.File and storagenode.File).
+type RandomAccessReader interface {
+	io.Reader
+	io.Seeker
+	io.ReaderAt
+}
+
 // isTIFF checks the TIFF byte-order mark. TIFF decoding needs random
 // access; image.DecodeConfig/Decode would buffer the whole file in memory
 // because they wrap the reader, so TIFF files are decoded from the
-// *os.File directly.
-func isTIFF(f *os.File) bool {
+// RandomAccessReader directly.
+func isTIFF(f RandomAccessReader) bool {
 	var head [4]byte
 	if _, err := f.ReadAt(head[:], 0); err != nil {
 		return false
@@ -46,7 +53,7 @@ func recoverDecoder(err *error) {
 
 // decodeImageConfig reads the dimensions and format (as image.DecodeConfig
 // names it) of the image in f.
-func decodeImageConfig(f *os.File) (_ image.Config, format string, err error) {
+func decodeImageConfig(f RandomAccessReader) (_ image.Config, format string, err error) {
 	defer recoverDecoder(&err)
 	if isTIFF(f) {
 		cfg, err := tiff.DecodeConfig(f)
@@ -59,7 +66,7 @@ func decodeImageConfig(f *os.File) (_ image.Config, format string, err error) {
 }
 
 // decodeImage decodes the whole image in f.
-func decodeImage(f *os.File) (_ image.Image, err error) {
+func decodeImage(f RandomAccessReader) (_ image.Image, err error) {
 	defer recoverDecoder(&err)
 	if isTIFF(f) {
 		return tiff.Decode(f)
@@ -73,7 +80,7 @@ func decodeImage(f *os.File) (_ image.Image, err error) {
 
 // imageDimensions returns the dimensions of the image file, or nil when
 // they cannot be determined.
-func imageDimensions(f *os.File) (width, height *int) {
+func imageDimensions(f RandomAccessReader) (width, height *int) {
 	cfg, _, err := decodeImageConfig(f)
 	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
 		return nil, nil

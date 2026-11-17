@@ -25,6 +25,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
 	"github.com/icaruszezen/trainmaster/backend/internal/review"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 	"github.com/icaruszezen/trainmaster/backend/internal/trainerpkg"
 	"github.com/icaruszezen/trainmaster/backend/internal/training"
 	"github.com/icaruszezen/trainmaster/backend/internal/web"
@@ -75,11 +76,21 @@ func run() error {
 		log.Info("automatic migrations disabled (TM_DB_AUTO_MIGRATE=false)")
 	}
 
+	storageNodes := storagenode.NewService(storagenode.Options{
+		DB: db.Pool, Storage: store, Logger: log, SecretKey: cfg.SecretKey,
+	})
+	if err := storageNodes.Start(ctx); err != nil {
+		return interrupted(ctx, log, err)
+	}
+	defer storageNodes.Stop()
+
 	// Background dataset import/scan jobs. A shutdown signal cancels ctx,
 	// which interrupts running jobs (they end as failed; queued jobs run
 	// after the next start). Stop waits for the workers; deferred after
 	// db.Close, it runs before the pool closes.
-	datasets := dataset.NewService(dataset.Options{DB: db.Pool, Storage: store, Logger: log})
+	datasets := dataset.NewService(dataset.Options{
+		DB: db.Pool, Storage: store, StorageNodes: storageNodes, Logger: log,
+	})
 	if err := datasets.Start(ctx); err != nil {
 		return interrupted(ctx, log, err)
 	}
@@ -95,14 +106,14 @@ func run() error {
 	// builds a previous run left (they can be retried), then builds queued
 	// versions one at a time and purges the recycle bin until shutdown; Stop
 	// runs before the services whose data it reads.
-	dataVersions := dataversion.NewService(dataversion.Options{DB: db.Pool, Storage: store, Logger: log,
-		Datasets: datasets, Projects: projects})
+	dataVersions := dataversion.NewService(dataversion.Options{DB: db.Pool, Storage: store,
+		StorageNodes: storageNodes, Logger: log, Datasets: datasets, Projects: projects})
 	// Model reviews and YOLO training jobs register themselves as task sources
 	// with the model service before models.Start begins serving claims.
 	reviews := review.NewService(review.Options{DB: db.Pool, Storage: store, Logger: log, Datasets: datasets,
 		Models: models, Projects: projects})
-	trainingJobs := training.NewService(training.Options{DB: db.Pool, Storage: store, Logger: log,
-		Projects: projects, DataVersions: dataVersions, Models: models})
+	trainingJobs := training.NewService(training.Options{DB: db.Pool, Storage: store,
+		StorageNodes: storageNodes, Logger: log, Projects: projects, DataVersions: dataVersions, Models: models})
 	models.Start(ctx)
 	defer models.Stop()
 	if err := reviews.Start(ctx); err != nil {
@@ -131,12 +142,13 @@ func run() error {
 		Logger:         log,
 		DB:             db,
 		Storage:        store,
+		StorageNodes:   storageNodes,
 		StartedAt:      startedAt,
 		TrustedProxies: cfg.TrustedProxies,
 		Datasets:       datasets,
 		Projects:       projects,
 		Compute: compute.NewService(compute.Options{
-			DB: db.Pool, Logger: log, HeartbeatInterval: cfg.NodeHeartbeatInterval,
+			DB: db.Pool, StorageNodes: storageNodes, Logger: log, HeartbeatInterval: cfg.NodeHeartbeatInterval,
 		}),
 		Models:            models,
 		Reviews:           reviews,

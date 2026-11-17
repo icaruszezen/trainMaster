@@ -126,6 +126,9 @@ type Usage struct {
 // It returns ErrUsageUnsupported on platforms without an implementation.
 func (s *Storage) Usage() (Usage, error) { return diskUsage(s.root) }
 
+// DiskUsage returns the capacity of the filesystem holding path.
+func DiskUsage(path string) (Usage, error) { return diskUsage(path) }
+
 // ErrUsageUnsupported is returned by Usage on platforms where disk usage is
 // not implemented.
 var ErrUsageUnsupported = errors.New("storage: disk usage not supported on this platform")

@@ -16,6 +16,7 @@ import (
 
 	"github.com/icaruszezen/trainmaster/backend/internal/dataversion"
 	"github.com/icaruszezen/trainmaster/backend/internal/model"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 func leaseSeconds() int { return int(model.LeaseDuration / time.Second) }
@@ -84,8 +85,9 @@ func (s *Service) claimOne(ctx context.Context, nodeID int64) (task *Task, skipp
 		// Verify data version is still ready and live.
 		var dvStatus, dirName string
 		var dvDeleted bool
-		err = tx.QueryRow(ctx, "SELECT status, dir_name, (deleted_at IS NOT NULL) FROM data_versions WHERE id = $1", dvID).
-			Scan(&dvStatus, &dirName, &dvDeleted)
+		var dvStorageNodeID int64
+		err = tx.QueryRow(ctx, "SELECT status, dir_name, (deleted_at IS NOT NULL), storage_node_id FROM data_versions WHERE id = $1", dvID).
+			Scan(&dvStatus, &dirName, &dvDeleted, &dvStorageNodeID)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows) || dvDeleted:
 			failMsg = "关联的数据版本已被删除"
@@ -150,6 +152,8 @@ func (s *Service) claimOne(ctx context.Context, nodeID int64) (task *Task, skipp
 		if dirName != "" {
 			dvRef.DirName = dirName
 		}
+		sharedLocal := dvStorageNodeID == 0 || dvStorageNodeID == storagenode.BuiltinID
+		dvRef.SharedLocal = &sharedLocal
 		if dvRef.ClassNames == nil {
 			dvRef.ClassNames = []string{}
 		}
@@ -201,6 +205,17 @@ func (s *Service) claimOne(ctx context.Context, nodeID int64) (task *Task, skipp
 		s.log.Warn("queued training job failed on claim", "job_id", failedID, "error", failMsg)
 	}
 	if task != nil {
+		if s.storageNodes != nil {
+			if policy, perr := s.storageNodes.GetTrainerCachePolicy(ctx); perr == nil {
+				payload := policy.TaskPayload()
+				task.DatasetCache = &payload
+			} else {
+				s.log.Warn("load trainer dataset cache policy", "err", perr)
+			}
+		} else {
+			payload := storagenode.DefaultTrainerCachePolicy().TaskPayload()
+			task.DatasetCache = &payload
+		}
 		if err := os.MkdirAll(filepath.Join(s.jobDir(task.ID), "weights"), 0o755); err != nil {
 			s.log.Warn("prepare job run dir", "job_id", task.ID, "err", err)
 		}

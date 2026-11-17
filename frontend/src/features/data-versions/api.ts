@@ -17,6 +17,7 @@ import {
 
 import type { AnnotationObject } from "@/features/datasets/api"
 import { projectKeys } from "@/features/projects/api"
+import type { StorageNodeRef } from "@/features/system/storage-api"
 import { apiGet, apiSend, type ListResponse } from "@/lib/api"
 import { queryClient } from "@/lib/query-client"
 
@@ -198,6 +199,8 @@ export type DataVersion = {
   /** 项目内的版本号 1、2…，不会再分配给别的版本。界面上写作“数据版本 v3”（format.ts）。 */
   version: number
   note: string
+  /** 该数据版本所在的存储节点。 */
+  storage_node: StorageNodeRef
   status: DataVersionStatus
   /** 生成失败的原因。 */
   error: string

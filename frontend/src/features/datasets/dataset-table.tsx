@@ -2,6 +2,7 @@ import type { MouseEvent } from "react"
 import { Images } from "lucide-react"
 import { Link, useNavigate } from "react-router"
 
+import { StorageNodeBadge } from "@/components/storage-node-badge"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import {
@@ -77,7 +78,7 @@ export function DatasetTable({
               大小
             </TableHead>
             <TableHead className="hidden lg:table-cell">项目</TableHead>
-            <TableHead className="hidden xl:table-cell">来源</TableHead>
+            <TableHead className="hidden xl:table-cell">存储 / 来源</TableHead>
             <TableHead className="hidden md:table-cell">更新时间</TableHead>
             <TableHead className="w-12 pr-4">
               <span className="sr-only">操作</span>
@@ -170,9 +171,12 @@ export function DatasetTable({
                   )}
                 </TableCell>
                 <TableCell className="hidden xl:table-cell">
-                  <Badge variant="outline" className="font-normal">
-                    {originLabels[dataset.origin]}
-                  </Badge>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <StorageNodeBadge node={dataset.storage_node} />
+                    <Badge variant="outline" className="font-normal">
+                      {originLabels[dataset.origin]}
+                    </Badge>
+                  </div>
                 </TableCell>
                 <TableCell
                   className="hidden text-muted-foreground md:table-cell"

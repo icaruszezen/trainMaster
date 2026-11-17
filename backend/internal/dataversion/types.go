@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // The JSON field names of the types in this file are the API contract with
@@ -85,13 +86,15 @@ const (
 
 // DataVersion is a frozen training set of a project.
 type DataVersion struct {
-	ID          int64  `json:"id"`
-	ProjectID   int64  `json:"project_id"`
-	ProjectName string `json:"project_name"` // the project's current name
-	Version     int    `json:"version"`      // within the project: 1, 2, ...; never given again
-	Note        string `json:"note"`
-	Status      string `json:"status"`
-	Error       string `json:"error"` // failed: why, shown to users
+	ID            int64               `json:"id"`
+	ProjectID     int64               `json:"project_id"`
+	ProjectName   string              `json:"project_name"` // the project's current name
+	StorageNodeID int64               `json:"-"`
+	StorageNode   storagenode.NodeRef `json:"storage_node"`
+	Version       int                 `json:"version"` // within the project: 1, 2, ...; never given again
+	Note          string              `json:"note"`
+	Status        string              `json:"status"`
+	Error         string              `json:"error"` // failed: why, shown to users
 	// Progress is set while building.
 	Progress *Progress `json:"progress"`
 	// QueuePosition is set while queued: 1 is built next.

@@ -4,6 +4,8 @@ import (
 	"path"
 	"strconv"
 	"time"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
 // The JSON field names of the types in this file are the API contract with
@@ -85,29 +87,32 @@ const (
 
 // Dataset is a folder of images under the storage directory datasets/.
 type Dataset struct {
-	ID               int64        `json:"id"`
-	Name             string       `json:"name"`
-	Description      string       `json:"description"`
-	DirName          string       `json:"dir_name"`
-	Path             string       `json:"path"` // absolute folder path on the server
-	Origin           string       `json:"origin"`
-	Status           string       `json:"status"`            // DatasetStatus*: "" when not marked
-	StatusUpdatedAt  *time.Time   `json:"status_updated_at"` // when the status last changed; nil: never set
-	DirectoryMissing bool         `json:"directory_missing"`
-	ImageCount       int          `json:"image_count"`
-	AnnotatedCount   int          `json:"annotated_count"` // VOC file with >= 1 object
-	EmptyCount       int          `json:"empty_count"`     // VOC file with 0 objects
-	InvalidCount     int          `json:"invalid_count"`   // VOC file that cannot be parsed
-	ObjectCount      int          `json:"object_count"`
-	LabelCount       int          `json:"label_count"`
-	TotalBytes       int64        `json:"total_bytes"`
-	Covers           []ImageRef   `json:"covers"`        // up to 4 images for the card mosaic
-	Projects         []ProjectRef `json:"projects"`      // the projects that include the dataset, by name
-	VersionCount     int          `json:"version_count"` // ready review versions (versions.go)
-	ActiveImport     *Import      `json:"active_import"` // latest uploading/queued/running job
-	ScannedAt        *time.Time   `json:"scanned_at"`
-	CreatedAt        time.Time    `json:"created_at"`
-	UpdatedAt        time.Time    `json:"updated_at"`
+	ID               int64               `json:"id"`
+	StorageNodeID    int64               `json:"-"`
+	RecycledInPlace  bool                `json:"-"`
+	StorageNode      storagenode.NodeRef `json:"storage_node"`
+	Name             string              `json:"name"`
+	Description      string              `json:"description"`
+	DirName          string              `json:"dir_name"`
+	Path             string              `json:"path"` // absolute folder path on the server (or remote display URI)
+	Origin           string              `json:"origin"`
+	Status           string              `json:"status"`            // DatasetStatus*: "" when not marked
+	StatusUpdatedAt  *time.Time          `json:"status_updated_at"` // when the status last changed; nil: never set
+	DirectoryMissing bool                `json:"directory_missing"`
+	ImageCount       int                 `json:"image_count"`
+	AnnotatedCount   int                 `json:"annotated_count"` // VOC file with >= 1 object
+	EmptyCount       int                 `json:"empty_count"`     // VOC file with 0 objects
+	InvalidCount     int                 `json:"invalid_count"`   // VOC file that cannot be parsed
+	ObjectCount      int                 `json:"object_count"`
+	LabelCount       int                 `json:"label_count"`
+	TotalBytes       int64               `json:"total_bytes"`
+	Covers           []ImageRef          `json:"covers"`        // up to 4 images for the card mosaic
+	Projects         []ProjectRef        `json:"projects"`      // the projects that include the dataset, by name
+	VersionCount     int                 `json:"version_count"` // ready review versions (versions.go)
+	ActiveImport     *Import             `json:"active_import"` // latest uploading/queued/running job
+	ScannedAt        *time.Time          `json:"scanned_at"`
+	CreatedAt        time.Time           `json:"created_at"`
+	UpdatedAt        time.Time           `json:"updated_at"`
 }
 
 // ImageRef identifies an image and the version of its file, for
@@ -234,16 +239,17 @@ type Progress struct {
 
 // Directory is a direct child folder of the storage directory datasets/.
 type Directory struct {
-	Name            string    `json:"name"`
-	Path            string    `json:"path"`
-	Registered      bool      `json:"registered"`
-	DatasetID       *int64    `json:"dataset_id"`
-	InRecycleBin    bool      `json:"in_recycle_bin"` // its dataset is in the recycle bin (deleted without its files): restore it instead
-	ImageCount      int       `json:"image_count"`
-	AnnotationCount int       `json:"annotation_count"` // .xml files
-	TotalBytes      int64     `json:"total_bytes"`      // bytes of the images counted
-	Approximate     bool      `json:"approximate"`      // the count stopped early
-	ModifiedAt      time.Time `json:"modified_at"`
+	Name            string              `json:"name"`
+	Path            string              `json:"path"`
+	StorageNode     storagenode.NodeRef `json:"storage_node"`
+	Registered      bool                `json:"registered"`
+	DatasetID       *int64              `json:"dataset_id"`
+	InRecycleBin    bool                `json:"in_recycle_bin"` // its dataset is in the recycle bin (deleted without its files): restore it instead
+	ImageCount      int                 `json:"image_count"`
+	AnnotationCount int                 `json:"annotation_count"` // .xml files
+	TotalBytes      int64               `json:"total_bytes"`      // bytes of the images counted
+	Approximate     bool                `json:"approximate"`      // the count stopped early
+	ModifiedAt      time.Time           `json:"modified_at"`
 }
 
 // Summary keys of import and scan jobs (spec §5.5).

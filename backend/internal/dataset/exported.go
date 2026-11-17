@@ -3,7 +3,6 @@ package dataset
 import (
 	"image"
 	"io"
-	"os"
 	"path"
 	"strings"
 )
@@ -22,7 +21,9 @@ func SidecarPath(rel, ext string) string { return sidecarPath(rel, ext) }
 
 // DecodeImageConfig reads the dimensions and format (as image.DecodeConfig
 // names it, "tiff" for TIFF) of the image in f. Decoder panics are errors.
-func DecodeImageConfig(f *os.File) (image.Config, string, error) { return decodeImageConfig(f) }
+func DecodeImageConfig(f RandomAccessReader) (image.Config, string, error) {
+	return decodeImageConfig(f)
+}
 
 // DecodeCost estimates the memory in bytes the decoder needs for the image
 // in f, of format (as DecodeImageConfig names it) with config cfg: the
@@ -34,7 +35,7 @@ func DecodeCost(f io.ReaderAt, format string, cfg image.Config) int64 {
 
 // DecodeImage decodes the whole image in f (TIFF included). Decoder panics
 // are errors.
-func DecodeImage(f *os.File) (image.Image, error) { return decodeImage(f) }
+func DecodeImage(f RandomAccessReader) (image.Image, error) { return decodeImage(f) }
 
 // IsTrainableImage reports whether training tools (Ultralytics, OpenCV)
 // read images with the extension of rel: GIF and AVIF are not read.
