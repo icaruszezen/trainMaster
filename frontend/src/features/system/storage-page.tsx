@@ -124,6 +124,9 @@ export function StoragePage() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const [dialogKey, setDialogKey] = useState(0)
   const [editingNode, setEditingNode] = useState<StorageNode | null>(null)
+  const [activatingNode, setActivatingNode] = useState<StorageNode | null>(null)
+  const [activatingBusy, setActivatingBusy] = useState(false)
+  const [activateError, setActivateError] = useState<string | null>(null)
   const [deletingNode, setDeletingNode] = useState<StorageNode | null>(null)
   const [deletingBusy, setDeletingBusy] = useState(false)
 
@@ -152,11 +155,39 @@ export function StoragePage() {
     setDialogOpen(true)
   }
 
+  const openActivate = (node: StorageNode) => {
+    if (node.is_active || activatingBusy) return
+    setActivateError(null)
+    setActivatingNode(node)
+  }
+
   const refreshAll = () => {
     void nodesQuery.refetch()
     void migratableQuery.refetch()
     void migrationsQuery.refetch()
     void cachePolicyQuery.refetch()
+  }
+
+  const confirmActivate = async () => {
+    if (!activatingNode || activatingBusy) return
+    setActivatingBusy(true)
+    setActivateError(null)
+    try {
+      await activateStorageNode(activatingNode.id)
+      await refreshStorageQueries()
+      toast.success(`已将“${activatingNode.name}”设为当前存储节点`, {
+        description:
+          "新建的数据集与数据版本将写入该节点；已有数据可在下方一键迁移。",
+      })
+      setActivatingNode(null)
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "切换存储节点失败"
+      setActivateError(message)
+      void refreshStorageQueries()
+    } finally {
+      setActivatingBusy(false)
+    }
   }
 
   const confirmDelete = async () => {
@@ -174,8 +205,13 @@ export function StoragePage() {
     }
   }
 
-  const activeNode =
-    nodesQuery.data?.items.find((n) => n.is_active) ?? null
+  const activeNode = nodesQuery.data?.items.find((n) => n.is_active) ?? null
+
+  const activatingTarget =
+    activatingNode !== null
+      ? (nodesQuery.data?.items.find((n) => n.id === activatingNode.id) ??
+        activatingNode)
+      : null
 
   const refreshing =
     nodesQuery.isFetching ||
@@ -210,9 +246,11 @@ export function StoragePage() {
         nodes={nodesQuery.data?.items}
         isPending={nodesQuery.isPending}
         error={nodesQuery.error}
+        activatingId={activatingBusy ? (activatingTarget?.id ?? null) : null}
         onRetry={() => void nodesQuery.refetch()}
         onAdd={openCreate}
         onEdit={openEdit}
+        onActivate={openActivate}
         onDelete={setDeletingNode}
       />
 
@@ -238,6 +276,28 @@ export function StoragePage() {
         onOpenChange={setDialogOpen}
         node={editingNode}
       />
+
+      <AlertDialog
+        open={activatingTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !activatingBusy) {
+            setActivatingNode(null)
+            setActivateError(null)
+          }
+        }}
+      >
+        <AlertDialogContent>
+          {activatingTarget && (
+            <ActivateStorageNodeDialogBody
+              node={activatingTarget}
+              activeNode={activeNode}
+              busy={activatingBusy}
+              error={activateError}
+              onConfirm={() => void confirmActivate()}
+            />
+          )}
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog
         open={deletingNode !== null}
@@ -276,25 +336,131 @@ export function StoragePage() {
   )
 }
 
+function formatNodeItemSummary(node: StorageNode): string {
+  const parts: string[] = []
+  if (node.stats.dataset_count > 0) {
+    parts.push(`${formatNumber(node.stats.dataset_count)} 个数据集`)
+  }
+  if (node.stats.data_version_count > 0) {
+    parts.push(`${formatNumber(node.stats.data_version_count)} 个数据版本`)
+  }
+  return parts.join("与 ")
+}
+
+export function ActivateStorageNodeDialogBody({
+  node,
+  activeNode,
+  busy,
+  error,
+  onConfirm,
+}: {
+  node: StorageNode
+  activeNode: StorageNode | null
+  busy: boolean
+  error: string | null
+  onConfirm: () => void
+}) {
+  const currentSummary =
+    activeNode !== null && activeNode.id !== node.id
+      ? formatNodeItemSummary(activeNode)
+      : ""
+
+  return (
+    <>
+      <AlertDialogHeader>
+        <AlertDialogTitle className="break-words">
+          切换当前存储为“{node.name}”？
+        </AlertDialogTitle>
+        <AlertDialogDescription>
+          确认后将先检测目标存储节点的连通性与读写权限。切换成功后，新建的数据集与数据版本将默认写入该节点；
+          {currentSummary && activeNode
+            ? `当前“${activeNode.name}”上的 ${currentSummary}保持不变，可随时在页面下方一键迁移。`
+            : "原有节点上的历史数据保持不变，可随时在页面下方在线迁移。"}
+        </AlertDialogDescription>
+      </AlertDialogHeader>
+
+      <div className="grid grid-cols-[minmax(0,1fr)] gap-2.5 rounded-lg border bg-muted/30 p-3 text-xs">
+        {activeNode && activeNode.id !== node.id && (
+          <div className="flex min-w-0 items-center justify-between gap-3">
+            <span className="shrink-0 text-muted-foreground">当前使用中</span>
+            <StorageNodeBadge node={activeNode} className="max-w-64 min-w-0" />
+          </div>
+        )}
+        <div className="flex min-w-0 items-center justify-between gap-3">
+          <span className="shrink-0 font-medium text-foreground">
+            切换至节点
+          </span>
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="shrink-0 text-muted-foreground">
+              {STORAGE_KIND_SHORT_LABELS[node.kind]}
+            </span>
+            <StorageNodeBadge node={node} className="max-w-56 min-w-0" />
+          </div>
+        </div>
+        <code
+          className="block truncate rounded-md border bg-background px-2.5 py-1.5 font-mono text-xs text-foreground"
+          title={node.display_target}
+        >
+          {node.display_target}
+        </code>
+      </div>
+
+      {!error && node.status === "error" && (
+        <p className="rounded-md bg-amber-500/10 px-3 py-2 text-xs wrap-anywhere text-amber-700 dark:text-amber-300">
+          该节点上次检测状态异常
+          {node.status_error ? `（${node.status_error}）` : ""}
+          ，确认切换时将重新探测连接与写入权限。
+        </p>
+      )}
+
+      {error && (
+        <p
+          role="alert"
+          className="rounded-md bg-destructive/10 px-3 py-2 text-xs wrap-anywhere text-destructive"
+        >
+          {error}
+        </p>
+      )}
+
+      <AlertDialogFooter>
+        <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
+        <AlertDialogAction
+          onClick={(event) => {
+            event.preventDefault()
+            onConfirm()
+          }}
+          disabled={busy}
+        >
+          {busy ? <Spinner aria-hidden /> : <ShieldCheck />}
+          {busy ? "正在切换…" : "确认切换"}
+        </AlertDialogAction>
+      </AlertDialogFooter>
+    </>
+  )
+}
+
 function StorageNodesSection({
   nodes,
   isPending,
   error,
+  activatingId,
   onRetry,
   onAdd,
   onEdit,
+  onActivate,
   onDelete,
 }: {
   nodes: StorageNode[] | undefined
   isPending: boolean
   error: Error | null
+  activatingId: number | null
   onRetry: () => void
   onAdd: () => void
   onEdit: (node: StorageNode) => void
+  onActivate: (node: StorageNode) => void
   onDelete: (node: StorageNode) => void
 }) {
   const [probingId, setProbingId] = useState<number | null>(null)
-  const [activatingId, setActivatingId] = useState<number | null>(null)
 
   const handleProbe = async (node: StorageNode) => {
     if (probingId !== null) return
@@ -321,23 +487,6 @@ function StorageNodesSection({
       toast.error(err instanceof Error ? err.message : "测试连接失败")
     } finally {
       setProbingId(null)
-    }
-  }
-
-  const handleActivate = async (node: StorageNode) => {
-    if (activatingId !== null) return
-    setActivatingId(node.id)
-    try {
-      await activateStorageNode(node.id)
-      await refreshStorageQueries()
-      toast.success(`已将“${node.name}”设为当前存储节点`, {
-        description:
-          "新建的数据集与数据版本将写入该节点；已有数据可在下方一键迁移。",
-      })
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "切换存储节点失败")
-    } finally {
-      setActivatingId(null)
     }
   }
 
@@ -450,19 +599,19 @@ function StorageNodesSection({
                   <dl className="grid grid-cols-3 gap-2 rounded-lg border bg-muted/25 px-3 py-2 text-xs">
                     <div className="grid gap-0.5">
                       <dt className="text-muted-foreground">数据集</dt>
-                      <dd className="font-semibold tabular-nums text-sm">
+                      <dd className="text-sm font-semibold tabular-nums">
                         {formatNumber(node.stats.dataset_count)}
                       </dd>
                     </div>
                     <div className="grid gap-0.5">
                       <dt className="text-muted-foreground">数据版本</dt>
-                      <dd className="font-semibold tabular-nums text-sm">
+                      <dd className="text-sm font-semibold tabular-nums">
                         {formatNumber(node.stats.data_version_count)}
                       </dd>
                     </div>
                     <div className="grid gap-0.5">
                       <dt className="text-muted-foreground">已存数据</dt>
-                      <dd className="font-semibold tabular-nums text-sm">
+                      <dd className="text-sm font-semibold tabular-nums">
                         {formatBytes(node.stats.stored_bytes)}
                       </dd>
                     </div>
@@ -491,8 +640,10 @@ function StorageNodesSection({
                     {!node.is_active ? (
                       <Button
                         size="xs"
-                        onClick={() => void handleActivate(node)}
-                        disabled={activatingId !== null}
+                        onClick={() => onActivate(node)}
+                        disabled={
+                          activatingId !== null || probingId === node.id
+                        }
                       >
                         {activatingId === node.id ? (
                           <Spinner className="size-3" aria-hidden />
@@ -620,7 +771,8 @@ function NodeCapacityBar({ usage }: { usage: StorageUsageInfo }) {
           已用 {formatBytes(usage.used_bytes)}（{usedPercent.toFixed(0)}%）
         </span>
         <span>
-          可用 {formatBytes(usage.free_bytes)} / {formatBytes(usage.total_bytes)}
+          可用 {formatBytes(usage.free_bytes)} /{" "}
+          {formatBytes(usage.total_bytes)}
         </span>
       </div>
     </div>
@@ -658,7 +810,8 @@ function StorageMigrationSection({
   }, [migrations])
 
   const selectableItems = useMemo(
-    () => migratable.filter((item) => !activeMigrationKeys.has(migrationKey(item))),
+    () =>
+      migratable.filter((item) => !activeMigrationKeys.has(migrationKey(item))),
     [migratable, activeMigrationKeys]
   )
 
@@ -668,7 +821,8 @@ function StorageMigrationSection({
   }, [selectedKeys, selectableItems])
 
   const allSelected =
-    selectableItems.length > 0 && validSelected.length === selectableItems.length
+    selectableItems.length > 0 &&
+    validSelected.length === selectableItems.length
 
   const toggleAll = (checked: boolean) => {
     if (checked) {
@@ -745,7 +899,11 @@ function StorageMigrationSection({
           将早期保存在其他节点上的数据集与已生成的数据版本在线迁移至当前存储节点
           {activeNode && (
             <>
-              （<strong className="font-medium text-foreground">{activeNode.name}</strong>）
+              （
+              <strong className="font-medium text-foreground">
+                {activeNode.name}
+              </strong>
+              ）
             </>
           )}
           ，自动逐文件核对字节数并同步元数据。
@@ -759,7 +917,9 @@ function StorageMigrationSection({
           <div className="flex items-center gap-3 rounded-lg border bg-muted/25 px-4 py-3.5 text-sm">
             <CheckCircle2 className="size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
             <div className="grid gap-0.5">
-              <p className="font-medium">所有数据集与已就绪数据版本均已在当前存储节点上</p>
+              <p className="font-medium">
+                所有数据集与已就绪数据版本均已在当前存储节点上
+              </p>
               <p className="text-xs text-muted-foreground">
                 切换到新的存储节点后，留在旧节点上的历史数据集与数据版本会自动列在这里供一键迁移。
               </p>
@@ -782,7 +942,7 @@ function StorageMigrationSection({
                     <TableHead>名称</TableHead>
                     <TableHead className="hidden sm:table-cell">类型</TableHead>
                     <TableHead>当前节点</TableHead>
-                    <TableHead className="text-right pr-3">规模</TableHead>
+                    <TableHead className="pr-3 text-right">规模</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -907,7 +1067,7 @@ function StorageMigrationSection({
                         <Badge variant="outline" className="font-normal">
                           {m.target_type === "dataset" ? "数据集" : "数据版本"}
                         </Badge>
-                        <span className="truncate font-medium text-sm text-foreground">
+                        <span className="truncate text-sm font-medium text-foreground">
                           {m.target_name}
                         </span>
                       </div>
@@ -931,7 +1091,9 @@ function StorageMigrationSection({
                       <span className="inline-flex items-center gap-1">
                         <span>{m.from_node.name}</span>
                         <ArrowRight className="size-3" />
-                        <span className="text-foreground">{m.to_node.name}</span>
+                        <span className="text-foreground">
+                          {m.to_node.name}
+                        </span>
                         {m.delete_source && (
                           <span className="text-muted-foreground">
                             · 校验后清理源文件
@@ -946,7 +1108,8 @@ function StorageMigrationSection({
                           </>
                         )}
                         {formatBytes(m.bytes_done)}
-                        {m.bytes_total > 0 && ` / ${formatBytes(m.bytes_total)}`}
+                        {m.bytes_total > 0 &&
+                          ` / ${formatBytes(m.bytes_total)}`}
                       </span>
                     </div>
 
@@ -980,7 +1143,9 @@ function MigrationStatusBadge({
     )
   }
   if (status === "failed") {
-    return <Badge variant="destructive">{MIGRATION_STATUS_LABELS[status]}</Badge>
+    return (
+      <Badge variant="destructive">{MIGRATION_STATUS_LABELS[status]}</Badge>
+    )
   }
   if (status === "running" || status === "queued") {
     return (
@@ -1057,7 +1222,8 @@ function TrainerCachePolicyCard({
           训练机短期数据集缓存策略
         </CardTitle>
         <CardDescription>
-          控制训练服务器（Compute Node）拉取数据集后的本地生命周期，通过心跳与任务指令自动下发给全部训练节点。
+          控制训练服务器（Compute
+          Node）拉取数据集后的本地生命周期，通过心跳与任务指令自动下发给全部训练节点。
         </CardDescription>
       </CardHeader>
 
@@ -1068,7 +1234,10 @@ function TrainerCachePolicyCard({
           <>
             <div className="flex items-start justify-between gap-3 rounded-lg border bg-muted/30 p-3.5">
               <div className="grid gap-1">
-                <Label htmlFor={`${id}-enabled`} className="text-sm font-medium">
+                <Label
+                  htmlFor={`${id}-enabled`}
+                  className="text-sm font-medium"
+                >
                   启用训练机短期数据集缓存
                 </Label>
                 <p className="text-xs text-muted-foreground">
@@ -1080,9 +1249,7 @@ function TrainerCachePolicyCard({
               <Switch
                 id={`${id}-enabled`}
                 checked={current.enabled}
-                onCheckedChange={(enabled) =>
-                  setDraft({ ...current, enabled })
-                }
+                onCheckedChange={(enabled) => setDraft({ ...current, enabled })}
                 disabled={saving}
               />
             </div>
@@ -1217,7 +1384,9 @@ function StorageDirectoriesCard() {
               <TableHeader>
                 <TableRow>
                   <TableHead>目录</TableHead>
-                  <TableHead className="hidden sm:table-cell">职责说明</TableHead>
+                  <TableHead className="hidden sm:table-cell">
+                    职责说明
+                  </TableHead>
                   <TableHead>容器内路径</TableHead>
                   <TableHead className="text-right">状态</TableHead>
                 </TableRow>

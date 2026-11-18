@@ -1,4 +1,5 @@
 import { QueryClientProvider } from "@tanstack/react-query"
+import { AlertDialog as AlertDialogPrimitive } from "radix-ui"
 import { renderToStaticMarkup } from "react-dom/server"
 import { MemoryRouter } from "react-router"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -21,9 +22,13 @@ import {
   type StorageMigration,
   type StorageNode,
 } from "@/features/system/storage-api"
-import { StoragePage } from "@/features/system/storage-page"
+import {
+  ActivateStorageNodeDialogBody,
+  StoragePage,
+} from "@/features/system/storage-page"
 import type { ListResponse } from "@/lib/api"
 import { queryClient } from "@/lib/query-client"
+import { enclosingClasses } from "@/lib/test-markup"
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -325,5 +330,122 @@ describe("StoragePage & StorageNodeBadge rendering", () => {
         <StorageNodeBadge node={BUILTIN_STORAGE_NODE_REF} hideBuiltin />
       )
     ).toBe("")
+  })
+
+  it("renders secondary confirmation dialog before switching storage node", () => {
+    const activeNode: StorageNode = {
+      id: 1,
+      name: "本机默认存储",
+      kind: "local",
+      is_builtin: true,
+      is_active: true,
+      has_secret: false,
+      display_target: "/data",
+      config: { local: { path: "/data" } },
+      status: "ok",
+      stats: {
+        dataset_count: 3,
+        trashed_dataset_count: 0,
+        data_version_count: 2,
+        trashed_data_version_count: 0,
+        stored_bytes: 512_000_000,
+      },
+      created_at: "2026-11-01T00:00:00Z",
+      updated_at: "2026-11-01T00:00:00Z",
+    }
+
+    const targetNode: StorageNode = {
+      id: 2,
+      name: "机房存储服务器 MinIO",
+      kind: "s3",
+      is_builtin: false,
+      is_active: false,
+      has_secret: true,
+      display_target:
+        "s3://vision-datasets/trainmaster (http://192.168.10.15:9000)",
+      config: {
+        s3: {
+          endpoint: "http://192.168.10.15:9000",
+          region: "us-east-1",
+          bucket: "vision-datasets",
+          prefix: "trainmaster",
+          access_key_id: "minioadmin",
+          force_path_style: true,
+          insecure_skip_verify: false,
+        },
+      },
+      status: "error",
+      status_error: "dial tcp 192.168.10.15:9000: i/o timeout",
+      stats: {
+        dataset_count: 0,
+        trashed_dataset_count: 0,
+        data_version_count: 0,
+        trashed_data_version_count: 0,
+        stored_bytes: 0,
+      },
+      created_at: "2026-11-10T00:00:00Z",
+      updated_at: "2026-11-10T00:00:00Z",
+    }
+
+    const renderBody = (props: {
+      node?: StorageNode
+      active?: StorageNode | null
+      busy?: boolean
+      error?: string | null
+    }) =>
+      renderToStaticMarkup(
+        <AlertDialogPrimitive.Root open>
+          <AlertDialogPrimitive.Content>
+            <ActivateStorageNodeDialogBody
+              node={props.node ?? targetNode}
+              activeNode={
+                props.active === undefined ? activeNode : props.active
+              }
+              busy={props.busy ?? false}
+              error={props.error ?? null}
+              onConfirm={() => {}}
+            />
+          </AlertDialogPrimitive.Content>
+        </AlertDialogPrimitive.Root>
+      )
+
+    const confirmHtml = renderBody({})
+    for (const expected of [
+      "切换当前存储为“机房存储服务器 MinIO”？",
+      "当前“本机默认存储”上的 3 个数据集与 2 个数据版本保持不变",
+      "当前使用中",
+      "切换至节点",
+      "S3 对象存储",
+      "s3://vision-datasets/trainmaster (http://192.168.10.15:9000)",
+      "该节点上次检测状态异常（dial tcp 192.168.10.15:9000: i/o timeout）",
+      "取消",
+      "确认切换",
+    ]) {
+      expect(confirmHtml).toContain(expected)
+    }
+
+    const emptyActiveHtml = renderBody({
+      active: {
+        ...activeNode,
+        stats: { ...activeNode.stats, dataset_count: 0, data_version_count: 0 },
+      },
+      node: { ...targetNode, status: "ok", status_error: undefined },
+    })
+    expect(emptyActiveHtml).toContain(
+      "原有节点上的历史数据保持不变，可随时在页面下方在线迁移。"
+    )
+    expect(emptyActiveHtml).not.toContain("该节点上次检测状态异常")
+
+    const busyHtml = renderBody({ busy: true })
+    expect(busyHtml).toContain("正在切换…")
+
+    const longFailure =
+      "目标存储节点无法连通或不可写，无法切换为当前节点: s3://vision-datasets-archive-primary-cluster/trainmaster/probe_check_permission_denied"
+    const errorHtml = renderBody({ error: longFailure })
+    expect(errorHtml).toContain('role="alert"')
+    expect(errorHtml).toContain(longFailure)
+    expect(errorHtml).not.toContain("该节点上次检测状态异常")
+    const classes = enclosingClasses(errorHtml, longFailure)
+    expect(classes?.at(-1)).toContain("wrap-anywhere")
   })
 })
