@@ -30,6 +30,8 @@ import { ComputePage } from "@/features/training/compute-page"
 import { NewTrainingJobPage } from "@/features/training/new-training-job-page"
 import { TrainingJobDetailPage } from "@/features/training/training-job-detail-page"
 import { TrainingJobsPage } from "@/features/training/training-jobs-page"
+import { TrainingTemplateFormPage } from "@/features/training/training-template-form-page"
+import { TrainingTemplatesPage } from "@/features/training/training-templates-page"
 import { AppLayout } from "@/layouts/app-layout"
 import { NotFoundPage } from "@/pages/not-found-page"
 import { RouteErrorPage } from "@/pages/route-error-page"
@@ -51,6 +53,7 @@ export const pages: Record<ModuleId, ComponentType> = {
   labels: LabelsPage,
   prelabel: PrelabelPage,
   "training-jobs": TrainingJobsPage,
+  "training-templates": TrainingTemplatesPage,
   compute: ComputePage,
   evaluations: EvaluationsPage,
   models: ModelsPage,
@@ -88,6 +91,14 @@ export const routes: RouteObject[] = [
           {
             path: "/training/jobs/:jobId",
             Component: TrainingJobDetailPage,
+          },
+          {
+            path: "/training/templates/new",
+            Component: TrainingTemplateFormPage,
+          },
+          {
+            path: "/training/templates/:templateId/edit",
+            Component: TrainingTemplateFormPage,
           },
           { path: "/datasets/versions/new", Component: NewDataVersionPage },
           {

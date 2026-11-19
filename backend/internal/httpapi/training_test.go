@@ -250,3 +250,101 @@ func TestTrainingHTTPFlow(t *testing.T) {
 		t.Fatalf("DELETE project with delete_training_jobs=true status=%d body=%s", delRec.Code, delRec.Body.String())
 	}
 }
+
+func TestTrainingTemplatesAPI(t *testing.T) {
+	e := newTrainingEnv(t, "")
+	ctx := context.Background()
+
+	// Params schema exposes common tier flags (12 common, 74 advanced).
+	schema := want[training.ParamsSchemaResponse](t, e.do("GET", "/api/v1/training/params-schema", nil), http.StatusOK)
+	commonCount := 0
+	for _, sp := range schema.Specs {
+		if sp.Common {
+			commonCount++
+		}
+	}
+	if commonCount != 12 {
+		t.Fatalf("schema common count = %d, want 12", commonCount)
+	}
+
+	// Empty template list.
+	empty := want[List[training.ParamTemplate]](t, e.do("GET", "/api/v1/training/templates", nil), http.StatusOK)
+	if empty.Total != 0 {
+		t.Fatalf("initial templates = %+v", empty)
+	}
+
+	// Create template.
+	tpl := want[training.ParamTemplate](t, e.do("POST", "/api/v1/training/templates", map[string]any{
+		"name":        "小目标标准方案",
+		"description": "1280px + AdamW + 关闭左右翻转",
+		"is_default":  true,
+		"params": map[string]any{
+			"epochs":    200,
+			"imgsz":     1280,
+			"optimizer": "AdamW",
+			"lr0":       0.001,
+			"fliplr":    0.0,
+		},
+	}), http.StatusCreated)
+	if tpl.ID <= 0 || !tpl.IsDefault || tpl.Params["epochs"] != float64(200) {
+		t.Fatalf("created template = %+v", tpl)
+	}
+
+	// Duplicate name -> 409 conflict.
+	wantError(t, e.do("POST", "/api/v1/training/templates", map[string]any{
+		"name": "小目标标准方案",
+	}), http.StatusConflict, codeConflict, "同名")
+
+	// Invalid param -> 422 validation failed.
+	wantError(t, e.do("POST", "/api/v1/training/templates", map[string]any{
+		"name":   "无效参数模板",
+		"params": map[string]any{"imgsz": 100},
+	}), http.StatusUnprocessableEntity, codeValidationFailed, "imgsz")
+
+	// GET & PATCH template.
+	got := want[training.ParamTemplate](t, e.do("GET", fmt.Sprintf("/api/v1/training/templates/%d", tpl.ID), nil), http.StatusOK)
+	if got.Name != tpl.Name {
+		t.Fatalf("GET template = %+v", got)
+	}
+	patched := want[training.ParamTemplate](t, e.do("PATCH", fmt.Sprintf("/api/v1/training/templates/%d", tpl.ID), map[string]any{
+		"description": "更新后的描述",
+		"params": map[string]any{
+			"epochs": 240,
+			"imgsz":  1280,
+		},
+	}), http.StatusOK)
+	if patched.Description != "更新后的描述" || patched.Params["epochs"] != float64(240) {
+		t.Fatalf("PATCH template = %+v", patched)
+	}
+
+	// Create training job referencing template, then delete template.
+	proj, err := e.projects.CreateProject(ctx, project.CreateProjectInput{Name: "连接器检测"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dvID := e.insertReadyVersion(t, proj.ID)
+	job := want[training.Job](t, e.do("POST", "/api/v1/training/jobs", map[string]any{
+		"project_id":      proj.ID,
+		"data_version_id": dvID,
+		"init_mode":       "scratch",
+		"yolo_version":    "yolo11",
+		"model_scale":     "s",
+		"template_id":     tpl.ID,
+		"params":          patched.Params,
+	}), http.StatusCreated)
+	if job.TemplateID == nil || *job.TemplateID != tpl.ID || job.TemplateName != "小目标标准方案" {
+		t.Fatalf("job template snapshot = id:%v name:%q", job.TemplateID, job.TemplateName)
+	}
+
+	delRec := e.do("DELETE", fmt.Sprintf("/api/v1/training/templates/%d", tpl.ID), nil)
+	if delRec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE template status=%d body=%s", delRec.Code, delRec.Body.String())
+	}
+	wantError(t, e.do("GET", fmt.Sprintf("/api/v1/training/templates/%d", tpl.ID), nil), http.StatusNotFound, codeNotFound, "不存在")
+
+	// Job still keeps template_name snapshot with template_id cleared.
+	jobAfter := want[training.Job](t, e.do("GET", fmt.Sprintf("/api/v1/training/jobs/%d", job.ID), nil), http.StatusOK)
+	if jobAfter.TemplateID != nil || jobAfter.TemplateName != "小目标标准方案" {
+		t.Fatalf("job after template delete = id:%v name:%q", jobAfter.TemplateID, jobAfter.TemplateName)
+	}
+}

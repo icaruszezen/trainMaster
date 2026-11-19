@@ -215,3 +215,51 @@ func TestNormalizeParams(t *testing.T) {
 		})
 	}
 }
+
+func TestCommonParamsTierAndTemplateNormalization(t *testing.T) {
+	schema := ParamsSchema()
+	wantCommon := map[string]bool{
+		"epochs":    true,
+		"patience":  true,
+		"batch":     true,
+		"imgsz":     true,
+		"optimizer": true,
+		"lr0":       true,
+		"cos_lr":    true,
+		"amp":       true,
+		"device":    true,
+		"workers":   true,
+		"cache":     true,
+		"mosaic":    true,
+	}
+	gotCommon := make(map[string]bool)
+	for _, sp := range schema.Specs {
+		if sp.Common {
+			gotCommon[sp.Key] = true
+		}
+	}
+	if len(gotCommon) != len(wantCommon) {
+		t.Fatalf("common param count = %d (%v), want %d (%v)", len(gotCommon), gotCommon, len(wantCommon), wantCommon)
+	}
+	for k := range wantCommon {
+		if !gotCommon[k] {
+			t.Errorf("expected %q to be marked Common: true", k)
+		}
+	}
+
+	norm, err := NormalizeTemplateParams(map[string]any{
+		"epochs": 200,
+		"imgsz":  1280,
+		"resume": true,
+		"fliplr": 0.0,
+	})
+	if err != nil {
+		t.Fatalf("NormalizeTemplateParams error: %v", err)
+	}
+	if norm["epochs"] != 200 || norm["imgsz"] != 1280 || norm["fliplr"] != 0.0 {
+		t.Errorf("unexpected normalized template params: epochs=%v imgsz=%v fliplr=%v", norm["epochs"], norm["imgsz"], norm["fliplr"])
+	}
+	if norm["resume"] != false {
+		t.Errorf("template resume must always be normalized to false, got %v", norm["resume"])
+	}
+}

@@ -229,7 +229,7 @@ export function TrainingJobsPage() {
           <Input
             value={keyword}
             onChange={(event) => setKeyword(event.target.value)}
-            placeholder="搜索任务名称或备注…"
+            placeholder="搜索任务名称、模板或备注…"
             className="pr-8 pl-9"
             aria-label="搜索训练任务"
           />

@@ -20,6 +20,7 @@ import {
   ScanSearch,
   Server,
   Settings,
+  SlidersHorizontal,
   Sparkles,
   Tags,
   Trash2,
@@ -37,6 +38,7 @@ export type ModuleId =
   | "labels"
   | "prelabel"
   | "training-jobs"
+  | "training-templates"
   | "compute"
   | "evaluations"
   | "models"
@@ -247,10 +249,26 @@ export const navGroups: NavGroup[] = [
         apiPath: "/api/v1/training/jobs",
         features: [
           "选择项目冻结的数据版本，支持从头训练（YOLOv8 / v9 / v10 / 11 / 12 / 26 各规模）、预训练权重微调与检查点断点续训",
-          "开放 Ultralytics YOLO 全量训练参数可编辑，默认按官方基准参数（cfg/default.yaml）预填，支持搜索、分组重置与导出 args.yaml",
+          "分级展示 12 项高频常用参数与可折叠的 74 项高级选项，支持参数模板一键加载、跨层级搜索、分组重置与导出 args.yaml",
           "任务排队与在线训练节点自动调度，支持同机共享目录零拷贝训练与远程自动拉取数据",
           "实时轮次进度、损失与 mAP 曲线、增量训练日志流与评估图表（混淆矩阵、PR 曲线、批次检测预览）",
           "随时取消停止、失败或取消后重跑、复用参数克隆任务，训练最佳权重自动或手动注册到项目模型仓库",
+        ],
+      },
+      {
+        id: "training-templates",
+        title: "参数模板",
+        path: "/training/templates",
+        icon: SlidersHorizontal,
+        description:
+          "保存与管理常用的 Ultralytics YOLO 训练参数预设，发起训练时可一键加载再微调，支持设置全局默认模板。",
+        status: "ready",
+        apiPath: "/api/v1/training/templates",
+        features: [
+          "创建、编辑、复制与删除全局共享的 YOLO 参数模板（涵盖 12 项常用参数与 74 项高级选项）",
+          "支持将任意一个模板设为默认模板，打开“新建训练任务”时自动预填",
+          "新建训练页支持一键切换模板、查看微调差异、恢复模板值、更新原模板或另存为新模板",
+          "支持从历史训练任务详情页一键保存为新模板，并在任务详情中追溯来源模板快照",
         ],
       },
       {

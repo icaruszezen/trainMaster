@@ -60,6 +60,7 @@ export type ParamSpec = {
   key: string
   label: string
   group: ParamGroupKey
+  common: boolean
   type: ParamType
   default: unknown
   min?: number
@@ -81,6 +82,30 @@ export type ParamsSchemaResponse = {
   specs: ParamSpec[]
   defaults: Record<string, unknown>
   scales: Record<string, ModelScale[]>
+}
+
+export type TrainingParamTemplate = {
+  id: number
+  name: string
+  description: string
+  params: Record<string, unknown>
+  is_default: boolean
+  created_at: string
+  updated_at: string
+}
+
+export type CreateTrainingParamTemplateInput = {
+  name: string
+  description?: string
+  params: Record<string, unknown>
+  is_default?: boolean
+}
+
+export type UpdateTrainingParamTemplateInput = {
+  name?: string
+  description?: string
+  params?: Record<string, unknown>
+  is_default?: boolean
 }
 
 export type TrainingDataVersionRef = {
@@ -193,6 +218,8 @@ export type TrainingJob = {
   task: ModelTask
   base_model_id: number | null
   base_model: TrainingBaseModelRef | null
+  template_id: number | null
+  template_name: string
   params: Record<string, unknown>
   auto_register: boolean
   status: TrainingStatus
@@ -254,6 +281,7 @@ export type CreateTrainingJobInput = {
   yolo_version?: YoloVersion
   model_scale?: string
   base_model_id?: number | null
+  template_id?: number | null
   params: Record<string, unknown>
   auto_register: boolean
 }
@@ -270,8 +298,10 @@ export type RegisterTrainedModelInput = {
 
 const BASE = "/api/v1/training"
 const JOBS_BASE = `${BASE}/jobs`
+const TEMPLATES_BASE = `${BASE}/templates`
 
 export const trainingJobApiPath = (id: number) => `${JOBS_BASE}/${id}`
+export const trainingTemplateApiPath = (id: number) => `${TEMPLATES_BASE}/${id}`
 
 export function trainingArtifactUrl(
   jobId: number,
@@ -309,6 +339,10 @@ function withQuery(
 export const trainingKeys = {
   all: ["training"] as const,
   schema: () => [...trainingKeys.all, "params-schema"] as const,
+  templates: () => [...trainingKeys.all, "templates"] as const,
+  templateList: (q: string) => [...trainingKeys.templates(), "list", q] as const,
+  templateDetail: (id: number) =>
+    [...trainingKeys.templates(), "detail", id] as const,
   lists: () => [...trainingKeys.all, "list"] as const,
   list: (filters: TrainingJobFilters) =>
     [...trainingKeys.lists(), filters] as const,
@@ -326,6 +360,56 @@ export function trainingParamsSchemaQuery() {
       apiGet<ParamsSchemaResponse>(`${BASE}/params-schema`, { signal }),
     staleTime: Infinity,
   })
+}
+
+export function trainingTemplatesQuery(q = "") {
+  const trimmed = q.trim()
+  return queryOptions({
+    queryKey: trainingKeys.templateList(trimmed),
+    queryFn: ({ signal }) =>
+      apiGet<ListResponse<TrainingParamTemplate>>(
+        withQuery(TEMPLATES_BASE, { q: trimmed }),
+        { signal }
+      ),
+  })
+}
+
+export function trainingTemplateQuery(id: number) {
+  return queryOptions({
+    queryKey: trainingKeys.templateDetail(id),
+    queryFn: ({ signal }) =>
+      apiGet<TrainingParamTemplate>(trainingTemplateApiPath(id), { signal }),
+  })
+}
+
+export function createTrainingTemplate(
+  input: CreateTrainingParamTemplateInput
+) {
+  return apiSend<TrainingParamTemplate>("POST", TEMPLATES_BASE, input)
+}
+
+export function updateTrainingTemplate(
+  id: number,
+  input: UpdateTrainingParamTemplateInput
+) {
+  return apiSend<TrainingParamTemplate>(
+    "PATCH",
+    trainingTemplateApiPath(id),
+    input
+  )
+}
+
+export function deleteTrainingTemplate(id: number) {
+  return apiSend<void>("DELETE", trainingTemplateApiPath(id))
+}
+
+export function cacheTrainingTemplate(template: TrainingParamTemplate) {
+  queryClient.setQueryData(trainingKeys.templateDetail(template.id), template)
+  void queryClient.invalidateQueries({ queryKey: trainingKeys.templates() })
+}
+
+export function invalidateTrainingTemplates() {
+  void queryClient.invalidateQueries({ queryKey: trainingKeys.templates() })
 }
 
 export function trainingJobsQuery(

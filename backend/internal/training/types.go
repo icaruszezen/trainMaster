@@ -144,6 +144,8 @@ type Job struct {
 	Task            string              `json:"task"`
 	BaseModelID     *int64              `json:"base_model_id"`
 	BaseModel       *BaseModelRef       `json:"base_model"`
+	TemplateID      *int64              `json:"template_id"`
+	TemplateName    string              `json:"template_name"`
 	Params          map[string]any      `json:"params"`
 	AutoRegister    bool                `json:"auto_register"`
 	Status          string              `json:"status"`
@@ -182,8 +184,37 @@ type CreateInput struct {
 	YOLOVersion   string         `json:"yolo_version"`
 	ModelScale    string         `json:"model_scale"`
 	BaseModelID   *int64         `json:"base_model_id"`
+	TemplateID    *int64         `json:"template_id"`
 	Params        map[string]any `json:"params"`
 	AutoRegister  *bool          `json:"auto_register"`
+}
+
+// ParamTemplate is a reusable global preset of normalized Ultralytics YOLO
+// training parameters.
+type ParamTemplate struct {
+	ID          int64          `json:"id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Params      map[string]any `json:"params"`
+	IsDefault   bool           `json:"is_default"`
+	CreatedAt   time.Time      `json:"created_at"`
+	UpdatedAt   time.Time      `json:"updated_at"`
+}
+
+// CreateTemplateInput holds fields for creating a new training parameter template.
+type CreateTemplateInput struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Params      map[string]any `json:"params"`
+	IsDefault   bool           `json:"is_default"`
+}
+
+// UpdateTemplateInput holds partial fields for updating an existing parameter template.
+type UpdateTemplateInput struct {
+	Name        *string         `json:"name"`
+	Description *string         `json:"description"`
+	Params      *map[string]any `json:"params"`
+	IsDefault   *bool           `json:"is_default"`
 }
 
 // UpdateInput holds editable metadata of a training job.

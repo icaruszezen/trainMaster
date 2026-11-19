@@ -7,6 +7,7 @@
  * - `?base_model=<id>`：预选基础权重模型
  * - `?init_mode=scratch|finetune|resume`：预选训练模式
  * - `?from=<jobId>`：从已有训练任务完整克隆模型设置与全部 86 项 YOLO 参数
+ * - `?template=<templateId>`：预加载指定的参数模板
  */
 import { useId, useMemo, useState, type FormEvent } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
@@ -14,10 +15,16 @@ import {
   AlertTriangle,
   Archive,
   ArrowLeft,
+  Bookmark,
+  BookmarkCheck,
+  BookmarkPlus,
   Layers,
   Plus,
   Rocket,
+  RotateCcw,
+  Settings2,
   Sparkles,
+  Star,
 } from "lucide-react"
 import { Link, useNavigate, useSearchParams } from "react-router"
 import { toast } from "sonner"
@@ -25,6 +32,15 @@ import { toast } from "sonner"
 import { PageHeader } from "@/components/page-header"
 import { StorageNodeBadge } from "@/components/storage-node-badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -40,6 +56,7 @@ import {
   Select,
   SelectContent,
   SelectItem,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
@@ -74,12 +91,16 @@ import { projectsQuery, type Project } from "@/features/projects/api"
 import { trainingDatasetCopyLabel } from "@/features/system/storage-api"
 import {
   cacheTrainingJob,
+  cacheTrainingTemplate,
   createTrainingJob,
   trainingJobQuery,
   trainingParamsSchemaQuery,
+  trainingTemplatesQuery,
+  updateTrainingTemplate,
   type InitMode,
   type ParamsSchemaResponse,
   type TrainingJob,
+  type TrainingParamTemplate,
 } from "@/features/training/api"
 import {
   INIT_MODE_DESCRIPTIONS,
@@ -88,26 +109,36 @@ import {
 import {
   parsePositiveId,
   TRAINING_JOBS_PATH,
+  TRAINING_TEMPLATES_PATH,
   trainingJobDetailPath,
   trainingJobsPath,
 } from "@/features/training/paths"
+import { SaveTemplateDialog } from "@/features/training/save-template-dialog"
 import {
+  applyTemplateParams,
   buildDefaultParams,
+  buildTemplateParamsPayload,
   countModifiedParams,
+  countTemplateParamDiffs,
   validateTrainingParams,
 } from "@/features/training/training-params"
 import { TrainingParamsEditor } from "@/features/training/training-params-editor"
+import { usePageTitle } from "@/hooks/use-page-title"
 import { formatBytes, formatNumber } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
 const INIT_MODES: readonly InitMode[] = ["scratch", "finetune", "resume"]
+const NO_TEMPLATE_VALUE = "__none__"
 
 export function NewTrainingJobPage() {
+  usePageTitle("新建训练任务")
+
   const [searchParams] = useSearchParams()
 
   const urlProjectId = parsePositiveId(searchParams.get("project"))
   const urlDataVersionId = parsePositiveId(searchParams.get("data_version"))
   const urlBaseModelId = parsePositiveId(searchParams.get("base_model"))
+  const urlTemplateId = parsePositiveId(searchParams.get("template"))
   const rawInitMode = searchParams.get("init_mode")
   const urlInitMode: InitMode | null = INIT_MODES.includes(
     rawInitMode as InitMode
@@ -120,6 +151,7 @@ export function NewTrainingJobPage() {
 
   const schemaQuery = useQuery(trainingParamsSchemaQuery())
   const projects = useQuery(projectsQuery())
+  const templatesQuery = useQuery(trainingTemplatesQuery())
   const fromJobQuery = useQuery({
     ...trainingJobQuery(fromJobId ?? 0),
     enabled: fromJobId !== null,
@@ -133,6 +165,7 @@ export function NewTrainingJobPage() {
   if (
     schemaQuery.isPending ||
     projects.isPending ||
+    templatesQuery.isPending ||
     (fromJobId !== null && fromJobQuery.isPending) ||
     (needBaseModelProject && initialModels.isPending)
   ) {
@@ -173,40 +206,129 @@ export function NewTrainingJobPage() {
           .id ?? null)
       : null
 
-  const formKey = `${fromJobQuery.data?.id ?? "new"}:${urlProjectId ?? ""}:${urlDataVersionId ?? ""}:${urlBaseModelId ?? ""}:${urlInitMode ?? ""}`
+  const templates = templatesQuery.data?.items ?? []
+
+  // 注意：不要把 defaultTemplateId 放进 formKey，避免用户在页内保存新默认模板时重置表单输入。
+  const formKey = `${fromJobQuery.data?.id ?? "new"}:${urlTemplateId ?? ""}:${urlProjectId ?? ""}:${urlDataVersionId ?? ""}:${urlBaseModelId ?? ""}:${urlInitMode ?? ""}`
 
   return (
     <NewTrainingJobForm
       key={formKey}
       schema={schemaQuery.data}
       projects={projects.data.items}
+      templates={templates}
       fromJob={fromJobQuery.data ?? null}
       urlProjectId={urlProjectId}
       urlDataVersionId={urlDataVersionId}
       urlBaseModelId={urlBaseModelId}
       urlInitMode={urlInitMode}
+      urlTemplateId={urlTemplateId}
       baseModelProjectId={baseModelProjectId}
     />
   )
 }
 
+function resolveInitialTemplateState({
+  schema,
+  templates,
+  fromJob,
+  urlTemplateId,
+  initialMode,
+}: {
+  schema: ParamsSchemaResponse
+  templates: TrainingParamTemplate[]
+  fromJob: TrainingJob | null
+  urlTemplateId: number | null
+  initialMode: InitMode
+}): {
+  params: Record<string, unknown>
+  activeTemplateId: number | null
+  missingUrlTemplate: boolean
+  autoLoadedDefault: boolean
+} {
+  // 优先级 1：从历史训练任务克隆
+  if (fromJob) {
+    const merged = buildDefaultParams(schema.specs, initialMode)
+    for (const [k, v] of Object.entries(fromJob.params)) {
+      merged[k] = Array.isArray(v) ? [...v] : v
+    }
+    const inheritedTemplateId =
+      fromJob.template_id !== null &&
+      templates.some((t) => t.id === fromJob.template_id)
+        ? fromJob.template_id
+        : null
+    return {
+      params: merged,
+      activeTemplateId: inheritedTemplateId,
+      missingUrlTemplate: false,
+      autoLoadedDefault: false,
+    }
+  }
+
+  // 优先级 2：URL 指定 ?template=<id>
+  if (urlTemplateId !== null) {
+    const matched = templates.find((t) => t.id === urlTemplateId)
+    if (matched) {
+      return {
+        params: applyTemplateParams(schema.specs, matched.params, initialMode),
+        activeTemplateId: matched.id,
+        missingUrlTemplate: false,
+        autoLoadedDefault: false,
+      }
+    }
+    return {
+      params: buildDefaultParams(schema.specs, initialMode),
+      activeTemplateId: null,
+      missingUrlTemplate: true,
+      autoLoadedDefault: false,
+    }
+  }
+
+  // 优先级 3：全局默认模板
+  const defaultTemplate = templates.find((t) => t.is_default)
+  if (defaultTemplate) {
+    return {
+      params: applyTemplateParams(
+        schema.specs,
+        defaultTemplate.params,
+        initialMode
+      ),
+      activeTemplateId: defaultTemplate.id,
+      missingUrlTemplate: false,
+      autoLoadedDefault: true,
+    }
+  }
+
+  // 优先级 4：Ultralytics 官方默认参数
+  return {
+    params: buildDefaultParams(schema.specs, initialMode),
+    activeTemplateId: null,
+    missingUrlTemplate: false,
+    autoLoadedDefault: false,
+  }
+}
+
 function NewTrainingJobForm({
   schema,
   projects,
+  templates,
   fromJob,
   urlProjectId,
   urlDataVersionId,
   urlBaseModelId,
   urlInitMode,
+  urlTemplateId,
   baseModelProjectId,
 }: {
   schema: ParamsSchemaResponse
   projects: Project[]
+  templates: TrainingParamTemplate[]
   fromJob: TrainingJob | null
   urlProjectId: number | null
   urlDataVersionId: number | null
   urlBaseModelId: number | null
   urlInitMode: InitMode | null
+  urlTemplateId: number | null
   baseModelProjectId: number | null
 }) {
   const navigate = useNavigate()
@@ -214,6 +336,20 @@ function NewTrainingJobForm({
   const initialMode: InitMode = fromJob
     ? fromJob.init_mode
     : (urlInitMode ?? "scratch")
+
+  const initialTemplateState = useMemo(
+    () =>
+      resolveInitialTemplateState({
+        schema,
+        templates,
+        fromJob,
+        urlTemplateId,
+        initialMode,
+      }),
+    // 仅按初始挂载参数计算一次，避免后续模板列表刷新覆盖表单输入
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  )
 
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(
     () =>
@@ -257,16 +393,23 @@ function NewTrainingJobForm({
   const [autoRegister, setAutoRegister] = useState<boolean>(
     () => fromJob?.auto_register ?? true
   )
-  const [params, setParams] = useState<Record<string, unknown>>(() => {
-    const merged = buildDefaultParams(schema.specs, initialMode)
-    if (fromJob) {
-      for (const [k, v] of Object.entries(fromJob.params)) {
-        merged[k] = Array.isArray(v) ? [...v] : v
-      }
-    }
-    return merged
-  })
+  const [activeTemplateId, setActiveTemplateId] = useState<number | null>(
+    initialTemplateState.activeTemplateId
+  )
+  const [params, setParams] = useState<Record<string, unknown>>(
+    initialTemplateState.params
+  )
+  const [saveDialogOpen, setSaveDialogOpen] = useState(false)
+  const [updateConfirmOpen, setUpdateConfirmOpen] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
+
+  const activeTemplate = useMemo(
+    () =>
+      activeTemplateId !== null
+        ? (templates.find((t) => t.id === activeTemplateId) ?? null)
+        : null,
+    [templates, activeTemplateId]
+  )
 
   const dataVersions = useQuery({
     ...dataVersionsQuery(projectId),
@@ -358,13 +501,74 @@ function NewTrainingJobForm({
     },
   })
 
+  const updateTemplateMutation = useMutation({
+    mutationFn: (template: TrainingParamTemplate) =>
+      updateTrainingTemplate(template.id, {
+        params: buildTemplateParamsPayload(schema.specs, params, initMode),
+      }),
+    onSuccess: (updated) => {
+      cacheTrainingTemplate(updated)
+      setUpdateConfirmOpen(false)
+      toast.success(`已更新参数模板“${updated.name}”`, {
+        description: "后续加载该模板时将使用最新保存的参数配置。",
+      })
+    },
+  })
+
+  const handleSelectTemplate = (rawValue: string) => {
+    setFormError(null)
+    if (rawValue === NO_TEMPLATE_VALUE) {
+      setActiveTemplateId(null)
+      setParams(buildDefaultParams(schema.specs, initMode))
+      toast.info("已切换为 Ultralytics 官方默认参数")
+      return
+    }
+    const id = Number(rawValue)
+    const matched = templates.find((t) => t.id === id)
+    if (!matched) {
+      return
+    }
+    setActiveTemplateId(matched.id)
+    setParams(applyTemplateParams(schema.specs, matched.params, initMode))
+    toast.success(`已加载参数模板“${matched.name}”`, {
+      description: "可直接提交训练，或继续微调下方常用与高级参数。",
+    })
+  }
+
+  const handleRestoreTemplate = () => {
+    if (!activeTemplate) {
+      return
+    }
+    setFormError(null)
+    setParams(
+      applyTemplateParams(schema.specs, activeTemplate.params, initMode)
+    )
+    toast.info(`已恢复模板“${activeTemplate.name}”的参数值`)
+  }
+
   const nameId = useId()
   const descId = useId()
   const projectSelectId = useId()
   const versionSelectId = useId()
   const baseModelSelectId = useId()
+  const templateSelectId = useId()
 
-  const modifiedCount = countModifiedParams(schema.specs, params)
+  const modifiedCount = useMemo(
+    () => countModifiedParams(schema.specs, params, undefined, initMode),
+    [schema.specs, params, initMode]
+  )
+  const templateDiffCount = useMemo(
+    () =>
+      activeTemplate
+        ? countTemplateParamDiffs(
+            schema.specs,
+            params,
+            activeTemplate.params,
+            initMode
+          )
+        : 0,
+    [schema.specs, params, activeTemplate, initMode]
+  )
 
   const submit = (event: FormEvent) => {
     event.preventDefault()
@@ -404,6 +608,7 @@ function NewTrainingJobForm({
         initMode === "scratch" ? yoloVersion : selectedBaseModel?.yolo_version,
       model_scale: initMode === "scratch" ? modelScale : undefined,
       base_model_id: initMode === "scratch" ? null : baseModelId,
+      template_id: activeTemplate ? activeTemplate.id : null,
       params,
       auto_register: autoRegister,
     })
@@ -413,7 +618,8 @@ function NewTrainingJobForm({
     urlProjectId !== null ? trainingJobsPath(urlProjectId) : TRAINING_JOBS_PATH
 
   return (
-    <form onSubmit={submit} className="grid min-w-0 gap-6" noValidate>
+    <>
+      <form onSubmit={submit} className="grid min-w-0 gap-6" noValidate>
       <div className="grid gap-2">
         <Button variant="ghost" size="sm" className="-ml-2 w-fit" asChild>
           <Link to={backPath}>
@@ -424,7 +630,7 @@ function NewTrainingJobForm({
 
         <PageHeader
           title="新建训练任务"
-          description="选择项目与冻结的数据版本，指定模型初始化方式，并按需编辑 Ultralytics YOLO 全量训练参数（默认已预填官方推荐参数）。"
+          description="选择项目与冻结的数据版本，指定模型初始化方式，并快速加载参数模板或按需调整常用与高级 YOLO 训练参数。"
         />
       </div>
 
@@ -435,6 +641,17 @@ function NewTrainingJobForm({
           <AlertDescription>
             包含模型设置以及 {modifiedCount} 项自定义 YOLO
             训练参数，提交前可继续修改任意字段。
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {initialTemplateState.missingUrlTemplate && (
+        <Alert>
+          <AlertTriangle className="size-4" />
+          <AlertTitle>指定的参数模板不存在或已被删除</AlertTitle>
+          <AlertDescription>
+            已回退为 Ultralytics
+            官方默认参数，可在下方参数模板栏重新选择其它模板。
           </AlertDescription>
         </Alert>
       )}
@@ -559,8 +776,8 @@ function NewTrainingJobForm({
               {selectedVersion.val_count === 0 && Boolean(params.val) && (
                 <p className="flex items-center gap-1.5 text-amber-600 dark:text-amber-500">
                   <AlertTriangle className="size-3.5 shrink-0" />
-                  该数据版本的验证集图片数为 0；建议在下方“验证与可视化设置”中将
-                  split 改为 train，或关闭 val。
+                  该数据版本的验证集图片数为 0；建议展开下方“高级选项 →
+                  验证与可视化设置”，将 split 改为 train 或关闭 val。
                 </p>
               )}
             </div>
@@ -754,15 +971,173 @@ function NewTrainingJobForm({
         </CardContent>
       </Card>
 
-      {/* 3. YOLO 全量参数编辑器 */}
+      {/* 3. YOLO 分级参数编辑器与模板快捷栏 */}
       <Card>
         <CardContent className="pt-6">
           <TrainingParamsEditor
             schema={schema}
             values={params}
-            onChange={setParams}
+            onChange={(next) => {
+              setParams(next)
+              setFormError(null)
+            }}
             initMode={initMode}
             disabled={createMutation.isPending}
+            headerSlot={
+              <div
+                className={cn(
+                  "grid gap-2.5 rounded-xl border p-3.5 transition-colors",
+                  activeTemplate
+                    ? "border-primary/30 bg-primary/[0.025]"
+                    : "bg-muted/25"
+                )}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2.5">
+                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                    <label
+                      htmlFor={templateSelectId}
+                      className="flex shrink-0 items-center gap-1.5 text-sm font-medium"
+                    >
+                      <Bookmark className="size-4 text-primary" />
+                      参数模板
+                    </label>
+
+                    <Select
+                      value={
+                        activeTemplate
+                          ? String(activeTemplate.id)
+                          : NO_TEMPLATE_VALUE
+                      }
+                      disabled={createMutation.isPending}
+                      onValueChange={handleSelectTemplate}
+                    >
+                      <SelectTrigger
+                        id={templateSelectId}
+                        className="w-full bg-background sm:w-88"
+                        aria-label="选择参数模板"
+                      >
+                        <SelectValue placeholder="选择参数模板" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {templates.map((tpl) => (
+                          <SelectItem key={tpl.id} value={String(tpl.id)}>
+                            {tpl.is_default ? `★ ${tpl.name}（默认）` : tpl.name}
+                          </SelectItem>
+                        ))}
+                        {templates.length > 0 && <SelectSeparator />}
+                        <SelectItem value={NO_TEMPLATE_VALUE}>
+                          不使用模板（Ultralytics 官方默认）
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="text-muted-foreground hover:text-foreground"
+                      asChild
+                    >
+                      <Link to={TRAINING_TEMPLATES_PATH}>
+                        <Settings2 />
+                        管理模板
+                      </Link>
+                    </Button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    {activeTemplate && templateDiffCount > 0 && (
+                      <>
+                        <Badge
+                          variant="secondary"
+                          className="font-normal text-primary tabular-nums"
+                        >
+                          已微调 {templateDiffCount} 项
+                        </Badge>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          disabled={
+                            createMutation.isPending ||
+                            updateTemplateMutation.isPending
+                          }
+                          onClick={handleRestoreTemplate}
+                        >
+                          <RotateCcw />
+                          恢复模板值
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={
+                            createMutation.isPending ||
+                            updateTemplateMutation.isPending
+                          }
+                          onClick={() => {
+                            updateTemplateMutation.reset()
+                            setUpdateConfirmOpen(true)
+                          }}
+                        >
+                          <BookmarkCheck />
+                          更新模板
+                        </Button>
+                      </>
+                    )}
+
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={createMutation.isPending}
+                      onClick={() => setSaveDialogOpen(true)}
+                    >
+                      <BookmarkPlus />
+                      {activeTemplate ? "另存为新模板" : "存为参数模板"}
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                  {activeTemplate ? (
+                    <>
+                      <span className="inline-flex items-center gap-1 font-medium text-foreground">
+                        {activeTemplate.is_default && (
+                          <Star className="size-3.5 fill-amber-500 text-amber-500" />
+                        )}
+                        当前模板：{activeTemplate.name}
+                      </span>
+                      {activeTemplate.description && (
+                        <>
+                          <span>·</span>
+                          <span className="truncate">
+                            {activeTemplate.description}
+                          </span>
+                        </>
+                      )}
+                      <span>·</span>
+                      <span>
+                        {templateDiffCount > 0
+                          ? `已相对模板微调 ${templateDiffCount} 项，可直接提交训练，也可以更新原模板或另存为新模板。`
+                          : initialTemplateState.autoLoadedDefault
+                            ? "已自动加载默认模板，可直接点击底部“开始训练”，或微调下方常用/高级参数。"
+                            : "参数与模板一致，可直接点击底部“开始训练”，或微调下方常用/高级参数。"}
+                      </span>
+                    </>
+                  ) : templates.length === 0 ? (
+                    <span>
+                      暂无已保存的参数模板；调整好下方常用或高级参数后，可点击右侧“存为参数模板”方便后续一键加载。
+                    </span>
+                  ) : (
+                    <span>
+                      当前使用 Ultralytics
+                      官方默认基准参数；可从左侧下拉快速加载常用模板，或将当前配置保存为新模板。
+                    </span>
+                  )}
+                </div>
+              </div>
+            }
           />
         </CardContent>
       </Card>
@@ -778,6 +1153,19 @@ function NewTrainingJobForm({
                   ? `基于模型 v${selectedBaseModel.version}（${INIT_MODE_LABELS[initMode]}）`
                   : INIT_MODE_LABELS[initMode]}
             </span>
+            {activeTemplate && (
+              <>
+                <span>·</span>
+                <Badge
+                  variant="secondary"
+                  className="h-5 gap-1 px-1.5 text-[11px] font-normal"
+                >
+                  <Bookmark className="size-3 text-primary" />
+                  {activeTemplate.name}
+                  {templateDiffCount > 0 && `（微调 ${templateDiffCount} 项）`}
+                </Badge>
+              </>
+            )}
             <span>·</span>
             <span className="tabular-nums">
               epochs={String(params.epochs ?? 100)}
@@ -827,6 +1215,63 @@ function NewTrainingJobForm({
           </Button>
         </div>
       </div>
-    </form>
+      </form>
+
+      <SaveTemplateDialog
+        open={saveDialogOpen}
+        onOpenChange={setSaveDialogOpen}
+        schema={schema}
+        params={params}
+        initMode={initMode}
+        defaultName={
+          activeTemplate ? `${activeTemplate.name}-副本` : name.trim()
+        }
+        defaultDescription={activeTemplate ? activeTemplate.description : ""}
+        title={activeTemplate ? "另存为新的参数模板" : "存为参数模板"}
+        onSaved={(saved) => {
+          setActiveTemplateId(saved.id)
+        }}
+      />
+
+      <AlertDialog open={updateConfirmOpen} onOpenChange={setUpdateConfirmOpen}>
+        <AlertDialogContent>
+          {activeTemplate && (
+            <>
+              <AlertDialogHeader>
+                <AlertDialogTitle className="break-words">
+                  更新参数模板“{activeTemplate.name}”？
+                </AlertDialogTitle>
+                <AlertDialogDescription>
+                  将把当前微调后的 {templateDiffCount}{" "}
+                  项参数覆盖写回该模板。已创建的历史训练任务均保留提交时的参数快照，不会受到影响。
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+
+              {updateTemplateMutation.error && (
+                <p
+                  role="alert"
+                  className="text-sm break-words text-destructive"
+                >
+                  {updateTemplateMutation.error.message}
+                </p>
+              )}
+
+              <AlertDialogFooter>
+                <AlertDialogCancel disabled={updateTemplateMutation.isPending}>
+                  取消
+                </AlertDialogCancel>
+                <Button
+                  disabled={updateTemplateMutation.isPending}
+                  onClick={() => updateTemplateMutation.mutate(activeTemplate)}
+                >
+                  {updateTemplateMutation.isPending && <Spinner aria-hidden />}
+                  确认更新模板
+                </Button>
+              </AlertDialogFooter>
+            </>
+          )}
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   )
 }

@@ -102,6 +102,7 @@ type ParamSpec struct {
 	Key         string        `json:"key"`
 	Label       string        `json:"label"`
 	Group       string        `json:"group"`
+	Common      bool          `json:"common"`
 	Type        string        `json:"type"` // int, float, nullable_float, bool, nullable_bool, string, enum, batch, cache, compile, freeze, int_list, quantize
 	Default     any           `json:"default"`
 	Min         *float64      `json:"min,omitempty"`
@@ -154,14 +155,16 @@ var paramGroups = []ParamGroupMeta{
 
 // paramSpecs lists all 86 tunable Ultralytics 8.4.198 configuration parameters
 // with their exact official default values from ultralytics/cfg/default.yaml.
+// The 12 parameters marked Common: true are displayed directly in the editor;
+// the remaining 74 live in the collapsible "高级选项" section.
 var paramSpecs = []ParamSpec{
 	// ---- 1. Core Training Settings (31) ----
-	{Key: "epochs", Label: "训练轮数 (epochs)", Group: GroupTrain, Type: "int", Default: 100, Min: fptr(1), Max: fptr(10000), Step: fptr(1), Description: "总训练轮数。若同时设置了最大训练时长 time，将以先到达者为准。"},
+	{Key: "epochs", Label: "训练轮数 (epochs)", Group: GroupTrain, Common: true, Type: "int", Default: 100, Min: fptr(1), Max: fptr(10000), Step: fptr(1), Description: "总训练轮数。若同时设置了最大训练时长 time，将以先到达者为准。"},
 	{Key: "time", Label: "最大训练时长 (time, 小时)", Group: GroupTrain, Type: "nullable_float", Default: nil, Min: fptr(0.01), Max: fptr(8760), Step: fptr(0.5), Description: "最大训练小时数；留空（null）表示不按时间限制，仅受 epochs 控制。"},
-	{Key: "patience", Label: "早停耐心轮数 (patience)", Group: GroupTrain, Type: "int", Default: 100, Min: fptr(0), Max: fptr(10000), Step: fptr(1), Description: "验证集指标连续多少轮无提升时提前停止训练；设为 0 表示禁用早停。"},
-	{Key: "batch", Label: "批次大小 (batch)", Group: GroupTrain, Type: "batch", Default: 16, Min: fptr(-1), Max: fptr(4096), Step: fptr(1), Description: "正整数表示固定批大小（默认 16）；-1 表示按 60% 显存自动计算；(0, 1) 小数表示按指定显存占比自动计算。"},
-	{Key: "imgsz", Label: "输入图像尺寸 (imgsz)", Group: GroupTrain, Type: "imgsz", Default: 640, Min: fptr(32), Max: fptr(4096), Step: fptr(32), Description: "训练与验证输入图像的边长（像素，如 640，或 [高, 宽]），需为 32 的倍数，官方默认 640。"},
-	{Key: "optimizer", Label: "优化器 (optimizer)", Group: GroupTrain, Type: "enum", Default: "auto", Options: []ParamOption{
+	{Key: "patience", Label: "早停耐心轮数 (patience)", Group: GroupTrain, Common: true, Type: "int", Default: 100, Min: fptr(0), Max: fptr(10000), Step: fptr(1), Description: "验证集指标连续多少轮无提升时提前停止训练；设为 0 表示禁用早停。"},
+	{Key: "batch", Label: "批次大小 (batch)", Group: GroupTrain, Common: true, Type: "batch", Default: 16, Min: fptr(-1), Max: fptr(4096), Step: fptr(1), Description: "正整数表示固定批大小（默认 16）；-1 表示按 60% 显存自动计算；(0, 1) 小数表示按指定显存占比自动计算。"},
+	{Key: "imgsz", Label: "输入图像尺寸 (imgsz)", Group: GroupTrain, Common: true, Type: "imgsz", Default: 640, Min: fptr(32), Max: fptr(4096), Step: fptr(32), Description: "训练与验证输入图像的边长（像素，如 640，或 [高, 宽]），需为 32 的倍数，官方默认 640。"},
+	{Key: "optimizer", Label: "优化器 (optimizer)", Group: GroupTrain, Common: true, Type: "enum", Default: "auto", Options: []ParamOption{
 		{Value: "auto", Label: "auto（按模型与迭代数自动选择）"},
 		{Value: "SGD", Label: "SGD"},
 		{Value: "MuSGD", Label: "MuSGD"},
@@ -172,11 +175,11 @@ var paramSpecs = []ParamSpec{
 		{Value: "RAdam", Label: "RAdam"},
 		{Value: "RMSProp", Label: "RMSProp"},
 	}, Description: "设为 auto 时 Ultralytics 会自动选择优化器并计算 lr0 与 momentum；手动指定时使用下方设置的 lr0 与 momentum。"},
-	{Key: "cos_lr", Label: "余弦退火学习率 (cos_lr)", Group: GroupTrain, Type: "bool", Default: false, Description: "使用余弦学习率调度替代默认的线性衰减调度。"},
-	{Key: "amp", Label: "自动混合精度 (amp)", Group: GroupTrain, Type: "bool", Default: true, Description: "启用混合精度训练（AMP），可显著节省显存并提升 GPU 训练速度。"},
-	{Key: "device", Label: "训练设备 (device)", Group: GroupTrain, Type: "string", Default: nil, Description: "留空自动选择可用 GPU（无 GPU 时回退 CPU）；也可填 0、0,1、cpu、mps 等。"},
-	{Key: "workers", Label: "数据加载线程数 (workers)", Group: GroupTrain, Type: "int", Default: 8, Min: fptr(0), Max: fptr(64), Step: fptr(1), Description: "DataLoader 工作进程数（Windows 或共享内存较小时可调低为 0–4）。"},
-	{Key: "cache", Label: "图像缓存策略 (cache)", Group: GroupTrain, Type: "cache", Default: false, Options: []ParamOption{
+	{Key: "cos_lr", Label: "余弦退火学习率 (cos_lr)", Group: GroupTrain, Common: true, Type: "bool", Default: false, Description: "使用余弦学习率调度替代默认的线性衰减调度。"},
+	{Key: "amp", Label: "自动混合精度 (amp)", Group: GroupTrain, Common: true, Type: "bool", Default: true, Description: "启用混合精度训练（AMP），可显著节省显存并提升 GPU 训练速度。"},
+	{Key: "device", Label: "训练设备 (device)", Group: GroupTrain, Common: true, Type: "string", Default: nil, Description: "留空自动选择可用 GPU（无 GPU 时回退 CPU）；也可填 0、0,1、cpu、mps 等。"},
+	{Key: "workers", Label: "数据加载线程数 (workers)", Group: GroupTrain, Common: true, Type: "int", Default: 8, Min: fptr(0), Max: fptr(64), Step: fptr(1), Description: "DataLoader 工作进程数（Windows 或共享内存较小时可调低为 0–4）。"},
+	{Key: "cache", Label: "图像缓存策略 (cache)", Group: GroupTrain, Common: true, Type: "cache", Default: false, Options: []ParamOption{
 		{Value: false, Label: "false（不缓存）"},
 		{Value: "ram", Label: "ram（缓存在内存，最快）"},
 		{Value: "disk", Label: "disk（缓存在磁盘 .npy）"},
@@ -214,7 +217,7 @@ var paramSpecs = []ParamSpec{
 	{Key: "dropout", Label: "分类 Dropout 概率 (dropout)", Group: GroupTrain, Type: "float", Default: 0.0, Min: fptr(0.0), Max: fptr(0.99), Step: fptr(0.05), TaskScope: "classify", Description: "分类任务专用：分类头的 Dropout 正则化概率。"},
 
 	// ---- 2. Optimizer & Loss Hyperparameters (20) ----
-	{Key: "lr0", Label: "初始学习率 (lr0)", Group: GroupHyperparameters, Type: "float", Default: 0.01, Min: fptr(1e-7), Max: fptr(10.0), Step: fptr(0.001), Description: "初始学习率（SGD 常用 0.01，Adam/AdamW 常用 0.001；optimizer=auto 时由框架自动覆盖）。"},
+	{Key: "lr0", Label: "初始学习率 (lr0)", Group: GroupHyperparameters, Common: true, Type: "float", Default: 0.01, Min: fptr(1e-7), Max: fptr(10.0), Step: fptr(0.001), Description: "初始学习率（SGD 常用 0.01，Adam/AdamW 常用 0.001；optimizer=auto 时由框架自动覆盖）。"},
 	{Key: "lrf", Label: "最终学习率比例 (lrf)", Group: GroupHyperparameters, Type: "float", Default: 0.01, Min: fptr(1e-5), Max: fptr(1.0), Step: fptr(0.01), Description: "最终学习率相对于初始学习率的比例（最终学习率 = lr0 × lrf）。"},
 	{Key: "momentum", Label: "动量 / Beta1 (momentum)", Group: GroupHyperparameters, Type: "float", Default: 0.937, Min: fptr(0.0), Max: fptr(1.0), Step: fptr(0.001), Description: "SGD 动量因子或 Adam 系列优化器的 beta1（optimizer=auto 时自动覆盖）。"},
 	{Key: "weight_decay", Label: "权重衰减 (weight_decay)", Group: GroupHyperparameters, Type: "float", Default: 0.0005, Min: fptr(0.0), Max: fptr(1.0), Step: fptr(0.0001), Description: "优化器 L2 正则化权重衰减系数。"},
@@ -247,7 +250,7 @@ var paramSpecs = []ParamSpec{
 	{Key: "flipud", Label: "上下翻转概率 (flipud)", Group: GroupAugmentation, Type: "float", Default: 0.0, Min: fptr(0.0), Max: fptr(1.0), Step: fptr(0.05), Description: "以指定概率将图像上下垂直翻转。"},
 	{Key: "fliplr", Label: "左右翻转概率 (fliplr)", Group: GroupAugmentation, Type: "float", Default: 0.5, Min: fptr(0.0), Max: fptr(1.0), Step: fptr(0.05), Description: "以指定概率将图像左右水平翻转（官方默认 0.5）。"},
 	{Key: "bgr", Label: "BGR 通道翻转概率 (bgr)", Group: GroupAugmentation, Type: "float", Default: 0.0, Min: fptr(0.0), Max: fptr(1.0), Step: fptr(0.05), Description: "以指定概率交换 RGB 与 BGR 颜色通道。"},
-	{Key: "mosaic", Label: "Mosaic 拼接概率 (mosaic)", Group: GroupAugmentation, Type: "float", Default: 1.0, Min: fptr(0.0), Max: fptr(1.0), Step: fptr(0.05), Description: "四图拼接增强概率，显著提升小目标与复杂背景泛化能力（默认 1.0）。"},
+	{Key: "mosaic", Label: "Mosaic 拼接概率 (mosaic)", Group: GroupAugmentation, Common: true, Type: "float", Default: 1.0, Min: fptr(0.0), Max: fptr(1.0), Step: fptr(0.05), Description: "四图拼接增强概率，显著提升小目标与复杂背景泛化能力（默认 1.0）。"},
 	{Key: "mixup", Label: "MixUp 混合概率 (mixup)", Group: GroupAugmentation, Type: "float", Default: 0.0, Min: fptr(0.0), Max: fptr(1.0), Step: fptr(0.05), Description: "按透明度混合两张图像及其标注框的概率。"},
 	{Key: "cutmix", Label: "CutMix 裁剪混合概率 (cutmix)", Group: GroupAugmentation, Type: "float", Default: 0.0, Min: fptr(0.0), Max: fptr(1.0), Step: fptr(0.05), Description: "将一张图像的矩形区域裁剪粘贴到另一张图像的概率。"},
 	{Key: "copy_paste", Label: "Copy-Paste 增强概率 (copy_paste)", Group: GroupAugmentation, Type: "float", Default: 0.0, Min: fptr(0.0), Max: fptr(1.0), Step: fptr(0.05), TaskScope: "segment", Description: "分割任务专用：跨图像复制粘贴目标实例的概率。"},
@@ -377,6 +380,14 @@ func NormalizeParams(raw map[string]any, initMode string) (map[string]any, error
 	}
 
 	return out, nil
+}
+
+// NormalizeTemplateParams overlays raw onto DefaultParams() and validates all
+// Ultralytics YOLO parameters for saving as a reusable parameter template.
+// resume is always forced to false because it is controlled by a training job's
+// init_mode rather than the template.
+func NormalizeTemplateParams(raw map[string]any) (map[string]any, error) {
+	return NormalizeParams(raw, InitScratch)
 }
 
 func normalizeOneParam(sp ParamSpec, raw any) (any, error) {

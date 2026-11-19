@@ -27,6 +27,48 @@ export function isSameParamValue(a: unknown, b: unknown): boolean {
   return false
 }
 
+/** 常用参数在表单中的推荐展示顺序。 */
+export const COMMON_PARAM_ORDER: readonly string[] = [
+  "epochs",
+  "batch",
+  "imgsz",
+  "patience",
+  "optimizer",
+  "lr0",
+  "cos_lr",
+  "amp",
+  "device",
+  "workers",
+  "cache",
+  "mosaic",
+]
+
+const COMMON_ORDER_INDEX = new Map(
+  COMMON_PARAM_ORDER.map((key, index) => [key, index])
+)
+
+/** 将全量参数按 common 标记拆分为“常用参数”与“高级选项”两组，常用项按直观调参顺序排列。 */
+export function splitSpecsByTier(specs: readonly ParamSpec[]): {
+  common: ParamSpec[]
+  advanced: ParamSpec[]
+} {
+  const common: ParamSpec[] = []
+  const advanced: ParamSpec[] = []
+  for (const spec of specs) {
+    if (spec.common) {
+      common.push(spec)
+    } else {
+      advanced.push(spec)
+    }
+  }
+  common.sort((a, b) => {
+    const ai = COMMON_ORDER_INDEX.get(a.key) ?? Number.MAX_SAFE_INTEGER
+    const bi = COMMON_ORDER_INDEX.get(b.key) ?? Number.MAX_SAFE_INTEGER
+    return ai - bi
+  })
+  return { common, advanced }
+}
+
 /** 从参数规格列表生成一份全新的官方默认参数拷贝。 */
 export function buildDefaultParams(
   specs: readonly ParamSpec[],
@@ -47,7 +89,96 @@ export function buildDefaultParams(
   return out
 }
 
-/** 判断单个参数是否被修改（相对官方默认值；resume 随训练模式联动除外）。 */
+/** 生成用于参数模板编辑的官方默认参数（固定 resume=false，保留 pretrained=true）。 */
+export function buildTemplateDefaultParams(
+  specs: readonly ParamSpec[]
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const spec of specs) {
+    out[spec.key] = Array.isArray(spec.default)
+      ? [...spec.default]
+      : spec.default
+  }
+  if ("resume" in out) {
+    out.resume = false
+  }
+  return out
+}
+
+/**
+ * 将模板参数加载到新建训练任务表单中：
+ * 以官方默认为底，叠加模板设定，并保持 resume 与 scratch 下 pretrained
+ * 同当前初始化模式一致。
+ */
+export function applyTemplateParams(
+  specs: readonly ParamSpec[],
+  templateParams: Record<string, unknown>,
+  initMode: InitMode
+): Record<string, unknown> {
+  const out = buildDefaultParams(specs, initMode)
+  for (const spec of specs) {
+    if (spec.key === "resume") {
+      continue
+    }
+    if (spec.key === "pretrained" && initMode === "scratch") {
+      continue
+    }
+    if (spec.key in templateParams) {
+      const val = templateParams[spec.key]
+      out[spec.key] = Array.isArray(val) ? [...val] : val
+    }
+  }
+  if ("resume" in out) {
+    out.resume = initMode === "resume"
+  }
+  if (initMode === "scratch" && "pretrained" in out) {
+    out.pretrained = false
+  }
+  return out
+}
+
+/**
+ * 从当前表单值提取适合保存为通用参数模板的参数对象：
+ * 固定 resume=false；若当前处于 scratch 模式则还原 pretrained=true，避免保存后的模板影响微调模式。
+ */
+export function buildTemplateParamsPayload(
+  specs: readonly ParamSpec[],
+  values: Record<string, unknown>,
+  initMode?: InitMode
+): Record<string, unknown> {
+  const out = buildTemplateDefaultParams(specs)
+  for (const spec of specs) {
+    if (spec.key === "resume") {
+      out.resume = false
+      continue
+    }
+    if (spec.key === "pretrained" && initMode === "scratch") {
+      out.pretrained = spec.default
+      continue
+    }
+    if (spec.key in values) {
+      const val = values[spec.key]
+      out[spec.key] = Array.isArray(val) ? [...val] : val
+    }
+  }
+  return out
+}
+
+/** 返回某个参数在当前模式下的基准默认值（用于过滤 scratch/resume 自动联动字段造成的“伪修改”）。 */
+export function getModeDefaultValue(
+  spec: ParamSpec,
+  initMode?: InitMode
+): unknown {
+  if (initMode === "resume" && spec.key === "resume") {
+    return true
+  }
+  if (initMode === "scratch" && spec.key === "pretrained") {
+    return false
+  }
+  return spec.default
+}
+
+/** 判断单个参数是否被修改（相对官方默认值）。 */
 export function isParamModified(
   spec: ParamSpec,
   values: Record<string, unknown>
@@ -58,22 +189,103 @@ export function isParamModified(
   return !isSameParamValue(values[spec.key], spec.default)
 }
 
+/** 判断单个参数是否相对当前模式基准默认值被用户主动修改。 */
+export function isParamModifiedForMode(
+  spec: ParamSpec,
+  values: Record<string, unknown>,
+  initMode?: InitMode
+): boolean {
+  if (!(spec.key in values)) {
+    return false
+  }
+  const value = values[spec.key]
+  if (isSameParamValue(value, spec.default)) {
+    return false
+  }
+  return !isSameParamValue(value, getModeDefaultValue(spec, initMode))
+}
+
 /** 统计全部或某个分组内偏离官方默认值的参数数量。 */
 export function countModifiedParams(
   specs: readonly ParamSpec[],
   values: Record<string, unknown>,
-  group?: ParamGroupKey
+  group?: ParamGroupKey,
+  initMode?: InitMode
 ): number {
   let count = 0
   for (const spec of specs) {
     if (group && spec.group !== group) {
       continue
     }
-    if (isParamModified(spec, values)) {
+    const modified =
+      initMode !== undefined
+        ? isParamModifiedForMode(spec, values, initMode)
+        : isParamModified(spec, values)
+    if (modified) {
       count += 1
     }
   }
   return count
+}
+
+/** 列出指定规格集中被修改的参数项（用于高级选项收起态摘要与模板预览）。 */
+export function listModifiedParams(
+  specs: readonly ParamSpec[],
+  values: Record<string, unknown>,
+  initMode?: InitMode
+): Array<{ spec: ParamSpec; value: unknown }> {
+  const out: Array<{ spec: ParamSpec; value: unknown }> = []
+  for (const spec of specs) {
+    const modified =
+      initMode !== undefined
+        ? isParamModifiedForMode(spec, values, initMode)
+        : isParamModified(spec, values)
+    if (modified) {
+      out.push({ spec, value: values[spec.key] })
+    }
+  }
+  return out
+}
+
+/** 统计当前表单参数相对指定模板的微调项数（自动忽略与 initMode 联动的字段）。 */
+export function countTemplateParamDiffs(
+  specs: readonly ParamSpec[],
+  values: Record<string, unknown>,
+  templateParams: Record<string, unknown>,
+  initMode: InitMode
+): number {
+  const baseline = applyTemplateParams(specs, templateParams, initMode)
+  let count = 0
+  for (const spec of specs) {
+    if (spec.key === "resume") {
+      continue
+    }
+    if (spec.key === "pretrained" && initMode === "scratch") {
+      continue
+    }
+    const cur = spec.key in values ? values[spec.key] : baseline[spec.key]
+    if (!isSameParamValue(cur, baseline[spec.key])) {
+      count += 1
+    }
+  }
+  return count
+}
+
+/** 紧凑格式化参数值，适合徽章与摘要标签展示。 */
+export function formatCompactParamValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "自动"
+  }
+  if (typeof value === "boolean") {
+    return value ? "true" : "false"
+  }
+  if (Array.isArray(value)) {
+    return `[${value.join(",")}]`
+  }
+  if (value === "") {
+    return "禁用"
+  }
+  return String(value)
 }
 
 /** 按关键词（英文键名、中文名称、说明、任务标签）与“仅显示已修改”筛选参数。 */
@@ -84,10 +296,12 @@ export function filterParamSpecs(
     group,
     query = "",
     onlyModified = false,
+    initMode,
   }: {
     group?: ParamGroupKey | "all"
     query?: string
     onlyModified?: boolean
+    initMode?: InitMode
   }
 ): ParamSpec[] {
   const q = query.trim().toLowerCase()
@@ -95,8 +309,14 @@ export function filterParamSpecs(
     if (group && group !== "all" && spec.group !== group) {
       return false
     }
-    if (onlyModified && !isParamModified(spec, values)) {
-      return false
+    if (onlyModified) {
+      const modified =
+        initMode !== undefined
+          ? isParamModifiedForMode(spec, values, initMode)
+          : isParamModified(spec, values)
+      if (!modified) {
+        return false
+      }
     }
     if (!q) {
       return true

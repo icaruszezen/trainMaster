@@ -17,6 +17,8 @@ import { ComputePage } from "@/features/training/compute-page"
 import { NewTrainingJobPage } from "@/features/training/new-training-job-page"
 import { TrainingJobDetailPage } from "@/features/training/training-job-detail-page"
 import { TrainingJobsPage } from "@/features/training/training-jobs-page"
+import { TrainingTemplateFormPage } from "@/features/training/training-template-form-page"
+import { TrainingTemplatesPage } from "@/features/training/training-templates-page"
 import { NotFoundPage } from "@/pages/not-found-page"
 import { pages, routes } from "@/router"
 
@@ -82,13 +84,27 @@ describe("routes", () => {
     expect(leaf("/models/5")?.handle).toBeUndefined()
   })
 
-  it("routes training jobs without shadowing compute", () => {
+  it("routes training jobs and parameter templates without shadowing compute", () => {
     expect(leafComponent("/training/jobs")).toBe(TrainingJobsPage)
     expect(leafComponent("/training/jobs/new")).toBe(NewTrainingJobPage)
     expect(leafComponent("/training/jobs/9")).toBe(TrainingJobDetailPage)
     expect(leafComponent("/training/jobs/9/extra")).toBe(NotFoundPage)
+    expect(leafComponent("/training/templates")).toBe(TrainingTemplatesPage)
+    expect(leafComponent("/training/templates/new")).toBe(
+      TrainingTemplateFormPage
+    )
+    expect(leafComponent("/training/templates/4/edit")).toBe(
+      TrainingTemplateFormPage
+    )
+    expect(leafComponent("/training/templates/4")).toBe(NotFoundPage)
+    expect(leafComponent("/training/templates/4/extra")).toBe(NotFoundPage)
     expect(leafComponent("/training/compute")).toBe(ComputePage)
-    for (const path of ["/training/jobs/new", "/training/jobs/9"]) {
+    for (const path of [
+      "/training/jobs/new",
+      "/training/jobs/9",
+      "/training/templates/new",
+      "/training/templates/4/edit",
+    ]) {
       expect(leaf(path)?.handle, path).toBeUndefined()
     }
   })

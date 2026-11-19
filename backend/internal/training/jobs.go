@@ -230,6 +230,24 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Job, error) {
 		}
 	}
 
+	var (
+		templateID   *int64
+		templateName string
+	)
+	if in.TemplateID != nil {
+		if *in.TemplateID <= 0 {
+			return Job{}, newError(ErrInvalid, "参数模板编号无效")
+		}
+		if err := s.db.QueryRow(ctx, `SELECT name FROM training_param_templates WHERE id = $1`, *in.TemplateID).Scan(&templateName); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return Job{}, errTemplateNotFound
+			}
+			return Job{}, err
+		}
+		tid := *in.TemplateID
+		templateID = &tid
+	}
+
 	params, err := NormalizeParams(in.Params, initMode)
 	if err != nil {
 		return Job{}, err
@@ -294,12 +312,12 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Job, error) {
 	err = s.db.QueryRow(ctx, `INSERT INTO training_jobs (
 			project_id, data_version_id, data_version_ref, name, description,
 			init_mode, yolo_version, model_scale, task, base_model_id, base_model_ref,
-			params, auto_register, status, total_epochs
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'detect', $9, $10, $11, $12, 'queued', $13)
+			template_id, template_name, params, auto_register, status, total_epochs
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'detect', $9, $10, $11, $12, $13, $14, 'queued', $15)
 		RETURNING id`,
 		in.ProjectID, dv.ID, dvRefJSON, name, desc,
 		initMode, yoloVersion, modelScale, baseID, baseRefJSON,
-		paramsJSON, autoRegister, totalEpochs).Scan(&jobID)
+		templateID, templateName, paramsJSON, autoRegister, totalEpochs).Scan(&jobID)
 	if err != nil {
 		return Job{}, fmt.Errorf("insert training job: %w", err)
 	}
@@ -312,7 +330,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Job, error) {
 const jobSelectCols = `
 	j.id, j.project_id, p.name, j.data_version_id, (dv.deleted_at IS NULL),
 	j.data_version_ref, j.name, j.description, j.init_mode, j.yolo_version, j.model_scale, j.task,
-	j.base_model_id, j.base_model_ref, j.params, j.auto_register,
+	j.base_model_id, j.base_model_ref, j.template_id, j.template_name, j.params, j.auto_register,
 	j.status, j.stage, j.attempts, j.current_epoch, j.total_epochs, j.batch_done, j.batch_total, j.eta_seconds,
 	j.metrics, j.artifacts, j.error, j.error_detail, j.result,
 	j.queued_at, j.started_at, j.finished_at, j.created_at, j.updated_at,
@@ -350,7 +368,7 @@ func scanJobRow(row pgx.Row) (Job, error) {
 	err := row.Scan(
 		&j.ID, &j.ProjectID, &j.ProjectName, &j.DataVersionID, &j.DataVersionLive,
 		&dvRefRaw, &j.Name, &j.Description, &j.InitMode, &j.YOLOVersion, &j.ModelScale, &j.Task,
-		&j.BaseModelID, &baseRefRaw, &paramsRaw, &j.AutoRegister,
+		&j.BaseModelID, &baseRefRaw, &j.TemplateID, &j.TemplateName, &paramsRaw, &j.AutoRegister,
 		&j.Status, &j.Stage, &j.Attempts, &j.CurrentEpoch, &j.TotalEpochs, &j.BatchDone, &j.BatchTotal, &j.ETASeconds,
 		&metricsRaw, &artRaw, &j.Error, &j.ErrorDetail, &resultRaw,
 		&j.QueuedAt, &j.StartedAt, &j.FinishedAt, &j.CreatedAt, &j.UpdatedAt,
@@ -482,6 +500,7 @@ func (s *Service) List(ctx context.Context, f ListFilter) ([]Job, error) {
 			AND ($4 = '' OR j.yolo_version = $4)
 			AND ($5 = '' OR strpos(lower(j.name), lower($5)) > 0
 				OR strpos(lower(j.description), lower($5)) > 0
+				OR strpos(lower(j.template_name), lower($5)) > 0
 				OR strpos(lower(p.name), lower($5)) > 0)
 		ORDER BY j.created_at DESC, j.id DESC`,
 		f.ProjectID, f.DataVersionID, f.Status, f.YOLOVersion, q)

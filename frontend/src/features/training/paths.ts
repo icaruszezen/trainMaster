@@ -2,6 +2,7 @@
 import type { InitMode } from "@/features/training/api"
 
 export const TRAINING_JOBS_PATH = "/training/jobs"
+export const TRAINING_TEMPLATES_PATH = "/training/templates"
 
 export function trainingJobsPath(projectId: number | null = null) {
   return projectId === null
@@ -13,6 +14,16 @@ export function trainingJobDetailPath(id: number) {
   return `${TRAINING_JOBS_PATH}/${id}`
 }
 
+export function newTrainingTemplatePath(fromTemplateId: number | null = null) {
+  return fromTemplateId === null
+    ? `${TRAINING_TEMPLATES_PATH}/new`
+    : `${TRAINING_TEMPLATES_PATH}/new?from=${fromTemplateId}`
+}
+
+export function editTrainingTemplatePath(id: number) {
+  return `${TRAINING_TEMPLATES_PATH}/${id}/edit`
+}
+
 export type NewTrainingJobLinkOptions = {
   projectId?: number | null
   dataVersionId?: number | null
@@ -20,6 +31,8 @@ export type NewTrainingJobLinkOptions = {
   initMode?: InitMode | null
   /** 复用已有训练任务的配置与全量 YOLO 参数。 */
   from?: number | null
+  /** 预加载指定的参数模板。 */
+  templateId?: number | null
 }
 
 export function newTrainingJobPath({
@@ -28,6 +41,7 @@ export function newTrainingJobPath({
   baseModelId = null,
   initMode = null,
   from = null,
+  templateId = null,
 }: NewTrainingJobLinkOptions = {}) {
   const search = new URLSearchParams()
   if (projectId !== null) {
@@ -44,6 +58,9 @@ export function newTrainingJobPath({
   }
   if (from !== null) {
     search.set("from", String(from))
+  }
+  if (templateId !== null) {
+    search.set("template", String(templateId))
   }
   const query = search.toString()
   return `${TRAINING_JOBS_PATH}/new${query ? `?${query}` : ""}`

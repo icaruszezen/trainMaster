@@ -3,7 +3,7 @@
  * 训练任务主页（`/training/jobs`）与项目详情“训练任务”标签页共用。
  */
 import type { MouseEvent } from "react"
-import { Box, Rocket } from "lucide-react"
+import { Bookmark, Box, Rocket } from "lucide-react"
 import { Link, useNavigate } from "react-router"
 
 import { Badge } from "@/components/ui/badge"
@@ -132,6 +132,15 @@ function TrainingJobTable({
                           <>
                             <span>·</span>
                             <span>基于模型 v{job.base_model.version}</span>
+                          </>
+                        )}
+                        {job.template_name && (
+                          <>
+                            <span>·</span>
+                            <span className="inline-flex items-center gap-1 text-foreground/80">
+                              <Bookmark className="size-3 text-primary" />
+                              {job.template_name}
+                            </span>
                           </>
                         )}
                       </div>
@@ -276,6 +285,12 @@ function TrainingJobCards({
                 <Badge variant="outline" className="font-normal">
                   {INIT_MODE_LABELS[job.init_mode]}
                 </Badge>
+                {job.template_name && (
+                  <Badge variant="secondary" className="gap-1 font-normal">
+                    <Bookmark className="size-3 text-primary" />
+                    {job.template_name}
+                  </Badge>
+                )}
                 {job.best_model && (
                   <Badge variant="secondary" className="font-normal">
                     模型 v{job.best_model.version}

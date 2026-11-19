@@ -1,16 +1,21 @@
 /**
- * Ultralytics YOLO 全量参数编辑器。
+ * Ultralytics YOLO 分级训练参数编辑器。
  *
- * 按服务端 `/api/v1/training/params-schema` 返回的 86 项官方参数规格渲染分组、
- * 搜索、修改状态追踪、单项/整组恢复官方默认值与 YAML 预览导出。所有参数均开放
- * 可编辑（特定任务专用参数会显示任务范围徽章，但同样允许编辑）。
+ * 按服务端 `/api/v1/training/params-schema` 下发的 86 项官方参数规格渲染：
+ * - 12 项高频常用参数（epochs、batch、imgsz、patience、optimizer、lr0、cos_lr、
+ *   amp、device、workers、cache、mosaic）直接展示；
+ * - 其余 74 项低频参数收起在页内“高级选项”折叠面板中，展开后保留原有 4 分组标签、
+ *   搜索、仅看已修改与分组重置；收起状态下若高级参数偏离默认，直接展示已修改项摘要。
  */
-import { useId, useMemo, useState } from "react"
+import { useId, useMemo, useState, type ReactNode } from "react"
 import {
+  ChevronDown,
+  ChevronUp,
   FileCode2,
   RotateCcw,
   Search,
   SlidersHorizontal,
+  Sparkles,
   X,
 } from "lucide-react"
 
@@ -45,22 +50,33 @@ import { CommandBlock } from "@/features/training/command-block"
 import { TASK_SCOPE_LABELS } from "@/features/training/format"
 import {
   buildDefaultParams,
+  buildTemplateDefaultParams,
   countModifiedParams,
   filterParamSpecs,
+  formatCompactParamValue,
   formatParamsYaml,
   formatParamValueText,
-  isParamModified,
+  getModeDefaultValue,
+  isParamModifiedForMode,
+  listModifiedParams,
   parseFreezeText,
   parseIntListText,
+  splitSpecsByTier,
 } from "@/features/training/training-params"
 import { cn } from "@/lib/utils"
+
+const MAX_COLLAPSED_CHIPS = 8
 
 export type TrainingParamsEditorProps = {
   schema: ParamsSchemaResponse
   values: Record<string, unknown>
   onChange: (next: Record<string, unknown>) => void
   initMode?: InitMode
+  /** job：用于新建训练任务；template：用于创建/编辑参数模板（resume 固定托管）。 */
+  mode?: "job" | "template"
   disabled?: boolean
+  /** 顶部扩展槽（如新建训练页的参数模板快捷选择与保存栏）。 */
+  headerSlot?: ReactNode
 }
 
 export function TrainingParamsEditor({
@@ -68,36 +84,84 @@ export function TrainingParamsEditor({
   values,
   onChange,
   initMode = "scratch",
+  mode = "job",
   disabled = false,
+  headerSlot,
 }: TrainingParamsEditorProps) {
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   const [activeTab, setActiveTab] = useState<ParamGroupKey | "all">("train")
   const [query, setQuery] = useState("")
-  const [onlyModified, setOnlyModified] = useState(false)
+  const [onlyModifiedAdvanced, setOnlyModifiedAdvanced] = useState(false)
   const [yamlOpen, setYamlOpen] = useState(false)
 
-  const totalModified = useMemo(
-    () => countModifiedParams(schema.specs, values),
-    [schema.specs, values]
+  const effectiveInitMode: InitMode | undefined =
+    mode === "job" ? initMode : undefined
+
+  const { common: commonSpecs, advanced: advancedSpecs } = useMemo(
+    () => splitSpecsByTier(schema.specs),
+    [schema.specs]
   )
 
-  // 当用户输入搜索词或开启“仅显示已修改”时，若选在“全部”能跨组浏览；如果当前在具体分组，只筛当前分组，同时支持一键切到全部。
-  const effectiveGroup = query.trim() !== "" ? "all" : activeTab
+  const groupLabelByKey = useMemo(
+    () => new Map(schema.groups.map((g) => [g.key, g.label])),
+    [schema.groups]
+  )
 
-  const filteredSpecs = useMemo(
+  const totalModified = useMemo(
+    () => countModifiedParams(schema.specs, values, undefined, effectiveInitMode),
+    [schema.specs, values, effectiveInitMode]
+  )
+  const commonModified = useMemo(
+    () => countModifiedParams(commonSpecs, values, undefined, effectiveInitMode),
+    [commonSpecs, values, effectiveInitMode]
+  )
+  const modifiedAdvancedItems = useMemo(
+    () => listModifiedParams(advancedSpecs, values, effectiveInitMode),
+    [advancedSpecs, values, effectiveInitMode]
+  )
+
+  const trimmedQuery = query.trim()
+  const isSearching = trimmedQuery !== ""
+
+  const searchResults = useMemo(() => {
+    if (!isSearching) {
+      return []
+    }
+    const matched = filterParamSpecs(schema.specs, values, {
+      group: "all",
+      query: trimmedQuery,
+      initMode: effectiveInitMode,
+    })
+    // 常用参数优先排在搜索结果前面，便于快速定位
+    return [...matched].sort((a, b) => Number(b.common) - Number(a.common))
+  }, [schema.specs, values, isSearching, trimmedQuery, effectiveInitMode])
+
+  const filteredAdvancedSpecs = useMemo(
     () =>
-      filterParamSpecs(schema.specs, values, {
-        group: effectiveGroup,
-        query,
-        onlyModified,
+      filterParamSpecs(advancedSpecs, values, {
+        group: activeTab,
+        onlyModified: onlyModifiedAdvanced,
+        initMode: effectiveInitMode,
       }),
-    [schema.specs, values, effectiveGroup, query, onlyModified]
+    [
+      advancedSpecs,
+      values,
+      activeTab,
+      onlyModifiedAdvanced,
+      effectiveInitMode,
+    ]
   )
 
   const activeGroupMeta = schema.groups.find((g) => g.key === activeTab)
-  const activeGroupModified =
+  const activeAdvancedGroupModified =
     activeTab === "all"
-      ? totalModified
-      : countModifiedParams(schema.specs, values, activeTab)
+      ? modifiedAdvancedItems.length
+      : countModifiedParams(
+          advancedSpecs,
+          values,
+          activeTab,
+          effectiveInitMode
+        )
 
   const setOneParam = (key: string, nextValue: unknown) => {
     onChange({
@@ -107,42 +171,72 @@ export function TrainingParamsEditor({
   }
 
   const resetOneParam = (spec: ParamSpec) => {
-    const fallback =
-      spec.key === "resume"
-        ? initMode === "resume"
-        : spec.key === "pretrained" && initMode === "scratch"
-          ? false
-          : Array.isArray(spec.default)
-            ? [...spec.default]
-            : spec.default
-    setOneParam(spec.key, fallback)
+    const base = getModeDefaultValue(spec, effectiveInitMode)
+    setOneParam(spec.key, Array.isArray(base) ? [...base] : base)
   }
 
-  const resetGroup = (group: ParamGroupKey) => {
-    const defaults = buildDefaultParams(schema.specs, initMode)
+  const resetSpecs = (targetSpecs: readonly ParamSpec[]) => {
+    const defaults =
+      mode === "template"
+        ? buildTemplateDefaultParams(schema.specs)
+        : buildDefaultParams(schema.specs, initMode)
     const next = { ...values }
-    for (const spec of schema.specs) {
-      if (spec.group === group) {
-        next[spec.key] = defaults[spec.key]
-      }
+    for (const spec of targetSpecs) {
+      next[spec.key] = defaults[spec.key]
     }
     onChange(next)
   }
 
-  const resetAll = () => {
-    onChange(buildDefaultParams(schema.specs, initMode))
+  const resetAdvancedGroup = (group: ParamGroupKey) => {
+    resetSpecs(advancedSpecs.filter((s) => s.group === group))
   }
 
+  const resetAll = () => {
+    onChange(
+      mode === "template"
+        ? buildTemplateDefaultParams(schema.specs)
+        : buildDefaultParams(schema.specs, initMode)
+    )
+  }
+
+  const openAdvancedModifiedView = () => {
+    setAdvancedOpen(true)
+    setActiveTab("all")
+    setOnlyModifiedAdvanced(true)
+  }
+
+  const isSpecLocked = (spec: ParamSpec) =>
+    disabled ||
+    (spec.key === "resume" && (mode === "template" || initMode === "resume"))
+
+  const specLockedHint = (spec: ParamSpec) => {
+    if (spec.key === "resume" && mode === "template") {
+      return "由训练任务初始化模式自动决定，模板中固定为 false"
+    }
+    if (spec.key === "resume" && initMode === "resume") {
+      return "断点续训模式下自动开启"
+    }
+    return undefined
+  }
+
+  const hiddenAdvancedChipCount = Math.max(
+    0,
+    modifiedAdvancedItems.length - MAX_COLLAPSED_CHIPS
+  )
+
   return (
-    <div className="grid min-w-0 gap-4">
+    <div className="grid min-w-0 gap-5">
+      {/* 标题与全局操作栏 */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="grid gap-1">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-base font-semibold">
-              Ultralytics YOLO 全量训练参数
+              {mode === "template"
+                ? "YOLO 模板参数配置"
+                : "Ultralytics YOLO 训练参数"}
             </h3>
             <Badge variant="outline" className="font-normal tabular-nums">
-              共 {schema.specs.length} 项可编辑
+              常用 {commonSpecs.length} 项 · 高级 {advancedSpecs.length} 项
             </Badge>
             {totalModified > 0 && (
               <Badge variant="secondary" className="font-normal tabular-nums">
@@ -151,9 +245,9 @@ export function TrainingParamsEditor({
             )}
           </div>
           <p className="text-xs text-muted-foreground">
-            基础训练参数均按 Ultralytics
-            官方默认值（cfg/default.yaml）预填，支持逐项调整、分组重置及导出
-            args.yaml。
+            直接展示 {commonSpecs.length} 项高频调参项，其余{" "}
+            {advancedSpecs.length} 项低频参数默认收纳在下方“高级选项”中；所有参数均以
+            Ultralytics 官方默认值（cfg/default.yaml）为基准。
           </p>
         </div>
 
@@ -180,130 +274,387 @@ export function TrainingParamsEditor({
         </div>
       </div>
 
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="relative min-w-0 flex-1">
-          <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="搜索英文参数名或中文说明（如 epochs、batch、lr0、mosaic、device、freeze…）"
-            className="pr-9 pl-9"
-            aria-label="搜索训练参数"
-          />
-          {query && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              className="absolute top-1/2 right-2 -translate-y-1/2 text-muted-foreground"
-              onClick={() => setQuery("")}
-              aria-label="清空搜索词"
-            >
-              <X />
-            </Button>
-          )}
-        </div>
+      {/* 模板快捷栏等外部扩展槽 */}
+      {headerSlot}
 
-        <label className="flex shrink-0 cursor-pointer items-center gap-2 text-sm select-none">
-          <Switch checked={onlyModified} onCheckedChange={setOnlyModified} />
-          <span className="tabular-nums">仅看已修改 ({totalModified})</span>
-        </label>
+      {/* 跨层级全局搜索 */}
+      <div className="relative min-w-0">
+        <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="搜索全部 86 项参数（含高级选项）：输入英文参数名或中文说明，如 epochs、lr0、fliplr、close_mosaic、freeze…"
+          className="pr-9 pl-9"
+          aria-label="搜索训练参数"
+        />
+        {query && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className="absolute top-1/2 right-2 -translate-y-1/2 text-muted-foreground"
+            onClick={() => setQuery("")}
+            aria-label="清空搜索词"
+          >
+            <X />
+          </Button>
+        )}
       </div>
 
-      {query.trim() === "" && (
-        <Tabs
-          value={activeTab}
-          onValueChange={(next) => setActiveTab(next as ParamGroupKey | "all")}
-          className="min-w-0"
-        >
-          <ScrollingTabsList value={activeTab}>
-            {schema.groups.map((group) => {
-              const modCount = countModifiedParams(
-                schema.specs,
-                values,
-                group.key
-              )
-              return (
-                <TabsTrigger
-                  key={group.key}
-                  value={group.key}
-                  className="gap-1.5"
-                >
-                  {group.label}
-                  {modCount > 0 && (
-                    <Badge
-                      variant="secondary"
-                      className="h-5 px-1.5 text-[11px] tabular-nums"
-                    >
-                      {modCount}
-                    </Badge>
-                  )}
-                </TabsTrigger>
-              )
-            })}
-            <TabsTrigger value="all" className="gap-1.5">
-              全部参数 ({schema.specs.length})
-            </TabsTrigger>
-          </ScrollingTabsList>
-        </Tabs>
-      )}
-
-      {query.trim() === "" && activeGroupMeta && (
-        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-muted/30 px-3.5 py-2.5 text-xs text-muted-foreground">
-          <span>{activeGroupMeta.description}</span>
-          {activeGroupModified > 0 && (
+      {isSearching ? (
+        <div className="grid gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+            <span className="tabular-nums">
+              匹配 “{trimmedQuery}” 共 {searchResults.length} 项参数（含{" "}
+              {searchResults.filter((s) => !s.common).length} 项高级选项）
+            </span>
             <Button
               type="button"
               variant="ghost"
               size="xs"
-              disabled={disabled}
-              onClick={() => resetGroup(activeGroupMeta.key)}
+              onClick={() => setQuery("")}
             >
-              <RotateCcw />
-              恢复本组默认 ({activeGroupModified})
+              清空搜索
             </Button>
-          )}
-        </div>
-      )}
+          </div>
 
-      {filteredSpecs.length === 0 ? (
-        <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed py-10 text-center text-sm text-muted-foreground">
-          <SlidersHorizontal className="size-5" />
-          <p>
-            {onlyModified
-              ? "当前范围内没有修改过的参数（全部与官方默认值一致）。"
-              : `没有匹配“${query.trim()}”的训练参数。`}
-          </p>
-          {(onlyModified || query.trim() !== "") && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                setOnlyModified(false)
-                setQuery("")
-              }}
-            >
-              显示全部参数
-            </Button>
+          {searchResults.length === 0 ? (
+            <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed py-10 text-center text-sm text-muted-foreground">
+              <SlidersHorizontal className="size-5" />
+              <p>没有匹配“{trimmedQuery}”的训练参数。</p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setQuery("")}
+              >
+                返回参数配置
+              </Button>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+              {searchResults.map((spec) => (
+                <ParamControlCard
+                  key={spec.key}
+                  spec={spec}
+                  value={spec.key in values ? values[spec.key] : spec.default}
+                  modified={isParamModifiedForMode(
+                    spec,
+                    values,
+                    effectiveInitMode
+                  )}
+                  disabled={isSpecLocked(spec)}
+                  lockedHint={specLockedHint(spec)}
+                  tierBadge={
+                    spec.common
+                      ? "常用"
+                      : `高级 · ${groupLabelByKey.get(spec.group) ?? spec.group}`
+                  }
+                  onChange={(nextVal) => setOneParam(spec.key, nextVal)}
+                  onReset={() => resetOneParam(spec)}
+                />
+              ))}
+            </div>
           )}
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-          {filteredSpecs.map((spec) => (
-            <ParamControlCard
-              key={spec.key}
-              spec={spec}
-              value={spec.key in values ? values[spec.key] : spec.default}
-              modified={isParamModified(spec, values)}
-              disabled={
-                disabled || (spec.key === "resume" && initMode === "resume")
-              }
-              onChange={(nextVal) => setOneParam(spec.key, nextVal)}
-              onReset={() => resetOneParam(spec)}
-            />
-          ))}
-        </div>
+        <>
+          {/* 一、常用参数区（直接展示） */}
+          <section className="grid gap-3" aria-label="常用训练参数">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Sparkles className="size-4 text-primary" />
+                <h4 className="text-sm font-semibold">常用参数</h4>
+                <Badge variant="outline" className="font-normal tabular-nums">
+                  {commonSpecs.length} 项
+                </Badge>
+                {commonModified > 0 && (
+                  <Badge
+                    variant="secondary"
+                    className="font-normal tabular-nums"
+                  >
+                    已修改 {commonModified} 项
+                  </Badge>
+                )}
+              </div>
+
+              {commonModified > 0 && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  disabled={disabled}
+                  onClick={() => resetSpecs(commonSpecs)}
+                >
+                  <RotateCcw />
+                  恢复常用默认 ({commonModified})
+                </Button>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+              {commonSpecs.map((spec) => (
+                <ParamControlCard
+                  key={spec.key}
+                  spec={spec}
+                  value={spec.key in values ? values[spec.key] : spec.default}
+                  modified={isParamModifiedForMode(
+                    spec,
+                    values,
+                    effectiveInitMode
+                  )}
+                  disabled={isSpecLocked(spec)}
+                  lockedHint={specLockedHint(spec)}
+                  onChange={(nextVal) => setOneParam(spec.key, nextVal)}
+                  onReset={() => resetOneParam(spec)}
+                />
+              ))}
+            </div>
+          </section>
+
+          {/* 二、高级选项折叠面板（其余 74 项） */}
+          <section
+            className={cn(
+              "overflow-hidden rounded-xl border transition-colors",
+              modifiedAdvancedItems.length > 0 && !advancedOpen
+                ? "border-primary/35 bg-primary/[0.015]"
+                : "bg-muted/15"
+            )}
+            aria-label="高级训练选项"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3.5">
+              <button
+                type="button"
+                aria-expanded={advancedOpen}
+                onClick={() => setAdvancedOpen((prev) => !prev)}
+                className="flex min-w-0 flex-1 items-start gap-2.5 text-left"
+              >
+                <SlidersHorizontal className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                <div className="grid min-w-0 gap-0.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold">高级选项</span>
+                    <Badge
+                      variant="outline"
+                      className="font-normal tabular-nums"
+                    >
+                      共 {advancedSpecs.length} 项
+                    </Badge>
+                    {modifiedAdvancedItems.length > 0 && (
+                      <Badge
+                        variant="secondary"
+                        className="font-normal text-primary tabular-nums"
+                      >
+                        已自定义 {modifiedAdvancedItems.length} 项
+                      </Badge>
+                    )}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    学习率衰减与损失函数权重、几何与颜色数据增强、网络层冻结、验证阈值及可视化等低频参数。
+                  </p>
+                </div>
+              </button>
+
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                aria-expanded={advancedOpen}
+                onClick={() => setAdvancedOpen((prev) => !prev)}
+              >
+                {advancedOpen ? (
+                  <>
+                    收起高级选项
+                    <ChevronUp />
+                  </>
+                ) : (
+                  <>
+                    展开高级选项
+                    <ChevronDown />
+                  </>
+                )}
+              </Button>
+            </div>
+
+            {/* 收起态已修改高级参数摘要 */}
+            {!advancedOpen && modifiedAdvancedItems.length > 0 && (
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-primary/15 bg-primary/[0.03] px-4 py-2.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">
+                    已自定义的高级参数：
+                  </span>
+                  {modifiedAdvancedItems
+                    .slice(0, MAX_COLLAPSED_CHIPS)
+                    .map(({ spec, value }) => (
+                      <button
+                        key={spec.key}
+                        type="button"
+                        onClick={openAdvancedModifiedView}
+                        title={`${spec.label}（官方默认：${formatParamValueText(spec.default)}）`}
+                        className="inline-flex items-center gap-1 rounded-md border border-primary/25 bg-background px-2 py-0.5 font-mono text-[11px] text-foreground transition-colors hover:border-primary/50 hover:bg-primary/5"
+                      >
+                        <span className="text-muted-foreground">{spec.key}=</span>
+                        <span className="font-semibold text-primary">
+                          {formatCompactParamValue(value)}
+                        </span>
+                      </button>
+                    ))}
+                  {hiddenAdvancedChipCount > 0 && (
+                    <Badge
+                      variant="outline"
+                      className="h-5 px-1.5 text-[11px] font-normal tabular-nums"
+                    >
+                      +{hiddenAdvancedChipCount} 项
+                    </Badge>
+                  )}
+                </div>
+
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  onClick={openAdvancedModifiedView}
+                >
+                  展开仅看已修改
+                </Button>
+              </div>
+            )}
+
+            {/* 展开态高级参数内容 */}
+            {advancedOpen && (
+              <div className="grid min-w-0 gap-4 border-t bg-background p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <Tabs
+                    value={activeTab}
+                    onValueChange={(next) =>
+                      setActiveTab(next as ParamGroupKey | "all")
+                    }
+                    className="min-w-0 flex-1"
+                  >
+                    <ScrollingTabsList value={activeTab}>
+                      {schema.groups.map((group) => {
+                        const groupCount = advancedSpecs.filter(
+                          (s) => s.group === group.key
+                        ).length
+                        const modCount = countModifiedParams(
+                          advancedSpecs,
+                          values,
+                          group.key,
+                          effectiveInitMode
+                        )
+                        return (
+                          <TabsTrigger
+                            key={group.key}
+                            value={group.key}
+                            className="gap-1.5"
+                          >
+                            {group.label}
+                            <span className="text-[11px] text-muted-foreground tabular-nums">
+                              ({groupCount})
+                            </span>
+                            {modCount > 0 && (
+                              <Badge
+                                variant="secondary"
+                                className="h-5 px-1.5 text-[11px] tabular-nums"
+                              >
+                                {modCount}
+                              </Badge>
+                            )}
+                          </TabsTrigger>
+                        )
+                      })}
+                      <TabsTrigger value="all" className="gap-1.5">
+                        全部高级 ({advancedSpecs.length})
+                      </TabsTrigger>
+                    </ScrollingTabsList>
+                  </Tabs>
+
+                  <div className="flex shrink-0 flex-wrap items-center gap-3">
+                    <label className="flex cursor-pointer items-center gap-2 text-xs select-none">
+                      <Switch
+                        checked={onlyModifiedAdvanced}
+                        onCheckedChange={setOnlyModifiedAdvanced}
+                      />
+                      <span className="tabular-nums">
+                        仅看已修改 ({modifiedAdvancedItems.length})
+                      </span>
+                    </label>
+
+                    {modifiedAdvancedItems.length > 0 && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        disabled={disabled}
+                        onClick={() => resetSpecs(advancedSpecs)}
+                      >
+                        <RotateCcw />
+                        重置全部高级
+                      </Button>
+                    )}
+                  </div>
+                </div>
+
+                {activeGroupMeta && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-muted/30 px-3.5 py-2 text-xs text-muted-foreground">
+                    <span>{activeGroupMeta.description}</span>
+                    {activeAdvancedGroupModified > 0 && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="xs"
+                        disabled={disabled}
+                        onClick={() => resetAdvancedGroup(activeGroupMeta.key)}
+                      >
+                        <RotateCcw />
+                        恢复本组默认 ({activeAdvancedGroupModified})
+                      </Button>
+                    )}
+                  </div>
+                )}
+
+                {filteredAdvancedSpecs.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed py-10 text-center text-sm text-muted-foreground">
+                    <SlidersHorizontal className="size-5" />
+                    <p>
+                      当前高级分组中没有修改过的参数（全部与官方默认值一致）。
+                    </p>
+                    {onlyModifiedAdvanced && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setOnlyModifiedAdvanced(false)}
+                      >
+                        显示本组全部高级参数
+                      </Button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+                    {filteredAdvancedSpecs.map((spec) => (
+                      <ParamControlCard
+                        key={spec.key}
+                        spec={spec}
+                        value={
+                          spec.key in values ? values[spec.key] : spec.default
+                        }
+                        modified={isParamModifiedForMode(
+                          spec,
+                          values,
+                          effectiveInitMode
+                        )}
+                        disabled={isSpecLocked(spec)}
+                        lockedHint={specLockedHint(spec)}
+                        onChange={(nextVal) => setOneParam(spec.key, nextVal)}
+                        onReset={() => resetOneParam(spec)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+        </>
       )}
 
       <Dialog open={yamlOpen} onOpenChange={setYamlOpen}>
@@ -338,6 +689,8 @@ function ParamControlCard({
   value,
   modified,
   disabled,
+  lockedHint,
+  tierBadge,
   onChange,
   onReset,
 }: {
@@ -345,6 +698,8 @@ function ParamControlCard({
   value: unknown
   modified: boolean
   disabled: boolean
+  lockedHint?: string
+  tierBadge?: string
   onChange: (next: unknown) => void
   onReset: () => void
 }) {
@@ -370,6 +725,14 @@ function ParamControlCard({
             <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] font-normal text-muted-foreground">
               {spec.key}
             </code>
+            {tierBadge && (
+              <Badge
+                variant={spec.common ? "secondary" : "outline"}
+                className="h-5 px-1.5 text-[10px] font-normal"
+              >
+                {tierBadge}
+              </Badge>
+            )}
             {scopeLabel && (
               <Badge
                 variant="outline"
@@ -380,15 +743,14 @@ function ParamControlCard({
             )}
           </label>
 
-          {modified && (
+          {modified && !disabled && (
             <Button
               type="button"
               variant="ghost"
               size="xs"
-              disabled={disabled}
               onClick={onReset}
               className="h-6 shrink-0 px-1.5 text-xs text-muted-foreground hover:text-foreground"
-              title={`恢复官方默认值：${formatParamValueText(spec.default)}`}
+              title={`恢复默认值：${formatParamValueText(spec.default)}`}
             >
               <RotateCcw className="size-3" />
               恢复默认
@@ -410,8 +772,10 @@ function ParamControlCard({
           onChange={onChange}
         />
         <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground tabular-nums">
-          <span>官方默认：{formatParamValueText(spec.default)}</span>
-          {spec.min !== undefined && spec.max !== undefined && (
+          <span>
+            {lockedHint ?? `官方默认：${formatParamValueText(spec.default)}`}
+          </span>
+          {!lockedHint && spec.min !== undefined && spec.max !== undefined && (
             <span>
               范围：{spec.min} – {spec.max}
             </span>

@@ -32,6 +32,8 @@ var (
 	errProjectNotFound     = &Error{Kind: ErrNotFound, Message: "项目不存在"}
 	errDataVersionNotFound = &Error{Kind: ErrNotFound, Message: "数据版本不存在"}
 	errBaseModelNotFound   = &Error{Kind: ErrNotFound, Message: "基础模型不存在"}
+	errTemplateNotFound    = &Error{Kind: ErrNotFound, Message: "参数模板不存在"}
+	errTemplateNameExists  = &Error{Kind: ErrConflict, Message: "已存在同名的参数模板，请更换名称"}
 	errArtifactNotFound    = &Error{Kind: ErrNotFound, Message: "训练产物文件不存在"}
 	errTaskGone            = &Error{Kind: ErrNotFound, Message: "训练任务已不存在"}
 	errTaskNotYours        = &Error{Kind: ErrConflict, Message: "该训练任务未被此节点持有（可能已取消、超时重入队或已结束）"}

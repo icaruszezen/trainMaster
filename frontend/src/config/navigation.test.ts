@@ -54,16 +54,32 @@ describe("navigation config", () => {
     }
   })
 
-  it("marks training jobs and compute modules as implemented with their APIs", () => {
+  it("marks training jobs, parameter templates, and compute modules as implemented with their APIs", () => {
     expect(getNavItem("training-jobs")).toMatchObject({
       status: "ready",
       path: "/training/jobs",
       apiPath: "/api/v1/training/jobs",
     })
+    expect(getNavItem("training-templates")).toMatchObject({
+      status: "ready",
+      title: "参数模板",
+      path: "/training/templates",
+      apiPath: "/api/v1/training/templates",
+    })
     expect(getNavItem("compute")).toMatchObject({
       status: "ready",
       path: "/training/compute",
       apiPath: "/api/v1/compute",
+    })
+    expect(findActiveNavItem("/training/templates/new")).toMatchObject({
+      group: { id: "training" },
+      item: { id: "training-templates" },
+      exact: false,
+    })
+    expect(findActiveNavItem("/training/templates/5/edit")).toMatchObject({
+      group: { id: "training" },
+      item: { id: "training-templates" },
+      exact: false,
     })
   })
 

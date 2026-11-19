@@ -2,21 +2,41 @@ import { describe, expect, it } from "vitest"
 
 import type { ParamSpec } from "@/features/training/api"
 import {
+  applyTemplateParams,
   buildDefaultParams,
+  buildTemplateDefaultParams,
+  buildTemplateParamsPayload,
   countModifiedParams,
+  countTemplateParamDiffs,
   filterParamSpecs,
+  formatCompactParamValue,
   formatParamsYaml,
   isParamModified,
+  isParamModifiedForMode,
+  listModifiedParams,
   parseFreezeText,
   parseIntListText,
+  splitSpecsByTier,
   validateTrainingParams,
 } from "@/features/training/training-params"
 
 const sampleSpecs: ParamSpec[] = [
   {
+    key: "lr0",
+    label: "初始学习率 (lr0)",
+    group: "hyperparameters",
+    common: true,
+    type: "float",
+    default: 0.01,
+    min: 1e-7,
+    max: 10,
+    description: "SGD 初始学习率",
+  },
+  {
     key: "epochs",
     label: "训练轮数 (epochs)",
     group: "train",
+    common: true,
     type: "int",
     default: 100,
     min: 1,
@@ -27,6 +47,7 @@ const sampleSpecs: ParamSpec[] = [
     key: "batch",
     label: "批次大小 (batch)",
     group: "train",
+    common: true,
     type: "batch",
     default: 16,
     description: "固定批大小或自动显存占比",
@@ -35,6 +56,7 @@ const sampleSpecs: ParamSpec[] = [
     key: "imgsz",
     label: "输入图像尺寸 (imgsz)",
     group: "train",
+    common: true,
     type: "imgsz",
     default: 640,
     description: "32 的倍数",
@@ -43,6 +65,7 @@ const sampleSpecs: ParamSpec[] = [
     key: "pretrained",
     label: "预训练权重 (pretrained)",
     group: "train",
+    common: false,
     type: "bool",
     default: true,
     description: "是否启用预训练权重",
@@ -51,24 +74,16 @@ const sampleSpecs: ParamSpec[] = [
     key: "resume",
     label: "断点续训 (resume)",
     group: "train",
+    common: false,
     type: "bool",
     default: false,
     description: "恢复优化器状态",
   },
   {
-    key: "lr0",
-    label: "初始学习率 (lr0)",
-    group: "hyperparameters",
-    type: "float",
-    default: 0.01,
-    min: 1e-7,
-    max: 10,
-    description: "SGD 初始学习率",
-  },
-  {
     key: "mosaic",
     label: "Mosaic 增强 (mosaic)",
     group: "augmentation",
+    common: true,
     type: "float",
     default: 1.0,
     min: 0,
@@ -79,6 +94,7 @@ const sampleSpecs: ParamSpec[] = [
     key: "overlap_mask",
     label: "合并掩码 (overlap_mask)",
     group: "train",
+    common: false,
     type: "bool",
     default: true,
     task_scope: "segment",
@@ -88,6 +104,7 @@ const sampleSpecs: ParamSpec[] = [
     key: "classes",
     label: "指定评估类别 (classes)",
     group: "val",
+    common: false,
     type: "int_list",
     default: null,
     description: "评估类别列表",
@@ -104,9 +121,17 @@ describe("buildDefaultParams & countModifiedParams", () => {
     expect(finetuneDefaults.resume).toBe(false)
     expect(countModifiedParams(sampleSpecs, finetuneDefaults)).toBe(0)
 
+    const scratchDefaults = buildDefaultParams(sampleSpecs, "scratch")
+    expect(scratchDefaults.pretrained).toBe(false)
+    expect(countModifiedParams(sampleSpecs, scratchDefaults, undefined, "scratch")).toBe(0)
+
     const resumeDefaults = buildDefaultParams(sampleSpecs, "resume")
     expect(resumeDefaults.resume).toBe(true)
-    expect(isParamModified(sampleSpecs[4], resumeDefaults)).toBe(true)
+    const resumeSpec = sampleSpecs.find((s) => s.key === "resume")!
+    expect(isParamModified(resumeSpec, resumeDefaults)).toBe(true)
+    expect(isParamModifiedForMode(resumeSpec, resumeDefaults, "resume")).toBe(
+      false
+    )
   })
 
   it("counts modified params globally and per group", () => {
@@ -121,6 +146,96 @@ describe("buildDefaultParams & countModifiedParams", () => {
     expect(countModifiedParams(sampleSpecs, values, "hyperparameters")).toBe(1)
     expect(countModifiedParams(sampleSpecs, values, "val")).toBe(1)
     expect(countModifiedParams(sampleSpecs, values, "augmentation")).toBe(0)
+  })
+})
+
+describe("splitSpecsByTier & template parameter helpers", () => {
+  it("splits specs into ordered common params and advanced params", () => {
+    const { common, advanced } = splitSpecsByTier(sampleSpecs)
+    expect(common.map((s) => s.key)).toEqual([
+      "epochs",
+      "batch",
+      "imgsz",
+      "lr0",
+      "mosaic",
+    ])
+    expect(advanced.map((s) => s.key)).toEqual([
+      "pretrained",
+      "resume",
+      "overlap_mask",
+      "classes",
+    ])
+  })
+
+  it("applies templates while respecting initMode bindings and counts template diffs", () => {
+    const tpl = {
+      ...buildTemplateDefaultParams(sampleSpecs),
+      epochs: 200,
+      imgsz: 1280,
+      classes: [0, 1],
+      resume: true,
+    }
+
+    const scratchApplied = applyTemplateParams(sampleSpecs, tpl, "scratch")
+    expect(scratchApplied.epochs).toBe(200)
+    expect(scratchApplied.imgsz).toBe(1280)
+    expect(scratchApplied.classes).toEqual([0, 1])
+    expect(scratchApplied.resume).toBe(false)
+    expect(scratchApplied.pretrained).toBe(false)
+
+    const resumeApplied = applyTemplateParams(sampleSpecs, tpl, "resume")
+    expect(resumeApplied.resume).toBe(true)
+    expect(resumeApplied.pretrained).toBe(true)
+
+    expect(
+      countTemplateParamDiffs(sampleSpecs, scratchApplied, tpl, "scratch")
+    ).toBe(0)
+    expect(
+      countTemplateParamDiffs(
+        sampleSpecs,
+        { ...scratchApplied, epochs: 250, lr0: 0.002 },
+        tpl,
+        "scratch"
+      )
+    ).toBe(2)
+  })
+
+  it("normalizes payload when saving a template from a scratch or resume job", () => {
+    const scratchValues = {
+      ...buildDefaultParams(sampleSpecs, "scratch"),
+      epochs: 150,
+      classes: [1],
+    }
+    const payload = buildTemplateParamsPayload(
+      sampleSpecs,
+      scratchValues,
+      "scratch"
+    )
+    expect(payload.epochs).toBe(150)
+    expect(payload.classes).toEqual([1])
+    expect(payload.pretrained).toBe(true)
+    expect(payload.resume).toBe(false)
+
+    const { advanced } = splitSpecsByTier(sampleSpecs)
+    const modAdvanced = listModifiedParams(advanced, scratchValues, "scratch")
+    expect(modAdvanced.map((item) => item.spec.key)).toEqual(["classes"])
+
+    const pretrainedSpec = sampleSpecs.find((s) => s.key === "pretrained")!
+    // In scratch mode, neither pretrained=false (UI default) nor pretrained=true (API/official default) is a user override.
+    expect(
+      isParamModifiedForMode(pretrainedSpec, { pretrained: false }, "scratch")
+    ).toBe(false)
+    expect(
+      isParamModifiedForMode(pretrainedSpec, { pretrained: true }, "scratch")
+    ).toBe(false)
+    expect(
+      isParamModifiedForMode(pretrainedSpec, { pretrained: false }, "finetune")
+    ).toBe(true)
+
+    expect(formatCompactParamValue(null)).toBe("自动")
+    expect(formatCompactParamValue("")).toBe("禁用")
+    expect(formatCompactParamValue([640, 960])).toBe("[640,960]")
+    expect(formatCompactParamValue(false)).toBe("false")
   })
 })
 

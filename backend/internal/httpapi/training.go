@@ -17,6 +17,15 @@ import (
 
 func (s *server) trainingRoutes(r chi.Router) {
 	r.Get("/params-schema", s.getTrainingParamsSchema)
+	r.Route("/templates", func(r chi.Router) {
+		r.Get("/", s.listTrainingTemplates)
+		r.Post("/", s.createTrainingTemplate)
+		r.Route("/{templateID}", func(r chi.Router) {
+			r.Get("/", s.getTrainingTemplate)
+			r.Patch("/", s.updateTrainingTemplate)
+			r.Delete("/", s.deleteTrainingTemplate)
+		})
+	})
 	r.Route("/jobs", func(r chi.Router) {
 		r.Get("/", s.listTrainingJobs)
 		r.Post("/", s.createTrainingJob)
@@ -59,8 +68,80 @@ func trainingJobID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	return pathIDOr404(w, r, "jobID", "训练任务不存在")
 }
 
+func trainingTemplateID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	return pathIDOr404(w, r, "templateID", "参数模板不存在")
+}
+
 func (s *server) getTrainingParamsSchema(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, training.ParamsSchema())
+}
+
+func (s *server) listTrainingTemplates(w http.ResponseWriter, r *http.Request) {
+	search, ok := searchParam(w, r)
+	if !ok {
+		return
+	}
+	items, err := s.training.ListTemplates(r.Context(), search)
+	if err != nil {
+		s.trainingError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, NewList(items, len(items)))
+}
+
+func (s *server) createTrainingTemplate(w http.ResponseWriter, r *http.Request) {
+	var req training.CreateTemplateInput
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	tpl, err := s.training.CreateTemplate(r.Context(), req)
+	if err != nil {
+		s.trainingError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, tpl)
+}
+
+func (s *server) getTrainingTemplate(w http.ResponseWriter, r *http.Request) {
+	id, ok := trainingTemplateID(w, r)
+	if !ok {
+		return
+	}
+	tpl, err := s.training.GetTemplate(r.Context(), id)
+	if err != nil {
+		s.trainingError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, tpl)
+}
+
+func (s *server) updateTrainingTemplate(w http.ResponseWriter, r *http.Request) {
+	id, ok := trainingTemplateID(w, r)
+	if !ok {
+		return
+	}
+	var req training.UpdateTemplateInput
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	tpl, err := s.training.UpdateTemplate(r.Context(), id, req)
+	if err != nil {
+		s.trainingError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, tpl)
+}
+
+func (s *server) deleteTrainingTemplate(w http.ResponseWriter, r *http.Request) {
+	id, ok := trainingTemplateID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.training.DeleteTemplate(r.Context(), id); err != nil {
+		s.trainingError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *server) listTrainingJobs(w http.ResponseWriter, r *http.Request) {

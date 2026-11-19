@@ -14,6 +14,8 @@ import {
   AlertTriangle,
   ArrowLeft,
   Award,
+  Bookmark,
+  BookmarkPlus,
   Box,
   ChevronDown,
   ChevronUp,
@@ -98,10 +100,12 @@ import {
   trainingQueueText,
 } from "@/features/training/format"
 import {
+  editTrainingTemplatePath,
   newTrainingJobPath,
   parsePositiveId,
   TRAINING_JOBS_PATH,
 } from "@/features/training/paths"
+import { SaveTemplateDialog } from "@/features/training/save-template-dialog"
 import { TrainingCurves } from "@/features/training/training-curves"
 import {
   canRegisterAnyWeight,
@@ -114,7 +118,8 @@ import {
   filterParamSpecs,
   formatParamsYaml,
   formatParamValueText,
-  isParamModified,
+  isParamModifiedForMode,
+  splitSpecsByTier,
 } from "@/features/training/training-params"
 import { TrainingStatusBadge } from "@/features/training/training-status"
 import { ApiError } from "@/lib/api"
@@ -348,6 +353,24 @@ export function TrainingJobDetailPage() {
             </>
           )}
         </span>
+        {job.template_name && (
+          <span className="inline-flex items-center gap-1">
+            <Bookmark className="size-3.5 text-primary" />
+            参数模板：
+            {job.template_id !== null ? (
+              <Link
+                to={editTrainingTemplatePath(job.template_id)}
+                className="font-medium text-foreground underline-offset-4 hover:underline"
+              >
+                {job.template_name}
+              </Link>
+            ) : (
+              <span className="font-medium text-foreground">
+                {job.template_name}（模板已删除）
+              </span>
+            )}
+          </span>
+        )}
         {(job.node || job.result?.node_name) && (
           <span className="inline-flex items-center gap-1">
             <Server className="size-3.5" />
@@ -1006,140 +1029,209 @@ function ParamsTab({
 }) {
   const [query, setQuery] = useState("")
   const [onlyModified, setOnlyModified] = useState(false)
+  const [saveOpen, setSaveOpen] = useState(false)
 
   if (!schema) {
     return <Skeleton className="h-64 rounded-xl" />
   }
 
-  const modifiedCount = countModifiedParams(schema.specs, job.params)
-  const filtered = filterParamSpecs(schema.specs, job.params, {
+  const { common: commonSpecs, advanced: advancedSpecs } = splitSpecsByTier(
+    schema.specs
+  )
+  const orderedSpecs = [...commonSpecs, ...advancedSpecs]
+
+  const modifiedCount = countModifiedParams(
+    orderedSpecs,
+    job.params,
+    undefined,
+    job.init_mode
+  )
+  const filtered = filterParamSpecs(orderedSpecs, job.params, {
     group: "all",
     query,
     onlyModified,
+    initMode: job.init_mode,
   })
   const yamlText = formatParamsYaml(schema.specs, job.params)
 
   return (
-    <Card className="py-4">
-      <CardHeader className="flex flex-col gap-3 px-4 pb-3 sm:px-6">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <CardTitle className="text-sm font-medium">
-              本次训练锁定的 YOLO 全量参数
-            </CardTitle>
-            <Badge variant="outline" className="font-normal tabular-nums">
-              共 {schema.specs.length} 项
-            </Badge>
-            {modifiedCount > 0 && (
-              <Badge variant="secondary" className="font-normal tabular-nums">
-                自定义修改 {modifiedCount} 项
+    <>
+      <Card className="py-4">
+        <CardHeader className="flex flex-col gap-3 px-4 pb-3 sm:px-6">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <CardTitle className="text-sm font-medium">
+                本次训练锁定的 YOLO 全量参数
+              </CardTitle>
+              <Badge variant="outline" className="font-normal tabular-nums">
+                常用 {commonSpecs.length} · 高级 {advancedSpecs.length}
               </Badge>
+              {modifiedCount > 0 && (
+                <Badge variant="secondary" className="font-normal tabular-nums">
+                  自定义修改 {modifiedCount} 项
+                </Badge>
+              )}
+              {job.template_name &&
+                (job.template_id !== null ? (
+                  <Badge
+                    variant="outline"
+                    className="gap-1 border-primary/30 bg-primary/[0.04] font-normal"
+                    asChild
+                  >
+                    <Link to={editTrainingTemplatePath(job.template_id)}>
+                      <Bookmark className="size-3 text-primary" />
+                      来源模板：{job.template_name}
+                    </Link>
+                  </Badge>
+                ) : (
+                  <Badge variant="outline" className="gap-1 font-normal">
+                    <Bookmark className="size-3 text-muted-foreground" />
+                    来源模板：{job.template_name}（已删除）
+                  </Badge>
+                ))}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="flex cursor-pointer items-center gap-1.5 text-xs select-none">
+                <Switch
+                  checked={onlyModified}
+                  onCheckedChange={setOnlyModified}
+                />
+                仅看已修改 ({modifiedCount})
+              </label>
+              <Button
+                type="button"
+                variant="outline"
+                size="xs"
+                onClick={() => setSaveOpen(true)}
+              >
+                <BookmarkPlus />
+                存为参数模板
+              </Button>
+              <CopyButton text={yamlText} label="复制 args.yaml" />
+            </div>
+          </div>
+
+          <div className="relative max-w-md">
+            <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="搜索参数名或中文说明…"
+              className="pr-8 pl-9"
+            />
+            {query && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                className="absolute top-1/2 right-1.5 -translate-y-1/2 text-muted-foreground"
+                onClick={() => setQuery("")}
+              >
+                <X />
+              </Button>
             )}
           </div>
+        </CardHeader>
 
-          <div className="flex items-center gap-2">
-            <label className="flex cursor-pointer items-center gap-1.5 text-xs select-none">
-              <Switch
-                checked={onlyModified}
-                onCheckedChange={setOnlyModified}
-              />
-              仅看已修改 ({modifiedCount})
-            </label>
-            <CopyButton text={yamlText} label="复制 args.yaml" />
-          </div>
-        </div>
+        <CardContent className="px-0">
+          {filtered.length === 0 ? (
+            <p className="py-10 text-center text-sm text-muted-foreground">
+              {onlyModified
+                ? "本次训练完全使用了 Ultralytics 官方默认参数，没有任何修改项。"
+                : "没有匹配的训练参数。"}
+            </p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="pl-4 sm:pl-6">参数名称</TableHead>
+                  <TableHead>层级 / 分组</TableHead>
+                  <TableHead>本次训练设定值</TableHead>
+                  <TableHead className="pr-4 sm:pr-6">官方默认值</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {filtered.map((spec) => {
+                  const modified = isParamModifiedForMode(
+                    spec,
+                    job.params,
+                    job.init_mode
+                  )
+                  const groupLabel =
+                    schema.groups.find((g) => g.key === spec.group)?.label ??
+                    spec.group
+                  const val =
+                    spec.key in job.params ? job.params[spec.key] : spec.default
 
-        <div className="relative max-w-md">
-          <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="搜索参数名或中文说明…"
-            className="pr-8 pl-9"
-          />
-          {query && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              className="absolute top-1/2 right-1.5 -translate-y-1/2 text-muted-foreground"
-              onClick={() => setQuery("")}
-            >
-              <X />
-            </Button>
-          )}
-        </div>
-      </CardHeader>
-
-      <CardContent className="px-0">
-        {filtered.length === 0 ? (
-          <p className="py-10 text-center text-sm text-muted-foreground">
-            {onlyModified
-              ? "本次训练完全使用了 Ultralytics 官方默认参数，没有任何修改项。"
-              : "没有匹配的训练参数。"}
-          </p>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="pl-4 sm:pl-6">参数名称</TableHead>
-                <TableHead>分组</TableHead>
-                <TableHead>本次训练设定值</TableHead>
-                <TableHead className="pr-4 sm:pr-6">官方默认值</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {filtered.map((spec) => {
-                const modified = isParamModified(spec, job.params)
-                const groupLabel =
-                  schema.groups.find((g) => g.key === spec.group)?.label ??
-                  spec.group
-                const val =
-                  spec.key in job.params ? job.params[spec.key] : spec.default
-
-                return (
-                  <TableRow
-                    key={spec.key}
-                    className={cn(modified && "bg-primary/[0.03]")}
-                  >
-                    <TableCell className="pl-4 sm:pl-6">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="font-medium">{spec.label}</span>
-                        <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
-                          {spec.key}
-                        </code>
-                        {spec.task_scope && (
+                  return (
+                    <TableRow
+                      key={spec.key}
+                      className={cn(modified && "bg-primary/[0.03]")}
+                    >
+                      <TableCell className="pl-4 sm:pl-6">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="font-medium">{spec.label}</span>
+                          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+                            {spec.key}
+                          </code>
+                          {spec.task_scope && (
+                            <Badge
+                              variant="outline"
+                              className="h-4 px-1 text-[10px] font-normal"
+                            >
+                              {TASK_SCOPE_LABELS[spec.task_scope] ??
+                                spec.task_scope}
+                            </Badge>
+                          )}
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground">
+                        <div className="flex flex-wrap items-center gap-1.5">
                           <Badge
-                            variant="outline"
+                            variant={spec.common ? "secondary" : "outline"}
                             className="h-4 px-1 text-[10px] font-normal"
                           >
-                            {TASK_SCOPE_LABELS[spec.task_scope] ??
-                              spec.task_scope}
+                            {spec.common ? "常用" : "高级"}
                           </Badge>
-                        )}
-                      </div>
-                    </TableCell>
-                    <TableCell className="text-xs text-muted-foreground">
-                      {groupLabel}
-                    </TableCell>
-                    <TableCell className="font-mono text-xs">
-                      <span
-                        className={cn(modified && "font-semibold text-primary")}
-                      >
-                        {formatParamValueText(val)}
-                      </span>
-                    </TableCell>
-                    <TableCell className="pr-4 font-mono text-xs text-muted-foreground sm:pr-6">
-                      {formatParamValueText(spec.default)}
-                    </TableCell>
-                  </TableRow>
-                )
-              })}
-            </TableBody>
-          </Table>
-        )}
-      </CardContent>
-    </Card>
+                          <span>{groupLabel}</span>
+                        </div>
+                      </TableCell>
+                      <TableCell className="font-mono text-xs">
+                        <span
+                          className={cn(
+                            modified && "font-semibold text-primary"
+                          )}
+                        >
+                          {formatParamValueText(val)}
+                        </span>
+                      </TableCell>
+                      <TableCell className="pr-4 font-mono text-xs text-muted-foreground sm:pr-6">
+                        {formatParamValueText(spec.default)}
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
+      <SaveTemplateDialog
+        open={saveOpen}
+        onOpenChange={setSaveOpen}
+        schema={schema}
+        params={job.params}
+        initMode={job.init_mode}
+        defaultName={
+          job.name ? `${job.name}-模板` : `训练 #${job.id} 参数模板`
+        }
+        defaultDescription={job.description}
+        title="将本次训练参数存为模板"
+        description={`保存“${trainingJobTitle(job)}”的 YOLO 训练参数配置，方便后续发起训练时一键复用。`}
+      />
+    </>
   )
 }
 
