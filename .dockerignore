@@ -4,6 +4,7 @@
 !backend/
 !frontend/
 !deploy/docker/entrypoint.sh
+!deploy/docker/storage-entrypoint.sh
 # Windows 训练节点的安装脚本与安装包的源文件（平台提供下载）
 !trainer/pyproject.toml
 !trainer/requirements.txt
