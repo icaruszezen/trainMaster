@@ -12,6 +12,7 @@ import { useId, useMemo, useState, type FormEvent } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import {
   AlertTriangle,
+  Archive,
   ArrowLeft,
   Layers,
   Plus,
@@ -22,6 +23,7 @@ import { Link, useNavigate, useSearchParams } from "react-router"
 import { toast } from "sonner"
 
 import { PageHeader } from "@/components/page-header"
+import { StorageNodeBadge } from "@/components/storage-node-badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -69,6 +71,7 @@ import {
   yoloVersions,
 } from "@/features/models/yolo-versions"
 import { projectsQuery, type Project } from "@/features/projects/api"
+import { trainingDatasetCopyLabel } from "@/features/system/storage-api"
 import {
   cacheTrainingJob,
   createTrainingJob,
@@ -518,6 +521,7 @@ function NewTrainingJobForm({
                 <span className="font-medium text-foreground">
                   {dataVersionTitle(selectedVersion)}
                 </span>
+                <StorageNodeBadge node={selectedVersion.storage_node} />
                 <span className="text-muted-foreground">·</span>
                 <span className="text-muted-foreground tabular-nums">
                   {splitSummary(versionSplitCounts(selectedVersion))}
@@ -527,6 +531,13 @@ function NewTrainingJobForm({
                   {selectedVersion.classes.length} 个类别
                 </span>
               </div>
+              <p className="flex items-center gap-1.5 text-muted-foreground">
+                <Archive className="size-3.5 shrink-0" aria-hidden />
+                <span>
+                  训练拷贝策略：
+                  {trainingDatasetCopyLabel(selectedVersion.storage_node)}
+                </span>
+              </p>
               {selectedVersion.classes.length > 0 && (
                 <div className="flex flex-wrap gap-1">
                   {selectedVersion.classes.slice(0, 16).map((cls, idx) => (

@@ -117,7 +117,7 @@ export function statusDetailText(
   if (v.status === "building" && v.progress) {
     return progressText(v.progress)
   }
-  return DATA_VERSION_STATUS_LABELS[v.status]
+  return DATA_VERSION_STATUS_LABELS[v.status] ?? v.status
 }
 
 /** “训练 800 · 验证 200 · 测试 0”。 */

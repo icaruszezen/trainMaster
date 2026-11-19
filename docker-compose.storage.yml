@@ -1,0 +1,55 @@
+# trainMaster 独立存储服务器一键部署配置（仅运行 trainmaster-storage 容器）。
+#
+# 在任意存储服务器（Linux / NAS / Docker 主机）上启动：
+#   TM_STORAGE_HOST_DIR=/mnt/storage TM_STORAGE_TOKEN=请替换为随机密钥 \
+#     docker compose -f docker-compose.storage.yml up -d --build
+#
+# 启动后，在 trainMaster 平台的「系统设置 → 存储管理」中点击「添加存储节点」，
+# 选择「trainMaster 存储服务（Docker 推荐）」，填入 http://<存储服务器IP>:8090 与令牌即可。
+
+name: trainmaster-storage
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  storage:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.storage
+      args:
+        GO_IMAGE: ${GO_IMAGE:-golang:1.25-alpine}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-alpine:3.23}
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+        ALPINE_MIRROR: ${ALPINE_MIRROR:-}
+        VERSION: ${TM_VERSION:-}
+        COMMIT: ${TM_COMMIT:-}
+        BUILD_TIME: ${TM_BUILD_TIME:-}
+    image: trainmaster-storage:${TM_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    hostname: ${TM_STORAGE_HOSTNAME:-trainmaster-storage}
+    ports:
+      - "${TM_STORAGE_PORT:-8090}:8090"
+    environment:
+      TM_STORAGE_ADDR: ":8090"
+      TM_STORAGE_DATA_DIR: /data
+      TM_STORAGE_TOKEN: ${TM_STORAGE_TOKEN:-}
+      TM_STORAGE_TEMP_TTL: ${TM_STORAGE_TEMP_TTL:-2h}
+      TM_LOG_LEVEL: ${TM_LOG_LEVEL:-info}
+      TM_LOG_FORMAT: json
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ${TM_STORAGE_HOST_DIR:-./data/storage-node}:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -Y off -qO- http://127.0.0.1:8090/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    stop_grace_period: 20s

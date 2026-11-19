@@ -7,7 +7,7 @@ import { queryOptions, useQuery } from "@tanstack/react-query"
 import { apiGet, apiSend, type ListResponse } from "@/lib/api"
 import { queryClient } from "@/lib/query-client"
 
-export type StorageNodeKind = "local" | "s3" | "smb"
+export type StorageNodeKind = "local" | "docker" | "s3" | "smb"
 
 export type StorageNodeStatus = "unknown" | "ok" | "error"
 
@@ -17,6 +17,7 @@ export type StorageNodeRef = {
   name: string
   kind: StorageNodeKind
   is_builtin: boolean
+  supports_archive?: boolean
 }
 
 export const BUILTIN_STORAGE_NODE_REF: StorageNodeRef = {
@@ -28,6 +29,11 @@ export const BUILTIN_STORAGE_NODE_REF: StorageNodeRef = {
 
 export type LocalStorageConfig = {
   path: string
+}
+
+export type DockerStorageConfig = {
+  endpoint: string
+  insecure_skip_verify: boolean
 }
 
 export type S3StorageConfig = {
@@ -51,8 +57,31 @@ export type SMBStorageConfig = {
 
 export type StorageNodeConfig = {
   local?: LocalStorageConfig
+  docker?: DockerStorageConfig
   s3?: S3StorageConfig
   smb?: SMBStorageConfig
+  /** 兼容顶层扁平化配置字段返回 */
+  endpoint?: string
+  insecure_skip_verify?: boolean
+}
+
+/** 兼容嵌套 `config.docker` 与顶层扁平 `config.endpoint` 两种服务端响应格式。 */
+export function getDockerConfig(
+  config?: StorageNodeConfig | null
+): DockerStorageConfig | undefined {
+  if (!config) {
+    return undefined
+  }
+  if (config.docker) {
+    return config.docker
+  }
+  if (typeof config.endpoint === "string" && config.endpoint !== "") {
+    return {
+      endpoint: config.endpoint,
+      insecure_skip_verify: Boolean(config.insecure_skip_verify),
+    }
+  }
+  return undefined
 }
 
 export type StorageUsageInfo = {
@@ -76,6 +105,7 @@ export type StorageNode = {
   is_builtin: boolean
   is_active: boolean
   has_secret: boolean
+  supports_archive?: boolean
   display_target: string
   config: StorageNodeConfig
   status: StorageNodeStatus
@@ -91,8 +121,11 @@ export type CreateStorageNodeInput = {
   name: string
   kind: StorageNodeKind
   local?: LocalStorageConfig
+  docker?: DockerStorageConfig
+  config?: DockerStorageConfig
   s3?: S3StorageConfig
   smb?: SMBStorageConfig
+  token?: string
   secret_access_key?: string
   password?: string
   activate: boolean
@@ -101,8 +134,11 @@ export type CreateStorageNodeInput = {
 export type UpdateStorageNodeInput = {
   name?: string
   local?: LocalStorageConfig
+  docker?: DockerStorageConfig
+  config?: DockerStorageConfig
   s3?: S3StorageConfig
   smb?: SMBStorageConfig
+  token?: string
   secret_access_key?: string
   password?: string
   clear_secret?: boolean
@@ -112,8 +148,11 @@ export type TestStorageNodeInput = {
   node_id?: number
   kind: StorageNodeKind
   local?: LocalStorageConfig
+  docker?: DockerStorageConfig
+  config?: DockerStorageConfig
   s3?: S3StorageConfig
   smb?: SMBStorageConfig
+  token?: string
   secret_access_key?: string
   password?: string
 }
@@ -135,11 +174,12 @@ export type TrainerCachePolicy = {
 export type MigrationTargetType = "dataset" | "data_version"
 
 export type MigrationStatus =
-  | "queued"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "canceled"
+  "queued" | "running" | "succeeded" | "failed" | "canceled"
+
+export type MigrationTransferMode = "archive" | "direct"
+
+export type MigrationStage =
+  "" | "packing" | "transferring" | "extracting" | "verifying" | "cleaning"
 
 export type MigratableItem = {
   target_type: MigrationTargetType
@@ -171,6 +211,9 @@ export type StorageMigration = {
   from_node: StorageNodeRef
   to_node: StorageNodeRef
   delete_source: boolean
+  transfer_mode?: MigrationTransferMode
+  stage?: MigrationStage | (string & {})
+  archive_bytes?: number
   status: MigrationStatus
   files_done: number
   files_total: number
@@ -184,15 +227,25 @@ export type StorageMigration = {
 }
 
 export const STORAGE_KIND_LABELS: Record<StorageNodeKind, string> = {
+  docker: "存储服务容器 (Docker)",
   s3: "S3 兼容对象存储（MinIO / RustFS / 云 S3）",
   smb: "SMB 共享文件夹（Windows / NAS）",
   local: "本机挂载目录",
 }
 
 export const STORAGE_KIND_SHORT_LABELS: Record<StorageNodeKind, string> = {
+  docker: "存储容器",
   s3: "S3 对象存储",
   smb: "SMB 共享",
   local: "本机目录",
+}
+
+export function storageKindLabel(kind: string): string {
+  return STORAGE_KIND_LABELS[kind as StorageNodeKind] ?? kind
+}
+
+export function storageKindShortLabel(kind: string): string {
+  return STORAGE_KIND_SHORT_LABELS[kind as StorageNodeKind] ?? kind
 }
 
 export const MIGRATION_STATUS_LABELS: Record<MigrationStatus, string> = {
@@ -201,6 +254,109 @@ export const MIGRATION_STATUS_LABELS: Record<MigrationStatus, string> = {
   succeeded: "已完成",
   failed: "失败",
   canceled: "已取消",
+}
+
+export const MIGRATION_STAGE_LABELS: Record<
+  Exclude<MigrationStage, "">,
+  string
+> = {
+  packing: "正在打包压缩…",
+  transferring: "正在传输压缩包…",
+  extracting: "正在解压落盘…",
+  verifying: "正在校验数据…",
+  cleaning: "正在清理临时包…",
+}
+
+export function migrationStageLabel(stage?: string | null): string | null {
+  if (!stage) {
+    return null
+  }
+  return MIGRATION_STAGE_LABELS[stage as Exclude<MigrationStage, "">] ?? stage
+}
+
+/** 判断存储节点是否具备存储容器打包/解压加速能力。 */
+export function nodeSupportsArchive(
+  node?: Pick<StorageNodeRef, "kind" | "supports_archive"> | null
+): boolean {
+  return Boolean(
+    node && (node.supports_archive === true || node.kind === "docker")
+  )
+}
+
+/** 根据源节点与目标节点的能力决定迁移传输模式（与后端 CanArchiveBetween 严格一致）。 */
+export function resolveMigrationTransferMode(
+  fromNode?:
+    | (Pick<StorageNodeRef, "kind" | "supports_archive"> & {
+        id?: number
+        is_builtin?: boolean
+      })
+    | null,
+  toNode?:
+    | (Pick<StorageNodeRef, "kind" | "supports_archive"> & {
+        id?: number
+        is_builtin?: boolean
+      })
+    | null
+): MigrationTransferMode {
+  if (!fromNode || !toNode) {
+    return "direct"
+  }
+  if (
+    typeof fromNode.id === "number" &&
+    typeof toNode.id === "number" &&
+    fromNode.id === toNode.id
+  ) {
+    return "direct"
+  }
+  const aDocker = fromNode.kind === "docker"
+  const bDocker = toNode.kind === "docker"
+  const aBuiltin = Boolean(fromNode.is_builtin)
+  const bBuiltin = Boolean(toNode.is_builtin)
+  if ((aDocker && bDocker) || (aDocker && bBuiltin) || (aBuiltin && bDocker)) {
+    return "archive"
+  }
+  if (
+    nodeSupportsArchive(fromNode) &&
+    nodeSupportsArchive(toNode) &&
+    (aDocker || bDocker)
+  ) {
+    return "archive"
+  }
+  return "direct"
+}
+
+export type TrainingDatasetCopyMode = "shared_local" | "archive" | "direct"
+
+export const TRAINING_DATASET_COPY_LABELS: Record<
+  TrainingDatasetCopyMode,
+  string
+> = {
+  shared_local:
+    "本机共享零拷贝（远程训练机拉取时走兼容存储流式拉取，不提供打包）",
+  archive: "存储容器打包拉取并解压（先打压缩包再传输，训练机接收后校验解压）",
+  direct: "兼容存储流式拉取（按现有方式接入，不提供打包操作）",
+}
+
+export const BUILTIN_ARCHIVE_TRAINING_COPY_LABEL =
+  "本机共享零拷贝（远程训练机拉取时走存储容器打包解压）"
+
+export function resolveTrainingDatasetCopyMode(
+  node?: Pick<StorageNodeRef, "kind" | "is_builtin" | "supports_archive"> | null
+): TrainingDatasetCopyMode {
+  if (!node || node.is_builtin) {
+    return "shared_local"
+  }
+  return nodeSupportsArchive(node) ? "archive" : "direct"
+}
+
+export function trainingDatasetCopyLabel(
+  node?: Pick<StorageNodeRef, "kind" | "is_builtin" | "supports_archive"> | null
+): string {
+  const mode = resolveTrainingDatasetCopyMode(node)
+  if (mode === "shared_local" && node && nodeSupportsArchive(node)) {
+    return BUILTIN_ARCHIVE_TRAINING_COPY_LABEL
+  }
+  return TRAINING_DATASET_COPY_LABELS[mode]
 }
 
 export function isActiveMigration(

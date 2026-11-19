@@ -85,9 +85,9 @@ func (s *Service) claimOne(ctx context.Context, nodeID int64) (task *Task, skipp
 		// Verify data version is still ready and live.
 		var dvStatus, dirName string
 		var dvDeleted bool
-		var dvStorageNodeID int64
-		err = tx.QueryRow(ctx, "SELECT status, dir_name, (deleted_at IS NOT NULL), storage_node_id FROM data_versions WHERE id = $1", dvID).
-			Scan(&dvStatus, &dirName, &dvDeleted, &dvStorageNodeID)
+		var dvStorageNodeID, dvTotalBytes int64
+		err = tx.QueryRow(ctx, "SELECT status, dir_name, (deleted_at IS NOT NULL), storage_node_id, total_bytes FROM data_versions WHERE id = $1", dvID).
+			Scan(&dvStatus, &dirName, &dvDeleted, &dvStorageNodeID, &dvTotalBytes)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows) || dvDeleted:
 			failMsg = "关联的数据版本已被删除"
@@ -174,23 +174,25 @@ func (s *Service) claimOne(ctx context.Context, nodeID int64) (task *Task, skipp
 
 		base := fmt.Sprintf("/api/v1/compute/agent/training-jobs/%d/", id)
 		t := &Task{
-			Kind:         TaskKind,
-			ID:           id,
-			LeaseSeconds: leaseSeconds(),
-			ProjectID:    projectID,
-			InitMode:     initMode,
-			YOLOVersion:  yoloVersion,
-			ModelScale:   modelScale,
-			ArchYAML:     archYAML,
-			Task:         jobTask,
-			DataVersion:  dvRef,
-			BaseModel:    baseRef,
-			Params:       params,
-			DatasetURL:   base + "dataset",
-			ProgressURL:  base + "progress",
-			ArtifactsURL: base + "artifacts",
-			CompleteURL:  base + "complete",
-			FailURL:      base + "fail",
+			Kind:           TaskKind,
+			ID:             id,
+			LeaseSeconds:   leaseSeconds(),
+			ProjectID:      projectID,
+			InitMode:       initMode,
+			YOLOVersion:    yoloVersion,
+			ModelScale:     modelScale,
+			ArchYAML:       archYAML,
+			Task:           jobTask,
+			DataVersion:    dvRef,
+			DVTotalBytes:   dvTotalBytes,
+			DVTransferMode: defaultTransferMode(sharedLocal),
+			BaseModel:      baseRef,
+			Params:         params,
+			DatasetURL:     base + "dataset",
+			ProgressURL:    base + "progress",
+			ArtifactsURL:   base + "artifacts",
+			CompleteURL:    base + "complete",
+			FailURL:        base + "fail",
 		}
 		if baseRef != nil {
 			t.BaseModelURL = base + "base-model"
@@ -205,12 +207,26 @@ func (s *Service) claimOne(ctx context.Context, nodeID int64) (task *Task, skipp
 		s.log.Warn("queued training job failed on claim", "job_id", failedID, "error", failMsg)
 	}
 	if task != nil {
+		base := fmt.Sprintf("/api/v1/compute/agent/training-jobs/%d/", task.ID)
 		if s.storageNodes != nil {
 			if policy, perr := s.storageNodes.GetTrainerCachePolicy(ctx); perr == nil {
 				payload := policy.TaskPayload()
 				task.DatasetCache = &payload
 			} else {
 				s.log.Warn("load trainer dataset cache policy", "err", perr)
+			}
+			supportsArchive, isSharedBuiltin := s.inspectDatasetTransferMode(ctx, task.DataVersion.ID)
+			switch {
+			case supportsArchive:
+				task.DVTransferMode = "archive"
+				task.DatasetArchive = &DatasetArchiveRef{
+					URL:    base + "dataset.tar.zst",
+					Format: "tar.zst",
+				}
+			case isSharedBuiltin:
+				task.DVTransferMode = "shared_local"
+			default:
+				task.DVTransferMode = "direct"
 			}
 		} else {
 			payload := storagenode.DefaultTrainerCachePolicy().TaskPayload()
@@ -224,6 +240,35 @@ func (s *Service) claimOne(ctx context.Context, nodeID int64) (task *Task, skipp
 			"init_mode", task.InitMode)
 	}
 	return task, skipped, nil
+}
+
+func defaultTransferMode(sharedLocal bool) string {
+	if sharedLocal {
+		return "shared_local"
+	}
+	return "direct"
+}
+
+func (s *Service) inspectDatasetTransferMode(ctx context.Context, dvID int64) (supportsArchive bool, isSharedBuiltin bool) {
+	if s.storageNodes == nil || dvID <= 0 {
+		return false, true
+	}
+	var storageNodeID int64
+	if err := s.db.QueryRow(ctx,
+		"SELECT storage_node_id FROM data_versions WHERE id = $1 AND deleted_at IS NULL", dvID).
+		Scan(&storageNodeID); err != nil {
+		return false, false
+	}
+	isSharedBuiltin = storageNodeID <= 0 || storageNodeID == storagenode.BuiltinID
+	refs, err := s.storageNodes.NodeRefs(ctx, []int64{storageNodeID})
+	if err != nil {
+		return false, isSharedBuiltin
+	}
+	ref, ok := refs[storageNodeID]
+	if !ok && isSharedBuiltin {
+		ref = refs[storagenode.BuiltinID]
+	}
+	return ref.SupportsArchive, isSharedBuiltin
 }
 
 func (s *Service) renewLease(ctx context.Context, q querier, jobID, nodeID int64, stage string) error {
@@ -258,6 +303,41 @@ func (s *Service) taskError(ctx context.Context, q querier, jobID int64) error {
 	return errTaskNotYours
 }
 
+// TaskDatasetStream represents either a Storage-Container-packed .zip archive
+// ("archive" mode, with known byte length and SHA-256) or a legacy streamed
+// YOLO .zip export ("direct" mode, zero storage-side packing).
+type TaskDatasetStream struct {
+	TransferMode string // "archive" or "direct"
+	FileName     string
+	ArchiveBytes int64
+	SHA256       string
+	RawBytes     int64
+	FilesCount   int
+	Stream       io.ReadCloser
+	LegacyExport *dataversion.Export
+	cleanup      func()
+}
+
+// Close releases any underlying stream, legacy export, and staged archive.
+func (d *TaskDatasetStream) Close() error {
+	var err error
+	if d.Stream != nil {
+		err = d.Stream.Close()
+		d.Stream = nil
+	}
+	if d.LegacyExport != nil {
+		if cerr := d.LegacyExport.Close(); err == nil {
+			err = cerr
+		}
+		d.LegacyExport = nil
+	}
+	if d.cleanup != nil {
+		d.cleanup()
+		d.cleanup = nil
+	}
+	return err
+}
+
 // OpenTaskDataset opens a streaming YOLO zip archive of the job's data version
 // for remote compute nodes that do not share the server's /data directory.
 func (s *Service) OpenTaskDataset(ctx context.Context, jobID, nodeID int64) (*dataversion.Export, error) {
@@ -279,6 +359,171 @@ func (s *Service) OpenTaskDataset(ctx context.Context, jobID, nodeID int64) (*da
 		return nil, err
 	}
 	return s.dataVersions.OpenExport(ctx, dvID, ticket.Token)
+}
+
+// OpenTaskDatasetStream serves GET /api/v1/compute/agent/training-jobs/{jobID}/dataset:
+// when the DataVersion resides on an archive-capable Storage Container (kind == "docker"
+// or Builtin with TM_STORAGE_SERVICE_URL), it delegates YOLO .zip packing to the
+// Storage Container and returns X-Archive-Sha256 + Content-Length ("archive" mode);
+// otherwise it falls back to dataversion.Export ("direct" mode, zero storage pack calls).
+func (s *Service) OpenTaskDatasetStream(ctx context.Context, jobID, nodeID int64) (*TaskDatasetStream, error) {
+	if err := s.renewLease(ctx, s.db, jobID, nodeID, StageDownloading); err != nil {
+		return nil, err
+	}
+	var dvID, storageNodeID int64
+	var dirName, status string
+	err := s.db.QueryRow(ctx, `SELECT v.id, v.dir_name, v.storage_node_id, v.status
+		FROM training_jobs j
+		JOIN data_versions v ON v.id = j.data_version_id
+		WHERE j.id = $1 AND v.deleted_at IS NULL`, jobID).
+		Scan(&dvID, &dirName, &storageNodeID, &status)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, errTaskGone
+		}
+		return nil, err
+	}
+	if status != dataversion.StatusReady || dirName == "" {
+		return nil, newError(ErrConflict, "数据版本尚未就绪")
+	}
+
+	if s.storageNodes != nil {
+		ref, archEP, aerr := s.storageNodes.ArchiveEndpointForNode(ctx, storageNodeID)
+		if aerr == nil && ref.SupportsArchive {
+			packed, perr := archEP.PackArchive(ctx, storagenode.PackRequest{
+				Space:  storagenode.SpaceExports,
+				DirRel: dirName,
+				Format: "zip",
+			})
+			if perr != nil {
+				return nil, fmt.Errorf("pack training dataset zip on storage container: %w", perr)
+			}
+			cleanup := func() {
+				delCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				_ = archEP.DeleteArchive(delCtx, packed.ArchiveID)
+			}
+			rc, oerr := archEP.OpenArchiveStream(ctx, packed.ArchiveID)
+			if oerr != nil {
+				cleanup()
+				return nil, fmt.Errorf("open training dataset zip stream: %w", oerr)
+			}
+			return &TaskDatasetStream{
+				TransferMode: "archive",
+				FileName:     fmt.Sprintf("dataset-v%d.zip", dvID),
+				ArchiveBytes: packed.ArchiveBytes,
+				SHA256:       packed.SHA256,
+				RawBytes:     packed.RawBytes,
+				FilesCount:   packed.FilesCount,
+				Stream:       rc,
+				cleanup:      cleanup,
+			}, nil
+		}
+	}
+
+	ticket, err := s.dataVersions.CreateExport(ctx, dvID, dataversion.ExportInput{
+		Format:           dataversion.FormatYOLO,
+		IncludeAugmented: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	exp, err := s.dataVersions.OpenExport(ctx, dvID, ticket.Token)
+	if err != nil {
+		return nil, err
+	}
+	return &TaskDatasetStream{
+		TransferMode: "direct",
+		FileName:     exp.FileName,
+		LegacyExport: exp,
+	}, nil
+}
+
+// TaskDatasetArchive wraps a packed .tar.zst stream of a ready DataVersion for
+// high-throughput trainer node download with SHA-256 verification.
+type TaskDatasetArchive struct {
+	Stream       io.ReadCloser
+	FileName     string
+	ArchiveBytes int64
+	SHA256       string
+	RawBytes     int64
+	FilesCount   int
+	cleanup      func()
+}
+
+// Close closes the underlying HTTP/file stream and deletes the staged archive.
+func (a *TaskDatasetArchive) Close() error {
+	var err error
+	if a.Stream != nil {
+		err = a.Stream.Close()
+		a.Stream = nil
+	}
+	if a.cleanup != nil {
+		a.cleanup()
+		a.cleanup = nil
+	}
+	return err
+}
+
+// OpenTaskDatasetArchive packs and opens a .tar.zst stream of the job's ready
+// DataVersion directory via its archive-capable storage node.
+func (s *Service) OpenTaskDatasetArchive(ctx context.Context, jobID, nodeID int64) (*TaskDatasetArchive, error) {
+	if err := s.renewLease(ctx, s.db, jobID, nodeID, StageDownloading); err != nil {
+		return nil, err
+	}
+	if s.storageNodes == nil {
+		return nil, newError(ErrNotFound, "当前环境未启用整包归档传输服务")
+	}
+	var dvID, storageNodeID int64
+	var dirName, status string
+	err := s.db.QueryRow(ctx, `SELECT v.id, v.dir_name, v.storage_node_id, v.status
+		FROM training_jobs j
+		JOIN data_versions v ON v.id = j.data_version_id
+		WHERE j.id = $1 AND v.deleted_at IS NULL`, jobID).
+		Scan(&dvID, &dirName, &storageNodeID, &status)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, errTaskGone
+		}
+		return nil, err
+	}
+	if status != "ready" || dirName == "" {
+		return nil, newError(ErrConflict, "数据版本尚未就绪")
+	}
+
+	ref, archEP, err := s.storageNodes.ArchiveEndpointForNode(ctx, storageNodeID)
+	if err != nil || !ref.SupportsArchive {
+		return nil, newError(ErrNotFound, "该数据版本所在存储节点不支持 .tar.zst 整包归档")
+	}
+
+	packed, err := archEP.PackArchive(ctx, storagenode.PackRequest{
+		Space:  storagenode.SpaceExports,
+		DirRel: dirName,
+		Format: "tar.zst",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("pack training dataset archive: %w", err)
+	}
+	cleanup := func() {
+		delCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = archEP.DeleteArchive(delCtx, packed.ArchiveID)
+	}
+
+	rc, err := archEP.OpenArchiveStream(ctx, packed.ArchiveID)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("open training dataset archive stream: %w", err)
+	}
+	return &TaskDatasetArchive{
+		Stream:       rc,
+		FileName:     fmt.Sprintf("dataset-v%d.tar.zst", dvID),
+		ArchiveBytes: packed.ArchiveBytes,
+		SHA256:       packed.SHA256,
+		RawBytes:     packed.RawBytes,
+		FilesCount:   packed.FilesCount,
+		cleanup:      cleanup,
+	}, nil
 }
 
 // OpenTaskBaseModel opens the base .pt weights file for a finetune or resume

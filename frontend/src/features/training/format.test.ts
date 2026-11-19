@@ -101,5 +101,16 @@ describe("training formatting helpers", () => {
         finished_at: "2026-11-12T10:02:35Z",
       })
     ).toBe(155)
+
+    expect(
+      trainingProgressText({
+        stage: "unpacking_archive" as never,
+        current_epoch: 0,
+        total_epochs: 50,
+        batch_done: 0,
+        batch_total: 0,
+        eta_seconds: null,
+      })
+    ).toBe("unpacking_archive")
   })
 })

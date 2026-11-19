@@ -300,8 +300,12 @@ type build struct {
 	labels  labelStatsList
 	written int64 // bytes of all stored files
 
-	crossDevice map[int]bool // sources on another file system or storage node
-	linkWarned  map[int]bool
+	crossDevice    map[int]bool // sources on another file system or storage node
+	linkWarned     map[int]bool
+	prefetched     map[int]bool
+	prefetchDirs   []string
+	dockerStageMu  sync.Mutex
+	dockerStageDir string
 }
 
 // buildImage is an original taken by a build.
@@ -344,7 +348,8 @@ type buildCopy struct {
 
 func newBuild(s *Service, job buildJob, log *slog.Logger) *build {
 	b := &build{s: s, job: job, log: log, dirs: map[string]bool{},
-		crossDevice: map[int]bool{}, linkWarned: map[int]bool{}, perSrc: make([]int, len(job.Sources)),
+		crossDevice: map[int]bool{}, linkWarned: map[int]bool{}, prefetched: map[int]bool{},
+		perSrc: make([]int, len(job.Sources)),
 		filter: newLabelFilter(job.Classes, job.Config), labels: newLabelStats(job.Classes), stride: 1}
 	if a := job.Config.Augmentation; a != nil {
 		b.stride = 1 + a.Copies
@@ -581,6 +586,7 @@ func (b *build) openSnapshots() error {
 			return fromDatasetError(de, ErrConflict)
 		}
 		b.snaps[i] = snap
+		b.maybePrefetchSnapshot(i, snap)
 	}
 	return nil
 }
@@ -591,6 +597,7 @@ func (b *build) closeSnapshots() {
 			snap.Close()
 		}
 	}
+	b.cleanupPrefetchDirs()
 }
 
 // prepare reads the annotation and checks the file of every image of the
@@ -793,11 +800,17 @@ func (b *build) linkImages() error {
 		}
 		batch = append(batch, img)
 		if len(batch) == insertBatch {
+			if err := b.flushDockerStage(batch); err != nil {
+				return err
+			}
 			if err := b.insertOriginals(batch); err != nil {
 				return err
 			}
 			batch = batch[:0]
 		}
+	}
+	if err := b.flushDockerStage(batch); err != nil {
+		return err
 	}
 	if err := b.insertOriginals(batch); err != nil {
 		return err
@@ -820,10 +833,16 @@ func (b *build) classIDs() map[string]int { return b.filter.classes }
 // p (empty for a negative sample).
 func (b *build) writeLabels(p string, objects []dataset.AnnotationObject, width, height int, ids map[string]int) error {
 	rel := dataset.UltralyticsLabelPath(p)
+	data := labelFileLines(objects, width, height, ids)
+	if ok, err := b.stageDockerBytes(rel, data); err != nil {
+		return fmt.Errorf("write label file: %w", err)
+	} else if ok {
+		return nil
+	}
 	if err := b.mkdirFor(rel); err != nil {
 		return err
 	}
-	if err := b.verDir.PutBytes(b.ctx, rel, labelFileLines(objects, width, height, ids), 0o644); err != nil {
+	if err := b.verDir.PutBytes(b.ctx, rel, data, 0o644); err != nil {
 		return fmt.Errorf("write label file: %w", err)
 	}
 	return nil
@@ -943,6 +962,9 @@ func (b *build) countOriginal(img *buildImage) {
 // locked) computes the comparison, writes version.json and makes the
 // version ready.
 func (b *build) finish() error {
+	if err := b.flushDockerStage(nil); err != nil {
+		return err
+	}
 	if err := b.setStage(StageFinishing, 0); err != nil {
 		return err
 	}

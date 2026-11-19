@@ -165,6 +165,13 @@ jobs:
             --build-arg COMMIT="${GITHUB_SHA::7}" \
             --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             -t trainmaster:ci .
+      - name: docker build storage (no push)
+        run: |
+          docker build \
+            -f deploy/docker/Dockerfile.storage \
+            --build-arg COMMIT="${GITHUB_SHA::7}" \
+            --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t trainmaster-storage:ci .
       # runner 没有 GPU：构建 CPU 版训练节点镜像（构建时已运行一次 CPU 自检），再冒烟检查 probe 的输出
       - name: docker build trainer (cpu, no push)
         run: docker build --build-arg TORCH_VARIANT=cpu -t trainmaster-trainer:ci-cpu trainer
@@ -173,7 +180,7 @@ jobs:
           docker run --rm trainmaster-trainer:ci-cpu python -m trainmaster_trainer probe > probe.json
           jq '{agent_version, environment: (.environment | {status, accelerator, torch_version, torch_variant, ultralytics_version, self_test: .self_test.status})}' probe.json
           jq -e '.environment.status == "cpu_only" and .environment.torch_variant == "cpu" and .environment.self_test.status == "passed"' probe.json > /dev/null
-      # 不设置 COMPOSE_PROFILES 时只有 postgres 与 app；gpu / cpu 分别加入 trainer / trainer-cpu
+      # 不设置 COMPOSE_PROFILES 时为 postgres、storage 与 app；gpu / cpu 分别加入 trainer / trainer-cpu
       - name: docker compose config
         run: |
           for profiles in "" gpu cpu; do
@@ -182,3 +189,4 @@ jobs:
             COMPOSE_PROFILES="$profiles" docker compose config --services
           done
           TM_REQUIRE_DOCKER=1 bash deploy/scripts/tests/test-compose.sh
+          TM_REQUIRE_DOCKER=1 bash deploy/scripts/tests/test-storage-compose.sh

@@ -1,0 +1,51 @@
+# trainMaster 独立存储服务镜像（trainmaster-storage）：Go 零 CGO 单二进制，运行于 Alpine。
+# 提供受限 POSIX 存储操作与高吞吐整包压缩/解压传输（.tar.zst / .zip），只需挂载 /data。
+#
+#   docker build -f deploy/docker/Dockerfile.storage -t trainmaster-storage:latest .
+#
+# 国内网络可加速依赖下载：
+#   --build-arg GOPROXY=https://goproxy.cn,direct
+#   --build-arg ALPINE_MIRROR=https://mirrors.aliyun.com/alpine
+
+ARG GO_IMAGE=golang:1.25-alpine
+ARG RUNTIME_IMAGE=alpine:3.23
+
+# ---- 1. 编译存储服务二进制 ----
+FROM ${GO_IMAGE} AS backend
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY} CGO_ENABLED=0
+WORKDIR /src/backend
+COPY backend/go.mod backend/go.sum ./
+RUN go mod download
+COPY backend/ ./
+ARG VERSION
+ARG COMMIT
+ARG BUILD_TIME
+RUN BI=github.com/icaruszezen/trainmaster/backend/internal/buildinfo \
+ && go build -trimpath \
+      -ldflags "-s -w ${VERSION:+-X $BI.Version=$VERSION} ${COMMIT:+-X $BI.Commit=$COMMIT} ${BUILD_TIME:+-X $BI.BuildTime=$BUILD_TIME}" \
+      -o /out/trainmaster-storage ./cmd/trainmaster-storage
+
+# ---- 2. 轻量运行镜像 ----
+FROM ${RUNTIME_IMAGE}
+ARG ALPINE_MIRROR
+RUN if [ -n "${ALPINE_MIRROR}" ]; then \
+      sed -i "s|https://dl-cdn.alpinelinux.org/alpine|${ALPINE_MIRROR}|g" /etc/apk/repositories; \
+    fi \
+ && apk add --no-cache ca-certificates tzdata su-exec
+COPY deploy/docker/storage-entrypoint.sh /usr/local/bin/storage-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/storage-entrypoint.sh && chmod 0755 /usr/local/bin/storage-entrypoint.sh
+COPY --from=backend /out/trainmaster-storage /app/trainmaster-storage
+
+ENV TM_STORAGE_ADDR=:8090 \
+    TM_STORAGE_DATA_DIR=/data \
+    TM_STORAGE_TEMP_TTL=2h \
+    TM_LOG_FORMAT=json
+WORKDIR /app
+EXPOSE 8090
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -Y off -qO- http://127.0.0.1:8090/healthz >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/storage-entrypoint.sh"]
+CMD ["/app/trainmaster-storage"]

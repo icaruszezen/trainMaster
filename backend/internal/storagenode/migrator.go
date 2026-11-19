@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/icaruszezen/trainmaster/backend/internal/storagearchive"
 )
 
 const migrationFreeHeadroom = 64 << 20 // 64 MiB safety margin when target reports disk usage
@@ -51,6 +53,7 @@ func (s *Service) recoverMigrations(ctx context.Context) error {
 				)) THEN 'succeeded'
 				ELSE 'failed'
 			END,
+			stage = '',
 			error = CASE
 				WHEN (sm.target_type = 'dataset' AND EXISTS (
 					SELECT 1 FROM datasets d WHERE d.id = sm.target_id AND d.storage_node_id = sm.to_node_id
@@ -233,7 +236,7 @@ type migrationRow struct {
 }
 
 const migrationSelectColumns = `id, target_type, target_id, target_name, from_node_id, to_node_id,
-	delete_source, status, files_done, files_total, bytes_done, bytes_total, error,
+	delete_source, transfer_mode, stage, archive_bytes, status, files_done, files_total, bytes_done, bytes_total, error,
 	created_at, started_at, finished_at, updated_at`
 
 func scanMigrationRow(row pgx.Row) (migrationRow, error) {
@@ -241,7 +244,7 @@ func scanMigrationRow(row pgx.Row) (migrationRow, error) {
 	err := row.Scan(
 		&r.m.ID, &r.m.TargetType, &r.m.TargetID, &r.m.TargetName,
 		&r.fromNodeID, &r.toNodeID,
-		&r.m.DeleteSource, &r.m.Status,
+		&r.m.DeleteSource, &r.m.TransferMode, &r.m.Stage, &r.m.ArchiveBytes, &r.m.Status,
 		&r.m.FilesDone, &r.m.FilesTotal, &r.m.BytesDone, &r.m.BytesTotal,
 		&r.m.Error,
 		&r.m.CreatedAt, &r.m.StartedAt, &r.m.FinishedAt, &r.m.UpdatedAt,
@@ -419,11 +422,29 @@ func (s *Service) CreateMigrations(ctx context.Context, in CreateMigrationsInput
 				return newError(ErrConflict, "%q 已经位于当前激活的存储节点 %q 上", targetName, activeRef.Name)
 			}
 
+			var fromKind string
+			var fromBuiltin bool
+			if err := tx.QueryRow(ctx,
+				"SELECT kind, is_builtin FROM storage_nodes WHERE id = $1", fromNodeID).
+				Scan(&fromKind, &fromBuiltin); err != nil {
+				return err
+			}
+			fromRef := NodeRef{
+				ID:              fromNodeID,
+				Kind:            fromKind,
+				IsBuiltin:       fromBuiltin,
+				SupportsArchive: s.NodeSupportsArchive(fromKind, fromBuiltin),
+			}
+			transferMode := TransferModeDirect
+			if s.CanArchiveBetween(fromRef, activeRef) {
+				transferMode = TransferModeArchive
+			}
+
 			mr, err := scanMigrationRow(tx.QueryRow(ctx, `INSERT INTO storage_migrations
-				(target_type, target_id, target_name, from_node_id, to_node_id, delete_source, status, bytes_total)
-				VALUES ($1, $2, $3, $4, $5, $6, 'queued', $7)
+				(target_type, target_id, target_name, from_node_id, to_node_id, delete_source, transfer_mode, status, bytes_total)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8)
 				RETURNING `+migrationSelectColumns,
-				t.TargetType, t.TargetID, targetName, fromNodeID, activeRef.ID, deleteSource, totalBytes))
+				t.TargetType, t.TargetID, targetName, fromNodeID, activeRef.ID, deleteSource, transferMode, totalBytes))
 			if err != nil {
 				return err
 			}
@@ -465,7 +486,7 @@ func (s *Service) CancelMigration(ctx context.Context, id int64) (Migration, err
 		switch mr.m.Status {
 		case MigrationQueued:
 			mr, scanErr = scanMigrationRow(tx.QueryRow(ctx, `UPDATE storage_migrations
-				SET status = 'canceled', error = '用户已取消', finished_at = now(), updated_at = now()
+				SET status = 'canceled', stage = '', error = '用户已取消', finished_at = now(), updated_at = now()
 				WHERE id = $1
 				RETURNING `+migrationSelectColumns, id))
 			if scanErr != nil {
@@ -491,7 +512,7 @@ func (s *Service) CancelMigration(ctx context.Context, id int64) (Migration, err
 				return newError(ErrConflict, "数据已完成节点切换，正在清理原节点文件，无法取消")
 			}
 			mr, scanErr = scanMigrationRow(tx.QueryRow(ctx, `UPDATE storage_migrations
-				SET status = 'canceled', error = '用户已取消', finished_at = now(), updated_at = now()
+				SET status = 'canceled', stage = '', error = '用户已取消', finished_at = now(), updated_at = now()
 				WHERE id = $1
 				RETURNING `+migrationSelectColumns, id))
 			if scanErr != nil {
@@ -668,6 +689,7 @@ func (s *Service) executeMigration(ctx context.Context, mr migrationRow) {
 		msg := cause.Error()
 		_, _ = s.db.Exec(cleanupCtx, `UPDATE storage_migrations
 			SET status = CASE WHEN status = 'canceled' THEN 'canceled' ELSE 'failed' END,
+				stage = '',
 				error = CASE WHEN status = 'canceled' THEN error ELSE $2 END,
 				finished_at = COALESCE(finished_at, now()),
 				updated_at = now()
@@ -711,13 +733,19 @@ func (s *Service) executeMigration(ctx context.Context, mr migrationRow) {
 		return
 	}
 
+	var fromRef, toRef NodeRef
 	var err error
-	if _, fromVol, err = s.VolumeForNode(ctx, mr.fromNodeID); err != nil {
+	if fromRef, fromVol, err = s.VolumeForNode(ctx, mr.fromNodeID); err != nil {
 		failOrCancel(fmt.Errorf("连接源存储节点失败：%w", err))
 		return
 	}
-	if _, toVol, err = s.VolumeForNode(ctx, mr.toNodeID); err != nil {
+	if toRef, toVol, err = s.VolumeForNode(ctx, mr.toNodeID); err != nil {
 		failOrCancel(fmt.Errorf("连接目标存储节点失败：%w", err))
+		return
+	}
+
+	if s.CanArchiveBetween(fromRef, toRef) {
+		s.executeArchiveMigration(ctx, mr, space, srcDirName, origUpdatedAt, fromVol, toVol, &dstDirName, &dstCreated, failOrCancel)
 		return
 	}
 
@@ -1040,4 +1068,275 @@ func updateDataVersionMigratedModTimes(ctx context.Context, tx pgx.Tx, versionID
 		}
 	}
 	return nil
+}
+
+func (s *Service) setMigrationStage(ctx context.Context, migrationID int64, stage string) {
+	_, _ = s.db.Exec(ctx,
+		`UPDATE storage_migrations SET stage = $2, updated_at = now() WHERE id = $1 AND status = 'running'`,
+		migrationID, stage)
+}
+
+func (s *Service) executeArchiveMigration(
+	ctx context.Context,
+	mr migrationRow,
+	space, srcDirName string,
+	origUpdatedAt time.Time,
+	fromVol, toVol Volume,
+	dstDirNamePtr *string,
+	dstCreatedPtr *bool,
+	failOrCancel func(error),
+) {
+	_, srcArch, err := s.ArchiveEndpointForNode(ctx, mr.fromNodeID)
+	if err != nil {
+		failOrCancel(fmt.Errorf("初始化源节点归档引擎失败：%w", err))
+		return
+	}
+	_, dstArch, err := s.ArchiveEndpointForNode(ctx, mr.toNodeID)
+	if err != nil {
+		failOrCancel(fmt.Errorf("初始化目标节点归档引擎失败：%w", err))
+		return
+	}
+
+	// Stage 1: Packing (.tar.zst) on source node.
+	_, _ = s.db.Exec(ctx, `UPDATE storage_migrations
+		SET transfer_mode = 'archive', stage = $2, updated_at = now()
+		WHERE id = $1 AND status = 'running'`, mr.m.ID, MigrationStagePacking)
+
+	packed, err := srcArch.PackArchive(ctx, PackRequest{
+		Space:  space,
+		DirRel: srcDirName,
+		Format: storagearchive.FormatTarZst,
+	})
+	if err != nil {
+		failOrCancel(fmt.Errorf("源存储节点打包归档失败：%w", err))
+		return
+	}
+	defer func() {
+		delCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = srcArch.DeleteArchive(delCtx, packed.ArchiveID)
+	}()
+
+	if u, uerr := toVol.Usage(ctx); uerr == nil && u.TotalBytes > 0 {
+		need := uint64(packed.RawBytes) + migrationFreeHeadroom
+		if u.FreeBytes < need {
+			failOrCancel(newError(ErrInsufficientStorage, "目标存储节点剩余空间不足（需要 %.1f MB，剩余 %.1f MB）",
+				float64(need)/(1<<20), float64(u.FreeBytes)/(1<<20)))
+			return
+		}
+	}
+
+	dstDirName, err := s.pickTargetDirName(ctx, mr.m.TargetType, mr.toNodeID, toVol, space, srcDirName)
+	if err != nil {
+		failOrCancel(err)
+		return
+	}
+	*dstDirNamePtr = dstDirName
+	*dstCreatedPtr = true
+
+	// Stage 2 & 3: Transferring + Extracting (.tar.zst with SHA-256 verification).
+	_, _ = s.db.Exec(ctx, `UPDATE storage_migrations
+		SET stage = $2, files_total = $3, bytes_total = $4, archive_bytes = $5, updated_at = now()
+		WHERE id = $1 AND status = 'running'`,
+		mr.m.ID, MigrationStageTransferring, packed.FilesCount, packed.RawBytes, packed.ArchiveBytes)
+
+	var unpacked UnpackSummary
+	var transferDone bool
+	if dlURL := srcArch.ArchiveDownloadURL(packed.ArchiveID); dlURL != "" && dstArch.SupportsPullUnpack() {
+		u, pullErr := dstArch.PullUnpackArchive(ctx, PullUnpackParams{
+			SourceURL:            dlURL,
+			SourceToken:          srcArch.BearerToken(),
+			InsecureSkipVerify:   srcArch.InsecureSkipVerify(),
+			ExpectedSHA256:       packed.SHA256,
+			ExpectedArchiveBytes: packed.ArchiveBytes,
+			ExpectedRawBytes:     &packed.RawBytes,
+			Space:                space,
+			DirRel:               dstDirName,
+			Format:               storagearchive.FormatTarZst,
+			Mode:                 storagearchive.ModeAtomic,
+			IncludeModTimes:      true,
+		})
+		if pullErr == nil {
+			unpacked = u
+			transferDone = true
+		} else if ctx.Err() != nil {
+			failOrCancel(pullErr)
+			return
+		} else if errors.Is(pullErr, storagearchive.ErrChecksumMismatch) ||
+			errors.Is(pullErr, storagearchive.ErrInsufficientStorage) ||
+			errors.Is(pullErr, storagearchive.ErrUnsafeArchiveEntry) ||
+			errors.Is(pullErr, storagearchive.ErrArchiveTooLarge) {
+			failOrCancel(fmt.Errorf("目标存储节点解压校验失败：%w", pullErr))
+			return
+		} else {
+			// Peer-to-peer pull unreachable across subnets: relay stream via backend.
+			s.log.Info("peer-to-peer archive pull unavailable, falling back to relayed stream",
+				"migration_id", mr.m.ID, "err", pullErr)
+		}
+	}
+
+	if !transferDone {
+		rc, openErr := srcArch.OpenArchiveStream(ctx, packed.ArchiveID)
+		if openErr != nil {
+			failOrCancel(fmt.Errorf("读取源节点归档流失败：%w", openErr))
+			return
+		}
+		var streamedArch int64
+		lastReport := time.Now()
+		progReader := &countingReader{
+			r: rc,
+			onRead: func(n int64) {
+				streamedArch += n
+				if packed.ArchiveBytes > 0 && streamedArch >= packed.ArchiveBytes {
+					s.setMigrationStage(ctx, mr.m.ID, MigrationStageExtracting)
+					return
+				}
+				if time.Since(lastReport) >= 400*time.Millisecond && packed.ArchiveBytes > 0 {
+					lastReport = time.Now()
+					estRaw := int64(float64(packed.RawBytes) * (float64(streamedArch) / float64(packed.ArchiveBytes)))
+					_, _ = s.db.Exec(ctx,
+						`UPDATE storage_migrations SET bytes_done = $2, updated_at = now() WHERE id = $1 AND status = 'running'`,
+						mr.m.ID, min(estRaw, packed.RawBytes))
+				}
+			},
+		}
+		u, unpackErr := dstArch.UnpackArchiveStream(ctx, UnpackStreamRequest{
+			Space:                space,
+			DirRel:               dstDirName,
+			Format:               storagearchive.FormatTarZst,
+			Mode:                 storagearchive.ModeAtomic,
+			ExpectedSHA256:       packed.SHA256,
+			ExpectedArchiveBytes: packed.ArchiveBytes,
+			DeclaredRawBytes:     &packed.RawBytes,
+			IncludeModTimes:      true,
+		}, progReader)
+		_ = rc.Close()
+		if unpackErr != nil {
+			if errors.Is(unpackErr, storagearchive.ErrInsufficientStorage) {
+				failOrCancel(newError(ErrInsufficientStorage, "目标存储节点剩余空间不足：%v", unpackErr))
+				return
+			}
+			failOrCancel(fmt.Errorf("流式传输或解压归档失败：%w", unpackErr))
+			return
+		}
+		unpacked = u
+	}
+
+	if err := ctx.Err(); err != nil {
+		failOrCancel(err)
+		return
+	}
+
+	// Stage 4: Verifying unpacked counts & target directory existence.
+	_, _ = s.db.Exec(ctx, `UPDATE storage_migrations
+		SET stage = $2, files_done = $3, bytes_done = $4, updated_at = now()
+		WHERE id = $1 AND status = 'running'`,
+		mr.m.ID, MigrationStageVerifying, unpacked.FilesCount, unpacked.RawBytes)
+
+	if unpacked.FilesCount != packed.FilesCount || unpacked.RawBytes != packed.RawBytes {
+		failOrCancel(fmt.Errorf("归档校验不一致：打包 %d 个文件（%d B），解压得到 %d 个文件（%d B）",
+			packed.FilesCount, packed.RawBytes, unpacked.FilesCount, unpacked.RawBytes))
+		return
+	}
+	if exists, _, derr := toVol.DirExists(ctx, space, dstDirName); derr != nil || !exists {
+		failOrCancel(fmt.Errorf("目标节点目录校验失败：%v", derr))
+		return
+	}
+
+	// Atomic PostgreSQL switch to destination node.
+	commitErr := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		var curMigStatus string
+		if err := tx.QueryRow(ctx,
+			"SELECT status FROM storage_migrations WHERE id = $1 FOR UPDATE", mr.m.ID).
+			Scan(&curMigStatus); err != nil {
+			return err
+		}
+		if curMigStatus != MigrationRunning {
+			return fmt.Errorf("迁移任务状态已变更为 %s", curMigStatus)
+		}
+
+		switch mr.m.TargetType {
+		case TargetDataset:
+			var curDir string
+			var curNode int64
+			var curUpdated time.Time
+			if err := tx.QueryRow(ctx, `SELECT dir_name, storage_node_id, updated_at
+				FROM datasets WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, mr.m.TargetID).
+				Scan(&curDir, &curNode, &curUpdated); err != nil {
+				return fmt.Errorf("锁定数据集失败：%w", err)
+			}
+			if curNode != mr.fromNodeID || curDir != srcDirName || !curUpdated.UTC().Equal(origUpdatedAt.UTC()) {
+				return errors.New("数据集在迁移期间发生了修改，已中止切换以保证数据安全（原数据未受影响）")
+			}
+			var busy bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (
+				SELECT 1 FROM dataset_imports
+				WHERE dataset_id = $1 AND status IN ('uploading', 'queued', 'running')
+			)`, mr.m.TargetID).Scan(&busy); err != nil {
+				return err
+			}
+			if busy {
+				return errors.New("数据集在迁移期间启动了导入任务，已中止切换")
+			}
+			if _, err := tx.Exec(ctx, `UPDATE datasets
+				SET storage_node_id = $2, dir_name = $3, recycled_in_place = false, updated_at = now()
+				WHERE id = $1`, mr.m.TargetID, mr.toNodeID, dstDirName); err != nil {
+				return err
+			}
+			if err := updateDatasetMigratedModTimes(ctx, tx, mr.m.TargetID, unpacked.ModTimes); err != nil {
+				return err
+			}
+
+		case TargetDataVersion:
+			var curDir, curVerStatus string
+			var curNode int64
+			if err := tx.QueryRow(ctx, `SELECT dir_name, storage_node_id, status
+				FROM data_versions WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, mr.m.TargetID).
+				Scan(&curDir, &curNode, &curVerStatus); err != nil {
+				return fmt.Errorf("锁定数据版本失败：%w", err)
+			}
+			if curVerStatus != "ready" || curNode != mr.fromNodeID || curDir != srcDirName {
+				return errors.New("数据版本在迁移期间发生了变更，已中止切换")
+			}
+			if _, err := tx.Exec(ctx, `UPDATE data_versions
+				SET storage_node_id = $2, dir_name = $3, updated_at = now()
+				WHERE id = $1`, mr.m.TargetID, mr.toNodeID, dstDirName); err != nil {
+				return err
+			}
+			if err := updateDataVersionMigratedModTimes(ctx, tx, mr.m.TargetID, unpacked.ModTimes); err != nil {
+				return err
+			}
+		}
+
+		_, err := tx.Exec(ctx, `UPDATE storage_migrations
+			SET files_done = $2, bytes_done = $3, archive_bytes = $4, updated_at = now()
+			WHERE id = $1`, mr.m.ID, unpacked.FilesCount, unpacked.RawBytes, packed.ArchiveBytes)
+		return err
+	})
+	if commitErr != nil {
+		failOrCancel(commitErr)
+		return
+	}
+
+	// Stage 5: Cleaning source directory after DB ownership switched.
+	if mr.m.DeleteSource {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		s.setMigrationStage(cleanCtx, mr.m.ID, MigrationStageCleaning)
+		if err := fromVol.RemoveDirAll(cleanCtx, space, srcDirName); err != nil {
+			s.log.Warn("remove migrated source directory failed",
+				"migration_id", mr.m.ID, "from_node_id", mr.fromNodeID,
+				"space", space, "dir", srcDirName, "err", err)
+		}
+		cleanCancel()
+	}
+
+	finCtx, finCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer finCancel()
+	if _, err := s.db.Exec(finCtx, `UPDATE storage_migrations
+		SET status = 'succeeded', stage = '', files_done = $2, files_total = $2,
+			bytes_done = $3, bytes_total = $3, archive_bytes = $4, error = '',
+			finished_at = now(), updated_at = now()
+		WHERE id = $1`, mr.m.ID, unpacked.FilesCount, unpacked.RawBytes, packed.ArchiveBytes); err != nil {
+		s.log.Warn("mark archive storage migration succeeded failed", "migration_id", mr.m.ID, "err", err)
+	}
 }

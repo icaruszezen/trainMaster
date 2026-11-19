@@ -17,6 +17,7 @@ func (s *server) storageRoutes(r chi.Router) {
 	r.Post("/nodes", s.createStorageNode)
 	r.Post("/nodes/test", s.testStorageNode) // static segment before /{nodeID}
 	r.Route("/nodes/{nodeID}", func(r chi.Router) {
+		r.Get("/", s.getStorageNode)
 		r.Patch("/", s.updateStorageNode)
 		r.Post("/activate", s.activateStorageNode)
 		r.Delete("/", s.deleteStorageNode)
@@ -84,6 +85,19 @@ func (s *server) listStorageNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, NewList(items, len(items)))
+}
+
+func (s *server) getStorageNode(w http.ResponseWriter, r *http.Request) {
+	id, ok := storageNodeID(w, r)
+	if !ok {
+		return
+	}
+	node, err := s.storageNodes.GetNode(r.Context(), id)
+	if err != nil {
+		s.storageError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, node)
 }
 
 func (s *server) createStorageNode(w http.ResponseWriter, r *http.Request) {

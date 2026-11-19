@@ -128,7 +128,10 @@ export function trainingProgressText(
     | "eta_seconds"
   >
 ) {
-  const stageText = job.stage ? TRAINING_STAGE_LABELS[job.stage] : "正在启动…"
+  const stageText = job.stage
+    ? (TRAINING_STAGE_LABELS[job.stage as Exclude<TrainingStage, "">] ??
+      job.stage)
+    : "正在启动…"
   if (job.stage !== "training" || job.total_epochs <= 0) {
     return stageText
   }

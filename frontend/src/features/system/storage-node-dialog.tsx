@@ -1,9 +1,18 @@
 import { useId, useState, type FormEvent } from "react"
-import { CheckCircle2, CircleAlert, PlugZap } from "lucide-react"
+import {
+  CheckCircle2,
+  CircleAlert,
+  Info,
+  KeyRound,
+  PlugZap,
+  Sparkles,
+  Terminal,
+} from "lucide-react"
 import { toast } from "sonner"
 
 import { StorageKindIcon } from "@/components/storage-node-badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import {
@@ -26,10 +35,12 @@ import { Spinner } from "@/components/ui/spinner"
 import { Switch } from "@/components/ui/switch"
 import {
   createStorageNode,
+  getDockerConfig,
   refreshStorageQueries,
-  STORAGE_KIND_LABELS,
+  storageKindLabel,
   testStorageNode,
   updateStorageNode,
+  type DockerStorageConfig,
   type LocalStorageConfig,
   type S3StorageConfig,
   type SMBStorageConfig,
@@ -37,6 +48,11 @@ import {
   type StorageNodeKind,
   type TestStorageNodeResult,
 } from "@/features/system/storage-api"
+import {
+  generateStorageToken,
+  storageConnectCommands,
+} from "@/features/system/storage-connect-commands"
+import { CommandBlock } from "@/features/training/command-block"
 import { formatBytes } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -51,21 +67,28 @@ const KIND_OPTIONS: {
   kind: StorageNodeKind
   title: string
   hint: string
+  recommended?: boolean
 }[] = [
+  {
+    kind: "docker",
+    title: "存储服务容器 (Docker)",
+    hint: "独立存储容器，支持先打包压缩、传输后自动解压",
+    recommended: true,
+  },
   {
     kind: "s3",
     title: "S3 对象存储",
-    hint: "MinIO / RustFS / 云 S3",
+    hint: "MinIO / RustFS / 云 S3（兼容直传）",
   },
   {
     kind: "smb",
     title: "SMB 共享文件夹",
-    hint: "Windows 共享 / NAS",
+    hint: "Windows 共享 / NAS（兼容直传）",
   },
   {
     kind: "local",
     title: "本机挂载目录",
-    hint: "NFS / 独立磁盘目录",
+    hint: "NFS / 独立磁盘目录（兼容直传）",
   },
 ]
 
@@ -76,10 +99,20 @@ export function StorageNodeDialog({
 }: StorageNodeDialogProps) {
   const editing = node !== null
   const formId = useId()
+  const initialDocker = getDockerConfig(node?.config)
 
-  const [kind, setKind] = useState<StorageNodeKind>(node?.kind ?? "s3")
+  const [kind, setKind] = useState<StorageNodeKind>(node?.kind ?? "docker")
   const [name, setName] = useState(node?.name ?? "")
   const [activate, setActivate] = useState(true)
+
+  // Docker storage container
+  const [dockerEndpoint, setDockerEndpoint] = useState(
+    initialDocker?.endpoint ?? "http://192.168.1.50:8090"
+  )
+  const [dockerToken, setDockerToken] = useState("")
+  const [dockerInsecureTLS, setDockerInsecureTLS] = useState(
+    initialDocker?.insecure_skip_verify ?? false
+  )
 
   // Local
   const [localPath, setLocalPath] = useState(node?.config.local?.path ?? "")
@@ -128,11 +161,26 @@ export function StorageNodeDialog({
 
   const busy = testing || submitting
 
+  const dockerCommands = storageConnectCommands({
+    endpoint: dockerEndpoint,
+    token: dockerToken,
+    hasSavedSecret: Boolean(editing && node.has_secret),
+  })
+
   const buildConfigs = (): {
     local?: LocalStorageConfig
+    docker?: DockerStorageConfig
+    config?: DockerStorageConfig
     s3?: S3StorageConfig
     smb?: SMBStorageConfig
   } => {
+    if (kind === "docker") {
+      const dockerCfg: DockerStorageConfig = {
+        endpoint: dockerEndpoint.trim(),
+        insecure_skip_verify: dockerInsecureTLS,
+      }
+      return { docker: dockerCfg, config: dockerCfg }
+    }
     if (kind === "local") {
       return { local: { path: localPath.trim() } }
     }
@@ -177,6 +225,7 @@ export function StorageNodeDialog({
         node_id: editing ? node.id : undefined,
         kind,
         ...configs,
+        token: kind === "docker" ? dockerToken || undefined : undefined,
         secret_access_key: kind === "s3" ? s3SecretKey || undefined : undefined,
         password: kind === "smb" ? smbPassword || undefined : undefined,
       })
@@ -206,6 +255,8 @@ export function StorageNodeDialog({
         await updateStorageNode(node.id, {
           name: trimmedName,
           ...configs,
+          token:
+            kind === "docker" && dockerToken !== "" ? dockerToken : undefined,
           secret_access_key:
             kind === "s3" && s3SecretKey !== "" ? s3SecretKey : undefined,
           password:
@@ -218,6 +269,7 @@ export function StorageNodeDialog({
           name: trimmedName,
           kind,
           ...configs,
+          token: kind === "docker" ? dockerToken || undefined : undefined,
           secret_access_key:
             kind === "s3" ? s3SecretKey || undefined : undefined,
           password: kind === "smb" ? smbPassword || undefined : undefined,
@@ -254,17 +306,15 @@ export function StorageNodeDialog({
               {editing ? `编辑存储节点：${node.name}` : "新增存储节点"}
             </DialogTitle>
             <DialogDescription>
-              存储服务器无需安装任何代理程序，平台通过标准协议读写{" "}
-              <code className="font-mono">datasets/</code> 与{" "}
-              <code className="font-mono">exports/data-versions/</code>
-              ，并在训练时流式下发到训练机。
+              推荐使用独立存储服务容器（Docker），在大批量数据集迁移与训练拷贝前自动打包压缩、传输完成后自动校验解压；同时完全兼容按现有方式接入的
+              S3、SMB 与挂载目录存储服务器。
             </DialogDescription>
           </DialogHeader>
 
           {!editing ? (
             <div className="grid gap-2">
               <Label>存储协议类型</Label>
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                 {KIND_OPTIONS.map((option) => {
                   const active = kind === option.kind
                   return (
@@ -283,12 +333,22 @@ export function StorageNodeDialog({
                           : "hover:bg-muted/60"
                       )}
                     >
-                      <span className="flex items-center gap-1.5 text-sm font-medium">
-                        <StorageKindIcon
-                          kind={option.kind}
-                          className="size-4 text-muted-foreground"
-                        />
-                        {option.title}
+                      <span className="flex w-full items-center justify-between gap-1.5 text-sm font-medium">
+                        <span className="flex items-center gap-1.5">
+                          <StorageKindIcon
+                            kind={option.kind}
+                            className="size-4 text-muted-foreground"
+                          />
+                          {option.title}
+                        </span>
+                        {option.recommended && (
+                          <Badge
+                            variant="secondary"
+                            className="h-5 px-1.5 text-[11px] font-normal"
+                          >
+                            支持打包加速
+                          </Badge>
+                        )}
                       </span>
                       <span className="text-xs text-muted-foreground">
                         {option.hint}
@@ -302,7 +362,7 @@ export function StorageNodeDialog({
             <div className="rounded-lg border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
               协议类型：
               <span className="font-medium text-foreground">
-                {STORAGE_KIND_LABELS[kind]}
+                {storageKindLabel(kind)}
               </span>
             </div>
           )}
@@ -318,16 +378,146 @@ export function StorageNodeDialog({
                   clearFeedback()
                 }}
                 placeholder={
-                  kind === "s3"
-                    ? "如：机房存储服务器 MinIO"
-                    : kind === "smb"
-                      ? "如：NAS 共享存储柜"
-                      : "如：大容量数据盘 /mnt/data"
+                  kind === "docker"
+                    ? "如：机房专用存储容器节点 #1"
+                    : kind === "s3"
+                      ? "如：机房存储服务器 MinIO"
+                      : kind === "smb"
+                        ? "如：NAS 共享存储柜"
+                        : "如：大容量数据盘 /mnt/data"
                 }
                 disabled={busy}
                 autoComplete="off"
               />
             </Field>
+
+            {kind === "docker" && (
+              <>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field>
+                    <FieldLabel htmlFor={`${formId}-docker-endpoint`}>
+                      存储容器服务地址（Endpoint）
+                    </FieldLabel>
+                    <Input
+                      id={`${formId}-docker-endpoint`}
+                      value={dockerEndpoint}
+                      onChange={(e) => {
+                        setDockerEndpoint(e.target.value)
+                        clearFeedback()
+                      }}
+                      placeholder="http://192.168.1.50:8090"
+                      disabled={busy}
+                      autoComplete="off"
+                    />
+                    <FieldDescription className="text-xs">
+                      填写存储服务器可被平台访问的 HTTP(S) 地址与端口（默认
+                      8090）。
+                    </FieldDescription>
+                  </Field>
+
+                  <Field>
+                    <div className="flex items-center justify-between gap-2">
+                      <FieldLabel htmlFor={`${formId}-docker-token`}>
+                        访问令牌（Bearer Token）
+                      </FieldLabel>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="xs"
+                        className="h-6 px-2 text-xs"
+                        disabled={busy}
+                        onClick={() => {
+                          setDockerToken(generateStorageToken())
+                          clearFeedback()
+                        }}
+                      >
+                        <Sparkles className="size-3" />
+                        随机生成
+                      </Button>
+                    </div>
+                    <Input
+                      id={`${formId}-docker-token`}
+                      type="password"
+                      value={dockerToken}
+                      onChange={(e) => {
+                        setDockerToken(e.target.value)
+                        clearFeedback()
+                      }}
+                      placeholder={
+                        editing && node.has_secret
+                          ? "已加密保存，留空保持不变"
+                          : "与存储容器 TM_STORAGE_TOKEN 一致"
+                      }
+                      disabled={busy}
+                      autoComplete="new-password"
+                    />
+                    <FieldDescription className="flex items-center gap-1 text-xs">
+                      <KeyRound className="size-3 shrink-0" />
+                      {editing && node.has_secret && !dockerToken
+                        ? "当前使用已加密保存的令牌；如需轮换请填写新令牌。"
+                        : dockerToken
+                          ? "已填入访问令牌，可直接复制下方命令在存储服务器上启动容器。"
+                          : "建议点击“随机生成”自动创建高强度令牌，服务端将使用 AES-256-GCM 加密存储。"}
+                    </FieldDescription>
+                  </Field>
+                </div>
+
+                <div className="flex items-center justify-between gap-3 rounded-lg border bg-muted/30 p-3">
+                  <div className="grid gap-0.5">
+                    <Label htmlFor={`${formId}-docker-tls`}>
+                      跳过 TLS 证书校验
+                    </Label>
+                    <span className="text-xs text-muted-foreground">
+                      仅当存储容器通过内网自签名 HTTPS 反向代理暴露时开启
+                    </span>
+                  </div>
+                  <Switch
+                    id={`${formId}-docker-tls`}
+                    checked={dockerInsecureTLS}
+                    onCheckedChange={(v) => {
+                      setDockerInsecureTLS(v)
+                      clearFeedback()
+                    }}
+                    disabled={busy}
+                  />
+                </div>
+
+                <div className="grid gap-2.5 rounded-lg border bg-muted/25 p-3.5 text-xs">
+                  <div className="flex items-center gap-1.5 font-medium text-foreground">
+                    <Terminal className="size-3.5 text-muted-foreground" />
+                    在存储服务器上启动独立存储 Docker 容器
+                  </div>
+                  <p className="text-muted-foreground">
+                    复制以下任一命令在目标存储机上运行（已自动带入端口{" "}
+                    <code className="font-mono text-foreground">
+                      {dockerCommands.port}
+                    </code>{" "}
+                    与上方访问令牌），启动后再点击左下角“测试连接”即可验证连通与打包能力：
+                  </p>
+                  <div className="grid gap-1.5">
+                    <span className="font-medium text-muted-foreground">
+                      方式一：使用仓库独立 Compose 配置启动（推荐）
+                    </span>
+                    <CommandBlock command={dockerCommands.dockerCompose} />
+                  </div>
+                  <div className="grid gap-1.5">
+                    <span className="font-medium text-muted-foreground">
+                      方式二：直接使用 Docker 镜像启动
+                    </span>
+                    <CommandBlock command={dockerCommands.dockerRun} />
+                  </div>
+                </div>
+              </>
+            )}
+
+            {kind !== "docker" && (
+              <div className="flex items-start gap-2 rounded-lg border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
+                <Info className="mt-0.5 size-3.5 shrink-0 text-sky-600 dark:text-sky-400" />
+                <span>
+                  按现有方式接入的存储服务器保持兼容直传，不提供打包操作；已保存的数据集、数据版本与训练拉取均按原有直传流程无缝运行。
+                </span>
+              </div>
+            )}
 
             {kind === "s3" && (
               <>
@@ -628,7 +818,8 @@ export function StorageNodeDialog({
                   autoComplete="off"
                 />
                 <FieldDescription className="text-xs">
-                  适用于已通过 NFS / 大容量数据盘挂载到平台服务器（容器内可见）的独立目录。
+                  适用于已通过 NFS /
+                  大容量数据盘挂载到平台服务器（容器内可见）的独立目录。
                 </FieldDescription>
               </Field>
             )}
@@ -673,9 +864,9 @@ export function StorageNodeDialog({
                   </p>
                 )}
                 {probeResult.usage && probeResult.usage.total_bytes > 0 && (
-                  <p className="tabular-nums text-muted-foreground">
-                    可用空间：{formatBytes(probeResult.usage.free_bytes)} / 总容量{" "}
-                    {formatBytes(probeResult.usage.total_bytes)}
+                  <p className="text-muted-foreground tabular-nums">
+                    可用空间：{formatBytes(probeResult.usage.free_bytes)} /
+                    总容量 {formatBytes(probeResult.usage.total_bytes)}
                   </p>
                 )}
               </AlertDescription>

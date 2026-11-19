@@ -236,27 +236,37 @@ func (f *ArtifactFile) Close() error {
 
 // ---- Agent task protocol types ----
 
+// DatasetArchiveRef advertises a bulk .tar.zst dataset endpoint to trainer agents
+// when the DataVersion's storage node supports archive acceleration.
+type DatasetArchiveRef struct {
+	URL    string `json:"url"`
+	Format string `json:"format"`
+}
+
 // Task is returned to a compute node when it claims a training_job task.
 type Task struct {
-	Kind         string                               `json:"kind"`
-	ID           int64                                `json:"id"`
-	LeaseSeconds int                                  `json:"lease_seconds"`
-	ProjectID    int64                                `json:"project_id"`
-	InitMode     string                               `json:"init_mode"`
-	YOLOVersion  string                               `json:"yolo_version"`
-	ModelScale   string                               `json:"model_scale"`
-	ArchYAML     string                               `json:"arch_yaml"` // e.g. "yolo11n.yaml" when scratch
-	Task         string                               `json:"task"`
-	DataVersion  DataVersionRef                       `json:"data_version"`
-	DatasetCache *storagenode.TrainerCacheTaskPayload `json:"dataset_cache,omitempty"`
-	BaseModel    *BaseModelRef                        `json:"base_model,omitempty"`
-	Params       map[string]any                       `json:"params"`
-	DatasetURL   string                               `json:"dataset_url"`
-	BaseModelURL string                               `json:"base_model_url,omitempty"`
-	ProgressURL  string                               `json:"progress_url"`
-	ArtifactsURL string                               `json:"artifacts_url"`
-	CompleteURL  string                               `json:"complete_url"`
-	FailURL      string                               `json:"fail_url"`
+	Kind           string                               `json:"kind"`
+	ID             int64                                `json:"id"`
+	LeaseSeconds   int                                  `json:"lease_seconds"`
+	ProjectID      int64                                `json:"project_id"`
+	InitMode       string                               `json:"init_mode"`
+	YOLOVersion    string                               `json:"yolo_version"`
+	ModelScale     string                               `json:"model_scale"`
+	ArchYAML       string                               `json:"arch_yaml"` // e.g. "yolo11n.yaml" when scratch
+	Task           string                               `json:"task"`
+	DataVersion    DataVersionRef                       `json:"data_version"`
+	DVTotalBytes   int64                                `json:"dv_total_bytes"`
+	DVTransferMode string                               `json:"dv_transfer_mode"`
+	DatasetCache   *storagenode.TrainerCacheTaskPayload `json:"dataset_cache,omitempty"`
+	DatasetArchive *DatasetArchiveRef                   `json:"dataset_archive,omitempty"`
+	BaseModel      *BaseModelRef                        `json:"base_model,omitempty"`
+	Params         map[string]any                       `json:"params"`
+	DatasetURL     string                               `json:"dataset_url"`
+	BaseModelURL   string                               `json:"base_model_url,omitempty"`
+	ProgressURL    string                               `json:"progress_url"`
+	ArtifactsURL   string                               `json:"artifacts_url"`
+	CompleteURL    string                               `json:"complete_url"`
+	FailURL        string                               `json:"fail_url"`
 }
 
 // ProgressInput is posted periodically by the compute node during training.

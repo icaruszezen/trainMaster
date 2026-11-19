@@ -28,10 +28,12 @@ const (
 
 // Options configures a storage node Service.
 type Options struct {
-	DB        *pgxpool.Pool
-	Storage   *storage.Storage
-	Logger    *slog.Logger
-	SecretKey string
+	DB                  *pgxpool.Pool
+	Storage             *storage.Storage
+	Logger              *slog.Logger
+	SecretKey           string
+	StorageServiceURL   string
+	StorageServiceToken string
 }
 
 type cachedVolume struct {
@@ -43,11 +45,13 @@ type cachedVolume struct {
 // Service manages storage nodes, protocol Volume drivers, trainer dataset cache
 // policies, and background cross-node migrations.
 type Service struct {
-	db       *pgxpool.Pool
-	storage  *storage.Storage
-	dataRoot string
-	log      *slog.Logger
-	cipher   *cipherBox
+	db                  *pgxpool.Pool
+	storage             *storage.Storage
+	dataRoot            string
+	log                 *slog.Logger
+	cipher              *cipherBox
+	storageServiceURL   string
+	storageServiceToken string
 
 	mu      sync.Mutex
 	volumes map[int64]cachedVolume
@@ -74,16 +78,18 @@ func NewService(o Options) *Service {
 		dataRoot = o.Storage.Root()
 	}
 	return &Service{
-		db:        o.DB,
-		storage:   o.Storage,
-		dataRoot:  dataRoot,
-		log:       log,
-		cipher:    newCipherBox(o.SecretKey, dataRoot, o.DB),
-		volumes:   make(map[int64]cachedVolume),
-		base:      context.Background(),
-		wakeMig:   make(chan struct{}, 1),
-		activeMig: make(map[MigrationTarget]int64),
-		cancelMig: make(map[int64]context.CancelFunc),
+		db:                  o.DB,
+		storage:             o.Storage,
+		dataRoot:            dataRoot,
+		log:                 log,
+		cipher:              newCipherBox(o.SecretKey, dataRoot, o.DB),
+		storageServiceURL:   strings.TrimRight(strings.TrimSpace(o.StorageServiceURL), "/"),
+		storageServiceToken: o.StorageServiceToken,
+		volumes:             make(map[int64]cachedVolume),
+		base:                context.Background(),
+		wakeMig:             make(chan struct{}, 1),
+		activeMig:           make(map[MigrationTarget]int64),
+		cancelMig:           make(map[int64]context.CancelFunc),
 	}
 }
 
@@ -166,12 +172,19 @@ func scanNodeRow(row pgx.Row) (nodeRow, error) {
 	return r, nil
 }
 
-func (r nodeRow) ref() NodeRef {
+func (s *Service) builtinRef() NodeRef {
+	ref := BuiltinRef()
+	ref.SupportsArchive = s.NodeSupportsArchive(KindLocal, true)
+	return ref
+}
+
+func (s *Service) rowRef(r nodeRow) NodeRef {
 	return NodeRef{
-		ID:        r.id,
-		Name:      r.name,
-		Kind:      r.kind,
-		IsBuiltin: r.isBuiltin,
+		ID:              r.id,
+		Name:            r.name,
+		Kind:            r.kind,
+		IsBuiltin:       r.isBuiltin,
+		SupportsArchive: s.NodeSupportsArchive(r.kind, r.isBuiltin),
 	}
 }
 
@@ -189,6 +202,15 @@ func (s *Service) parseRowConfig(r nodeRow) (NodeConfig, string, error) {
 			}
 		}
 		return NodeConfig{Local: &lc}, lc.Path, nil
+
+	case KindDocker:
+		var dc DockerConfig
+		if len(r.rawConfig) > 0 {
+			if err := json.Unmarshal(r.rawConfig, &dc); err != nil {
+				return NodeConfig{}, "", fmt.Errorf("parse docker config: %w", err)
+			}
+		}
+		return NodeConfig{Docker: &dc}, dc.Endpoint, nil
 
 	case KindS3:
 		var sc S3Config
@@ -262,6 +284,24 @@ func (s *Service) buildVolume(nodeID int64, isBuiltin bool, kind string, cfg Nod
 		norm := NodeConfig{Local: &LocalConfig{Path: vol.Root()}}
 		return vol, norm, vol.Root(), nil
 
+	case KindDocker:
+		if cfg.Docker == nil {
+			return nil, NodeConfig{}, "", newError(ErrInvalid, "请填写 trainMaster 存储服务地址")
+		}
+		normDC, err := validateDockerConfig(*cfg.Docker)
+		if err != nil {
+			return nil, NodeConfig{}, "", err
+		}
+		if s.storageServiceURL != "" && strings.EqualFold(normDC.Endpoint, s.storageServiceURL) {
+			return nil, NodeConfig{}, "", newError(ErrConflict, "该地址已是平台内置的本机默认存储服务地址")
+		}
+		vol, err := NewDockerVolume(nodeID, isBuiltin, normDC, creds)
+		if err != nil {
+			return nil, NodeConfig{}, "", err
+		}
+		norm := NodeConfig{Docker: &normDC}
+		return vol, norm, normDC.Endpoint, nil
+
 	case KindS3:
 		if cfg.S3 == nil {
 			return nil, NodeConfig{}, "", newError(ErrInvalid, "请填写 S3 存储连接参数")
@@ -285,7 +325,7 @@ func (s *Service) buildVolume(nodeID int64, isBuiltin bool, kind string, cfg Nod
 		return vol, norm, formatSMBTarget(vol.cfg), nil
 
 	default:
-		return nil, NodeConfig{}, "", newError(ErrInvalid, "不支持的存储协议类型 %q（可选：local、s3、smb）", kind)
+		return nil, NodeConfig{}, "", newError(ErrInvalid, "不支持的存储协议类型 %q（可选：docker、local、s3、smb）", kind)
 	}
 }
 
@@ -296,6 +336,8 @@ func marshalProtocolConfig(kind string, isBuiltin bool, cfg NodeConfig) ([]byte,
 	switch kind {
 	case KindLocal:
 		return json.Marshal(cfg.Local)
+	case KindDocker:
+		return json.Marshal(cfg.Docker)
 	case KindS3:
 		return json.Marshal(cfg.S3)
 	case KindSMB:
@@ -306,7 +348,7 @@ func marshalProtocolConfig(kind string, isBuiltin bool, cfg NodeConfig) ([]byte,
 }
 
 func (s *Service) volumeFromRow(ctx context.Context, r nodeRow) (NodeRef, Volume, error) {
-	ref := r.ref()
+	ref := s.rowRef(r)
 
 	s.mu.Lock()
 	if cv, ok := s.volumes[r.id]; ok && cv.updatedAt.Equal(r.updatedAt) {
@@ -359,7 +401,7 @@ func (s *Service) evictCachedVolume(id int64) {
 }
 
 func (s *Service) fallbackBuiltinVolume() (NodeRef, Volume, error) {
-	ref := BuiltinRef()
+	ref := s.builtinRef()
 	s.mu.Lock()
 	if cv, ok := s.volumes[BuiltinID]; ok {
 		s.mu.Unlock()
@@ -418,7 +460,7 @@ func (s *Service) VolumeForNode(ctx context.Context, nodeID int64) (NodeRef, Vol
 
 // NodeRefs loads compact NodeRef metadata for a batch of storage_node_ids.
 func (s *Service) NodeRefs(ctx context.Context, ids []int64) (map[int64]NodeRef, error) {
-	out := map[int64]NodeRef{BuiltinID: BuiltinRef()}
+	out := map[int64]NodeRef{BuiltinID: s.builtinRef()}
 	if s.db == nil || len(ids) == 0 {
 		return out, nil
 	}
@@ -444,6 +486,7 @@ func (s *Service) NodeRefs(ctx context.Context, ids []int64) (map[int64]NodeRef,
 		if err := rows.Scan(&ref.ID, &ref.Name, &ref.Kind, &ref.IsBuiltin); err != nil {
 			return nil, err
 		}
+		ref.SupportsArchive = s.NodeSupportsArchive(ref.Kind, ref.IsBuiltin)
 		out[ref.ID] = ref
 	}
 	return out, rows.Err()
@@ -541,20 +584,21 @@ func (s *Service) rowToNode(ctx context.Context, r nodeRow, stats NodeStats) (No
 		return Node{}, err
 	}
 	n := Node{
-		ID:            r.id,
-		Name:          r.name,
-		Kind:          r.kind,
-		IsBuiltin:     r.isBuiltin,
-		IsActive:      r.isActive,
-		HasSecret:     len(r.credentialsEnc) > 0,
-		DisplayTarget: target,
-		Config:        cfg,
-		Status:        r.lastStatus,
-		StatusError:   r.lastError,
-		LastCheckedAt: r.lastCheckedAt,
-		Stats:         stats,
-		CreatedAt:     r.createdAt,
-		UpdatedAt:     r.updatedAt,
+		ID:              r.id,
+		Name:            r.name,
+		Kind:            r.kind,
+		IsBuiltin:       r.isBuiltin,
+		IsActive:        r.isActive,
+		SupportsArchive: s.NodeSupportsArchive(r.kind, r.isBuiltin),
+		HasSecret:       len(r.credentialsEnc) > 0,
+		DisplayTarget:   target,
+		Config:          cfg,
+		Status:          r.lastStatus,
+		StatusError:     r.lastError,
+		LastCheckedAt:   r.lastCheckedAt,
+		Stats:           stats,
+		CreatedAt:       r.createdAt,
+		UpdatedAt:       r.updatedAt,
 	}
 
 	switch r.kind {
@@ -575,7 +619,7 @@ func (s *Service) rowToNode(ctx context.Context, r nodeRow, stats NodeStats) (No
 				n.Usage = toUsageInfo(u)
 			}
 		}
-	case KindSMB:
+	case KindDocker, KindSMB:
 		if r.lastStatus == StatusOK || r.isActive {
 			uctx, cancel := context.WithTimeout(ctx, listUsageTimeout)
 			if _, vol, verr := s.volumeFromRow(uctx, r); verr == nil {
@@ -694,8 +738,8 @@ func validateNodeName(raw string) (string, error) {
 func (s *Service) TestConnection(ctx context.Context, in TestNodeInput) (TestNodeResult, error) {
 	kind := strings.TrimSpace(in.Kind)
 	isBuiltin := false
-	cfg := NodeConfig{Local: in.Local, S3: in.S3, SMB: in.SMB}
-	creds := Credentials{SecretAccessKey: in.SecretAccessKey, Password: in.Password}
+	cfg := NodeConfig{Local: in.Local, Docker: in.Docker, S3: in.S3, SMB: in.SMB}
+	creds := Credentials{SecretAccessKey: in.SecretAccessKey, Password: in.Password, Token: in.Token}
 
 	if in.NodeID > 0 && s.db != nil {
 		r, err := scanNodeRow(s.db.QueryRow(ctx,
@@ -711,10 +755,20 @@ func (s *Service) TestConnection(ctx context.Context, in TestNodeInput) (TestNod
 		if err != nil {
 			return TestNodeResult{}, err
 		}
-		if cfg.Local == nil && cfg.S3 == nil && cfg.SMB == nil {
+		if kind == KindDocker && cfg.Docker == nil && hasNonNullJSON(in.rawConfig) {
+			dc, tok, derr := decodeDockerConfigAlias(in.rawConfig)
+			if derr != nil {
+				return TestNodeResult{}, newError(ErrInvalid, "存储服务配置格式无效")
+			}
+			cfg.Docker = dc
+			if creds.Token == "" && tok != "" {
+				creds.Token = tok
+			}
+		}
+		if cfg.Local == nil && cfg.Docker == nil && cfg.S3 == nil && cfg.SMB == nil {
 			cfg = storedCfg
 		}
-		if creds.SecretAccessKey == "" && creds.Password == "" && len(r.credentialsEnc) > 0 {
+		if creds.SecretAccessKey == "" && creds.Password == "" && creds.Token == "" && len(r.credentialsEnc) > 0 {
 			storedCreds, err := s.cipher.decrypt(ctx, r.credentialsEnc)
 			if err != nil {
 				return TestNodeResult{}, wrapError(ErrUnavailable, err, "解密已保存的凭据失败")
@@ -773,6 +827,30 @@ func (s *Service) TestConnection(ctx context.Context, in TestNodeInput) (TestNod
 	}, nil
 }
 
+// GetNode returns a single storage node by ID.
+func (s *Service) GetNode(ctx context.Context, id int64) (Node, error) {
+	if s.db == nil {
+		if id == BuiltinID {
+			nodes, err := s.ListNodes(ctx)
+			if err != nil || len(nodes) == 0 {
+				return Node{}, err
+			}
+			return nodes[0], nil
+		}
+		return Node{}, newError(ErrNotFound, "存储节点不存在")
+	}
+	r, err := scanNodeRow(s.db.QueryRow(ctx,
+		"SELECT "+nodeSelectColumns+" FROM storage_nodes WHERE id = $1", id))
+	if err != nil {
+		return Node{}, err
+	}
+	statsMap, err := s.queryNodeStats(ctx)
+	if err != nil {
+		return Node{}, err
+	}
+	return s.rowToNode(ctx, r, statsMap[id])
+}
+
 // CreateNode creates a new storage node and optionally activates it.
 func (s *Service) CreateNode(ctx context.Context, in CreateNodeInput) (Node, error) {
 	if s.db == nil {
@@ -783,8 +861,8 @@ func (s *Service) CreateNode(ctx context.Context, in CreateNodeInput) (Node, err
 		return Node{}, err
 	}
 	kind := strings.TrimSpace(in.Kind)
-	cfg := NodeConfig{Local: in.Local, S3: in.S3, SMB: in.SMB}
-	creds := Credentials{SecretAccessKey: in.SecretAccessKey, Password: in.Password}
+	cfg := NodeConfig{Local: in.Local, Docker: in.Docker, S3: in.S3, SMB: in.SMB}
+	creds := Credentials{SecretAccessKey: in.SecretAccessKey, Password: in.Password, Token: in.Token}
 
 	vol, normCfg, _, err := s.buildVolume(0, false, kind, cfg, creds)
 	if err != nil {
@@ -794,6 +872,11 @@ func (s *Service) CreateNode(ctx context.Context, in CreateNodeInput) (Node, err
 
 	if kind == KindLocal {
 		if err := s.checkLocalPathUnique(ctx, normCfg.Local.Path, 0); err != nil {
+			return Node{}, err
+		}
+	}
+	if kind == KindDocker {
+		if err := s.checkDockerEndpointUnique(ctx, normCfg.Docker.Endpoint, 0); err != nil {
 			return Node{}, err
 		}
 	}
@@ -868,6 +951,30 @@ func (s *Service) checkLocalPathUnique(ctx context.Context, cleanPath string, ex
 	return rows.Err()
 }
 
+func (s *Service) checkDockerEndpointUnique(ctx context.Context, cleanEndpoint string, exceptID int64) error {
+	rows, err := s.db.Query(ctx,
+		"SELECT id, name, config FROM storage_nodes WHERE kind = 'docker' AND id <> $1", exceptID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var name string
+		var raw []byte
+		if err := rows.Scan(&id, &name, &raw); err != nil {
+			return err
+		}
+		var dc DockerConfig
+		if json.Unmarshal(raw, &dc) == nil {
+			if norm, nerr := validateDockerConfig(dc); nerr == nil && strings.EqualFold(norm.Endpoint, cleanEndpoint) {
+				return newError(ErrConflict, "存储服务地址 %q 已被存储节点 %q 使用", cleanEndpoint, name)
+			}
+		}
+	}
+	return rows.Err()
+}
+
 // UpdateNode updates a storage node's name, configuration, or credentials.
 func (s *Service) UpdateNode(ctx context.Context, id int64, in UpdateNodeInput) (Node, error) {
 	if s.db == nil {
@@ -880,9 +987,22 @@ func (s *Service) UpdateNode(ctx context.Context, id int64, in UpdateNodeInput) 
 	}
 
 	if r.isBuiltin {
-		if in.Local != nil || in.S3 != nil || in.SMB != nil ||
-			in.SecretAccessKey != nil || in.Password != nil || in.ClearSecret {
+		if in.Local != nil || in.Docker != nil || in.S3 != nil || in.SMB != nil || hasNonNullJSON(in.rawConfig) ||
+			in.SecretAccessKey != nil || in.Password != nil || in.Token != nil || in.ClearSecret {
 			return Node{}, newError(ErrConflict, "本机默认存储目录由系统环境变量 TM_DATA_DIR 决定，不支持修改连接参数")
+		}
+	}
+
+	if !r.isBuiltin && r.kind == KindDocker && hasNonNullJSON(in.rawConfig) {
+		dc, tok, derr := decodeDockerConfigAlias(in.rawConfig)
+		if derr != nil {
+			return Node{}, newError(ErrInvalid, "存储服务配置格式无效")
+		}
+		if in.Docker == nil {
+			in.Docker = dc
+		}
+		if in.Token == nil && tok != "" {
+			in.Token = &tok
 		}
 	}
 
@@ -901,21 +1021,28 @@ func (s *Service) UpdateNode(ctx context.Context, id int64, in UpdateNodeInput) 
 	if !r.isBuiltin {
 		switch r.kind {
 		case KindLocal:
-			if in.S3 != nil || in.SMB != nil {
+			if in.Docker != nil || in.S3 != nil || in.SMB != nil {
 				return Node{}, newError(ErrInvalid, "不支持修改已创建存储节点的协议类型")
 			}
 			if in.Local != nil {
 				cfg.Local = in.Local
 			}
+		case KindDocker:
+			if in.Local != nil || in.S3 != nil || in.SMB != nil {
+				return Node{}, newError(ErrInvalid, "不支持修改已创建存储节点的协议类型")
+			}
+			if in.Docker != nil {
+				cfg.Docker = in.Docker
+			}
 		case KindS3:
-			if in.Local != nil || in.SMB != nil {
+			if in.Local != nil || in.Docker != nil || in.SMB != nil {
 				return Node{}, newError(ErrInvalid, "不支持修改已创建存储节点的协议类型")
 			}
 			if in.S3 != nil {
 				cfg.S3 = in.S3
 			}
 		case KindSMB:
-			if in.Local != nil || in.S3 != nil {
+			if in.Local != nil || in.Docker != nil || in.S3 != nil {
 				return Node{}, newError(ErrInvalid, "不支持修改已创建存储节点的协议类型")
 			}
 			if in.SMB != nil {
@@ -928,7 +1055,8 @@ func (s *Service) UpdateNode(ctx context.Context, id int64, in UpdateNodeInput) 
 	if err != nil && !in.ClearSecret {
 		// Allow replacing broken credentials if caller explicitly sends a new secret.
 		hasReplacement := (in.SecretAccessKey != nil && *in.SecretAccessKey != "") ||
-			(in.Password != nil && *in.Password != "")
+			(in.Password != nil && *in.Password != "") ||
+			(in.Token != nil && *in.Token != "")
 		if !hasReplacement {
 			return Node{}, wrapError(ErrUnavailable, err, "读取原存储节点密钥失败，请重新填写密钥保存")
 		}
@@ -943,6 +1071,9 @@ func (s *Service) UpdateNode(ctx context.Context, id int64, in UpdateNodeInput) 
 	if in.Password != nil && *in.Password != "" {
 		creds.Password = *in.Password
 	}
+	if in.Token != nil && *in.Token != "" {
+		creds.Token = *in.Token
+	}
 
 	vol, normCfg, _, err := s.buildVolume(r.id, r.isBuiltin, r.kind, cfg, creds)
 	if err != nil {
@@ -952,6 +1083,11 @@ func (s *Service) UpdateNode(ctx context.Context, id int64, in UpdateNodeInput) 
 
 	if r.kind == KindLocal && !r.isBuiltin {
 		if err := s.checkLocalPathUnique(ctx, normCfg.Local.Path, r.id); err != nil {
+			return Node{}, err
+		}
+	}
+	if r.kind == KindDocker {
+		if err := s.checkDockerEndpointUnique(ctx, normCfg.Docker.Endpoint, r.id); err != nil {
 			return Node{}, err
 		}
 	}

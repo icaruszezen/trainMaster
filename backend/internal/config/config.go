@@ -66,6 +66,14 @@ type Config struct {
 	// Empty: the platform auto-generates and persists a key in the data
 	// directory / app_settings.
 	SecretKey string
+	// StorageServiceURL is the optional HTTP(S) base URL of the co-located
+	// trainmaster-storage container (TM_STORAGE_SERVICE_URL, e.g.
+	// "http://storage:8090"), enabling bulk archive operations on the built-in
+	// local storage node.
+	StorageServiceURL string
+	// StorageServiceToken is the optional Bearer token for StorageServiceURL
+	// (TM_STORAGE_SERVICE_TOKEN, falling back to TM_STORAGE_TOKEN).
+	StorageServiceToken string
 }
 
 // Limits of the training node settings.
@@ -220,6 +228,20 @@ func Load(getenv func(string) string) (*Config, error) {
 		} else {
 			cfg.SecretKey = secret
 		}
+	}
+
+	if rawStorageURL := get("TM_STORAGE_SERVICE_URL", ""); rawStorageURL != "" {
+		parsed, err := url.Parse(rawStorageURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			fail("TM_STORAGE_SERVICE_URL", "must be a valid http:// or https:// URL (got %q)", rawStorageURL)
+		} else {
+			cfg.StorageServiceURL = strings.TrimRight(rawStorageURL, "/")
+		}
+	}
+	if tok := verbatim("TM_STORAGE_SERVICE_TOKEN", ""); tok != "" {
+		cfg.StorageServiceToken = tok
+	} else if tok := verbatim("TM_STORAGE_TOKEN", ""); tok != "" {
+		cfg.StorageServiceToken = tok
 	}
 
 	if len(problems) > 0 {

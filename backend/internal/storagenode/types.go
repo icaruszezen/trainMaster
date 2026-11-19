@@ -1,12 +1,30 @@
 package storagenode
 
-import "time"
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+	"time"
+)
 
 // Storage node protocol kinds.
 const (
-	KindLocal = "local"
-	KindS3    = "s3"
-	KindSMB   = "smb"
+	KindLocal  = "local"
+	KindDocker = "docker"
+	KindS3     = "s3"
+	KindSMB    = "smb"
+)
+
+// Transfer modes and archive migration stages.
+const (
+	TransferModeDirect  = "direct"
+	TransferModeArchive = "archive"
+
+	MigrationStagePacking      = "packing"
+	MigrationStageTransferring = "transferring"
+	MigrationStageExtracting   = "extracting"
+	MigrationStageVerifying    = "verifying"
+	MigrationStageCleaning     = "cleaning"
 )
 
 // Managed logical namespaces stored on a storage node.
@@ -43,10 +61,11 @@ const (
 // NodeRef is the compact storage node reference embedded in Dataset and
 // DataVersion API responses.
 type NodeRef struct {
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	Kind      string `json:"kind"`
-	IsBuiltin bool   `json:"is_builtin"`
+	ID              int64  `json:"id"`
+	Name            string `json:"name"`
+	Kind            string `json:"kind"`
+	IsBuiltin       bool   `json:"is_builtin"`
+	SupportsArchive bool   `json:"supports_archive"`
 }
 
 // BuiltinRef returns the default NodeRef for the built-in local storage node.
@@ -58,6 +77,12 @@ func BuiltinRef() NodeRef {
 // For the built-in node, Path is resolved dynamically from TM_DATA_DIR.
 type LocalConfig struct {
 	Path string `json:"path"`
+}
+
+// DockerConfig holds non-secret configuration for a trainMaster Docker storage node.
+type DockerConfig struct {
+	Endpoint           string `json:"endpoint"`
+	InsecureSkipVerify bool   `json:"insecure_skip_verify"`
 }
 
 // S3Config holds non-secret configuration for an S3-compatible storage node.
@@ -83,9 +108,29 @@ type SMBConfig struct {
 
 // NodeConfig holds protocol-specific public parameters.
 type NodeConfig struct {
-	Local *LocalConfig `json:"local,omitempty"`
-	S3    *S3Config    `json:"s3,omitempty"`
-	SMB   *SMBConfig   `json:"smb,omitempty"`
+	Local  *LocalConfig  `json:"local,omitempty"`
+	Docker *DockerConfig `json:"docker,omitempty"`
+	S3     *S3Config     `json:"s3,omitempty"`
+	SMB    *SMBConfig    `json:"smb,omitempty"`
+}
+
+// MarshalJSON emits both nested "docker": {...} and flat "endpoint" /
+// "insecure_skip_verify" fields when Docker != nil so both nested and flat API
+// consumers work seamlessly while leaving Local/S3/SMB untouched.
+func (c NodeConfig) MarshalJSON() ([]byte, error) {
+	if c.Docker != nil && c.Local == nil && c.S3 == nil && c.SMB == nil {
+		return json.Marshal(struct {
+			Docker             *DockerConfig `json:"docker"`
+			Endpoint           string        `json:"endpoint"`
+			InsecureSkipVerify bool          `json:"insecure_skip_verify"`
+		}{
+			Docker:             c.Docker,
+			Endpoint:           c.Docker.Endpoint,
+			InsecureSkipVerify: c.Docker.InsecureSkipVerify,
+		})
+	}
+	type plain NodeConfig
+	return json.Marshal(plain(c))
 }
 
 // Credentials holds secret fields encrypted at rest in credentials_enc and
@@ -93,9 +138,10 @@ type NodeConfig struct {
 type Credentials struct {
 	SecretAccessKey string `json:"secret_access_key,omitempty"`
 	Password        string `json:"password,omitempty"`
+	Token           string `json:"token,omitempty"`
 }
 
-// UsageInfo reports filesystem capacity when supported (Local and SMB).
+// UsageInfo reports filesystem capacity when supported (Local, Docker, and SMB).
 type UsageInfo struct {
 	TotalBytes uint64 `json:"total_bytes"`
 	FreeBytes  uint64 `json:"free_bytes"`
@@ -113,64 +159,224 @@ type NodeStats struct {
 
 // Node is a storage node returned by the management API.
 type Node struct {
-	ID            int64      `json:"id"`
-	Name          string     `json:"name"`
-	Kind          string     `json:"kind"`
-	IsBuiltin     bool       `json:"is_builtin"`
-	IsActive      bool       `json:"is_active"`
-	HasSecret     bool       `json:"has_secret"`
-	DisplayTarget string     `json:"display_target"`
-	Config        NodeConfig `json:"config"`
-	Status        string     `json:"status"`
-	StatusError   string     `json:"status_error,omitempty"`
-	LastCheckedAt *time.Time `json:"last_checked_at,omitempty"`
-	Usage         *UsageInfo `json:"usage,omitempty"`
-	Stats         NodeStats  `json:"stats"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID              int64      `json:"id"`
+	Name            string     `json:"name"`
+	Kind            string     `json:"kind"`
+	IsBuiltin       bool       `json:"is_builtin"`
+	IsActive        bool       `json:"is_active"`
+	SupportsArchive bool       `json:"supports_archive"`
+	HasSecret       bool       `json:"has_secret"`
+	DisplayTarget   string     `json:"display_target"`
+	Config          NodeConfig `json:"config"`
+	Status          string     `json:"status"`
+	StatusError     string     `json:"status_error,omitempty"`
+	LastCheckedAt   *time.Time `json:"last_checked_at,omitempty"`
+	Usage           *UsageInfo `json:"usage,omitempty"`
+	Stats           NodeStats  `json:"stats"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 // Ref returns the compact NodeRef of n.
 func (n Node) Ref() NodeRef {
-	return NodeRef{ID: n.ID, Name: n.Name, Kind: n.Kind, IsBuiltin: n.IsBuiltin}
+	return NodeRef{
+		ID:              n.ID,
+		Name:            n.Name,
+		Kind:            n.Kind,
+		IsBuiltin:       n.IsBuiltin,
+		SupportsArchive: n.SupportsArchive,
+	}
+}
+
+type rawDockerConfigWithToken struct {
+	Endpoint           string        `json:"endpoint"`
+	InsecureSkipVerify bool          `json:"insecure_skip_verify"`
+	Token              string        `json:"token"`
+	Docker             *DockerConfig `json:"docker"`
 }
 
 // CreateNodeInput holds parameters for creating a storage node.
 type CreateNodeInput struct {
-	Name            string       `json:"name"`
-	Kind            string       `json:"kind"`
-	Local           *LocalConfig `json:"local,omitempty"`
-	S3              *S3Config    `json:"s3,omitempty"`
-	SMB             *SMBConfig   `json:"smb,omitempty"`
-	SecretAccessKey string       `json:"secret_access_key,omitempty"`
-	Password        string       `json:"password,omitempty"`
-	Activate        bool         `json:"activate"`
+	Name            string        `json:"name"`
+	Kind            string        `json:"kind"`
+	Local           *LocalConfig  `json:"local,omitempty"`
+	Docker          *DockerConfig `json:"docker,omitempty"`
+	S3              *S3Config     `json:"s3,omitempty"`
+	SMB             *SMBConfig    `json:"smb,omitempty"`
+	SecretAccessKey string        `json:"secret_access_key,omitempty"`
+	Password        string        `json:"password,omitempty"`
+	Token           string        `json:"token,omitempty"`
+	Activate        bool          `json:"activate"`
+}
+
+// UnmarshalJSON accepts both "docker": {...} and "config": {...} (as well as
+// top-level or nested "token") for KindDocker inputs.
+func (in *CreateNodeInput) UnmarshalJSON(data []byte) error {
+	type alias CreateNodeInput
+	var aux struct {
+		alias
+		ConfigRaw   json.RawMessage           `json:"config"`
+		DockerRaw   *rawDockerConfigWithToken `json:"docker"`
+		Credentials *Credentials              `json:"credentials"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*in = CreateNodeInput(aux.alias)
+	if aux.DockerRaw != nil {
+		in.Docker = &DockerConfig{
+			Endpoint:           aux.DockerRaw.Endpoint,
+			InsecureSkipVerify: aux.DockerRaw.InsecureSkipVerify,
+		}
+		if in.Token == "" && aux.DockerRaw.Token != "" {
+			in.Token = aux.DockerRaw.Token
+		}
+	}
+	if strings.TrimSpace(in.Kind) == KindDocker && hasNonNullJSON(aux.ConfigRaw) {
+		dc, tok, err := decodeDockerConfigAlias(aux.ConfigRaw)
+		if err != nil {
+			return err
+		}
+		if in.Docker == nil {
+			in.Docker = dc
+		}
+		if in.Token == "" && tok != "" {
+			in.Token = tok
+		}
+	}
+	if in.Token == "" && aux.Credentials != nil && aux.Credentials.Token != "" {
+		in.Token = aux.Credentials.Token
+	}
+	return nil
 }
 
 // UpdateNodeInput holds parameters for updating an existing storage node.
-// Empty SecretAccessKey / Password preserves the previously saved secret unless
-// ClearSecret is true.
+// Empty SecretAccessKey / Password / Token preserves the previously saved
+// secret unless ClearSecret is true.
 type UpdateNodeInput struct {
-	Name            *string      `json:"name,omitempty"`
-	Local           *LocalConfig `json:"local,omitempty"`
-	S3              *S3Config    `json:"s3,omitempty"`
-	SMB             *SMBConfig   `json:"smb,omitempty"`
-	SecretAccessKey *string      `json:"secret_access_key,omitempty"`
-	Password        *string      `json:"password,omitempty"`
-	ClearSecret     bool         `json:"clear_secret,omitempty"`
+	Name            *string       `json:"name,omitempty"`
+	Local           *LocalConfig  `json:"local,omitempty"`
+	Docker          *DockerConfig `json:"docker,omitempty"`
+	S3              *S3Config     `json:"s3,omitempty"`
+	SMB             *SMBConfig    `json:"smb,omitempty"`
+	SecretAccessKey *string       `json:"secret_access_key,omitempty"`
+	Password        *string       `json:"password,omitempty"`
+	Token           *string       `json:"token,omitempty"`
+	ClearSecret     bool          `json:"clear_secret,omitempty"`
+
+	rawConfig json.RawMessage
+}
+
+// UnmarshalJSON accepts both "docker": {...} and "config": {...} on PATCH,
+// deferring "config" alias resolution until UpdateNode knows the target node's kind.
+func (in *UpdateNodeInput) UnmarshalJSON(data []byte) error {
+	type alias UpdateNodeInput
+	var aux struct {
+		alias
+		ConfigRaw   json.RawMessage           `json:"config"`
+		DockerRaw   *rawDockerConfigWithToken `json:"docker"`
+		Credentials *Credentials              `json:"credentials"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*in = UpdateNodeInput(aux.alias)
+	in.rawConfig = append(json.RawMessage(nil), aux.ConfigRaw...)
+	if aux.DockerRaw != nil {
+		in.Docker = &DockerConfig{
+			Endpoint:           aux.DockerRaw.Endpoint,
+			InsecureSkipVerify: aux.DockerRaw.InsecureSkipVerify,
+		}
+		if in.Token == nil && aux.DockerRaw.Token != "" {
+			tok := aux.DockerRaw.Token
+			in.Token = &tok
+		}
+	}
+	if in.Token == nil && aux.Credentials != nil && aux.Credentials.Token != "" {
+		tok := aux.Credentials.Token
+		in.Token = &tok
+	}
+	return nil
 }
 
 // TestNodeInput holds parameters for probing a candidate or existing node.
 // When NodeID > 0 and no new secret is sent, the stored encrypted credentials
 // of NodeID are reused.
 type TestNodeInput struct {
-	NodeID          int64        `json:"node_id,omitempty"`
-	Kind            string       `json:"kind"`
-	Local           *LocalConfig `json:"local,omitempty"`
-	S3              *S3Config    `json:"s3,omitempty"`
-	SMB             *SMBConfig   `json:"smb,omitempty"`
-	SecretAccessKey string       `json:"secret_access_key,omitempty"`
-	Password        string       `json:"password,omitempty"`
+	NodeID          int64         `json:"node_id,omitempty"`
+	Kind            string        `json:"kind"`
+	Local           *LocalConfig  `json:"local,omitempty"`
+	Docker          *DockerConfig `json:"docker,omitempty"`
+	S3              *S3Config     `json:"s3,omitempty"`
+	SMB             *SMBConfig    `json:"smb,omitempty"`
+	SecretAccessKey string        `json:"secret_access_key,omitempty"`
+	Password        string        `json:"password,omitempty"`
+	Token           string        `json:"token,omitempty"`
+
+	rawConfig json.RawMessage
+}
+
+// UnmarshalJSON accepts both "docker": {...} and "config": {...} on test probe.
+func (in *TestNodeInput) UnmarshalJSON(data []byte) error {
+	type alias TestNodeInput
+	var aux struct {
+		alias
+		ConfigRaw   json.RawMessage           `json:"config"`
+		DockerRaw   *rawDockerConfigWithToken `json:"docker"`
+		Credentials *Credentials              `json:"credentials"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*in = TestNodeInput(aux.alias)
+	in.rawConfig = append(json.RawMessage(nil), aux.ConfigRaw...)
+	if aux.DockerRaw != nil {
+		in.Docker = &DockerConfig{
+			Endpoint:           aux.DockerRaw.Endpoint,
+			InsecureSkipVerify: aux.DockerRaw.InsecureSkipVerify,
+		}
+		if in.Token == "" && aux.DockerRaw.Token != "" {
+			in.Token = aux.DockerRaw.Token
+		}
+	}
+	if strings.TrimSpace(in.Kind) == KindDocker && hasNonNullJSON(in.rawConfig) {
+		dc, tok, err := decodeDockerConfigAlias(in.rawConfig)
+		if err != nil {
+			return err
+		}
+		if in.Docker == nil {
+			in.Docker = dc
+		}
+		if in.Token == "" && tok != "" {
+			in.Token = tok
+		}
+	}
+	if in.Token == "" && aux.Credentials != nil && aux.Credentials.Token != "" {
+		in.Token = aux.Credentials.Token
+	}
+	return nil
+}
+
+func hasNonNullJSON(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
+}
+
+func decodeDockerConfigAlias(raw json.RawMessage) (*DockerConfig, string, error) {
+	var cfgRaw rawDockerConfigWithToken
+	if err := json.Unmarshal(raw, &cfgRaw); err != nil {
+		return nil, "", err
+	}
+	if cfgRaw.Docker != nil {
+		return &DockerConfig{
+			Endpoint:           cfgRaw.Docker.Endpoint,
+			InsecureSkipVerify: cfgRaw.Docker.InsecureSkipVerify,
+		}, cfgRaw.Token, nil
+	}
+	return &DockerConfig{
+		Endpoint:           cfgRaw.Endpoint,
+		InsecureSkipVerify: cfgRaw.InsecureSkipVerify,
+	}, cfgRaw.Token, nil
 }
 
 // TestNodeResult reports the outcome of a connection & write probe.
@@ -260,6 +466,9 @@ type Migration struct {
 	FromNode     NodeRef    `json:"from_node"`
 	ToNode       NodeRef    `json:"to_node"`
 	DeleteSource bool       `json:"delete_source"`
+	TransferMode string     `json:"transfer_mode"`
+	Stage        string     `json:"stage"`
+	ArchiveBytes int64      `json:"archive_bytes"`
 	Status       string     `json:"status"`
 	FilesDone    int        `json:"files_done"`
 	FilesTotal   int        `json:"files_total"`
