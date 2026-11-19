@@ -9,6 +9,7 @@ import {
   countModifiedParams,
   countTemplateParamDiffs,
   filterParamSpecs,
+  filterTemplatesBySource,
   formatCompactParamValue,
   formatParamsYaml,
   isParamModified,
@@ -16,7 +17,9 @@ import {
   listModifiedParams,
   parseFreezeText,
   parseIntListText,
+  partitionTemplatesBySource,
   splitSpecsByTier,
+  suggestedTemplateCopyName,
   validateTrainingParams,
 } from "@/features/training/training-params"
 
@@ -323,5 +326,41 @@ describe("validateTrainingParams & formatParamsYaml", () => {
     expect(yaml).toContain("epochs: 100\n")
     expect(yaml).toContain("imgsz: [640, 960]\n")
     expect(yaml).toContain("classes: null\n")
+  })
+})
+
+describe("template source helpers", () => {
+  const templates = [
+    { id: 10, name: "产线焊点检测", is_builtin: false },
+    { id: 1, name: "快速验证 / 试跑", is_builtin: true },
+    { id: 11, name: "自定义高分模板", is_builtin: false },
+    { id: 2, name: "通用工业检测基准", is_builtin: true },
+  ]
+
+  it("partitions custom and builtin templates while preserving order", () => {
+    const { custom, builtin } = partitionTemplatesBySource(templates)
+    expect(custom.map((t) => t.id)).toEqual([10, 11])
+    expect(builtin.map((t) => t.id)).toEqual([1, 2])
+  })
+
+  it("filters templates by source tab", () => {
+    expect(filterTemplatesBySource(templates, "all").map((t) => t.id)).toEqual([
+      10, 1, 11, 2,
+    ])
+    expect(
+      filterTemplatesBySource(templates, "custom").map((t) => t.id)
+    ).toEqual([10, 11])
+    expect(
+      filterTemplatesBySource(templates, "builtin").map((t) => t.id)
+    ).toEqual([1, 2])
+  })
+
+  it("suggests distinct copy names for built-in and custom templates", () => {
+    expect(
+      suggestedTemplateCopyName({ name: "高分辨率微小缺陷", is_builtin: true })
+    ).toBe("高分辨率微小缺陷-自定义")
+    expect(
+      suggestedTemplateCopyName({ name: "产线焊点检测", is_builtin: false })
+    ).toBe("产线焊点检测-副本")
   })
 })

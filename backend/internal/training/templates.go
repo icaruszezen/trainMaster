@@ -58,7 +58,7 @@ func isTemplateUniqueNameError(err error) bool {
 	return pgErr.ConstraintName == "training_param_templates_name_key" || strings.Contains(pgErr.Message, "training_param_templates_name_key")
 }
 
-const templateSelectCols = `id, name, description, params, is_default, created_at, updated_at`
+const templateSelectCols = `id, name, description, params, is_default, is_builtin, COALESCE(builtin_key, ''), created_at, updated_at`
 
 func scanTemplateRow(row pgx.Row) (ParamTemplate, error) {
 	var (
@@ -67,7 +67,7 @@ func scanTemplateRow(row pgx.Row) (ParamTemplate, error) {
 	)
 	if err := row.Scan(
 		&tpl.ID, &tpl.Name, &tpl.Description, &paramsRaw,
-		&tpl.IsDefault, &tpl.CreatedAt, &tpl.UpdatedAt,
+		&tpl.IsDefault, &tpl.IsBuiltin, &tpl.BuiltinKey, &tpl.CreatedAt, &tpl.UpdatedAt,
 	); err != nil {
 		return ParamTemplate{}, err
 	}
@@ -89,8 +89,9 @@ func scanTemplateRow(row pgx.Row) (ParamTemplate, error) {
 	return tpl, nil
 }
 
-// ListTemplates returns all global training parameter templates, default first,
-// then most recently updated. search optionally matches name or description.
+// ListTemplates returns all global training parameter templates: default first,
+// then custom templates (most recently updated), then system built-in presets
+// in their curated workflow order. search optionally matches name or description.
 func (s *Service) ListTemplates(ctx context.Context, search string) ([]ParamTemplate, error) {
 	q := strings.TrimSpace(search)
 	rows, err := s.db.Query(ctx, `SELECT `+templateSelectCols+`
@@ -98,7 +99,7 @@ func (s *Service) ListTemplates(ctx context.Context, search string) ([]ParamTemp
 		WHERE ($1 = ''
 			OR strpos(lower(name), lower($1)) > 0
 			OR strpos(lower(description), lower($1)) > 0)
-		ORDER BY is_default DESC, updated_at DESC, id DESC`, q)
+		ORDER BY is_default DESC, is_builtin ASC, builtin_order ASC, updated_at DESC, id DESC`, q)
 	if err != nil {
 		return nil, err
 	}
@@ -184,6 +185,8 @@ func (s *Service) CreateTemplate(ctx context.Context, in CreateTemplateInput) (P
 }
 
 // UpdateTemplate applies partial updates to an existing training parameter template.
+// System built-in templates only permit toggling is_default; attempts to modify
+// their name, description, or params are rejected with ErrConflict.
 func (s *Service) UpdateTemplate(ctx context.Context, id int64, in UpdateTemplateInput) (ParamTemplate, error) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -198,6 +201,10 @@ func (s *Service) UpdateTemplate(ctx context.Context, id int64, in UpdateTemplat
 	}
 	if err != nil {
 		return ParamTemplate{}, err
+	}
+
+	if cur.IsBuiltin && (in.Name != nil || in.Description != nil || in.Params != nil) {
+		return ParamTemplate{}, errTemplateBuiltinReadOnly
 	}
 
 	name := cur.Name
@@ -275,16 +282,33 @@ func (s *Service) UpdateTemplate(ctx context.Context, id int64, in UpdateTemplat
 	return updated, nil
 }
 
-// DeleteTemplate permanently deletes a training parameter template.
-// Any training jobs referencing it keep their template_name snapshot while
-// template_id is set to NULL by the foreign key constraint.
+// DeleteTemplate permanently deletes a custom training parameter template.
+// System built-in templates cannot be deleted. Any training jobs referencing a
+// deleted custom template keep their template_name snapshot while template_id
+// is set to NULL by the foreign key constraint.
 func (s *Service) DeleteTemplate(ctx context.Context, id int64) error {
-	tag, err := s.db.Exec(ctx, `DELETE FROM training_param_templates WHERE id = $1`, id)
+	tx, err := s.db.Begin(ctx)
 	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var isBuiltin bool
+	if err := tx.QueryRow(ctx, `SELECT is_builtin FROM training_param_templates WHERE id = $1 FOR UPDATE`, id).Scan(&isBuiltin); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errTemplateNotFound
+		}
+		return fmt.Errorf("lookup parameter template: %w", err)
+	}
+	if isBuiltin {
+		return errTemplateBuiltinDelete
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM training_param_templates WHERE id = $1`, id); err != nil {
 		return fmt.Errorf("delete parameter template: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return errTemplateNotFound
+	if err := tx.Commit(ctx); err != nil {
+		return err
 	}
 	s.log.Info("training parameter template deleted", "template_id", id)
 	return nil

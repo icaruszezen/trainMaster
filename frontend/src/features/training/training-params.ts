@@ -8,7 +8,46 @@ import type {
   InitMode,
   ParamGroupKey,
   ParamSpec,
+  TrainingParamTemplate,
 } from "@/features/training/api"
+
+export type TemplateSourceFilter = "all" | "custom" | "builtin"
+
+/** 将参数模板按来源拆分为“自定义模板”与“系统内置模板”两组（保留服务端排序）。 */
+export function partitionTemplatesBySource<
+  T extends Pick<TrainingParamTemplate, "is_builtin">,
+>(templates: readonly T[]): { custom: T[]; builtin: T[] } {
+  const custom: T[] = []
+  const builtin: T[] = []
+  for (const tpl of templates) {
+    if (tpl.is_builtin) {
+      builtin.push(tpl)
+    } else {
+      custom.push(tpl)
+    }
+  }
+  return { custom, builtin }
+}
+
+/** 按来源标签筛选参数模板列表。 */
+export function filterTemplatesBySource<
+  T extends Pick<TrainingParamTemplate, "is_builtin">,
+>(templates: readonly T[], source: TemplateSourceFilter): T[] {
+  if (source === "custom") {
+    return templates.filter((t) => !t.is_builtin)
+  }
+  if (source === "builtin") {
+    return templates.filter((t) => t.is_builtin)
+  }
+  return [...templates]
+}
+
+/** 生成从已有模板复制/派生时的默认名称建议。 */
+export function suggestedTemplateCopyName(
+  source: Pick<TrainingParamTemplate, "name" | "is_builtin">
+): string {
+  return source.is_builtin ? `${source.name}-自定义` : `${source.name}-副本`
+}
 
 /** 深度比较两个参数值是否与官方默认值一致。 */
 export function isSameParamValue(a: unknown, b: unknown): boolean {

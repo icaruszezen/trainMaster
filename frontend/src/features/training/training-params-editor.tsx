@@ -75,6 +75,8 @@ export type TrainingParamsEditorProps = {
   /** job：用于新建训练任务；template：用于创建/编辑参数模板（resume 固定托管）。 */
   mode?: "job" | "template"
   disabled?: boolean
+  /** 只读预览模式（如系统内置模板详情）：禁用参数编辑并隐藏各类“恢复默认”按钮，仍支持搜索、展开高级项与查看 YAML。 */
+  readOnly?: boolean
   /** 顶部扩展槽（如新建训练页的参数模板快捷选择与保存栏）。 */
   headerSlot?: ReactNode
 }
@@ -86,8 +88,10 @@ export function TrainingParamsEditor({
   initMode = "scratch",
   mode = "job",
   disabled = false,
+  readOnly = false,
   headerSlot,
 }: TrainingParamsEditorProps) {
+  const effectiveDisabled = disabled || readOnly
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [activeTab, setActiveTab] = useState<ParamGroupKey | "all">("train")
   const [query, setQuery] = useState("")
@@ -206,7 +210,7 @@ export function TrainingParamsEditor({
   }
 
   const isSpecLocked = (spec: ParamSpec) =>
-    disabled ||
+    effectiveDisabled ||
     (spec.key === "resume" && (mode === "template" || initMode === "resume"))
 
   const specLockedHint = (spec: ParamSpec) => {
@@ -261,16 +265,18 @@ export function TrainingParamsEditor({
             <FileCode2 />
             查看 YAML
           </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={disabled || totalModified === 0}
-            onClick={resetAll}
-          >
-            <RotateCcw />
-            全部恢复默认
-          </Button>
+          {!readOnly && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={effectiveDisabled || totalModified === 0}
+              onClick={resetAll}
+            >
+              <RotateCcw />
+              全部恢复默认
+            </Button>
+          )}
         </div>
       </div>
 
@@ -378,12 +384,12 @@ export function TrainingParamsEditor({
                 )}
               </div>
 
-              {commonModified > 0 && (
+              {!readOnly && commonModified > 0 && (
                 <Button
                   type="button"
                   variant="ghost"
                   size="xs"
-                  disabled={disabled}
+                  disabled={effectiveDisabled}
                   onClick={() => resetSpecs(commonSpecs)}
                 >
                   <RotateCcw />
@@ -579,12 +585,12 @@ export function TrainingParamsEditor({
                       </span>
                     </label>
 
-                    {modifiedAdvancedItems.length > 0 && (
+                    {!readOnly && modifiedAdvancedItems.length > 0 && (
                       <Button
                         type="button"
                         variant="outline"
                         size="xs"
-                        disabled={disabled}
+                        disabled={effectiveDisabled}
                         onClick={() => resetSpecs(advancedSpecs)}
                       >
                         <RotateCcw />
@@ -597,12 +603,12 @@ export function TrainingParamsEditor({
                 {activeGroupMeta && (
                   <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-muted/30 px-3.5 py-2 text-xs text-muted-foreground">
                     <span>{activeGroupMeta.description}</span>
-                    {activeAdvancedGroupModified > 0 && (
+                    {!readOnly && activeAdvancedGroupModified > 0 && (
                       <Button
                         type="button"
                         variant="ghost"
                         size="xs"
-                        disabled={disabled}
+                        disabled={effectiveDisabled}
                         onClick={() => resetAdvancedGroup(activeGroupMeta.key)}
                       >
                         <RotateCcw />

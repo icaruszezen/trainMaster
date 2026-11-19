@@ -9,11 +9,14 @@ import { useMutation, useQuery } from "@tanstack/react-query"
 import {
   Copy,
   Ellipsis,
+  Eye,
+  Lock,
   Pencil,
   Plus,
   Rocket,
   Search,
   SearchX,
+  ShieldCheck,
   SlidersHorizontal,
   Star,
   StarOff,
@@ -54,6 +57,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { LoadError } from "@/features/datasets/load-error"
 import {
   cacheTrainingTemplate,
@@ -72,10 +76,13 @@ import {
   newTrainingTemplatePath,
 } from "@/features/training/paths"
 import {
+  filterTemplatesBySource,
   formatCompactParamValue,
   isParamModified,
   listModifiedParams,
+  partitionTemplatesBySource,
   splitSpecsByTier,
+  type TemplateSourceFilter,
 } from "@/features/training/training-params"
 import { formatDateTime, formatNumber, formatRelativeTime } from "@/lib/format"
 import { queryClient } from "@/lib/query-client"
@@ -94,6 +101,7 @@ const MAX_ADVANCED_CHIPS = 6
 
 export function TrainingTemplatesPage() {
   const [keyword, setKeyword] = useState("")
+  const [sourceFilter, setSourceFilter] = useState<TemplateSourceFilter>("all")
   const [deleting, setDeleting] = useState<TrainingParamTemplate | null>(null)
 
   const templatesQuery = useQuery(trainingTemplatesQuery(keyword))
@@ -120,14 +128,25 @@ export function TrainingTemplatesPage() {
     },
   })
 
-  const items = templatesQuery.data?.items ?? []
-  const hasFilter = keyword.trim() !== ""
+  const items = useMemo(
+    () => templatesQuery.data?.items ?? [],
+    [templatesQuery.data?.items]
+  )
+  const { custom: customItems, builtin: builtinItems } = useMemo(
+    () => partitionTemplatesBySource(items),
+    [items]
+  )
+  const visibleItems = useMemo(
+    () => filterTemplatesBySource(items, sourceFilter),
+    [items, sourceFilter]
+  )
+  const hasSearch = keyword.trim() !== ""
 
   return (
     <>
       <PageHeader
         title="参数模板"
-        description="将常用的 Ultralytics YOLO 训练参数（常用项与高级选项）保存为可复用模板，发起训练时可一键加载再按需微调，也支持指定一个默认模板自动预填。"
+        description="内置面向工业视觉检测的常用 YOLO 参数预设，也支持创建与管理团队自定义模板；发起训练时可一键加载再按需微调，或指定一个默认模板自动预填。"
         actions={
           <Button asChild>
             <Link to={newTrainingTemplatePath()}>
@@ -138,35 +157,72 @@ export function TrainingTemplatesPage() {
         }
       />
 
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="relative min-w-52 flex-1 sm:max-w-sm">
-          <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={keyword}
-            onChange={(event) => setKeyword(event.target.value)}
-            placeholder="搜索模板名称或说明…"
-            className="pr-8 pl-9"
-            aria-label="搜索参数模板"
-          />
-          {keyword && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              className="absolute top-1/2 right-1.5 -translate-y-1/2 text-muted-foreground"
-              onClick={() => setKeyword("")}
-              aria-label="清空搜索"
-            >
-              <X />
-            </Button>
-          )}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-3">
+          <div className="relative min-w-52 flex-1 sm:max-w-sm">
+            <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={keyword}
+              onChange={(event) => setKeyword(event.target.value)}
+              placeholder="搜索模板名称或说明…"
+              className="pr-8 pl-9"
+              aria-label="搜索参数模板"
+            />
+            {keyword && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                className="absolute top-1/2 right-1.5 -translate-y-1/2 text-muted-foreground"
+                onClick={() => setKeyword("")}
+                aria-label="清空搜索"
+              >
+                <X />
+              </Button>
+            )}
+          </div>
+
+          <Tabs
+            value={sourceFilter}
+            onValueChange={(next) =>
+              setSourceFilter(next as TemplateSourceFilter)
+            }
+          >
+            <TabsList aria-label="按模板来源筛选">
+              <TabsTrigger value="all" className="gap-1.5">
+                全部
+                {templatesQuery.data && (
+                  <span className="text-[11px] text-muted-foreground tabular-nums">
+                    ({formatNumber(items.length)})
+                  </span>
+                )}
+              </TabsTrigger>
+              <TabsTrigger value="custom" className="gap-1.5">
+                自定义
+                {templatesQuery.data && (
+                  <span className="text-[11px] text-muted-foreground tabular-nums">
+                    ({formatNumber(customItems.length)})
+                  </span>
+                )}
+              </TabsTrigger>
+              <TabsTrigger value="builtin" className="gap-1.5">
+                系统内置
+                {templatesQuery.data && (
+                  <span className="text-[11px] text-muted-foreground tabular-nums">
+                    ({formatNumber(builtinItems.length)})
+                  </span>
+                )}
+              </TabsTrigger>
+            </TabsList>
+          </Tabs>
         </div>
 
         <p className="flex items-center gap-2 text-sm text-muted-foreground tabular-nums">
           {templatesQuery.isFetching && templatesQuery.data && (
             <Spinner className="size-3.5" aria-hidden />
           )}
-          {templatesQuery.data && `共 ${formatNumber(items.length)} 个模板`}
+          {templatesQuery.data &&
+            `显示 ${formatNumber(visibleItems.length)} / ${formatNumber(items.length)} 个模板`}
         </p>
       </div>
 
@@ -187,22 +243,37 @@ export function TrainingTemplatesPage() {
           retrying={templatesQuery.isFetching}
           onRetry={() => templatesQuery.refetch()}
         />
-      ) : items.length === 0 ? (
-        hasFilter ? (
+      ) : visibleItems.length === 0 ? (
+        hasSearch ? (
           <Empty className="border bg-card">
             <EmptyHeader>
               <EmptyMedia variant="icon">
                 <SearchX />
               </EmptyMedia>
               <EmptyTitle className="text-base">
-                没有匹配“{keyword.trim()}”的参数模板
+                没有匹配“{keyword.trim()}”的
+                {sourceFilter === "custom"
+                  ? "自定义"
+                  : sourceFilter === "builtin"
+                    ? "系统内置"
+                    : ""}
+                参数模板
               </EmptyTitle>
               <EmptyDescription>
-                尝试更换关键词、清空搜索，或直接创建一个新的参数模板。
+                尝试更换关键词、切换来源筛选，或直接创建一个新的参数模板。
               </EmptyDescription>
             </EmptyHeader>
             <EmptyContent>
               <div className="flex flex-wrap justify-center gap-2">
+                {sourceFilter !== "all" && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setSourceFilter("all")}
+                  >
+                    查看全部来源
+                  </Button>
+                )}
                 <Button
                   variant="outline"
                   size="sm"
@@ -215,6 +286,35 @@ export function TrainingTemplatesPage() {
                     <Plus />
                     新建参数模板
                   </Link>
+                </Button>
+              </div>
+            </EmptyContent>
+          </Empty>
+        ) : sourceFilter === "custom" ? (
+          <Empty className="border bg-card">
+            <EmptyHeader className="max-w-lg">
+              <EmptyMedia variant="icon">
+                <SlidersHorizontal />
+              </EmptyMedia>
+              <EmptyTitle>还没有自定义参数模板</EmptyTitle>
+              <EmptyDescription>
+                你可以从空白参数新建自定义模板，也可以直接复制任意系统内置模板进行定制微调，或在新建训练任务时一键保存当前参数。
+              </EmptyDescription>
+            </EmptyHeader>
+            <EmptyContent>
+              <div className="flex flex-wrap justify-center gap-2">
+                <Button asChild>
+                  <Link to={newTrainingTemplatePath()}>
+                    <Plus />
+                    新建参数模板
+                  </Link>
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => setSourceFilter("builtin")}
+                >
+                  <ShieldCheck />
+                  查看系统内置模板 ({builtinItems.length})
                 </Button>
               </div>
             </EmptyContent>
@@ -250,7 +350,7 @@ export function TrainingTemplatesPage() {
         )
       ) : (
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-          {items.map((template) => (
+          {visibleItems.map((template) => (
             <TemplateCard
               key={template.id}
               template={template}
@@ -265,7 +365,11 @@ export function TrainingTemplatesPage() {
                   isDefault: !template.is_default,
                 })
               }
-              onDelete={() => setDeleting(template)}
+              onDelete={() => {
+                if (!template.is_builtin) {
+                  setDeleting(template)
+                }
+              }}
             />
           ))}
         </div>
@@ -341,6 +445,12 @@ function TemplateCard({
             >
               {template.name}
             </Link>
+            {template.is_builtin && (
+              <Badge variant="secondary" className="gap-1 font-normal">
+                <ShieldCheck className="size-3 text-primary" />
+                系统内置
+              </Badge>
+            )}
             {template.is_default && (
               <Badge className="gap-1 bg-amber-500/15 text-amber-700 hover:bg-amber-500/20 dark:text-amber-400">
                 <Star className="size-3 fill-current" />
@@ -371,8 +481,8 @@ function TemplateCard({
           <DropdownMenuContent align="end" className="w-48">
             <DropdownMenuItem asChild>
               <Link to={editTrainingTemplatePath(template.id)}>
-                <Pencil />
-                编辑模板
+                {template.is_builtin ? <Eye /> : <Pencil />}
+                {template.is_builtin ? "查看参数详情" : "编辑模板"}
               </Link>
             </DropdownMenuItem>
             <DropdownMenuItem
@@ -385,14 +495,18 @@ function TemplateCard({
             <DropdownMenuItem asChild>
               <Link to={newTrainingTemplatePath(template.id)}>
                 <Copy />
-                复制为新模板
+                {template.is_builtin ? "复制为自定义模板" : "复制为新模板"}
               </Link>
             </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem variant="destructive" onSelect={onDelete}>
-              <Trash2 />
-              删除模板
-            </DropdownMenuItem>
+            {!template.is_builtin && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem variant="destructive" onSelect={onDelete}>
+                  <Trash2 />
+                  删除模板
+                </DropdownMenuItem>
+              </>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       </CardHeader>
@@ -431,7 +545,7 @@ function TemplateCard({
           <div className="grid gap-1.5 text-xs">
             <div className="flex flex-wrap items-center gap-2 text-muted-foreground tabular-nums">
               <span>
-                相对官方默认自定义{" "}
+                相对官方默认调整{" "}
                 <strong className="font-medium text-foreground">
                   {summary.totalModified}
                 </strong>{" "}
@@ -482,20 +596,44 @@ function TemplateCard({
       </CardContent>
 
       <CardFooter className="flex flex-wrap items-center justify-between gap-2 border-t bg-muted/15 px-5 py-3">
-        <span
-          className="text-xs text-muted-foreground tabular-nums"
-          title={formatDateTime(template.updated_at)}
-        >
-          更新于 {formatRelativeTime(template.updated_at)}
-        </span>
+        {template.is_builtin ? (
+          <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+            <Lock className="size-3" />
+            系统内置 · 只读预设
+          </span>
+        ) : (
+          <span
+            className="text-xs text-muted-foreground tabular-nums"
+            title={formatDateTime(template.updated_at)}
+          >
+            更新于 {formatRelativeTime(template.updated_at)}
+          </span>
+        )}
 
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" asChild>
-            <Link to={editTrainingTemplatePath(template.id)}>
-              <Pencil />
-              编辑
-            </Link>
-          </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          {template.is_builtin ? (
+            <>
+              <Button variant="outline" size="sm" asChild>
+                <Link to={editTrainingTemplatePath(template.id)}>
+                  <Eye />
+                  查看参数
+                </Link>
+              </Button>
+              <Button variant="outline" size="sm" asChild>
+                <Link to={newTrainingTemplatePath(template.id)}>
+                  <Copy />
+                  复制
+                </Link>
+              </Button>
+            </>
+          ) : (
+            <Button variant="outline" size="sm" asChild>
+              <Link to={editTrainingTemplatePath(template.id)}>
+                <Pencil />
+                编辑
+              </Link>
+            </Button>
+          )}
           <Button size="sm" asChild>
             <Link to={newTrainingJobPath({ templateId: template.id })}>
               <Rocket />
