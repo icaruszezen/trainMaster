@@ -13,6 +13,7 @@ import json
 import math
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
@@ -24,6 +25,7 @@ DEFAULT_TIMEOUT = 10.0
 MAX_ERROR_BODY = 64 * 1024
 CHUNK_SIZE = 1 << 20
 USER_AGENT = f"trainmaster-trainer/{__version__}"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 class ApiError(Exception):
@@ -40,15 +42,41 @@ class TransportError(Exception):
     """无法连接服务端、超时或连接中断（也包括调用方通过 abort 中止的传输）。"""
 
 
-class Transfer(NamedTuple):
-    """下载的结果：字节数与 sha256（小写十六进制）。"""
-
+class _TransferTuple(NamedTuple):
     size: int
     sha256: str
 
 
+class Transfer(_TransferTuple):
+    """下载的结果：字节数与 sha256（小写十六进制），并附带小写键名的响应头。"""
+
+    headers: dict[str, str]
+
+    def __new__(
+        cls,
+        size: int,
+        sha256: str,
+        headers: Mapping[str, str] | None = None,
+    ) -> Transfer:
+        self = super().__new__(cls, size, sha256)
+        self.headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+        return self
+
+    def header(self, name: str, default: str = "") -> str:
+        """按大小写无关读取响应头。"""
+        return self.headers.get(name.lower(), default)
+
+
 class _Aborted(Exception):
     """上传途中 abort() 返回 True：从请求体的生成器中抛出，结束这次请求。"""
+
+
+def _default_opener(base_url: str) -> urllib.request.OpenerDirector:
+    """构造默认 opener：本地回环地址绕过环境 HTTP_PROXY，其余地址遵循环境代理与 NO_PROXY。"""
+    host = (urllib.parse.urlsplit(base_url).hostname or "").strip().lower()
+    if host in _LOOPBACK_HOSTS:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener()
 
 
 def json_safe(value: Any) -> Any:
@@ -89,7 +117,7 @@ class Client:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
-        self._opener = opener or urllib.request.build_opener()
+        self._opener = opener or _default_opener(self.base_url)
 
     def _headers(self, extra: Mapping[str, str] | None, **base: str) -> dict[str, str]:
         headers = {"User-Agent": USER_AGENT, **base}
@@ -201,8 +229,11 @@ class Client:
         resp = self._open(req, timeout)
         digest = hashlib.sha256()
         size = 0
+        resp_headers: dict[str, str] = {}
         try:
             with resp, open(dest, "wb") as f:
+                if getattr(resp, "headers", None) is not None:
+                    resp_headers = {str(k).lower(): str(v) for k, v in resp.headers.items()}
                 declared = resp.headers.get("Content-Length")
                 expected = int(declared) if declared and declared.strip().isdigit() else None
                 if max_bytes is not None and expected is not None and expected > max_bytes:
@@ -232,7 +263,7 @@ class Client:
             with contextlib.suppress(OSError):
                 dest.unlink()
             raise
-        return Transfer(size, digest.hexdigest())
+        return Transfer(size, digest.hexdigest(), resp_headers)
 
     def put_file(
         self,

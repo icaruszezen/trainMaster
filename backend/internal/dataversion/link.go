@@ -1,6 +1,8 @@
 package dataversion
 
 import (
+	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -13,7 +15,9 @@ import (
 	"time"
 
 	"github.com/icaruszezen/trainmaster/backend/internal/augment"
+	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 	"github.com/icaruszezen/trainmaster/backend/internal/storage"
+	"github.com/icaruszezen/trainmaster/backend/internal/storagearchive"
 	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
@@ -147,11 +151,14 @@ func (b *build) storeOriginal(img *buildImage) (storedFile, error) {
 	switch {
 	case err != nil || !fi.Mode().IsRegular():
 		return out, errSourceMissing
-	case fi.Size() != img.sourceSize || !sameFileTime(fi.ModTime(), img.sourceMod):
+	case fi.Size() != img.sourceSize || (!b.prefetched[img.source] && !sameFileTime(fi.ModTime(), img.sourceMod)):
 		return out, errSourceChanged
 	}
-	if err := b.mkdirFor(img.path); err != nil {
-		return out, err
+	useDockerStage := b.vol != nil && b.vol.Kind() == storagenode.KindDocker && b.s.storageNodes != nil
+	if !useDockerStage {
+		if err := b.mkdirFor(img.path); err != nil {
+			return out, err
+		}
 	}
 
 	var orientation *augment.Orientation
@@ -189,13 +196,16 @@ func (b *build) storeOriginal(img *buildImage) (storedFile, error) {
 			if err := b.space.before(fi.Size()); err != nil {
 				return out, err
 			}
-			st, _, copyErr := b.vol.CopyFileWithin(
+			st, linked, copyErr := b.vol.CopyFileWithin(
 				b.ctx,
 				storagenode.SpaceDatasets, snap.Dataset.DirName+"/"+img.rel,
 				storagenode.SpaceExports, b.job.DirName+"/"+img.path,
 				nil,
 			)
 			if copyErr == nil {
+				if linked {
+					return storedFile{stored: StoredLink, copied: 0, size: st.Size(), modTime: st.ModTime()}, nil
+				}
 				b.space.wrote(st.Size())
 				return storedFile{stored: StoredCopy, copied: st.Size(), size: st.Size(), modTime: st.ModTime()}, nil
 			}
@@ -223,6 +233,31 @@ func (b *build) storeOriginal(img *buildImage) (storedFile, error) {
 		}
 		return storedFile{stored: StoredCopy, orientationFixed: orientation != nil, copied: n, size: st.Size(),
 			modTime: st.ModTime()}, nil
+	}
+
+	if useDockerStage {
+		stageRoot, serr := b.ensureDockerStageDir()
+		if serr == nil {
+			dst := filepath.Join(stageRoot, filepath.FromSlash(img.path))
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				return out, fmt.Errorf("copy image: %w", err)
+			}
+			n, err := copyFileFrom(src, fi.Size(), dst, orientation)
+			if err != nil {
+				return out, err
+			}
+			b.space.wrote(n)
+			st, err := os.Lstat(dst)
+			if err != nil {
+				return out, err
+			}
+			return storedFile{stored: StoredCopy, orientationFixed: orientation != nil, copied: n, size: st.Size(),
+				modTime: st.ModTime()}, nil
+		}
+	}
+
+	if err := b.mkdirFor(img.path); err != nil {
+		return out, err
 	}
 
 	if orientation == nil {
@@ -312,8 +347,9 @@ func copyFileFrom(src io.ReaderAt, size int64, dst string, o *augment.Orientatio
 	}
 	name := tmp.Name()
 	// CreateTemp makes the file 0600; the version folder is read by other
-	// users too (training nodes over a shared mount, backups).
-	err = tmp.Chmod(0o644)
+	// users too (training nodes over a shared mount, backups). Ensure we ignore
+	// EPERM on FUSE scratch mounts that already default to 0777.
+	_ = tmp.Chmod(0o644)
 	var n int64
 	if err == nil {
 		n, err = io.Copy(tmp, io.NewSectionReader(src, 0, size))
@@ -351,4 +387,256 @@ func (b *build) mkdirFor(rel string) error {
 	}
 	b.dirs[dir] = true
 	return nil
+}
+
+// maybePrefetchSnapshot bulk-fetches a cross-node KindDocker dataset snapshot
+// via a single .tar.zst stream so prepare() and linkImages() read locally
+// without N separate HTTP round-trips.
+func (b *build) maybePrefetchSnapshot(sourceIdx int, snap *dataset.Snapshot) {
+	if b.s.storageNodes == nil || snap == nil || snap.Root == nil || snap.Root.LocalDir() != "" || len(snap.Images) == 0 {
+		return
+	}
+	if !b.s.storageNodes.CanArchiveBetweenIDs(b.ctx, snap.Dataset.StorageNodeID, b.job.StorageNodeID) {
+		return
+	}
+	_, srcArch, err := b.s.storageNodes.ArchiveEndpointForNode(b.ctx, snap.Dataset.StorageNodeID)
+	if err != nil {
+		return
+	}
+
+	seen := make(map[string]bool, len(snap.Images)*2)
+	paths := make([]string, 0, len(snap.Images)*2)
+	for _, img := range snap.Images {
+		if img.RelPath != "" && !seen[img.RelPath] {
+			seen[img.RelPath] = true
+			paths = append(paths, img.RelPath)
+		}
+		if img.AnnotationPath != nil && *img.AnnotationPath != "" && !seen[*img.AnnotationPath] {
+			seen[*img.AnnotationPath] = true
+			paths = append(paths, *img.AnnotationPath)
+		}
+	}
+	if len(paths) == 0 {
+		return
+	}
+
+	packed, err := srcArch.PackArchive(b.ctx, storagenode.PackRequest{
+		Space:  storagenode.SpaceDatasets,
+		DirRel: snap.Dataset.DirName,
+		Format: storagearchive.FormatTarZst,
+		Paths:  paths,
+	})
+	if err != nil {
+		b.log.Warn("data version archive prefetch pack fallback to direct",
+			"dataset_id", snap.Dataset.ID, "err", err)
+		return
+	}
+	defer func() {
+		delCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = srcArch.DeleteArchive(delCtx, packed.ArchiveID)
+	}()
+
+	tmpBase := b.s.storage.Dir(storage.Tmp)
+	_ = os.MkdirAll(tmpBase, 0o755)
+	stageParent := filepath.Join(tmpBase, fmt.Sprintf(".dv-prefetch-%d-%d-%s", b.job.ID, snap.Dataset.ID, strings.ToLower(rand.Text()[:8])))
+	if err := os.MkdirAll(stageParent, 0o755); err != nil {
+		return
+	}
+
+	rc, err := srcArch.OpenArchiveStream(b.ctx, packed.ArchiveID)
+	if err != nil {
+		_ = os.RemoveAll(stageParent)
+		return
+	}
+	archFile := filepath.Join(stageParent, "src.tar.zst")
+	f, err := os.OpenFile(archFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		_ = rc.Close()
+		_ = os.RemoveAll(stageParent)
+		return
+	}
+	_, copyErr := io.Copy(f, rc)
+	_ = rc.Close()
+	if cerr := f.Close(); copyErr == nil {
+		copyErr = cerr
+	}
+	if copyErr != nil {
+		_ = os.RemoveAll(stageParent)
+		return
+	}
+
+	zeroHeadroom := uint64(0)
+	_, err = storagearchive.Unpack(b.ctx, storagearchive.UnpackOptions{
+		ArchivePath:          archFile,
+		Format:               storagearchive.FormatTarZst,
+		SpaceDir:             stageParent,
+		TargetRel:            "files",
+		Mode:                 storagearchive.ModeAtomic,
+		ExpectedSHA256:       packed.SHA256,
+		ExpectedArchiveBytes: packed.ArchiveBytes,
+		DeclaredRawBytes:     &packed.RawBytes,
+		FreeHeadroom:         &zeroHeadroom,
+	})
+	_ = os.Remove(archFile)
+	if err != nil {
+		_ = os.RemoveAll(stageParent)
+		b.log.Warn("data version archive prefetch unpack fallback to direct",
+			"dataset_id", snap.Dataset.ID, "err", err)
+		return
+	}
+
+	localRoot, err := storagenode.OpenLocalDir(filepath.Join(stageParent, "files"))
+	if err != nil {
+		_ = os.RemoveAll(stageParent)
+		return
+	}
+	_ = snap.Root.Close()
+	snap.Root = localRoot
+	b.prefetched[sourceIdx] = true
+	b.prefetchDirs = append(b.prefetchDirs, stageParent)
+}
+
+func (b *build) cleanupPrefetchDirs() {
+	b.dockerStageMu.Lock()
+	stageDir := b.dockerStageDir
+	b.dockerStageDir = ""
+	b.dockerStageMu.Unlock()
+	if stageDir != "" {
+		_ = os.RemoveAll(stageDir)
+	}
+	for _, dir := range b.prefetchDirs {
+		_ = os.RemoveAll(dir)
+	}
+	b.prefetchDirs = nil
+}
+
+func (b *build) ensureDockerStageDir() (string, error) {
+	b.dockerStageMu.Lock()
+	defer b.dockerStageMu.Unlock()
+	if b.dockerStageDir != "" {
+		return b.dockerStageDir, nil
+	}
+	tmpBase := b.s.storage.Dir(storage.Tmp)
+	if err := os.MkdirAll(tmpBase, 0o755); err != nil {
+		return "", err
+	}
+	dir := filepath.Join(tmpBase, fmt.Sprintf(".dv-outstage-%d-%s", b.job.ID, strings.ToLower(rand.Text()[:8])))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	b.dockerStageDir = dir
+	return dir, nil
+}
+
+func (b *build) stageDockerBytes(rel string, data []byte) (bool, error) {
+	ok, _, err := b.stageDockerBytesWithModTime(rel, data, false)
+	return ok, err
+}
+
+func (b *build) stageDockerBytesWithModTime(rel string, data []byte, exclusive bool) (bool, time.Time, error) {
+	if b.vol == nil || b.vol.Kind() != storagenode.KindDocker || b.s.storageNodes == nil {
+		return false, time.Time{}, nil
+	}
+	stageRoot, err := b.ensureDockerStageDir()
+	if err != nil {
+		return false, time.Time{}, nil
+	}
+	dst := filepath.Join(stageRoot, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return false, time.Time{}, err
+	}
+	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	if exclusive {
+		flags = os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	}
+	f, err := os.OpenFile(dst, flags, 0o644)
+	if err != nil {
+		return false, time.Time{}, err
+	}
+	_, writeErr := f.Write(data)
+	if cerr := f.Close(); writeErr == nil {
+		writeErr = cerr
+	}
+	if writeErr != nil {
+		_ = os.Remove(dst)
+		return false, time.Time{}, writeErr
+	}
+	fi, err := os.Lstat(dst)
+	if err != nil {
+		return false, time.Time{}, err
+	}
+	return true, fi.ModTime(), nil
+}
+
+func (b *build) flushDockerStage(batch []*buildImage) error {
+	summary, err := b.flushDockerStageSummary()
+	if err != nil || summary == nil {
+		return err
+	}
+	for _, img := range batch {
+		if mt, ok := summary.ModTimes[img.path]; ok {
+			img.modTime = dbTime(mt)
+		}
+	}
+	return nil
+}
+
+func (b *build) flushDockerStageSummary() (*storagenode.UnpackSummary, error) {
+	b.dockerStageMu.Lock()
+	stageDir := b.dockerStageDir
+	b.dockerStageDir = ""
+	b.dockerStageMu.Unlock()
+	if stageDir == "" {
+		return nil, nil
+	}
+	defer func() {
+		_ = os.RemoveAll(stageDir)
+	}()
+
+	_, dstArch, err := b.s.storageNodes.ArchiveEndpointForNode(b.ctx, b.job.StorageNodeID)
+	if err != nil {
+		return nil, fmt.Errorf("open destination docker archive endpoint: %w", err)
+	}
+
+	tmpBase := b.s.storage.Dir(storage.Tmp)
+	archPath := filepath.Join(tmpBase, fmt.Sprintf(".dv-outpack-%d-%s.tar.zst", b.job.ID, strings.ToLower(rand.Text()[:8])))
+	defer func() { _ = os.Remove(archPath) }()
+
+	zeroHeadroom := uint64(0)
+	packed, err := storagearchive.Pack(b.ctx, storagearchive.PackOptions{
+		SourceDir:       stageDir,
+		DestArchivePath: archPath,
+		Format:          storagearchive.FormatTarZst,
+		FreeHeadroom:    &zeroHeadroom,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("pack staged data version batch: %w", err)
+	}
+	if packed.FilesCount == 0 {
+		return nil, nil
+	}
+
+	f, err := os.Open(archPath)
+	if err != nil {
+		return nil, err
+	}
+	summary, unpackErr := dstArch.UnpackArchiveStream(b.ctx, storagenode.UnpackStreamRequest{
+		Space:                storagenode.SpaceExports,
+		DirRel:               b.job.DirName,
+		Format:               storagearchive.FormatTarZst,
+		Mode:                 storagearchive.ModeMergeOverwrite,
+		ExpectedSHA256:       packed.SHA256,
+		ExpectedArchiveBytes: packed.ArchiveBytes,
+		DeclaredRawBytes:     &packed.RawBytes,
+		IncludeModTimes:      true,
+	}, f)
+	_ = f.Close()
+	if unpackErr != nil {
+		if errors.Is(unpackErr, storagearchive.ErrInsufficientStorage) {
+			return nil, newError(ErrInsufficientStorage, "目标存储节点磁盘空间不足")
+		}
+		return nil, fmt.Errorf("upload staged data version batch: %w", unpackErr)
+	}
+	return &summary, nil
 }

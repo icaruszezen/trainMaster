@@ -564,3 +564,477 @@ def test_dataset_cache_manager_lru_and_ttl(tmp_path: Path):
     now[0] += 120
     mgr.apply_policy(policy)
     assert list(mgr.cache_root.iterdir()) == []
+
+
+def test_training_task_info_parses_additive_archive_fields_and_defaults():
+    base_task = {
+        "id": 88,
+        "project_id": 2,
+        "init_mode": "scratch",
+        "yolo_version": "yolo11",
+        "model_scale": "n",
+        "arch_yaml": "yolo11n.yaml",
+        "task": "detect",
+        "data_version": {"id": 9, "dir_name": "proj-2/v3", "shared_local": False},
+        "params": {"epochs": 5},
+        "dataset_url": "/api/v1/compute/agent/training-jobs/88/dataset",
+        "progress_url": "/api/v1/compute/agent/training-jobs/88/progress",
+        "artifacts_url": "/api/v1/compute/agent/training-jobs/88/artifacts",
+        "complete_url": "/api/v1/compute/agent/training-jobs/88/complete",
+        "fail_url": "/api/v1/compute/agent/training-jobs/88/fail",
+    }
+    omitted = training.TrainingJobInfo.parse(base_task)
+    assert omitted.dv_total_bytes == 0
+    assert omitted.dv_transfer_mode == ""
+
+    top_level = training.TrainingTaskInfo.parse(
+        {**base_task, "dv_total_bytes": 12_345_678, "dv_transfer_mode": "archive"}
+    )
+    assert top_level.dv_total_bytes == 12_345_678
+    assert top_level.dv_transfer_mode == "archive"
+
+    nested = training.TrainingTaskInfo.parse(
+        {
+            **base_task,
+            "data_version": {
+                "id": 9,
+                "dir_name": "proj-2/v3",
+                "shared_local": False,
+                "total_bytes": 4_096_000,
+                "transfer_mode": "direct",
+            },
+        }
+    )
+    assert nested.dv_total_bytes == 4_096_000
+    assert nested.dv_transfer_mode == "direct"
+
+
+def test_archive_mode_verifies_sha256_logs_progress_unlinks_zip_and_caches(
+    platform: FakePlatform, tmp_path: Path, monkeypatch
+):
+    import hashlib
+
+    ml_dir = tmp_path / "fake-train-ml"
+    _write_fake_train_ml(ml_dir)
+    monkeypatch.setenv("PYTHONPATH", str(ml_dir))
+
+    zip_bytes = _make_dataset_zip()
+    zip_sha = hashlib.sha256(zip_bytes).hexdigest()
+    job_id = platform.add_training_job(
+        zip_bytes,
+        params={"epochs": 1},
+        dataset_headers={
+            "X-Archive-Sha256": zip_sha,
+            "X-Content-Sha256": zip_sha,
+            "X-Transfer-Mode": "archive",
+        },
+        task={
+            "dv_total_bytes": len(zip_bytes),
+            "dv_transfer_mode": "archive",
+            "data_version": {
+                "id": 51,
+                "version": 1,
+                "dir_name": "proj-1/v51",
+                "shared_local": False,
+                "class_names": ["person", "helmet"],
+            },
+            "dataset_cache": {"enabled": True, "max_versions": 2, "ttl_seconds": 600},
+        },
+    )
+
+    with Run(tmp_path, platform, progress_interval=0.2) as run:
+        job = wait_until(
+            lambda: (
+                (j := platform.training_job(job_id))
+                and j["status"] in ("succeeded", "failed")
+                and j
+            ),
+            timeout=30,
+        )
+        assert job["status"] == "succeeded", job
+        wait_until(lambda: run.worker.tasks_run == 1)
+        assert not (run.state_dir / "work" / f"training-job-{job_id}").exists()
+        assert (run.state_dir / "dataset-cache" / "dv-51" / "data.yaml").is_file()
+        assert not list((run.state_dir / "dataset-cache").rglob("*.zip"))
+
+    assert "存储容器已打包数据集压缩包，正在传输" in job["logs"]
+    assert "压缩包校验通过" in job["logs"]
+    assert zip_sha[:12] in job["logs"]
+
+
+def test_archive_checksum_mismatch_aborts_before_safe_extract_zip_and_unlinks(
+    platform: FakePlatform, tmp_path: Path, monkeypatch
+):
+    import fake_platform as fp_mod
+
+    monkeypatch.setattr(fp_mod, "MAX_ATTEMPTS", 1)
+
+    # 1. 直接单元测试：不匹配的 X-Archive-Sha256 立即删除压缩包并抛出 ValueError / TaskFailed
+    corrupt_zip = tmp_path / "corrupt-dataset.zip"
+    corrupt_zip.write_bytes(_make_dataset_zip())
+    with pytest.raises((ValueError, TaskFailed), match="SHA-256 mismatch"):
+        training.verify_dataset_archive_checksum(
+            corrupt_zip,
+            {"X-Archive-Sha256": "a" * 64},
+        )
+    assert not corrupt_zip.exists()
+
+    # 2. 端到端集成测试：校验失败时绝不调用 safe_extract_zip，也不污染短期缓存
+    extract_calls: list[Path] = []
+    real_extract = training.safe_extract_zip
+
+    def spy_extract(zip_path: Path, dest_dir: Path, abort=None, **kwargs) -> Path:
+        extract_calls.append(zip_path)
+        return real_extract(zip_path, dest_dir, abort=abort, **kwargs)
+
+    monkeypatch.setattr(training, "safe_extract_zip", spy_extract)
+
+    job_id = platform.add_training_job(
+        _make_dataset_zip(),
+        params={"epochs": 1},
+        dataset_headers={
+            "X-Content-Sha256": "b" * 64,
+            "X-Transfer-Mode": "archive",
+        },
+        task={
+            "dv_transfer_mode": "archive",
+            "data_version": {
+                "id": 52,
+                "version": 2,
+                "dir_name": "proj-1/v52",
+                "shared_local": False,
+                "class_names": ["person", "helmet"],
+            },
+            "dataset_cache": {"enabled": True, "max_versions": 2, "ttl_seconds": 600},
+        },
+    )
+
+    with Run(tmp_path, platform, progress_interval=0.2) as run:
+        job = wait_until(
+            lambda: (j := platform.training_job(job_id)) and j["status"] == "failed" and j,
+            timeout=30,
+        )
+        wait_until(lambda: run.worker.tasks_run == 1)
+        assert extract_calls == []
+        assert not (run.state_dir / "dataset-cache" / "dv-52").exists()
+        assert not (run.state_dir / "work" / f"training-job-{job_id}").exists()
+
+    assert "SHA-256 mismatch" in job["error"]
+
+
+def test_legacy_direct_mode_without_checksum_header_falls_back_cleanly(
+    platform: FakePlatform, tmp_path: Path, monkeypatch
+):
+    ml_dir = tmp_path / "fake-train-ml"
+    _write_fake_train_ml(ml_dir)
+    monkeypatch.setenv("PYTHONPATH", str(ml_dir))
+
+    job_id = platform.add_training_job(
+        _make_dataset_zip(),
+        params={"epochs": 1},
+        dataset_headers={"X-Transfer-Mode": "direct"},
+        task={
+            "dv_transfer_mode": "direct",
+            "data_version": {
+                "id": 53,
+                "version": 1,
+                "dir_name": "proj-1/v53",
+                "shared_local": False,
+                "class_names": ["person", "helmet"],
+            },
+        },
+    )
+
+    with Run(tmp_path, platform, progress_interval=0.2) as run:
+        job = wait_until(
+            lambda: (
+                (j := platform.training_job(job_id))
+                and j["status"] in ("succeeded", "failed")
+                and j
+            ),
+            timeout=30,
+        )
+        assert job["status"] == "succeeded", job
+        wait_until(lambda: run.worker.tasks_run == 1)
+        assert not (run.state_dir / "work" / f"training-job-{job_id}").exists()
+
+    assert "兼容存储流式拉取训练数据集，正在解压" in job["logs"]
+
+
+def test_dv_total_bytes_disk_headroom_evicts_cache_and_rejects_when_insufficient(
+    platform: FakePlatform, tmp_path: Path, monkeypatch
+):
+    import shutil as shutil_mod
+    from collections import namedtuple
+
+    import fake_platform as fp_mod
+
+    monkeypatch.setattr(fp_mod, "MAX_ATTEMPTS", 1)
+
+    state_dir = tmp_path / "evict-state"
+    mgr = training.DatasetCacheManager(state_dir)
+    src = tmp_path / "sample-ds"
+    sample_zip = tmp_path / "sample.zip"
+    sample_zip.write_bytes(_make_dataset_zip())
+    training.safe_extract_zip(sample_zip, src)
+
+    policy = training.DatasetCachePolicy(enabled=True, max_versions=3, ttl_seconds=600)
+    mgr.store(10, src, policy)
+    mgr.store(11, src, policy)
+
+    Usage = namedtuple("Usage", ["total", "used", "free"])
+
+    def fake_usage(_path):
+        # 每存在一个缓存目录占用 400 MiB；总剩余空间随驱逐动态增加
+        cached_count = (
+            sum(1 for p in mgr.cache_root.iterdir() if p.is_dir()) if mgr.cache_root.is_dir() else 0
+        )
+        free = (1400 << 20) - cached_count * (400 << 20)
+        return Usage(2000 << 20, (2000 << 20) - free, free)
+
+    monkeypatch.setattr(shutil_mod, "disk_usage", fake_usage)
+
+    # 需要 1100 MiB，且排除正在复用的 dv-11：应驱逐最旧的 dv-10（释放后 1000 MiB -> 继续检查时不误删 dv-11）
+    mgr.evict_for_space(tmp_path, 950 << 20, exclude_dv_id=11)
+    assert not (mgr.cache_root / "dv-10").exists()
+    assert (mgr.cache_root / "dv-11").is_dir()
+
+    # 当 dv_total_bytes 远超磁盘剩余空间时，在发起 /dataset 下载前直接拒绝任务
+    huge_bytes = 50 << 30
+    job_id = platform.add_training_job(
+        _make_dataset_zip(),
+        params={"epochs": 1},
+        task={
+            "dv_total_bytes": huge_bytes,
+            "dv_transfer_mode": "archive",
+            "data_version": {
+                "id": 99,
+                "version": 1,
+                "dir_name": "proj-1/v99",
+                "shared_local": False,
+                "class_names": ["person"],
+            },
+        },
+    )
+
+    with Run(tmp_path, platform, progress_interval=0.2) as run:
+        job = wait_until(
+            lambda: (j := platform.training_job(job_id)) and j["status"] == "failed" and j,
+            timeout=30,
+        )
+        wait_until(lambda: run.worker.tasks_run == 1)
+
+    assert "训练节点磁盘空间不足" in job["error"]
+    dataset_gets = [r for r in platform.requests if r["path"].endswith(f"/{job_id}/dataset")]
+    assert dataset_gets == []
+
+
+def test_safe_extract_zip_rejects_zip_bomb_symlink_fifo_and_dot_member(tmp_path: Path):
+    import io
+    import zipfile
+
+    # 1. Zip bomb exceeding max_raw_bytes fails non-retryably and removes dest_dir
+    bomb_buf = io.BytesIO()
+    with zipfile.ZipFile(bomb_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("data.yaml", "nc: 1\n")
+        zf.writestr("bomb.bin", b"\x00" * (2 << 20))
+    bomb_zip = tmp_path / "bomb.zip"
+    bomb_zip.write_bytes(bomb_buf.getvalue())
+    bomb_dest = tmp_path / "bomb-dest"
+    with pytest.raises(TaskFailed) as bomb_exc:
+        training.safe_extract_zip(bomb_zip, bomb_dest, max_raw_bytes=1024)
+    assert bomb_exc.value.retryable is False
+    assert not bomb_dest.exists()
+
+    # 2. Unix symlink external_attr (0o120777 << 16) is rejected non-retryably
+    sym_buf = io.BytesIO()
+    with zipfile.ZipFile(sym_buf, "w") as zf:
+        zf.writestr("data.yaml", "nc: 1\n")
+        zi = zipfile.ZipInfo("evil_link.txt")
+        zi.external_attr = 0o120777 << 16
+        zf.writestr(zi, "/etc/passwd")
+    sym_zip = tmp_path / "sym.zip"
+    sym_zip.write_bytes(sym_buf.getvalue())
+    sym_dest = tmp_path / "sym-dest"
+    with pytest.raises(TaskFailed) as sym_exc:
+        training.safe_extract_zip(sym_zip, sym_dest)
+    assert sym_exc.value.retryable is False
+    assert not sym_dest.exists()
+
+    # 3. Unix FIFO external_attr (0o010600 << 16) is rejected non-retryably
+    fifo_buf = io.BytesIO()
+    with zipfile.ZipFile(fifo_buf, "w") as zf:
+        zi = zipfile.ZipInfo("evil.fifo")
+        zi.external_attr = 0o010600 << 16
+        zf.writestr(zi, b"")
+    fifo_zip = tmp_path / "fifo.zip"
+    fifo_zip.write_bytes(fifo_buf.getvalue())
+    with pytest.raises(TaskFailed) as fifo_exc:
+        training.safe_extract_zip(fifo_zip, tmp_path / "fifo-dest")
+    assert fifo_exc.value.retryable is False
+
+    # 4. Member named "." is rejected non-retryably (not IsADirectoryError / retryable=True)
+    dot_buf = io.BytesIO()
+    with zipfile.ZipFile(dot_buf, "w") as zf:
+        zf.writestr(".", b"x")
+        zf.writestr("data.yaml", "nc: 1\n")
+    dot_zip = tmp_path / "dot.zip"
+    dot_zip.write_bytes(dot_buf.getvalue())
+    with pytest.raises(TaskFailed) as dot_exc:
+        training.safe_extract_zip(dot_zip, tmp_path / "dot-dest")
+    assert dot_exc.value.retryable is False
+
+
+def test_archive_mode_rejects_missing_sha256_headers_and_unlinks_zip(
+    platform: FakePlatform, tmp_path: Path, monkeypatch
+):
+    import fake_platform as fp_mod
+
+    monkeypatch.setattr(fp_mod, "MAX_ATTEMPTS", 1)
+
+    # 1. Direct unit check: X-Transfer-Mode: archive without SHA-256 header unlinks zip and raises
+    unverified_zip = tmp_path / "unverified.zip"
+    unverified_zip.write_bytes(_make_dataset_zip())
+    with pytest.raises(training.DatasetArchiveChecksumError) as exc_info:
+        training.verify_dataset_archive_checksum(
+            unverified_zip,
+            {"X-Transfer-Mode": "archive"},
+        )
+    assert exc_info.value.retryable is True
+    assert not unverified_zip.exists()
+
+    # 2. Full job integration check: dv_transfer_mode="archive" with stripped checksum headers aborts pre-extract
+    extract_calls: list[Path] = []
+    monkeypatch.setattr(
+        training,
+        "safe_extract_zip",
+        lambda zp, dd, **kw: extract_calls.append(zp),
+    )
+
+    job_id = platform.add_training_job(
+        _make_dataset_zip(),
+        params={"epochs": 1},
+        dataset_headers={"X-Transfer-Mode": "archive"},
+        task={
+            "dv_transfer_mode": "archive",
+            "data_version": {
+                "id": 61,
+                "version": 1,
+                "dir_name": "proj-1/v61",
+                "shared_local": False,
+                "class_names": ["person"],
+            },
+            "dataset_cache": {"enabled": True, "max_versions": 2, "ttl_seconds": 600},
+        },
+    )
+
+    with Run(tmp_path, platform, progress_interval=0.2) as run:
+        job = wait_until(
+            lambda: (j := platform.training_job(job_id)) and j["status"] == "failed" and j,
+            timeout=30,
+        )
+        wait_until(lambda: run.worker.tasks_run == 1)
+        assert extract_calls == []
+        assert not (run.state_dir / "dataset-cache" / "dv-61").exists()
+    assert "X-Archive-Sha256" in job["error"]
+
+
+def test_cache_manager_virtiofs_copy_immutability_stale_tmp_and_toctou_disk_recheck(
+    platform: FakePlatform, tmp_path: Path, monkeypatch
+):
+    import os as os_mod
+    import shutil as shutil_mod
+    from collections import namedtuple
+
+    import fake_platform as fp_mod
+
+    monkeypatch.setattr(fp_mod, "MAX_ATTEMPTS", 1)
+
+    now = [2000.0]
+    state_dir = tmp_path / "cache-hardening-state"
+    mgr = training.DatasetCacheManager(state_dir, wall_clock=lambda: now[0])
+    src = tmp_path / "extracted-src"
+    sample_zip = tmp_path / "sample.zip"
+    sample_zip.write_bytes(_make_dataset_zip())
+    training.safe_extract_zip(sample_zip, src)
+    orig_yaml_text = (src / "data.yaml").read_text(encoding="utf-8")
+
+    # 1. Simulate VirtioFS / SMB where BOTH os.link and shutil.copy2 raise EPERM
+    def deny_link(*_a, **_kw):
+        raise PermissionError(1, "Operation not permitted")
+
+    def deny_copy2(*_a, **_kw):
+        raise PermissionError(1, "Operation not permitted")
+
+    policy = training.DatasetCachePolicy(enabled=True, max_versions=3, ttl_seconds=60)
+    with monkeypatch.context() as mp:
+        mp.setattr(os_mod, "link", deny_link)
+        mp.setattr(shutil_mod, "copy2", deny_copy2)
+        mgr.store(71, src, policy)
+        mat_dir = tmp_path / "mat-virtiofs"
+        mat_yaml = mgr.materialize(71, mat_dir, policy)
+        assert mat_yaml is not None and mat_yaml.is_file()
+
+    # 2. Mutating materialized data.yaml in-place must NOT corrupt cached data.yaml
+    mat_yaml.write_text("CORRUPTED_BY_JOB\n", encoding="utf-8")
+    cached_yaml = mgr.cache_root / "dv-71" / "data.yaml"
+    assert cached_yaml.read_text(encoding="utf-8") == orig_yaml_text
+
+    # 3. Stray file in cache_root is unlinked; fresh .tmp-dv-* preserved; stale .tmp-dv-* removed
+    stray_file = mgr.cache_root / "stray-note.txt"
+    stray_file.write_text("not a dir", encoding="utf-8")
+    fresh_tmp = mgr.cache_root / f".tmp-dv-80-123-{int((now[0] - 5) * 1000)}"
+    fresh_tmp.mkdir(parents=True)
+    stale_tmp = mgr.cache_root / f".tmp-dv-81-123-{int((now[0] - 3600) * 1000)}"
+    stale_tmp.mkdir(parents=True)
+
+    mgr.apply_policy(policy)
+    assert not stray_file.exists()
+    assert fresh_tmp.is_dir()
+    assert not stale_tmp.exists()
+    shutil_mod.rmtree(fresh_tmp, ignore_errors=True)
+
+    # 4. Unexpected OSError inside store() cleans up .tmp-dv-* staging directory
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            training,
+            "_link_or_copy_tree",
+            lambda *_a, **_kw: (_ for _ in ()).throw(OSError("disk io error")),
+        )
+        mgr.store(72, src, policy)
+    leaked_tmps = [p for p in mgr.cache_root.iterdir() if p.name.startswith(".tmp-")]
+    assert leaked_tmps == []
+
+    # 5. TOCTOU disk re-check: has_cached=True during _execute (600 MiB free > 512 MiB),
+    # then materialize() misses while dv_total_bytes=400 MiB requires 512+800=1312 MiB -> aborts pre-download!
+    Usage = namedtuple("Usage", ["total", "used", "free"])
+    monkeypatch.setattr(
+        shutil_mod, "disk_usage", lambda _p: Usage(2000 << 20, 1400 << 20, 600 << 20)
+    )
+    monkeypatch.setattr(training.DatasetCacheManager, "has_cached", lambda *_a, **_kw: True)
+    monkeypatch.setattr(training.DatasetCacheManager, "materialize", lambda *_a, **_kw: None)
+
+    job_id = platform.add_training_job(
+        _make_dataset_zip(),
+        params={"epochs": 1},
+        task={
+            "dv_total_bytes": 400 << 20,
+            "dv_transfer_mode": "archive",
+            "data_version": {
+                "id": 73,
+                "version": 1,
+                "dir_name": "proj-1/v73",
+                "shared_local": False,
+                "class_names": ["person"],
+            },
+            "dataset_cache": {"enabled": True, "max_versions": 2, "ttl_seconds": 60},
+        },
+    )
+    with Run(tmp_path / "toctou-run", platform, progress_interval=0.2) as run:
+        job = wait_until(
+            lambda: (j := platform.training_job(job_id)) and j["status"] == "failed" and j,
+            timeout=30,
+        )
+        wait_until(lambda: run.worker.tasks_run == 1)
+    assert "训练节点磁盘空间不足" in job["error"]
+    assert [r for r in platform.requests if r["path"].endswith(f"/{job_id}/dataset")] == []

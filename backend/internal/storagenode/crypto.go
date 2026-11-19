@@ -106,7 +106,7 @@ func (c *cipherBox) resolveKey(ctx context.Context) ([]byte, error) {
 }
 
 func (c *cipherBox) encrypt(ctx context.Context, creds Credentials) ([]byte, error) {
-	if creds.SecretAccessKey == "" && creds.Password == "" {
+	if creds.SecretAccessKey == "" && creds.Password == "" && creds.Token == "" {
 		return nil, nil
 	}
 	key, err := c.resolveKey(ctx)

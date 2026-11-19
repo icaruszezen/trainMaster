@@ -441,7 +441,8 @@ function StatusNotice({
           <Spinner aria-hidden />
           <AlertTitle>
             正在生成
-            {progress && ` · ${DATA_VERSION_STAGE_LABELS[progress.stage]}`}
+            {progress &&
+              ` · ${DATA_VERSION_STAGE_LABELS[progress.stage] ?? progress.stage}`}
           </AlertTitle>
           <AlertDescription>
             <div className="grid w-full gap-1.5">

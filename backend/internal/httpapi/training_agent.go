@@ -3,7 +3,9 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 
@@ -20,6 +22,7 @@ import (
 func (s *server) agentTrainingRoutes(r chi.Router) {
 	r.Route("/training-jobs/{jobID}", func(r chi.Router) {
 		r.Get("/dataset", s.agentTrainingDataset)
+		r.Get("/dataset.tar.zst", s.agentTrainingDatasetArchive)
 		r.Get("/base-model", s.agentTrainingBaseModel)
 		r.Post("/progress", s.agentTrainingProgress)
 		r.Put("/artifacts", s.agentTrainingUploadArtifact)
@@ -62,24 +65,83 @@ func (s *server) agentTrainingDataset(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	exp, err := s.training.OpenTaskDataset(r.Context(), id, nodeID)
+	ds, err := s.training.OpenTaskDatasetStream(r.Context(), id, nodeID)
 	if err != nil {
 		s.agentTrainingError(w, r, err)
 		return
 	}
-	defer exp.Close()
+	defer ds.Close()
 
 	h := w.Header()
 	h.Set("Content-Type", "application/zip")
-	h.Set("Content-Disposition", attachmentDisposition(exp.FileName))
+	h.Set("Content-Disposition", attachmentDisposition(ds.FileName))
 	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Transfer-Mode", ds.TransferMode)
+	if ds.TransferMode == "archive" {
+		if ds.SHA256 != "" {
+			h.Set("X-Archive-Sha256", ds.SHA256)
+			h.Set("X-Content-Sha256", ds.SHA256)
+		}
+		if ds.RawBytes > 0 {
+			h.Set("X-Archive-Raw-Bytes", strconv.FormatInt(ds.RawBytes, 10))
+		}
+		if ds.FilesCount > 0 {
+			h.Set("X-Archive-Files", strconv.Itoa(ds.FilesCount))
+		}
+		if ds.ArchiveBytes > 0 {
+			h.Set("Content-Length", strconv.FormatInt(ds.ArchiveBytes, 10))
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
 		return
 	}
-	if err := exp.Write(r.Context(), w); err != nil {
+	if ds.Stream != nil {
+		if _, err := io.Copy(w, ds.Stream); err != nil {
+			if r.Context().Err() == nil {
+				s.log.Error("agent dataset archive zip download failed", "job_id", id, "node_id", nodeID, "err", err)
+			}
+			panic(http.ErrAbortHandler)
+		}
+		return
+	}
+	if err := ds.LegacyExport.Write(r.Context(), w); err != nil {
 		if r.Context().Err() == nil {
 			s.log.Error("agent dataset download failed", "job_id", id, "node_id", nodeID, "err", err)
+		}
+		panic(http.ErrAbortHandler)
+	}
+}
+
+func (s *server) agentTrainingDatasetArchive(w http.ResponseWriter, r *http.Request) {
+	id, nodeID, ok := s.agentTrainingJob(w, r)
+	if !ok {
+		return
+	}
+	arch, err := s.training.OpenTaskDatasetArchive(r.Context(), id, nodeID)
+	if err != nil {
+		s.agentTrainingError(w, r, err)
+		return
+	}
+	defer arch.Close()
+
+	h := w.Header()
+	h.Set("Content-Type", "application/zstd")
+	h.Set("Content-Disposition", attachmentDisposition(arch.FileName))
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Archive-Sha256", arch.SHA256)
+	h.Set("X-Archive-Raw-Bytes", strconv.FormatInt(arch.RawBytes, 10))
+	h.Set("X-Archive-Files-Count", strconv.Itoa(arch.FilesCount))
+	if arch.ArchiveBytes > 0 {
+		h.Set("Content-Length", strconv.FormatInt(arch.ArchiveBytes, 10))
+	}
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	if _, err := io.Copy(w, arch.Stream); err != nil {
+		if r.Context().Err() == nil {
+			s.log.Error("agent dataset archive download failed", "job_id", id, "node_id", nodeID, "err", err)
 		}
 		panic(http.ErrAbortHandler)
 	}

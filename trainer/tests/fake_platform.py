@@ -124,11 +124,19 @@ class FakePlatform:
             def log_message(self, *args: Any) -> None:
                 pass
 
-            def _send(self, status: int, payload: Any, content_type: str | None = None) -> None:
+            def _send(
+                self,
+                status: int,
+                payload: Any,
+                content_type: str | None = None,
+                extra_headers: dict[str, str] | None = None,
+            ) -> None:
                 body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", content_type or "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                for hk, hv in (extra_headers or {}).items():
+                    self.send_header(hk, hv)
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -194,11 +202,15 @@ class FakePlatform:
                         self.close_connection = True
                         self.connection.shutdown(2)
                         return
-                    status, payload = response
+                    if len(response) == 3:
+                        status, payload, extra_headers = response
+                    else:
+                        status, payload = response
+                        extra_headers = None
                     content_type = (
                         "application/octet-stream" if isinstance(payload, bytes) else None
                     )
-                    self._send(status, payload, content_type)
+                    self._send(status, payload, content_type, extra_headers)
                     return
                 self._send(404, {"error": {"code": "not_found", "message": "接口不存在"}})
 
@@ -733,6 +745,7 @@ class FakePlatform:
         base_sha256: str | None = None,
         params: dict[str, Any] | None = None,
         task: dict[str, Any] | None = None,
+        dataset_headers: dict[str, str] | None = None,
     ) -> int:
         with self.lock:
             job_id = self._next_training
@@ -770,6 +783,7 @@ class FakePlatform:
                     "val_count": 2,
                 },
                 "dataset_zip": dataset_zip,
+                "dataset_headers": dict(dataset_headers) if dataset_headers else None,
                 "base_model": base_model,
                 "base_model_data": base_model_data,
                 "params": {"epochs": 2, "batch": 4, "imgsz": 640, **(params or {})},
@@ -832,7 +846,7 @@ class FakePlatform:
             "error": job.get("error", ""),
         }
 
-    def training_request(self, method: str, request: dict[str, Any]) -> tuple[int, Any] | str:
+    def training_request(self, method: str, request: dict[str, Any]) -> tuple[int, Any] | Any:
         parts = urllib.parse.urlsplit(request["path"])
         m = _TRAINING_PATH.fullmatch(parts.path)
         if m is None:
@@ -863,7 +877,9 @@ class FakePlatform:
 
     def _training_dataset(
         self, job: dict[str, Any], request: dict[str, Any], query: dict[str, str]
-    ) -> tuple[int, Any]:
+    ) -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:
+        if job.get("dataset_headers"):
+            return 200, job["dataset_zip"], dict(job["dataset_headers"])
         return 200, job["dataset_zip"]
 
     def _training_base_model(

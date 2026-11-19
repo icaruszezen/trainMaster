@@ -12,11 +12,20 @@ import {
   BUILTIN_STORAGE_NODE_REF,
   createStorageMigrations,
   createStorageNode,
+  getDockerConfig,
   migratableItemsQuery,
+  migrationStageLabel,
+  nodeSupportsArchive,
+  resolveMigrationTransferMode,
+  resolveTrainingDatasetCopyMode,
+  storageKindLabel,
+  storageKindShortLabel,
   storageMigrationsQuery,
   storageNodesQuery,
   testStorageNode,
   trainerCachePolicyQuery,
+  trainingDatasetCopyLabel,
+  updateStorageNode,
   updateTrainerCachePolicy,
   type MigratableItem,
   type StorageMigration,
@@ -54,8 +63,8 @@ function requestOf(fetchMock: ReturnType<typeof mockFetch>) {
   }
 }
 
-describe("storage API client", () => {
-  it("tests, creates, and activates storage nodes via /api/v1/storage", async () => {
+describe("storage API client & capability helpers", () => {
+  it("tests, creates, updates, and activates s3 and docker storage nodes via /api/v1/storage", async () => {
     const fetchMock = mockFetch(() =>
       Response.json({
         ok: true,
@@ -85,24 +94,56 @@ describe("storage API client", () => {
 
     fetchMock.mockClear()
     await createStorageNode({
-      name: "机房 MinIO",
-      kind: "s3",
-      s3: {
-        endpoint: "http://192.168.10.15:9000",
-        region: "us-east-1",
-        bucket: "vision-datasets",
-        prefix: "trainmaster",
-        access_key_id: "minioadmin",
-        force_path_style: true,
+      name: "独立存储容器 #1",
+      kind: "docker",
+      docker: {
+        endpoint: "http://192.168.1.50:8090",
         insecure_skip_verify: false,
       },
-      secret_access_key: "secret123",
+      config: {
+        endpoint: "http://192.168.1.50:8090",
+        insecure_skip_verify: false,
+      },
+      token: "storage-token-123",
       activate: true,
     })
     expect(requestOf(fetchMock)).toMatchObject({
       path: "/api/v1/storage/nodes",
       method: "POST",
-      body: { name: "机房 MinIO", kind: "s3", activate: true },
+      body: {
+        name: "独立存储容器 #1",
+        kind: "docker",
+        config: {
+          endpoint: "http://192.168.1.50:8090",
+          insecure_skip_verify: false,
+        },
+        token: "storage-token-123",
+        activate: true,
+      },
+    })
+
+    fetchMock.mockClear()
+    await updateStorageNode(3, {
+      name: "独立存储容器 #1（已更新）",
+      docker: {
+        endpoint: "https://192.168.1.50:8443",
+        insecure_skip_verify: true,
+      },
+      config: {
+        endpoint: "https://192.168.1.50:8443",
+        insecure_skip_verify: true,
+      },
+    })
+    expect(requestOf(fetchMock)).toMatchObject({
+      path: "/api/v1/storage/nodes/3",
+      method: "PATCH",
+      body: {
+        name: "独立存储容器 #1（已更新）",
+        config: {
+          endpoint: "https://192.168.1.50:8443",
+          insecure_skip_verify: true,
+        },
+      },
     })
 
     fetchMock.mockClear()
@@ -112,6 +153,104 @@ describe("storage API client", () => {
       method: "POST",
       body: undefined,
     })
+  })
+
+  it("normalizes docker config, capability flags, transfer modes, and stage labels safely", () => {
+    expect(
+      getDockerConfig({
+        docker: {
+          endpoint: "http://10.0.0.5:8090",
+          insecure_skip_verify: false,
+        },
+      })
+    ).toEqual({ endpoint: "http://10.0.0.5:8090", insecure_skip_verify: false })
+    expect(
+      getDockerConfig({
+        endpoint: "https://10.0.0.5:8443",
+        insecure_skip_verify: true,
+      })
+    ).toEqual({ endpoint: "https://10.0.0.5:8443", insecure_skip_verify: true })
+
+    const builtinArchive = {
+      ...BUILTIN_STORAGE_NODE_REF,
+      supports_archive: true,
+    }
+    const dockerRef = {
+      id: 3,
+      name: "存储容器 A",
+      kind: "docker" as const,
+      is_builtin: false,
+      supports_archive: true,
+    }
+    const s3Ref = {
+      id: 2,
+      name: "MinIO",
+      kind: "s3" as const,
+      is_builtin: false,
+      supports_archive: false,
+    }
+
+    expect(nodeSupportsArchive(dockerRef)).toBe(true)
+    expect(nodeSupportsArchive(builtinArchive)).toBe(true)
+    expect(nodeSupportsArchive(s3Ref)).toBe(false)
+
+    const passiveLocalRef = {
+      id: 4,
+      name: "挂载盘",
+      kind: "local" as const,
+      is_builtin: false,
+      supports_archive: false,
+    }
+
+    expect(resolveMigrationTransferMode(builtinArchive, dockerRef)).toBe(
+      "archive"
+    )
+    expect(
+      resolveMigrationTransferMode(BUILTIN_STORAGE_NODE_REF, dockerRef)
+    ).toBe("archive")
+    expect(
+      resolveMigrationTransferMode(dockerRef, BUILTIN_STORAGE_NODE_REF)
+    ).toBe("archive")
+    expect(resolveMigrationTransferMode(builtinArchive, passiveLocalRef)).toBe(
+      "direct"
+    )
+    expect(resolveMigrationTransferMode(builtinArchive, s3Ref)).toBe("direct")
+    expect(resolveMigrationTransferMode(dockerRef, s3Ref)).toBe("direct")
+
+    expect(resolveTrainingDatasetCopyMode(BUILTIN_STORAGE_NODE_REF)).toBe(
+      "shared_local"
+    )
+    expect(resolveTrainingDatasetCopyMode(dockerRef)).toBe("archive")
+    expect(resolveTrainingDatasetCopyMode(s3Ref)).toBe("direct")
+
+    expect(trainingDatasetCopyLabel(BUILTIN_STORAGE_NODE_REF)).toContain(
+      "兼容存储流式拉取"
+    )
+    expect(trainingDatasetCopyLabel(BUILTIN_STORAGE_NODE_REF)).not.toContain(
+      "存储容器打包"
+    )
+    expect(trainingDatasetCopyLabel(builtinArchive)).toContain(
+      "存储容器打包解压"
+    )
+    expect(trainingDatasetCopyLabel(dockerRef)).toContain(
+      "存储容器打包拉取并解压"
+    )
+    expect(trainingDatasetCopyLabel(s3Ref)).toContain("兼容存储流式拉取")
+
+    expect(migrationStageLabel("packing")).toBe("正在打包压缩…")
+    expect(migrationStageLabel("transferring")).toBe("正在传输压缩包…")
+    expect(migrationStageLabel("extracting")).toBe("正在解压落盘…")
+    expect(migrationStageLabel("verifying")).toBe("正在校验数据…")
+    expect(migrationStageLabel("cleaning")).toBe("正在清理临时包…")
+    expect(migrationStageLabel("custom_future_stage")).toBe(
+      "custom_future_stage"
+    )
+    expect(migrationStageLabel("")).toBeNull()
+
+    expect(storageKindLabel("docker")).toBe("存储服务容器 (Docker)")
+    expect(storageKindLabel("future_kind")).toBe("future_kind")
+    expect(storageKindShortLabel("docker")).toBe("存储容器")
+    expect(storageKindShortLabel("future_kind")).toBe("future_kind")
   })
 
   it("updates trainer cache policy and starts online migrations", async () => {
@@ -152,7 +291,7 @@ describe("storage API client", () => {
 })
 
 describe("StoragePage & StorageNodeBadge rendering", () => {
-  it("renders storage nodes, migratable items, migration progress, and cache policy", () => {
+  it("renders Docker and legacy storage nodes, capability badges, pre-migration mode, and multi-stage progress", () => {
     const nodes: StorageNode[] = [
       {
         id: 1,
@@ -161,6 +300,7 @@ describe("StoragePage & StorageNodeBadge rendering", () => {
         is_builtin: true,
         is_active: false,
         has_secret: false,
+        supports_archive: true,
         display_target: "/data",
         config: { local: { path: "/data" } },
         status: "ok",
@@ -184,8 +324,9 @@ describe("StoragePage & StorageNodeBadge rendering", () => {
         name: "机房存储服务器 MinIO",
         kind: "s3",
         is_builtin: false,
-        is_active: true,
+        is_active: false,
         has_secret: true,
+        supports_archive: false,
         display_target: "s3://vision-datasets/trainmaster",
         config: {
           s3: {
@@ -200,14 +341,40 @@ describe("StoragePage & StorageNodeBadge rendering", () => {
         },
         status: "ok",
         stats: {
+          dataset_count: 1,
+          trashed_dataset_count: 0,
+          data_version_count: 0,
+          trashed_data_version_count: 0,
+          stored_bytes: 1_200_000_000,
+        },
+        created_at: "2026-11-10T00:00:00Z",
+        updated_at: "2026-11-10T00:00:00Z",
+      },
+      {
+        id: 3,
+        name: "机房存储容器节点 A",
+        kind: "docker",
+        is_builtin: false,
+        is_active: true,
+        has_secret: true,
+        supports_archive: true,
+        display_target: "http://192.168.1.50:8090",
+        config: {
+          docker: {
+            endpoint: "http://192.168.1.50:8090",
+            insecure_skip_verify: false,
+          },
+        },
+        status: "ok",
+        stats: {
           dataset_count: 3,
           trashed_dataset_count: 0,
           data_version_count: 2,
           trashed_data_version_count: 0,
           stored_bytes: 4_800_000_000,
         },
-        created_at: "2026-11-10T00:00:00Z",
-        updated_at: "2026-11-10T00:00:00Z",
+        created_at: "2026-11-12T00:00:00Z",
+        updated_at: "2026-11-12T00:00:00Z",
       },
     ]
 
@@ -219,12 +386,39 @@ describe("StoragePage & StorageNodeBadge rendering", () => {
         dir_name: "line_a_legacy",
         image_count: 240,
         total_bytes: 128_000_000,
-        storage_node: BUILTIN_STORAGE_NODE_REF,
+        storage_node: { ...BUILTIN_STORAGE_NODE_REF, supports_archive: true },
         created_at: "2026-11-02T00:00:00Z",
       },
     ]
 
+    const dockerNodeRef = {
+      id: 3,
+      name: "机房存储容器节点 A",
+      kind: "docker" as const,
+      is_builtin: false,
+      supports_archive: true,
+    }
+
     const migrations: StorageMigration[] = [
+      {
+        id: 12,
+        target_type: "dataset",
+        target_id: 8,
+        target_name: "焊缝缺陷大图集",
+        from_node: { ...BUILTIN_STORAGE_NODE_REF, supports_archive: true },
+        to_node: dockerNodeRef,
+        delete_source: true,
+        transfer_mode: "archive",
+        stage: "extracting",
+        archive_bytes: 125_829_120,
+        status: "running",
+        files_done: 600,
+        files_total: 600,
+        bytes_done: 125_829_120,
+        bytes_total: 125_829_120,
+        created_at: "2026-11-16T08:00:00Z",
+        updated_at: "2026-11-16T08:01:00Z",
+      },
       {
         id: 9,
         target_type: "data_version",
@@ -236,8 +430,10 @@ describe("StoragePage & StorageNodeBadge rendering", () => {
           name: "机房存储服务器 MinIO",
           kind: "s3",
           is_builtin: false,
+          supports_archive: false,
         },
         delete_source: true,
+        transfer_mode: "direct",
         status: "succeeded",
         files_done: 480,
         files_total: 480,
@@ -256,7 +452,7 @@ describe("StoragePage & StorageNodeBadge rendering", () => {
       go_version: "go1.25",
       started_at: "2026-11-17T00:00:00Z",
       uptime_seconds: 3600,
-      database: { status: "ok", server_version: "15.8", schema_version: 17 },
+      database: { status: "ok", server_version: "15.8", schema_version: 18 },
       storage: {
         root: "/data",
         total_bytes: 500_000_000_000,
@@ -302,11 +498,22 @@ describe("StoragePage & StorageNodeBadge rendering", () => {
       "存储管理",
       "本机默认存储",
       "机房存储服务器 MinIO",
+      "机房存储容器节点 A",
+      "存储容器",
+      "支持打包加速",
+      "兼容直传·不打包",
       "当前使用中",
+      "http://192.168.1.50:8090",
       "s3://vision-datasets/trainmaster",
+      "压缩包整包迁移（先打压缩包 → 传输 → 解压缩包）",
       "产线A-历史样本",
       "一键全部迁移（1）",
+      "焊缝缺陷大图集",
+      "压缩包传输",
+      "正在解压落盘…",
+      "压缩包 120 MB",
       "外观检测 · 数据版本 v2",
+      "逐文件直传",
       "训练机短期数据集缓存策略",
       "训练结束立即删除本地数据集",
       "平台本机系统目录",
@@ -314,17 +521,11 @@ describe("StoragePage & StorageNodeBadge rendering", () => {
       expect(html).toContain(expected)
     }
 
-    const badgeHtml = renderToStaticMarkup(
-      <StorageNodeBadge
-        node={{
-          id: 2,
-          name: "机房存储服务器 MinIO",
-          kind: "s3",
-          is_builtin: false,
-        }}
-      />
+    const dockerBadgeHtml = renderToStaticMarkup(
+      <StorageNodeBadge node={dockerNodeRef} />
     )
-    expect(badgeHtml).toContain("机房存储服务器 MinIO")
+    expect(dockerBadgeHtml).toContain("机房存储容器节点 A")
+    expect(dockerBadgeHtml).toContain("支持打包加速")
     expect(
       renderToStaticMarkup(
         <StorageNodeBadge node={BUILTIN_STORAGE_NODE_REF} hideBuiltin />
@@ -447,5 +648,110 @@ describe("StoragePage & StorageNodeBadge rendering", () => {
     expect(errorHtml).not.toContain("该节点上次检测状态异常")
     const classes = enclosingClasses(errorHtml, longFailure)
     expect(classes?.at(-1)).toContain("wrap-anywhere")
+  })
+
+  it("renders legacy direct pre-migration banner and remaining archive stages", () => {
+    const dockerRef = {
+      id: 3,
+      name: "存储容器 B",
+      kind: "docker" as const,
+      is_builtin: false,
+      supports_archive: true,
+    }
+    const s3ActiveNode: StorageNode = {
+      id: 2,
+      name: "机房传统 S3",
+      kind: "s3",
+      is_builtin: false,
+      is_active: true,
+      has_secret: true,
+      supports_archive: false,
+      display_target: "s3://legacy-bucket/tm",
+      config: {},
+      status: "ok",
+      stats: {
+        dataset_count: 0,
+        trashed_dataset_count: 0,
+        data_version_count: 0,
+        trashed_data_version_count: 0,
+        stored_bytes: 0,
+      },
+      created_at: "2026-11-10T00:00:00Z",
+      updated_at: "2026-11-10T00:00:00Z",
+    }
+
+    const stages = ["packing", "transferring", "verifying", "cleaning"] as const
+    const migrations: StorageMigration[] = stages.map((stage, idx) => ({
+      id: 20 + idx,
+      target_type: "dataset",
+      target_id: 30 + idx,
+      target_name: `迁移任务-${stage}`,
+      from_node: { ...BUILTIN_STORAGE_NODE_REF, supports_archive: true },
+      to_node: dockerRef,
+      delete_source: false,
+      transfer_mode: "archive",
+      stage,
+      archive_bytes: stage === "packing" ? 0 : 62_914_560,
+      status: "running",
+      files_done: stage === "packing" ? 0 : 120,
+      files_total: 240,
+      bytes_done: stage === "packing" ? 0 : 31_457_280,
+      bytes_total: 62_914_560,
+      created_at: "2026-11-16T08:00:00Z",
+      updated_at: "2026-11-16T08:01:00Z",
+    }))
+
+    queryClient.setQueryData<ListResponse<StorageNode>>(
+      storageNodesQuery.queryKey,
+      { items: [s3ActiveNode], total: 1 }
+    )
+    queryClient.setQueryData<ListResponse<MigratableItem>>(
+      migratableItemsQuery.queryKey,
+      {
+        items: [
+          {
+            target_type: "data_version",
+            target_id: 9,
+            name: "数据版本 v1",
+            dir_name: "p1/v1",
+            image_count: 50,
+            total_bytes: 10_485_760,
+            storage_node: BUILTIN_STORAGE_NODE_REF,
+            created_at: "2026-11-01T00:00:00Z",
+          },
+        ],
+        total: 1,
+      }
+    )
+    queryClient.setQueryData<ListResponse<StorageMigration>>(
+      storageMigrationsQuery.queryKey,
+      { items: migrations, total: migrations.length }
+    )
+    queryClient.setQueryData(trainerCachePolicyQuery.queryKey, {
+      enabled: true,
+      max_versions: 2,
+      ttl_hours: 24,
+    })
+
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <QueryClientProvider client={queryClient}>
+          <TooltipProvider>
+            <StoragePage />
+          </TooltipProvider>
+        </QueryClientProvider>
+      </MemoryRouter>
+    )
+
+    for (const expected of [
+      "兼容逐文件直传（按现有存储接入，不提供打包）",
+      "正在打包压缩…",
+      "正在传输压缩包…",
+      "正在校验数据…",
+      "正在清理临时包…",
+      "压缩包 60 MB",
+    ]) {
+      expect(html).toContain(expected)
+    }
   })
 })

@@ -17,11 +17,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import inspect
 import json
 import logging
 import math
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -70,6 +73,7 @@ WORK_DIR_PREFIX = "training-job-"
 
 INIT_MODES = ("scratch", "finetune", "resume")
 STAGES = ("preparing", "downloading", "training", "uploading")
+DATASET_TRANSFER_MODES = ("shared_local", "archive", "direct")
 
 # 训练日志与实时进度刷新周期（秒）；无新日志时仍按 progress_interval（15s）续租。
 LOG_FLUSH_INTERVAL = 2.0
@@ -81,6 +85,10 @@ MIN_FREE_DISK_BYTES = 512 << 20  # 工作目录至少保留 512 MiB 可用空间
 # 允许上传到平台 runs/job-<id>/ 的产物扩展名（与后端 cleanArtifactRel 一致）。
 ARTIFACT_PLOT_EXTS = frozenset({".png", ".jpg", ".jpeg"})
 ARTIFACT_META_EXTS = frozenset({".csv", ".yaml", ".yml"})
+
+
+class DatasetArchiveChecksumError(TaskFailed, ValueError):
+    """下载的数据集压缩包 SHA-256 校验失败（同时继承 TaskFailed 与 ValueError）。"""
 
 
 class TrainingError(Exception):
@@ -633,7 +641,10 @@ def _run_training(
         raise TrainingError(f"训练结束但未生成模型权重文件（{save_dir / 'weights'}）")
     # 当某些训练配置（如 val=False）只生成了 last.pt 时，复制一份作为 best.pt 以便自动注册
     if not best_pt.is_file() and last_pt.is_file():
-        shutil.copy2(last_pt, best_pt)
+        try:
+            shutil.copy2(last_pt, best_pt)
+        except OSError:
+            shutil.copyfile(last_pt, best_pt)
 
     device_str = str(getattr(trainer_obj, "device", "") or kwargs.get("device") or "auto")
     result = {
@@ -992,8 +1003,44 @@ class DatasetCachePolicy:
         return cls(enabled=enabled, max_versions=mv, ttl_seconds=ttl)
 
 
-def _link_or_copy_tree(src_dir: Path, dst_dir: Path) -> tuple[int, Path | None]:
-    """把 src_dir 下的文件硬链接（不支持时退回复制）到 dst_dir，跳过缓存元数据文件。"""
+STALE_TMP_CACHE_SECONDS = 1800.0  # 仅清理超过 30 分钟的崩溃残留 .tmp-* 目录，避免误删并发写入目录
+
+
+def _copy_file_tolerant(src: Path, dst: Path) -> None:
+    """优先使用 shutil.copy2 保留元数据；若 VirtioFS / SMB / NFS 拒绝 copystat，退回 shutil.copyfile。"""
+    try:
+        shutil.copy2(src, dst)
+    except OSError:
+        shutil.copyfile(src, dst)
+
+
+def _rmtree_force(path: Path) -> None:
+    """安全递归删除目录（自动为只读缓存文件补写权限）；若是普通文件或符号链接则直接 unlink。"""
+    if path.is_symlink() or not path.is_dir():
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        return
+
+    def _on_rm_error(func: Callable[..., Any], target: str, _exc: Any) -> None:
+        with contextlib.suppress(OSError):
+            os.chmod(target, 0o700)
+            func(target)
+
+    shutil.rmtree(path, onerror=_on_rm_error)
+
+
+_TMP_DV_DIR_RE = re.compile(r"^\.tmp-dv-\d+-\d+-(-?\d+)$")
+_COPY_ISOLATED_EXTS = frozenset({".yaml", ".yml", ".txt", ".json", ".cache"})
+
+
+def _link_or_copy_tree(
+    src_dir: Path,
+    dst_dir: Path,
+    *,
+    freeze_cached_files: bool = False,
+) -> tuple[int, Path | None]:
+    """把 src_dir 下的图像硬链接（不支持时退回复制）到 dst_dir，文本/YAML 配置独立复制以防原地篡改污染缓存。"""
+    _ = freeze_cached_files
     total_bytes = 0
     best_yaml: Path | None = None
     for item in src_dir.rglob("*"):
@@ -1009,10 +1056,13 @@ def _link_or_copy_tree(src_dir: Path, dst_dir: Path) -> tuple[int, Path | None]:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
             target.unlink()
-        try:
-            os.link(item, target)
-        except OSError:
-            shutil.copy2(item, target)
+        if item.suffix.lower() in _COPY_ISOLATED_EXTS:
+            _copy_file_tolerant(item, target)
+        else:
+            try:
+                os.link(item, target)
+            except OSError:
+                _copy_file_tolerant(item, target)
         with contextlib.suppress(OSError):
             total_bytes += item.stat().st_size
         if target.name == "data.yaml" and (
@@ -1069,15 +1119,15 @@ class DatasetCacheManager:
                 return None
             dest_dir.mkdir(parents=True, exist_ok=True)
             try:
-                _, data_yaml = _link_or_copy_tree(entry_dir, dest_dir)
+                _, data_yaml = _link_or_copy_tree(entry_dir, dest_dir, freeze_cached_files=False)
             except OSError as exc:
                 log.warning("dataset cache materialize failed for dv-%s: %s", dv_id, exc)
-                shutil.rmtree(entry_dir, ignore_errors=True)
-                shutil.rmtree(dest_dir, ignore_errors=True)
+                _rmtree_force(entry_dir)
+                _rmtree_force(dest_dir)
                 return None
             if data_yaml is None or not data_yaml.is_file():
-                shutil.rmtree(entry_dir, ignore_errors=True)
-                shutil.rmtree(dest_dir, ignore_errors=True)
+                _rmtree_force(entry_dir)
+                _rmtree_force(dest_dir)
                 return None
             meta["last_used_at"] = self._wall_clock()
             self._write_meta_locked(entry_dir, meta)
@@ -1090,16 +1140,19 @@ class DatasetCacheManager:
             if not policy.enabled:
                 self._clear_locked()
                 return
+            stage_dir: Path | None = None
             try:
                 self.cache_root.mkdir(parents=True, exist_ok=True)
                 now = self._wall_clock()
                 stage_dir = self.cache_root / f".tmp-dv-{dv_id}-{os.getpid()}-{int(now * 1000)}"
                 if stage_dir.exists():
-                    shutil.rmtree(stage_dir, ignore_errors=True)
+                    _rmtree_force(stage_dir)
                 stage_dir.mkdir(parents=True, exist_ok=True)
-                size_bytes, data_yaml = _link_or_copy_tree(extracted_dir, stage_dir)
+                size_bytes, data_yaml = _link_or_copy_tree(
+                    extracted_dir, stage_dir, freeze_cached_files=True
+                )
                 if data_yaml is None:
-                    shutil.rmtree(stage_dir, ignore_errors=True)
+                    _rmtree_force(stage_dir)
                     return
                 self._write_meta_locked(
                     stage_dir,
@@ -1112,14 +1165,46 @@ class DatasetCacheManager:
                 )
                 entry_dir = self.cache_root / f"dv-{dv_id}"
                 if entry_dir.exists():
-                    shutil.rmtree(entry_dir, ignore_errors=True)
+                    _rmtree_force(entry_dir)
                 stage_dir.replace(entry_dir)
+                stage_dir = None
                 self._enforce_locked(policy)
             except OSError as exc:
+                if stage_dir is not None and stage_dir.exists():
+                    _rmtree_force(stage_dir)
                 log.warning("cannot populate trainer dataset cache for dv-%s: %s", dv_id, exc)
+            except BaseException:
+                if stage_dir is not None and stage_dir.exists():
+                    _rmtree_force(stage_dir)
+                raise
 
-    def evict_for_space(self, path_on_disk: Path, need_bytes: int) -> None:
+    def has_cached(self, dv_id: int, policy: DatasetCachePolicy) -> bool:
+        """判断指定数据版本在当前缓存策略下是否已有未过期的有效缓存。"""
+        if not policy.enabled:
+            return False
+        with self._lock:
+            if not self.cache_root.is_dir():
+                return False
+            entry_dir = self.cache_root / f"dv-{dv_id}"
+            meta = self._read_meta_locked(entry_dir)
+            if meta is None:
+                return False
+            if self._wall_clock() - float(meta["last_used_at"]) > policy.ttl_seconds:
+                return False
+            return any(
+                p.is_file() and not p.is_symlink() and p.name == "data.yaml"
+                for p in entry_dir.rglob("data.yaml")
+            )
+
+    def evict_for_space(
+        self,
+        path_on_disk: Path,
+        need_bytes: int,
+        *,
+        exclude_dv_id: int | None = None,
+    ) -> None:
         """磁盘可用空间不足时按最久未使用顺序主动驱逐旧缓存版本。"""
+        excluded = f"dv-{exclude_dv_id}" if exclude_dv_id is not None else None
         with self._lock:
             if not self.cache_root.is_dir():
                 return
@@ -1130,11 +1215,13 @@ class DatasetCacheManager:
                         return
                 except OSError:
                     return
-                shutil.rmtree(entry_dir, ignore_errors=True)
+                if excluded is not None and entry_dir.name == excluded:
+                    continue
+                _rmtree_force(entry_dir)
 
     def _clear_locked(self) -> None:
         if self.cache_root.exists():
-            shutil.rmtree(self.cache_root, ignore_errors=True)
+            _rmtree_force(self.cache_root)
 
     def _read_meta_locked(self, entry_dir: Path) -> dict[str, Any] | None:
         meta_path = entry_dir / CACHE_META_FILE
@@ -1153,18 +1240,35 @@ class DatasetCacheManager:
         with contextlib.suppress(OSError):
             meta_path.write_text(json.dumps(dict(meta)) + "\n", encoding="utf-8")
 
+    def _is_stale_tmp_dir_locked(self, child: Path, now: float) -> bool:
+        m = _TMP_DV_DIR_RE.match(child.name)
+        if m is not None:
+            created_at = int(m.group(1)) / 1000.0
+            return (now - created_at) > STALE_TMP_CACHE_SECONDS
+        try:
+            mtime = child.stat().st_mtime
+        except OSError:
+            return True
+        return (time.time() - mtime) > STALE_TMP_CACHE_SECONDS
+
     def _list_entries_locked(self) -> list[tuple[Path, float]]:
-        """返回按 last_used_at 从旧到新排序的有效缓存目录列表，顺带清理残余临时目录。"""
+        """返回按 last_used_at 从旧到新排序的有效缓存目录列表，顺带清理过期残余临时项与杂散文件。"""
         if not self.cache_root.is_dir():
             return []
+        now = self._wall_clock()
         entries: list[tuple[Path, float]] = []
         for child in self.cache_root.iterdir():
-            if child.name.startswith(".tmp-") or not child.is_dir():
-                shutil.rmtree(child, ignore_errors=True)
+            if child.is_symlink() or not child.is_dir():
+                with contextlib.suppress(OSError):
+                    child.unlink(missing_ok=True)
+                continue
+            if child.name.startswith(".tmp-"):
+                if self._is_stale_tmp_dir_locked(child, now):
+                    _rmtree_force(child)
                 continue
             meta = self._read_meta_locked(child)
             if meta is None:
-                shutil.rmtree(child, ignore_errors=True)
+                _rmtree_force(child)
                 continue
             entries.append((child, float(meta["last_used_at"])))
         entries.sort(key=lambda item: item[1])
@@ -1180,16 +1284,30 @@ class DatasetCacheManager:
         kept: list[tuple[Path, float]] = []
         for entry_dir, last_used in self._list_entries_locked():
             if now - last_used > policy.ttl_seconds:
-                shutil.rmtree(entry_dir, ignore_errors=True)
+                _rmtree_force(entry_dir)
             else:
                 kept.append((entry_dir, last_used))
         while len(kept) > policy.max_versions:
             oldest_dir, _ = kept.pop(0)
-            shutil.rmtree(oldest_dir, ignore_errors=True)
+            _rmtree_force(oldest_dir)
 
 
 # ---------------------------------------------------------------------------
 # 父进程：执行平台下发的 training_job 任务
+
+
+def _non_negative_int(value: Any) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return 0
+
+
+def _normalize_transfer_mode(value: Any) -> str:
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in DATASET_TRANSFER_MODES:
+            return cleaned
+    return ""
 
 
 @dataclass(frozen=True)
@@ -1216,6 +1334,8 @@ class TrainingTaskInfo:
     artifacts_url: str
     complete_url: str
     fail_url: str
+    dv_total_bytes: int = 0
+    dv_transfer_mode: str = ""
 
     @classmethod
     def parse(cls, task: Mapping[str, Any]) -> TrainingTaskInfo:
@@ -1258,6 +1378,14 @@ class TrainingTaskInfo:
         dv_dir_name = dv_dir if isinstance(dv_dir, str) and dv_dir else None
         raw_shared = dv.get("shared_local")
         dv_shared_local = raw_shared if isinstance(raw_shared, bool) else None
+        dv_total_bytes = _non_negative_int(task.get("dv_total_bytes")) or _non_negative_int(
+            dv.get("dv_total_bytes") if "dv_total_bytes" in dv else dv.get("total_bytes")
+        )
+        dv_transfer_mode = _normalize_transfer_mode(
+            task.get("dv_transfer_mode")
+        ) or _normalize_transfer_mode(
+            dv.get("dv_transfer_mode") if "dv_transfer_mode" in dv else dv.get("transfer_mode")
+        )
         dataset_cache = DatasetCachePolicy.from_json(task.get("dataset_cache"))
 
         base_size: int | None = None
@@ -1301,39 +1429,215 @@ class TrainingTaskInfo:
             artifacts_url=url("artifacts_url"),
             complete_url=url("complete_url"),
             fail_url=url("fail_url"),
+            dv_total_bytes=dv_total_bytes,
+            dv_transfer_mode=dv_transfer_mode,
         )
 
 
+TrainingJobInfo = TrainingTaskInfo
+
+
+def required_training_disk_bytes(
+    info: TrainingTaskInfo,
+    *,
+    shared_local: bool = False,
+    cached: bool = False,
+) -> int:
+    """估算训练任务启动前至少需要的磁盘空间（含基础模型、数据集解压目录与临时压缩包余量）。"""
+    need = (info.base_size_bytes or 0) + MIN_FREE_DISK_BYTES
+    if not shared_local and not cached and info.dv_total_bytes > 0:
+        # 下载解压阶段同时存在临时 dataset.zip 与解压后的 dataset/ 目录，预留 2 倍数据版本大小
+        need += info.dv_total_bytes * 2
+    return need
+
+
+def _normalized_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
+    if not headers:
+        return {}
+    return {str(k).lower(): str(v).strip() for k, v in headers.items() if v is not None}
+
+
+def verify_dataset_archive_checksum(
+    zip_path: Path,
+    headers: Mapping[str, str] | None,
+    abort: Callable[[], bool] | None = None,
+    *,
+    require_checksum: bool = False,
+) -> str | None:
+    """解压前校验 dataset.zip 的 SHA-256；archive 模式强制要求校验头，不一致或缺失时删除压缩包并报错。"""
+    normalized = _normalized_headers(headers)
+    header_mode = _normalize_transfer_mode(normalized.get("x-transfer-mode"))
+    must_verify = bool(require_checksum or header_mode == "archive")
+
+    archive_sha = normalized.get("x-archive-sha256", "")
+    content_sha = normalized.get("x-content-sha256", "")
+    if not archive_sha and not content_sha:
+        if must_verify:
+            with contextlib.suppress(OSError):
+                zip_path.unlink()
+            raise DatasetArchiveChecksumError(
+                "下载的数据集压缩包校验失败（缺少 X-Archive-Sha256 校验响应头），已删除未校验的压缩包",
+                "archive transfer mode requires non-empty X-Archive-Sha256 or X-Content-Sha256 header",
+                retryable=True,
+            )
+        return None
+
+    actual_sha = file_sha256(zip_path, abort)
+    for header_name, expected in (
+        ("X-Archive-Sha256", archive_sha),
+        ("X-Content-Sha256", content_sha),
+    ):
+        if not expected:
+            continue
+        expected_lower = expected.lower()
+        if not _SHA256.fullmatch(expected_lower) or actual_sha != expected_lower:
+            with contextlib.suppress(OSError):
+                zip_path.unlink()
+            raise DatasetArchiveChecksumError(
+                "下载的数据集压缩包校验失败（SHA-256 mismatch / sha256 不一致），已删除损坏的压缩包",
+                f"{header_name} expected {expected_lower}, got {actual_sha}",
+                retryable=True,
+            )
+    return actual_sha
+
+
+def _resolve_extract_max_raw_bytes(
+    info: TrainingTaskInfo, norm_headers: Mapping[str, str], work: Path
+) -> int:
+    raw_hdr = norm_headers.get("x-archive-raw-bytes", "")
+    if raw_hdr:
+        try:
+            declared = int(raw_hdr)
+        except ValueError:
+            raise TaskFailed(
+                f"数据集压缩包 X-Archive-Raw-Bytes 响应头非法：{raw_hdr!r}",
+                retryable=False,
+            ) from None
+        if declared < 0:
+            raise TaskFailed(
+                f"数据集压缩包 X-Archive-Raw-Bytes 不能为负数：{raw_hdr!r}",
+                retryable=False,
+            )
+        limit = min(MAX_DATASET_ZIP_BYTES, declared)
+    elif info.dv_total_bytes > 0:
+        limit = min(
+            MAX_DATASET_ZIP_BYTES,
+            max(info.dv_total_bytes * 4, info.dv_total_bytes + (4 << 20)),
+        )
+    else:
+        limit = MAX_DATASET_ZIP_BYTES
+
+    with contextlib.suppress(OSError):
+        free_bytes = shutil.disk_usage(work).free
+        if free_bytes > (64 << 20):
+            limit = min(limit, free_bytes - (16 << 20))
+    return limit
+
+
 def safe_extract_zip(
-    zip_path: Path, dest_dir: Path, abort: Callable[[], bool] | None = None
+    zip_path: Path,
+    dest_dir: Path,
+    abort: Callable[[], bool] | None = None,
+    *,
+    max_raw_bytes: int | None = None,
 ) -> Path:
-    """安全解压数据集 zip 到 dest_dir（防范路径穿越），并返回其中的 data.yaml 路径。"""
+    """安全解压数据集 zip 到 dest_dir（防范路径穿越、符号链接/特殊文件、"." 覆盖与解压炸弹），并返回 data.yaml。"""
+    byte_limit = MAX_DATASET_ZIP_BYTES if max_raw_bytes is None else max(0, int(max_raw_bytes))
     dest_resolved = dest_dir.resolve()
     data_yaml: Path | None = None
+    total_extracted = 0
+
     with zipfile.ZipFile(zip_path, "r") as zf:
         for member in zf.infolist():
             if abort is not None and abort():
                 raise TransportError("extract aborted")
+
+            unix_mode = (member.external_attr >> 16) & 0xFFFF
+            if unix_mode and (
+                stat.S_ISLNK(unix_mode)
+                or stat.S_ISFIFO(unix_mode)
+                or stat.S_ISCHR(unix_mode)
+                or stat.S_ISBLK(unix_mode)
+                or stat.S_ISSOCK(unix_mode)
+            ):
+                _rmtree_force(dest_dir)
+                raise TaskFailed(
+                    f"数据集压缩包包含不安全的符号链接或特殊文件：{member.filename!r}",
+                    retryable=False,
+                )
+
             name = member.filename.replace("\\", "/")
-            if not name or name.startswith("/"):
-                raise TaskFailed(f"数据集压缩包包含非法路径：{member.filename!r}")
+            if not name or name.startswith("/") or ".." in name.split("/"):
+                _rmtree_force(dest_dir)
+                raise TaskFailed(
+                    f"数据集压缩包包含非法或越界路径：{member.filename!r}",
+                    retryable=False,
+                )
+
             target = (dest_dir / name).resolve()
             try:
                 target.relative_to(dest_resolved)
             except ValueError as exc:
-                raise TaskFailed(f"数据集压缩包包含越界路径：{member.filename!r}") from exc
-            if member.is_dir() or name.endswith("/"):
+                _rmtree_force(dest_dir)
+                raise TaskFailed(
+                    f"数据集压缩包包含越界路径：{member.filename!r}",
+                    retryable=False,
+                ) from exc
+
+            is_dir_entry = member.is_dir() or name.endswith("/")
+            if target == dest_resolved:
+                if is_dir_entry:
+                    dest_resolved.mkdir(parents=True, exist_ok=True)
+                    continue
+                _rmtree_force(dest_dir)
+                raise TaskFailed(
+                    f"数据集压缩包包含非法根目录文件项：{member.filename!r}",
+                    retryable=False,
+                )
+
+            if is_dir_entry:
                 target.mkdir(parents=True, exist_ok=True)
                 continue
+
+            if member.file_size > byte_limit or (total_extracted + member.file_size) > byte_limit:
+                _rmtree_force(dest_dir)
+                raise TaskFailed(
+                    f"数据集压缩包解压体积超出安全上限（>{format_bytes(byte_limit)}），已中止解压",
+                    retryable=False,
+                )
+
             target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink() or target.is_dir():
+                _rmtree_force(dest_dir)
+                raise TaskFailed(
+                    f"数据集压缩包目标路径冲突或不安全：{member.filename!r}",
+                    retryable=False,
+                )
+
             with zf.open(member, "r") as src, open(target, "wb") as dst:
-                shutil.copyfileobj(src, dst, length=1 << 20)
+                while True:
+                    if abort is not None and abort():
+                        raise TransportError("extract aborted")
+                    chunk = src.read(256 * 1024)
+                    if not chunk:
+                        break
+                    total_extracted += len(chunk)
+                    if total_extracted > byte_limit:
+                        dst.close()
+                        _rmtree_force(dest_dir)
+                        raise TaskFailed(
+                            f"数据集压缩包实际解压体积超出安全上限（>{format_bytes(byte_limit)}），已删除半成品目录",
+                            retryable=False,
+                        )
+                    dst.write(chunk)
+
             if target.name == "data.yaml" and (
                 data_yaml is None or len(target.parts) < len(data_yaml.parts)
             ):
                 data_yaml = target
+
     if data_yaml is None or not data_yaml.is_file():
-        raise TaskFailed("下载的数据集压缩包中缺少 data.yaml 配置文件")
+        raise TaskFailed("下载的数据集压缩包中缺少 data.yaml 配置文件", retryable=False)
     return data_yaml
 
 
@@ -1508,8 +1812,22 @@ class TrainingJobTask:
 
     def _execute(self, info: TrainingTaskInfo) -> dict[str, Any]:
         work = self._prepare_work_dir(info)
-        need_bytes = (info.base_size_bytes or 0) + MIN_FREE_DISK_BYTES
-        self.dataset_cache.evict_for_space(work, need_bytes)
+        shared_yaml = self._resolve_shared_dataset_yaml(info)
+        policy = self._effective_cache_policy(info)
+        cached = (
+            shared_yaml is None
+            and policy.enabled
+            and info.dv_id is not None
+            and self.dataset_cache.has_cached(info.dv_id, policy)
+        )
+        need_bytes = required_training_disk_bytes(
+            info, shared_local=shared_yaml is not None, cached=cached
+        )
+        self.dataset_cache.evict_for_space(
+            work,
+            need_bytes,
+            exclude_dv_id=info.dv_id if policy.enabled else None,
+        )
         self._check_disk(work, need_bytes)
 
         self._set_stage(
@@ -1606,8 +1924,7 @@ class TrainingJobTask:
                 retryable=True,
             )
 
-    def _prepare_dataset(self, info: TrainingTaskInfo, work: Path) -> Path:
-        """优先使用本机默认存储共享目录；远程存储节点则优先命中本地短期缓存，未命中时从平台流式下载解压。"""
+    def _resolve_shared_dataset_yaml(self, info: TrainingTaskInfo) -> Path | None:
         if info.dv_shared_local is not False and self.data_dir is not None and info.dv_dir_name:
             rel = Path(*info.dv_dir_name.strip("/").split("/"))
             candidate_dir = self.data_dir / "exports" / rel
@@ -1618,16 +1935,27 @@ class TrainingJobTask:
                 and not (candidate_dir / ".pending").exists()
                 and os.access(candidate_dir, os.W_OK)
             ):
-                log.info(
-                    "training job %s using shared dataset directory %s", info.id, candidate_dir
-                )
                 return candidate_yaml
+        return None
 
-        dataset_dir = work / "dataset"
+    def _effective_cache_policy(self, info: TrainingTaskInfo) -> DatasetCachePolicy:
         policy = self.dataset_cache.latest_policy or info.dataset_cache
         if info.dataset_cache.enabled != policy.enabled or info.dataset_cache != policy:
             # 任务刚下发时的策略最新，同步给缓存管理器
-            policy = info.dataset_cache
+            return info.dataset_cache
+        return policy
+
+    def _prepare_dataset(self, info: TrainingTaskInfo, work: Path) -> Path:
+        """优先使用本机默认存储共享目录；远程存储节点则优先命中本地短期缓存，未命中时从平台下载校验并解压。"""
+        shared_yaml = self._resolve_shared_dataset_yaml(info)
+        if shared_yaml is not None:
+            log.info(
+                "training job %s using shared dataset directory %s", info.id, shared_yaml.parent
+            )
+            return shared_yaml
+
+        dataset_dir = work / "dataset"
+        policy = self._effective_cache_policy(info)
 
         if policy.enabled and info.dv_id is not None:
             cached_yaml = self.dataset_cache.materialize(info.dv_id, dataset_dir, policy)
@@ -1648,36 +1976,91 @@ class TrainingJobTask:
         else:
             self.dataset_cache.apply_policy(policy)
 
-        self._set_stage("downloading", log_chunk="[trainMaster] 正在从平台下载训练数据集归档...\n")
+        # 若 _execute() 预检时缓存尚有效、但 materialize() 因刚好过期/损坏未命中，
+        # 必须在发起网络拉取前按完整 2 * dv_total_bytes 重新驱逐并校验可用空间（消除 TOCTOU）。
+        need_download_bytes = required_training_disk_bytes(info, shared_local=False, cached=False)
+        self.dataset_cache.evict_for_space(
+            work,
+            need_download_bytes,
+            exclude_dv_id=info.dv_id if policy.enabled else None,
+        )
+        self._check_disk(work, need_download_bytes)
+
+        if info.dv_transfer_mode == "archive":
+            initial_log = "[trainMaster] 存储容器已打包数据集压缩包，正在传输...\n"
+        elif info.dv_transfer_mode == "direct":
+            initial_log = "[trainMaster] 兼容存储流式拉取训练数据集，正在下载...\n"
+        else:
+            initial_log = "[trainMaster] 正在从平台下载训练数据集归档...\n"
+        self._set_stage("downloading", log_chunk=initial_log)
+
         zip_path = work / "dataset.zip"
         try:
-            self.client.download(
-                info.dataset_url,
-                zip_path,
-                headers=self._headers,
-                timeout=TRANSFER_TIMEOUT,
-                max_bytes=MAX_DATASET_ZIP_BYTES,
-                abort=self._interrupted,
-            )
-        except ApiError as exc:
-            raise self._api_error(exc, "下载训练数据集") from None
-        except TransportError as exc:
-            self._check_interrupted()
-            raise TaskFailed(f"下载训练数据集失败：{exc}", retryable=True) from None
-        except OSError as exc:
-            raise TaskFailed(f"写入训练数据集压缩包失败：{exc}", retryable=True) from None
+            try:
+                got = self.client.download(
+                    info.dataset_url,
+                    zip_path,
+                    headers=self._headers,
+                    timeout=TRANSFER_TIMEOUT,
+                    max_bytes=MAX_DATASET_ZIP_BYTES,
+                    abort=self._interrupted,
+                )
+            except ApiError as exc:
+                raise self._api_error(exc, "下载训练数据集") from None
+            except TransportError as exc:
+                self._check_interrupted()
+                raise TaskFailed(f"下载训练数据集失败：{exc}", retryable=True) from None
+            except OSError as exc:
+                raise TaskFailed(f"写入训练数据集压缩包失败：{exc}", retryable=True) from None
 
-        self._check_interrupted()
-        dataset_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            data_yaml = safe_extract_zip(zip_path, dataset_dir, abort=self._interrupted)
-        except zipfile.BadZipFile as exc:
-            raise TaskFailed(f"下载的数据集压缩包已损坏：{exc}", retryable=True) from None
-        except TransportError:
             self._check_interrupted()
-            raise TaskFailed("解压训练数据集被中断", retryable=True) from None
-        except OSError as exc:
-            raise TaskFailed(f"解压训练数据集失败：{exc}", retryable=True) from None
+            resp_headers = getattr(got, "headers", None)
+            norm_headers = _normalized_headers(
+                resp_headers if isinstance(resp_headers, Mapping) else None
+            )
+            header_mode = _normalize_transfer_mode(norm_headers.get("x-transfer-mode"))
+            claimed_mode = (
+                info.dv_transfer_mode if info.dv_transfer_mode in ("archive", "direct") else ""
+            )
+            require_sha = bool(claimed_mode == "archive" or header_mode == "archive")
+            verified_sha = verify_dataset_archive_checksum(
+                zip_path,
+                resp_headers,
+                abort=self._interrupted,
+                require_checksum=require_sha,
+            )
+            effective_mode = (
+                header_mode or claimed_mode or ("archive" if verified_sha else "direct")
+            )
+
+            if effective_mode == "archive":
+                prefix = (
+                    ""
+                    if info.dv_transfer_mode == "archive"
+                    else "存储容器已打包数据集压缩包，正在传输 — "
+                )
+                extract_log = (
+                    f"[trainMaster] {prefix}压缩包校验通过"
+                    f"（SHA-256: {verified_sha[:12]}...），正在解压...\n"
+                )
+            else:
+                extract_log = "[trainMaster] 兼容存储流式拉取训练数据集，正在解压...\n"
+            self._send_progress({"log_chunk": extract_log})
+
+            max_raw_bytes = _resolve_extract_max_raw_bytes(info, norm_headers, work)
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                extract_kwargs: dict[str, Any] = {"abort": self._interrupted}
+                if "max_raw_bytes" in inspect.signature(safe_extract_zip).parameters:
+                    extract_kwargs["max_raw_bytes"] = max_raw_bytes
+                data_yaml = safe_extract_zip(zip_path, dataset_dir, **extract_kwargs)
+            except zipfile.BadZipFile as exc:
+                raise TaskFailed(f"下载的数据集压缩包已损坏：{exc}", retryable=True) from None
+            except TransportError:
+                self._check_interrupted()
+                raise TaskFailed("解压训练数据集被中断", retryable=True) from None
+            except OSError as exc:
+                raise TaskFailed(f"解压训练数据集失败：{exc}", retryable=True) from None
         finally:
             with contextlib.suppress(OSError):
                 zip_path.unlink()

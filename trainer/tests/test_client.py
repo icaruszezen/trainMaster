@@ -195,10 +195,16 @@ class _FileServer:
     """GET 返回固定内容（可声明错误的 Content-Length 并提前断开），PUT 记录收到的内容并返回 JSON。"""
 
     def __init__(
-        self, body: bytes = b"", *, declared: int | None = None, status: int = 200
+        self,
+        body: bytes = b"",
+        *,
+        declared: int | None = None,
+        status: int = 200,
+        response_headers: dict[str, str] | None = None,
     ) -> None:
         outer = self
         self.body, self.declared, self.status = body, declared, status
+        self.response_headers = dict(response_headers or {})
         self.puts: list[dict[str, Any]] = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -219,6 +225,8 @@ class _FileServer:
                 self.send_response(200)
                 length = outer.declared if outer.declared is not None else len(outer.body)
                 self.send_header("Content-Length", str(length))
+                for hk, hv in outer.response_headers.items():
+                    self.send_header(hk, hv)
                 self.end_headers()
                 self.wfile.write(outer.body)
                 self.close_connection = True
@@ -372,3 +380,36 @@ def test_put_file_error_and_abort(files, tmp_path):
     assert "aborted" in str(info2.value)
     with pytest.raises(OSError):
         Client(server.url).put_file("/output", tmp_path / "missing.onnx")
+
+
+def test_download_returns_case_insensitive_headers_and_unpacks(files, tmp_path):
+    import hashlib
+
+    body = b"archive-zip-payload"
+    expected_sha = hashlib.sha256(body).hexdigest()
+    server = files(
+        body,
+        response_headers={
+            "X-Archive-Sha256": expected_sha.upper(),
+            "X-Transfer-Mode": "archive",
+        },
+    )
+    dest = tmp_path / "dataset.zip"
+    got = Client(server.url).download("/dataset", dest)
+    size, sha = got
+    assert size == len(body)
+    assert sha == expected_sha
+    assert got.header("x-archive-sha256") == expected_sha.upper()
+    assert got.header("X-Transfer-Mode") == "archive"
+    assert got.headers["x-transfer-mode"] == "archive"
+
+
+def test_loopback_base_url_bypasses_ambient_http_proxy(platform, monkeypatch):
+    # 即使环境设置了不可达的 HTTP_PROXY 且未配置 NO_PROXY，127.0.0.1 / localhost 也应直连
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    client = Client(platform.url, "secret-token-0123456789")
+    resp = client.register({"node_key": "k-loopback", "hardware": {"gpus": []}})
+    assert resp["node_id"] >= 1

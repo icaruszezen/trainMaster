@@ -45,7 +45,8 @@ LDFLAGS   := -s -w \
 
 .PHONY: help dev-db dev-backend dev-frontend \
 	test test-backend test-frontend test-trainer lint lint-backend lint-frontend lint-trainer \
-	build build-backend build-frontend reviewer docker-build docker-build-trainer setup up down logs ps
+	build build-backend build-storage build-frontend reviewer \
+	docker-build docker-build-storage docker-build-trainer setup up down logs ps
 
 help: ## 显示可用命令
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  %-22s %s\n", $$1, $$2}' $(firstword $(MAKEFILE_LIST))
@@ -143,13 +144,16 @@ $(TRAINER_VENV)/.installed: trainer/requirements-dev.txt
 
 ## ---- 构建 ----
 
-build: build-frontend build-backend ## 构建前端（frontend/dist）与后端二进制（backend/bin/trainmaster）
+build: build-frontend build-backend ## 构建前端（frontend/dist）与后端二进制（backend/bin/trainmaster、trainmaster-storage）
 
 build-frontend: frontend/node_modules
 	cd frontend && npm run build
 
-build-backend:
+build-backend: build-storage
 	cd backend && CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/trainmaster ./cmd/trainmaster
+
+build-storage: ## 构建独立存储服务二进制（backend/bin/trainmaster-storage）
+	cd backend && CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/trainmaster-storage ./cmd/trainmaster-storage
 
 # 界面构建到 backend/cmd/trainmaster-reviewer/web/dist，编译时嵌入程序；-H windowsgui：窗口程序，不弹出控制台。
 # 在本机试用：cd backend && go run ./cmd/trainmaster-reviewer -browser [审图包.zip]（Linux / macOS 在浏览器中打开）。
@@ -160,6 +164,9 @@ reviewer: frontend/node_modules ## 构建 Windows 版本地审图程序（backen
 
 docker-build: ## 构建应用镜像 trainmaster:$TM_IMAGE_TAG
 	$(COMPOSE) build app
+
+docker-build-storage: ## 构建独立存储服务镜像 trainmaster-storage:$TM_IMAGE_TAG
+	$(COMPOSE) -f docker-compose.storage.yml build storage
 
 # 变体（TM_TORCH_VARIANT）由 make setup 写入 .env，两个训练节点服务（trainer / trainer-cpu）使用同一个镜像；
 # 没有写入时 trainer 为 cu130，trainer-cpu 为 cpu（构建它：docker compose --profile cpu build trainer-cpu）。
@@ -181,7 +188,7 @@ setup: ## 检测本机显卡、驱动与 Docker 的 GPU 支持，把训练节点
 up: export TM_SETUP_CALLER := up
 up: setup ## 检测计算资源（同 make setup）后构建并启动全部服务（训练节点构建失败时只警告）
 	$(COMPOSE) up -d --build postgres app
-	@services="$$($(COMPOSE) config --services | grep -vx -e postgres -e app || true)"; \
+	@services="$$($(COMPOSE) config --services | grep -vx -e postgres -e app -e storage || true)"; \
 	if [ -n "$$services" ]; then \
 		echo $(COMPOSE) up -d --build --no-deps $$services; \
 		$(COMPOSE) up -d --build --no-deps $$services || { \

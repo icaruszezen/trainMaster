@@ -77,7 +77,12 @@ func run() error {
 	}
 
 	storageNodes := storagenode.NewService(storagenode.Options{
-		DB: db.Pool, Storage: store, Logger: log, SecretKey: cfg.SecretKey,
+		DB:                  db.Pool,
+		Storage:             store,
+		Logger:              log,
+		SecretKey:           cfg.SecretKey,
+		StorageServiceURL:   cfg.StorageServiceURL,
+		StorageServiceToken: cfg.StorageServiceToken,
 	})
 	if err := storageNodes.Start(ctx); err != nil {
 		return interrupted(ctx, log, err)

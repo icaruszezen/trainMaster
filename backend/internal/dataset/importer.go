@@ -2,6 +2,7 @@ package dataset
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -9,8 +10,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"syscall"
 
+	"github.com/icaruszezen/trainmaster/backend/internal/storagearchive"
 	"github.com/icaruszezen/trainmaster/backend/internal/storagenode"
 )
 
@@ -162,7 +165,7 @@ func (s *Service) runImport(ctx context.Context, d Dataset, job Import, p *progr
 		}
 	}
 
-	moved, err := s.moveStaged(ctx, root, staged, job.OnConflict, unconverted, renames, sum, p,
+	moved, err := s.moveStaged(ctx, d, root, staged, job.OnConflict, unconverted, renames, sum, p,
 		func(plans []*renamePlan) { s.recordRenames(job.ID, plans) })
 	err = diskFull(err)
 	if moved > 0 || err == nil {
@@ -341,8 +344,13 @@ const (
 // replaced image's annotation, so it ends up unannotated as reported.
 // renames are the plans of renamed and identical images (by their staged
 // path): those moved in are marked placed and counted.
-func (s *Service) moveStaged(ctx context.Context, dst storagenode.Dir, staged, onConflict string, unconverted map[string]bool,
+func (s *Service) moveStaged(ctx context.Context, d Dataset, dst storagenode.Dir, staged, onConflict string, unconverted map[string]bool,
 	renames map[string]*renamePlan, sum *importSummary, p *progressTracker, record func([]*renamePlan)) (int, error) {
+	if s.storageNodes != nil && d.StorageNodeID > 0 && dst.LocalDir() == "" {
+		if ref, dstArch, aerr := s.storageNodes.ArchiveEndpointForNode(ctx, d.StorageNodeID); aerr == nil && ref.Kind == storagenode.KindDocker {
+			return s.moveStagedDockerArchive(ctx, d, dst, dstArch, staged, onConflict, unconverted, renames, sum, p, record)
+		}
+	}
 	var batch []*renamePlan
 	defer func() { record(batch) }()
 	set, err := walkFiles(ctx, s.log, staged, nil)
@@ -596,4 +604,254 @@ func moveFile(src, dst string) error {
 	}
 	in.Close()
 	return os.Remove(src)
+}
+
+func (s *Service) moveStagedDockerArchive(
+	ctx context.Context,
+	d Dataset,
+	dst storagenode.Dir,
+	dstArch storagenode.ArchiveEndpoint,
+	staged, onConflict string,
+	unconverted map[string]bool,
+	renames map[string]*renamePlan,
+	sum *importSummary,
+	p *progressTracker,
+	record func([]*renamePlan),
+) (int, error) {
+	var batch []*renamePlan
+	defer func() { record(batch) }()
+
+	set, err := walkFiles(ctx, s.log, staged, nil)
+	if errors.Is(err, fs.ErrNotExist) {
+		set, err = &fileSet{}, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("list staged files: %w", err)
+	}
+	src, err := storagenode.OpenLocalDir(staged)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer src.Close()
+
+	// Walk existing remote dataset entries in one RPC instead of per-file HEAD calls.
+	existingModes := make(map[string]fs.FileMode)
+	if err := dst.WalkFiles(ctx, func(rel string, info fs.FileInfo, _ bool) error {
+		existingModes[rel] = info.Mode()
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("inspect remote dataset entries: %w", err)
+	}
+
+	checkPathDirs := func(dirRel string) error {
+		if dirRel == "." || dirRel == "" {
+			return nil
+		}
+		parts := strings.Split(dirRel, "/")
+		cur := ""
+		for _, part := range parts {
+			if cur == "" {
+				cur = part
+			} else {
+				cur += "/" + part
+			}
+			if m, ok := existingModes[cur]; ok {
+				if m&fs.ModeSymlink != 0 || !m.IsDir() {
+					return errUnsafeTarget
+				}
+			}
+		}
+		return nil
+	}
+
+	checkFileSlot := func(rel string) (bool, error) {
+		m, ok := existingModes[rel]
+		if !ok {
+			return false, nil
+		}
+		if m&fs.ModeSymlink != 0 {
+			return false, errUnsafeTarget
+		}
+		if !m.IsRegular() {
+			return false, errOccupied
+		}
+		return true, nil
+	}
+
+	cache := newAnnotationCache(src)
+	images := set.imagePaths()
+	pairs := pairAnnotations(images, set.xmlPaths(), cache.filename)
+	sum.Orphaned += len(set.XMLs) - len(pairs)
+	sum.Ignored += set.Ignored
+
+	p.setStage(ctx, stageImporting, unitFiles, int64(len(images)))
+	if len(images) == 0 {
+		return 0, nil
+	}
+
+	packRoot := filepath.Join(filepath.Dir(staged), ".docker-pack-"+strings.ToLower(rand.Text()[:8]))
+	if err := os.MkdirAll(packRoot, 0o755); err != nil {
+		return 0, err
+	}
+	defer func() { _ = os.RemoveAll(packRoot) }()
+
+	var sidecarsToDelete []string
+	var pendingPlans []*renamePlan
+	moved := 0
+	stagedCount := 0
+
+	stageIntoPack := func(rel string) error {
+		srcPath := filepath.Join(staged, filepath.FromSlash(rel))
+		dstPath := filepath.Join(packRoot, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+			return err
+		}
+		if err := moveFile(srcPath, dstPath); err != nil {
+			return err
+		}
+		existingModes[rel] = 0o644
+		stagedCount++
+		return nil
+	}
+
+	for _, rel := range images {
+		if err := ctx.Err(); err != nil {
+			return moved, err
+		}
+		xmlRel := pairs[rel]
+		valid := false
+		if xmlRel != "" {
+			_, perr := cache.get(xmlRel)
+			valid = perr == nil
+		}
+
+		if err := checkPathDirs(path.Dir(rel)); err != nil {
+			res, perr := placementFor(err)
+			if perr != nil {
+				return 0, perr
+			}
+			if res == placedUnsafe {
+				sum.Unsafe++
+			} else {
+				sum.Skipped++
+			}
+			continue
+		}
+		exists, err := checkFileSlot(rel)
+		if err != nil {
+			res, perr := placementFor(err)
+			if perr != nil {
+				return 0, perr
+			}
+			if res == placedUnsafe {
+				sum.Unsafe++
+			} else {
+				sum.Skipped++
+			}
+			continue
+		}
+		if exists && onConflict != ConflictOverwrite {
+			sum.Skipped++
+			continue
+		}
+
+		if err := stageIntoPack(rel); err != nil {
+			return 0, err
+		}
+		if exists {
+			sum.Replaced++
+			if xmlRel == "" && unconverted[rel] {
+				sideXML := sidecarPath(rel, ".xml")
+				if okSlot, serr := checkFileSlot(sideXML); serr == nil && okSlot {
+					sidecarsToDelete = append(sidecarsToDelete, sideXML)
+				}
+			}
+		} else {
+			sum.Added++
+		}
+		moved++
+
+		if plan := renames[rel]; plan != nil {
+			if plan.Identical {
+				sum.Identical++
+			} else {
+				sum.Renamed++
+			}
+			pendingPlans = append(pendingPlans, plan)
+		}
+
+		if xmlRel != "" {
+			if valid {
+				sum.Matched++
+			} else {
+				sum.Invalid++
+			}
+			if checkPathDirs(path.Dir(xmlRel)) == nil {
+				if xmlExists, xerr := checkFileSlot(xmlRel); xerr == nil && (!xmlExists || onConflict == ConflictOverwrite) {
+					if err := stageIntoPack(xmlRel); err != nil {
+						return 0, err
+					}
+				}
+			}
+		}
+	}
+
+	if stagedCount > 0 {
+		archPath := filepath.Join(filepath.Dir(staged), ".docker-upload-"+strings.ToLower(rand.Text()[:8])+".tar.zst")
+		defer func() { _ = os.Remove(archPath) }()
+
+		zeroHeadroom := uint64(0)
+		packed, err := storagearchive.Pack(ctx, storagearchive.PackOptions{
+			SourceDir:       packRoot,
+			DestArchivePath: archPath,
+			Format:          storagearchive.FormatTarZst,
+			FreeHeadroom:    &zeroHeadroom,
+		})
+		if err != nil {
+			return 0, fmt.Errorf("pack dataset import archive: %w", err)
+		}
+
+		f, err := os.Open(archPath)
+		if err != nil {
+			return 0, err
+		}
+		unpackMode := storagearchive.ModeMergeSkip
+		if onConflict == ConflictOverwrite {
+			unpackMode = storagearchive.ModeMergeOverwrite
+		}
+		_, unpackErr := dstArch.UnpackArchiveStream(ctx, storagenode.UnpackStreamRequest{
+			Space:                storagenode.SpaceDatasets,
+			DirRel:               d.DirName,
+			Format:               storagearchive.FormatTarZst,
+			Mode:                 unpackMode,
+			ExpectedSHA256:       packed.SHA256,
+			ExpectedArchiveBytes: packed.ArchiveBytes,
+			DeclaredRawBytes:     &packed.RawBytes,
+		}, f)
+		_ = f.Close()
+		if unpackErr != nil {
+			if errors.Is(unpackErr, storagearchive.ErrInsufficientStorage) {
+				return 0, errDiskFull
+			}
+			return 0, fmt.Errorf("stream dataset import archive: %w", unpackErr)
+		}
+	}
+
+	for _, sideXML := range sidecarsToDelete {
+		if err := dst.RemoveFile(ctx, sideXML); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return moved, fmt.Errorf("remove replaced annotation: %w", err)
+		}
+	}
+
+	for _, plan := range pendingPlans {
+		if batch = append(batch, plan); len(batch) == renameRecordBatch {
+			record(batch)
+			batch = nil
+		}
+	}
+	p.set(ctx, int64(len(images)), int64(len(images)))
+	return moved, nil
 }

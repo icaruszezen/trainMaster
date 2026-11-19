@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # docker-compose.yml 的检查：bash deploy/scripts/tests/test-compose.sh
 #
-# 用真实的 docker compose 解析 docker-compose.yml（不启动任何容器），检查各 profile 下的服务、
-# x-trainer 锚点合并后的配置、GPU 设备预留与变量插值。不读取仓库中的 .env 与 docker-compose.override.yml，
-# 也不受 shell 中 COMPOSE_PROFILES 等变量的影响。没有 docker compose 或 python3 时跳过
-# （设置 TM_REQUIRE_DOCKER=1 时改为失败，CI 使用）。
+# 优先用真实的 docker compose 解析 docker-compose.yml（不启动任何容器），检查各 profile 下的服务
+# （含内置 storage 服务）、x-trainer 锚点合并后的配置、GPU 设备预留与变量插值。
+# 当环境未安装 docker 且未设置 TM_REQUIRE_DOCKER=1 时，若存在 python3 + PyYAML 则自动执行静态 YAML
+# 结构与插值检查（而非盲目跳过）；设置 TM_REQUIRE_DOCKER=1 时强制要求 docker compose（CI 使用）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -17,12 +17,64 @@ skip() {
 	echo "compose: 跳过（$1）"
 	exit 0
 }
-command -v docker >/dev/null 2>&1 || skip "没有安装 docker"
-docker compose version >/dev/null 2>&1 || skip "没有 docker compose 插件"
+
 command -v python3 >/dev/null 2>&1 || skip "没有 python3"
+
+HAS_DOCKER=0
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+	HAS_DOCKER=1
+elif [ "${TM_REQUIRE_DOCKER:-}" = 1 ]; then
+	skip "没有安装 docker 或 docker compose 插件"
+fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/test-compose.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+
+if [ "$HAS_DOCKER" -eq 0 ]; then
+	if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+		skip "没有安装 docker 且缺少 PyYAML"
+	fi
+	python3 - "$ROOT/docker-compose.yml" <<'PYEOF'
+import sys
+import yaml
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    doc = yaml.safe_load(f)
+
+services = doc.get("services") or {}
+problems = []
+
+def check(cond, msg):
+    if not cond:
+        problems.append(msg)
+
+check(sorted(services) == ["app", "postgres", "storage", "trainer", "trainer-cpu"],
+      f"services 应包含 app/postgres/storage/trainer/trainer-cpu，实际为 {sorted(services)}")
+
+st = services.get("storage") or {}
+check(st.get("build", {}).get("dockerfile") == "deploy/docker/Dockerfile.storage",
+      f"storage build.dockerfile 异常: {st.get('build')}")
+check("profiles" not in st, "storage 应为默认常驻服务（无 profiles）")
+check(st.get("environment", {}).get("TM_STORAGE_DATA_DIR") == "/data",
+      "storage 应设置 TM_STORAGE_DATA_DIR=/data")
+check(any(str(v).endswith(":/data") for v in st.get("volumes", [])),
+      f"storage 应挂载 /data: {st.get('volumes')}")
+
+app = services.get("app") or {}
+check("storage" in (app.get("depends_on") or {}), "app depends_on 应包含 storage")
+app_env = app.get("environment") or {}
+check("TM_STORAGE_SERVICE_URL" in app_env, "app 应配置 TM_STORAGE_SERVICE_URL")
+check("TM_STORAGE_SERVICE_TOKEN" in app_env, "app 应配置 TM_STORAGE_SERVICE_TOKEN")
+
+if problems:
+    for p in problems:
+        print("FAIL [static] " + p, file=sys.stderr)
+    sys.exit(1)
+PYEOF
+	echo "compose: 静态 YAML 检查全部通过（storage、app、postgres、trainer、trainer-cpu）"
+	exit 0
+fi
 
 fails=0
 
@@ -60,6 +112,8 @@ TM_NODE_NAME=gpu-01
 TM_SERVER_URL=http://10.0.0.5:8080
 TM_HOST_STORAGE_DIR=/srv/tm/storage
 TM_HOST_TRAINER_DIR=/srv/tm/trainer
+TM_STORAGE_SERVICE_URL=http://storage:8090
+TM_STORAGE_SERVICE_TOKEN=storage-secret-tok
 TRAINER_PYTHON_IMAGE=registry.example.com/python:3.12-slim-bookworm
 PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 TORCH_FIND_LINKS=https://mirrors.aliyun.com/pytorch-wheels
@@ -82,7 +136,7 @@ if [ "$fails" -eq 0 ]; then
 	services="$(cd "$ROOT" && env -i PATH="$PATH" HOME="${HOME:-/tmp}" \
 		docker compose -f docker-compose.yml --env-file "$WORK/down.env" --profile '*' --profile gpu --profile cpu \
 		config --services | sort | tr '\n' ' ')"
-	if [ "$services" != "app postgres trainer trainer-cpu " ]; then
+	if [ "$services" != "app postgres storage trainer trainer-cpu " ]; then
 		echo "FAIL [down] --profile '*' 应列出全部服务，实际为：$services" >&2
 		fails=$((fails + 1))
 	fi
@@ -120,6 +174,19 @@ def volume_targets(svc):
     return {v["target"]: v["source"] for v in svc.get("volumes", [])}
 
 
+def check_storage(name, svc, tag="latest", host_dir=None, token=""):
+    check(name, svc.get("image") == f"trainmaster-storage:{tag}", f"storage image 为 {svc.get('image')}")
+    build = svc.get("build", {})
+    check(name, build.get("dockerfile") == "deploy/docker/Dockerfile.storage", f"storage dockerfile 为 {build}")
+    check(name, svc.get("restart") == "unless-stopped", f"storage restart 为 {svc.get('restart')}")
+    targets = volume_targets(svc)
+    check(name, "/data" in targets, f"storage volumes 为 {targets}")
+    if host_dir is not None:
+        check(name, targets.get("/data") == host_dir, f"storage /data 挂载为 {targets.get('/data')}")
+    check(name, env(svc, "TM_STORAGE_DATA_DIR") == "/data", "TM_STORAGE_DATA_DIR 应为 /data")
+    check(name, env(svc, "TM_STORAGE_TOKEN") == token, f"TM_STORAGE_TOKEN 为 {env(svc, 'TM_STORAGE_TOKEN')}")
+
+
 def check_trainer(name, svc, variant="cu130", tag="latest", shm=8 * 1024**3, service="trainer", mode="auto",
                   hostname="trainmaster-trainer", pinned="auto"):
     check(name, svc.get("image") == f"trainmaster-trainer:{tag}-{variant}", f"image 为 {svc.get('image')}")
@@ -136,46 +203,46 @@ def check_trainer(name, svc, variant="cu130", tag="latest", shm=8 * 1024**3, ser
     check(name, env(svc, "TM_DATA_DIR") == "/data", "TM_DATA_DIR 应为 /data")
     for key in ("TM_SERVER_URL", "TM_NODE_TOKEN", "TM_NODE_NAME", "TM_LOG_LEVEL", "PUID", "PGID", "TZ"):
         check(name, key in (svc.get("environment") or {}), f"缺少环境变量 {key}")
-    # 节点据此给出修复建议中的服务名与命令（docs/deployment.md 第 10 节）
     check(name, env(svc, "TM_TRAINER_SERVICE") == service, f"TM_TRAINER_SERVICE 为 {env(svc, 'TM_TRAINER_SERVICE')}")
     check(name, env(svc, "TM_TRAINER_MODE") == mode, f"TM_TRAINER_MODE 为 {env(svc, 'TM_TRAINER_MODE')}")
-    # 固定的变体：节点据此建议 --variant auto，而不是再固定另一个变体
     check(name, env(svc, "TM_TRAINER_VARIANT") == pinned, f"TM_TRAINER_VARIANT 为 {env(svc, 'TM_TRAINER_VARIANT')}")
-    # 主机名用宿主机的主机名（TM_HOST_HOSTNAME），不是每次重建都会变化的容器 ID
     check(name, svc.get("hostname") == hostname, f"hostname 为 {svc.get('hostname')}")
 
 
-# 没有 profile：与之前一样只有 postgres 与 app
+# 没有 profile：postgres、storage 与 app
 s = load("none")
-check("none", sorted(s) == ["app", "postgres"], f"服务为 {sorted(s)}")
+check("none", sorted(s) == ["app", "postgres", "storage"], f"服务为 {sorted(s)}")
+check_storage("none", s["storage"])
 check("none", s["app"].get("hostname") == "trainmaster", f"app 的 hostname 为 {s['app'].get('hostname')}")
+check("none", env(s["app"], "TM_STORAGE_SERVICE_URL") == "http://storage:8090", "app 默认连接本机 storage:8090")
 check("none", "TM_NODE_TOKEN" in (s["app"].get("environment") or {}), "app 缺少 TM_NODE_TOKEN")
 check("none", env(s["app"], "TM_NODE_TOKEN") == "", "默认不设置令牌")
-# 本机训练节点的模式也传给 app（GET /api/v1/compute/server 的 node_registration.local_trainer_mode）
 check("none", env(s["app"], "TM_TRAINER_MODE") == "auto", f"app 的 TM_TRAINER_MODE 为 {env(s['app'], 'TM_TRAINER_MODE')}")
 
 # gpu：trainer 使用全部显卡
 s = load("gpu")
-check("gpu", sorted(s) == ["app", "postgres", "trainer"], f"服务为 {sorted(s)}")
+check("gpu", sorted(s) == ["app", "postgres", "storage", "trainer"], f"服务为 {sorted(s)}")
 check_trainer("gpu", s["trainer"])
 check("gpu", gpu_devices(s["trainer"]) == [{"driver": "nvidia", "count": -1, "capabilities": ["gpu"]}],
       f"GPU 设备预留为 {gpu_devices(s['trainer'])}（count: all 合并后应为 -1）")
 check("gpu", env(s["trainer"], "TM_SERVER_URL") == "http://app:8080", "默认连接同一 compose 网络中的 app")
-check("gpu", "deploy" not in s["app"] and "deploy" not in s["postgres"], "只有 trainer 预留 GPU")
+check("gpu", "deploy" not in s["app"] and "deploy" not in s["postgres"] and "deploy" not in s["storage"],
+      "只有 trainer 预留 GPU")
 
 # cpu：trainer-cpu 不预留 GPU
 s = load("cpu")
-check("cpu", sorted(s) == ["app", "postgres", "trainer-cpu"], f"服务为 {sorted(s)}")
-# 没有运行 make setup（TM_TORCH_VARIANT 为空）时 CPU 训练节点构建 CPU 版 PyTorch，不是 cu130
+check("cpu", sorted(s) == ["app", "postgres", "storage", "trainer-cpu"], f"服务为 {sorted(s)}")
 check_trainer("cpu", s["trainer-cpu"], variant="cpu", service="trainer-cpu")
 check("cpu", gpu_devices(s["trainer-cpu"]) is None, "trainer-cpu 不应预留 GPU")
 
 s = load("both")
-check("both", sorted(s) == ["app", "postgres", "trainer", "trainer-cpu"], f"服务为 {sorted(s)}")
+check("both", sorted(s) == ["app", "postgres", "storage", "trainer", "trainer-cpu"], f"服务为 {sorted(s)}")
 
-# 变量插值：两个训练节点与 app 使用同一个令牌，镜像标签带变体
+# 变量插值：两个训练节点与 app 使用同一个令牌，storage 与 app 共享 TM_STORAGE_SERVICE_TOKEN
 s = load("custom")
 check("custom", s["app"].get("hostname") == "gpu-host-01", f"app 的 hostname 为 {s['app'].get('hostname')}")
+check_storage("custom/storage", s["storage"], tag="v1", host_dir="/srv/tm/storage", token="storage-secret-tok")
+check("custom", env(s["app"], "TM_STORAGE_SERVICE_TOKEN") == "storage-secret-tok", "app 存储服务令牌应来自 .env")
 for name in ("trainer", "trainer-cpu"):
     svc = s[name]
     check_trainer(f"custom/{name}", svc, variant="cpu", tag="v1", shm=2 * 1024**3, service=name, mode="cpu",
@@ -199,9 +266,9 @@ s = load("variant")
 check_trainer("variant/trainer", s["trainer"], variant="cu126", pinned="cu126")
 check_trainer("variant/trainer-cpu", s["trainer-cpu"], variant="cu126", service="trainer-cpu", pinned="cu126")
 
-# 关闭了训练节点（make setup --mode off）：没有训练节点，app 知道模式为 off
+# 关闭了训练节点（make setup --mode off）：没有训练节点，仍有 postgres、storage 与 app
 s = load("off")
-check("off", sorted(s) == ["app", "postgres"], f"服务为 {sorted(s)}")
+check("off", sorted(s) == ["app", "postgres", "storage"], f"服务为 {sorted(s)}")
 check("off", env(s["app"], "TM_TRAINER_MODE") == "off", f"app 的 TM_TRAINER_MODE 为 {env(s['app'], 'TM_TRAINER_MODE')}")
 
 for p in problems:
@@ -214,4 +281,4 @@ if [ "$fails" -gt 0 ]; then
 	echo "compose: 检查失败" >&2
 	exit 1
 fi
-echo "compose: 全部通过（无 profile、gpu、cpu、全部 profile、关闭训练节点与变量插值）"
+echo "compose: 全部通过（无 profile、gpu、cpu、全部 profile、storage 集成、关闭训练节点与变量插值）"

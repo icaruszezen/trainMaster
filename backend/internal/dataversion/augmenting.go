@@ -109,7 +109,6 @@ func (b *build) augmentImages() error {
 		close(next)
 		wg.Wait()
 
-		var rows []imageRow
 		var made []*buildCopy
 		for _, r := range results {
 			if r.err != nil {
@@ -122,7 +121,6 @@ func (b *build) augmentImages() error {
 				if err := b.writeLabels(c.path, c.objects, c.width, c.height, ids); err != nil {
 					return err
 				}
-				rows = append(rows, b.copyRow(c))
 				made = append(made, c)
 				b.space.wrote(c.size)
 			}
@@ -130,7 +128,22 @@ func (b *build) augmentImages() error {
 				return err
 			}
 		}
-		if len(rows) > 0 {
+		summary, err := b.flushDockerStageSummary()
+		if err != nil {
+			return err
+		}
+		if summary != nil {
+			for _, c := range made {
+				if mt, ok := summary.ModTimes[c.path]; ok {
+					c.modTime = dbTime(mt)
+				}
+			}
+		}
+		if len(made) > 0 {
+			rows := make([]imageRow, len(made))
+			for i, c := range made {
+				rows[i] = b.copyRow(c)
+			}
 			if _, err := b.insertRows(rows); err != nil {
 				return err
 			}
@@ -140,6 +153,9 @@ func (b *build) augmentImages() error {
 			b.written += c.size
 			b.stats.Storage.GeneratedBytes += c.size
 		}
+	}
+	if err := b.flushDockerStage(nil); err != nil {
+		return err
 	}
 	return nil
 }
@@ -272,6 +288,11 @@ func (b *build) writeImage(p string, img image.Image, format string) (int64, tim
 	var buf bytes.Buffer
 	if err := augment.Encode(&buf, img, format); err != nil {
 		return 0, time.Time{}, fmt.Errorf("write augmented image: %w", err)
+	}
+	if ok, mt, err := b.stageDockerBytesWithModTime(p, buf.Bytes(), true); err != nil {
+		return 0, time.Time{}, fmt.Errorf("write augmented image: %w", err)
+	} else if ok {
+		return int64(buf.Len()), dbTime(mt), nil
 	}
 	if err := b.mkdirFor(p); err != nil {
 		return 0, time.Time{}, err

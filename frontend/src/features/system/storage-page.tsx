@@ -1,11 +1,13 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import {
+  Archive,
   ArrowRight,
   ArrowRightLeft,
   CheckCircle2,
   Cpu,
   HardDrive,
+  Info,
   Pencil,
   PlugZap,
   Plus,
@@ -63,18 +65,23 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { dataVersionDetailPath } from "@/features/data-versions/paths"
+import { TaskProgress } from "@/features/datasets/task-progress"
 import { useSystemInfo } from "@/features/system/api"
 import {
   activateStorageNode,
   cancelStorageMigration,
   createStorageMigrations,
   deleteStorageNode,
+  getDockerConfig,
   isActiveMigration,
   migratableItemsQuery,
   MIGRATION_STATUS_LABELS,
   migrationKey,
+  migrationStageLabel,
+  nodeSupportsArchive,
   refreshStorageQueries,
-  STORAGE_KIND_SHORT_LABELS,
+  resolveMigrationTransferMode,
+  storageKindShortLabel,
   storageMigrationsQuery,
   storageNodesQuery,
   testStorageNode,
@@ -206,7 +213,6 @@ export function StoragePage() {
   }
 
   const activeNode = nodesQuery.data?.items.find((n) => n.is_active) ?? null
-
   const activatingTarget =
     activatingNode !== null
       ? (nodesQuery.data?.items.find((n) => n.id === activatingNode.id) ??
@@ -392,7 +398,7 @@ export function ActivateStorageNodeDialogBody({
           </span>
           <div className="flex min-w-0 items-center gap-1.5">
             <span className="shrink-0 text-muted-foreground">
-              {STORAGE_KIND_SHORT_LABELS[node.kind]}
+              {storageKindShortLabel(node.kind)}
             </span>
             <StorageNodeBadge node={node} className="max-w-56 min-w-0" />
           </div>
@@ -466,10 +472,13 @@ function StorageNodesSection({
     if (probingId !== null) return
     setProbingId(node.id)
     try {
+      const dockerCfg = getDockerConfig(node.config)
       const res = await testStorageNode({
         node_id: node.id,
         kind: node.kind,
         local: node.config.local,
+        docker: dockerCfg,
+        config: dockerCfg,
         s3: node.config.s3,
         smb: node.config.smb,
       })
@@ -535,6 +544,7 @@ function StorageNodesSection({
             node.stats.trashed_dataset_count +
             node.stats.data_version_count +
             node.stats.trashed_data_version_count
+          const archiveCapable = nodeSupportsArchive(node)
           const deleteBlockedReason = node.is_builtin
             ? "内置默认存储节点不可删除"
             : node.is_active
@@ -570,7 +580,7 @@ function StorageNodesSection({
                         {node.name}
                       </CardTitle>
                       <p className="text-xs text-muted-foreground">
-                        {STORAGE_KIND_SHORT_LABELS[node.kind]}
+                        {storageKindShortLabel(node.kind)}
                         {node.is_builtin ? " · 平台内置" : ""}
                       </p>
                     </div>
@@ -584,6 +594,25 @@ function StorageNodesSection({
                     )}
                     <NodeStatusBadge status={node.status} />
                   </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {archiveCapable ? (
+                    <Badge
+                      variant="secondary"
+                      className="gap-1 border-indigo-500/25 bg-indigo-500/10 font-normal text-indigo-700 dark:border-indigo-400/30 dark:bg-indigo-400/15 dark:text-indigo-300"
+                    >
+                      <Archive className="size-3" aria-hidden />
+                      支持打包加速
+                    </Badge>
+                  ) : (
+                    <Badge
+                      variant="outline"
+                      className="font-normal text-muted-foreground"
+                    >
+                      兼容直传·不打包
+                    </Badge>
+                  )}
                 </div>
 
                 <code
@@ -619,6 +648,11 @@ function StorageNodesSection({
 
                   {node.usage && node.usage.total_bytes > 0 ? (
                     <NodeCapacityBar usage={node.usage} />
+                  ) : node.kind === "docker" ? (
+                    <p className="text-xs text-muted-foreground">
+                      独立存储 Docker
+                      容器节点，大批量迁移与训练拉取自动先打包压缩、传输完成后校验解压。
+                    </p>
                   ) : node.kind === "s3" ? (
                     <p className="text-xs text-muted-foreground">
                       对象存储按需弹性扩展，凭证已加密保存在数据库中。
@@ -728,7 +762,8 @@ function StorageNodesSection({
             </div>
             <p className="text-sm font-medium">添加外部存储服务器</p>
             <p className="max-w-xs text-xs text-muted-foreground">
-              支持 S3 兼容存储（MinIO / RustFS）与 Windows / NAS SMB
+              支持独立存储服务容器（Docker，整包加速迁移与训练复制）、S3
+              兼容存储与 SMB
               共享目录，把图片存放在专用存储机上以释放训练服务器空间。
             </p>
           </button>
@@ -888,6 +923,29 @@ function StorageMigrationSection({
     return selectableItems.filter((item) => set.has(migrationKey(item)))
   }, [selectableItems, validSelected])
 
+  const previewItems =
+    selectedItems.length > 0
+      ? selectedItems
+      : selectableItems.length > 0
+        ? selectableItems
+        : migratable
+
+  const modeSummary = useMemo(() => {
+    let archiveCount = 0
+    let directCount = 0
+    for (const item of previewItems) {
+      if (
+        resolveMigrationTransferMode(item.storage_node, activeNode) ===
+        "archive"
+      ) {
+        archiveCount += 1
+      } else {
+        directCount += 1
+      }
+    }
+    return { archiveCount, directCount }
+  }, [activeNode, previewItems])
+
   return (
     <Card className="flex flex-col">
       <CardHeader>
@@ -906,7 +964,7 @@ function StorageMigrationSection({
               ）
             </>
           )}
-          ，自动逐文件核对字节数并同步元数据。
+          ，支持存储容器压缩包整包迁移与传统存储逐文件兼容直传。
         </CardDescription>
       </CardHeader>
 
@@ -927,6 +985,60 @@ function StorageMigrationSection({
           </div>
         ) : (
           <div className="grid gap-3">
+            {activeNode && previewItems.length > 0 && (
+              <div
+                className={cn(
+                  "flex items-start gap-2.5 rounded-lg border px-3.5 py-2.5 text-xs",
+                  modeSummary.archiveCount > 0 && modeSummary.directCount === 0
+                    ? "border-indigo-500/30 bg-indigo-500/8 text-foreground dark:border-indigo-400/30 dark:bg-indigo-400/10"
+                    : "bg-muted/30 text-muted-foreground"
+                )}
+              >
+                {modeSummary.archiveCount > 0 &&
+                modeSummary.directCount === 0 ? (
+                  <>
+                    <Archive className="mt-0.5 size-3.5 shrink-0 text-indigo-600 dark:text-indigo-400" />
+                    <div className="grid gap-0.5">
+                      <span className="font-medium text-foreground">
+                        压缩包整包迁移（先打压缩包 → 传输 → 解压缩包）
+                      </span>
+                      <span className="text-muted-foreground">
+                        源节点与目标存储容器均支持归档引擎：先在源端打包为校验压缩包，整包传输后在目标端原子解压并清理临时压缩包，大幅减少海量小文件网络开销。
+                      </span>
+                    </div>
+                  </>
+                ) : modeSummary.directCount > 0 &&
+                  modeSummary.archiveCount === 0 ? (
+                  <>
+                    <Info className="mt-0.5 size-3.5 shrink-0 text-sky-600 dark:text-sky-400" />
+                    <div className="grid gap-0.5">
+                      <span className="font-medium text-foreground">
+                        兼容逐文件直传（按现有存储接入，不提供打包）
+                      </span>
+                      <span className="text-muted-foreground">
+                        涉及按现有协议接入的存储服务器，自动保持逐文件流式传输与字节数校验，无需额外代理。
+                      </span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <Archive className="mt-0.5 size-3.5 shrink-0 text-indigo-600 dark:text-indigo-400" />
+                    <div className="grid gap-0.5">
+                      <span className="font-medium text-foreground">
+                        按节点能力智能分流迁移模式
+                      </span>
+                      <span className="text-muted-foreground">
+                        当前包含 {modeSummary.archiveCount}{" "}
+                        项压缩包整包迁移（先打压缩包 → 传输 → 解压缩包）与{" "}
+                        {modeSummary.directCount}{" "}
+                        项兼容逐文件直传（按现有存储接入，不提供打包）。
+                      </span>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
             <div className="overflow-hidden rounded-lg border">
               <Table>
                 <TableHeader>
@@ -1052,75 +1164,14 @@ function StorageMigrationSection({
               <span>保留最近 {migrations.length} 条</span>
             </div>
             <ul className="divide-y rounded-lg border">
-              {migrations.slice(0, 8).map((m) => {
-                const active = isActiveMigration(m)
-                const pct =
-                  m.bytes_total > 0
-                    ? percentOf(m.bytes_done, m.bytes_total)
-                    : m.files_total > 0
-                      ? percentOf(m.files_done, m.files_total)
-                      : 0
-                return (
-                  <li key={m.id} className="grid gap-2 px-3.5 py-2.5 text-xs">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex min-w-0 items-center gap-2">
-                        <Badge variant="outline" className="font-normal">
-                          {m.target_type === "dataset" ? "数据集" : "数据版本"}
-                        </Badge>
-                        <span className="truncate text-sm font-medium text-foreground">
-                          {m.target_name}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <MigrationStatusBadge status={m.status} />
-                        {active && (
-                          <Button
-                            variant="ghost"
-                            size="icon-xs"
-                            onClick={() => void handleCancel(m)}
-                            disabled={cancelingId === m.id}
-                            aria-label="取消迁移"
-                          >
-                            <X />
-                          </Button>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-muted-foreground">
-                      <span className="inline-flex items-center gap-1">
-                        <span>{m.from_node.name}</span>
-                        <ArrowRight className="size-3" />
-                        <span className="text-foreground">
-                          {m.to_node.name}
-                        </span>
-                        {m.delete_source && (
-                          <span className="text-muted-foreground">
-                            · 校验后清理源文件
-                          </span>
-                        )}
-                      </span>
-                      <span className="tabular-nums">
-                        {m.files_total > 0 && (
-                          <>
-                            {formatNumber(m.files_done)} /{" "}
-                            {formatNumber(m.files_total)} 个文件 ·{" "}
-                          </>
-                        )}
-                        {formatBytes(m.bytes_done)}
-                        {m.bytes_total > 0 &&
-                          ` / ${formatBytes(m.bytes_total)}`}
-                      </span>
-                    </div>
-
-                    {active && <Progress value={pct} className="h-1.5" />}
-
-                    {m.status === "failed" && m.error && (
-                      <p className="text-destructive">{m.error}</p>
-                    )}
-                  </li>
-                )
-              })}
+              {migrations.slice(0, 8).map((m) => (
+                <MigrationProgressRow
+                  key={m.id}
+                  migration={m}
+                  canceling={cancelingId === m.id}
+                  onCancel={() => void handleCancel(m)}
+                />
+              ))}
             </ul>
           </div>
         )}
@@ -1129,35 +1180,141 @@ function StorageMigrationSection({
   )
 }
 
+function MigrationProgressRow({
+  migration: m,
+  canceling,
+  onCancel,
+}: {
+  migration: StorageMigration
+  canceling: boolean
+  onCancel: () => void
+}) {
+  const active = isActiveMigration(m)
+  const transferMode =
+    m.transfer_mode ?? resolveMigrationTransferMode(m.from_node, m.to_node)
+  const stageText = migrationStageLabel(m.stage)
+  const archiveBytes =
+    typeof m.archive_bytes === "number" && m.archive_bytes > 0
+      ? m.archive_bytes
+      : null
+
+  const pct: number | null =
+    m.bytes_total > 0 && (m.bytes_done > 0 || m.stage !== "packing")
+      ? percentOf(m.bytes_done, m.bytes_total)
+      : m.files_total > 0 && (m.files_done > 0 || m.stage !== "packing")
+        ? percentOf(m.files_done, m.files_total)
+        : active && m.stage === "packing"
+          ? null
+          : 0
+
+  return (
+    <li className="grid gap-2 px-3.5 py-2.5 text-xs">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+          <Badge variant="outline" className="font-normal">
+            {m.target_type === "dataset" ? "数据集" : "数据版本"}
+          </Badge>
+          <span className="truncate text-sm font-medium text-foreground">
+            {m.target_name}
+          </span>
+          {transferMode === "archive" ? (
+            <Badge
+              variant="secondary"
+              className="gap-1 border-indigo-500/25 bg-indigo-500/10 font-normal text-indigo-700 dark:border-indigo-400/30 dark:bg-indigo-400/15 dark:text-indigo-300"
+            >
+              <Archive className="size-3" aria-hidden />
+              压缩包传输
+            </Badge>
+          ) : (
+            <Badge
+              variant="outline"
+              className="font-normal text-muted-foreground"
+            >
+              逐文件直传
+            </Badge>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {active && stageText && (
+            <span className="font-medium text-indigo-700 dark:text-indigo-300">
+              {stageText}
+            </span>
+          )}
+          <MigrationStatusBadge status={m.status} />
+          {active && (
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={onCancel}
+              disabled={canceling}
+              aria-label="取消迁移"
+            >
+              <X />
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-muted-foreground">
+        <span className="inline-flex flex-wrap items-center gap-1">
+          <span>{m.from_node.name}</span>
+          <ArrowRight className="size-3" />
+          <span className="text-foreground">{m.to_node.name}</span>
+          {m.delete_source && (
+            <span className="text-muted-foreground">· 校验后清理源文件</span>
+          )}
+        </span>
+        <span className="tabular-nums">
+          {archiveBytes !== null && <>压缩包 {formatBytes(archiveBytes)} · </>}
+          {m.files_total > 0 && (
+            <>
+              {formatNumber(m.files_done)} / {formatNumber(m.files_total)}{" "}
+              个文件
+              {" · "}
+            </>
+          )}
+          {formatBytes(m.bytes_done)}
+          {m.bytes_total > 0 && ` / ${formatBytes(m.bytes_total)}`}
+        </span>
+      </div>
+
+      {active && <TaskProgress value={pct} label="迁移进度" />}
+
+      {m.status === "failed" && m.error && (
+        <p className="text-destructive">{m.error}</p>
+      )}
+    </li>
+  )
+}
+
 function MigrationStatusBadge({
   status,
 }: {
   status: StorageMigration["status"]
 }) {
+  const label = MIGRATION_STATUS_LABELS[status] ?? status
   if (status === "succeeded") {
     return (
       <Badge variant="outline" className="gap-1 font-normal">
         <span className="size-1.5 rounded-full bg-emerald-500" />
-        {MIGRATION_STATUS_LABELS[status]}
+        {label}
       </Badge>
     )
   }
   if (status === "failed") {
-    return (
-      <Badge variant="destructive">{MIGRATION_STATUS_LABELS[status]}</Badge>
-    )
+    return <Badge variant="destructive">{label}</Badge>
   }
   if (status === "running" || status === "queued") {
     return (
       <Badge variant="secondary" className="gap-1 font-normal">
         <Spinner className="size-3" aria-hidden />
-        {MIGRATION_STATUS_LABELS[status]}
+        {label}
       </Badge>
     )
   }
   return (
     <Badge variant="outline" className="font-normal text-muted-foreground">
-      {MIGRATION_STATUS_LABELS[status]}
+      {label}
     </Badge>
   )
 }
