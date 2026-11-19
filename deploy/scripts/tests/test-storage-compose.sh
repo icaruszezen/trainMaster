@@ -37,6 +37,7 @@ grep -q 'CGO_ENABLED=0' "$DOCKERFILE" || fail "Dockerfile.storage 应启用 CGO_
 grep -q './cmd/trainmaster-storage' "$DOCKERFILE" || fail "Dockerfile.storage 应构建 ./cmd/trainmaster-storage"
 grep -q '/healthz' "$DOCKERFILE" || fail "Dockerfile.storage 应包含 /healthz 健康检查"
 grep -q 'storage-entrypoint.sh' "$DOCKERFILE" || fail "Dockerfile.storage 应使用 storage-entrypoint.sh"
+grep -qxF '!deploy/docker/storage-entrypoint.sh' "$ROOT/.dockerignore" || fail ".dockerignore 应将 !deploy/docker/storage-entrypoint.sh 加入白名单"
 
 # 2. storage-entrypoint.sh 实际执行检查（非 root 模式下创建受管子目录并执行命令；非法 PUID 拒绝启动）
 TEST_DATA="$WORK/data-root"
