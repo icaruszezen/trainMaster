@@ -114,6 +114,9 @@ func (s *Service) Start(ctx context.Context) error {
 	if err := os.MkdirAll(s.runsDir(), 0o755); err != nil {
 		return fmt.Errorf("create runs dir: %w", err)
 	}
+	if err := s.EnsureBuiltinTemplates(ctx); err != nil {
+		return fmt.Errorf("ensure builtin training templates: %w", err)
+	}
 	if err := s.expireLeases(ctx); err != nil {
 		return fmt.Errorf("expire stale training leases: %w", err)
 	}

@@ -90,6 +90,8 @@ export type TrainingParamTemplate = {
   description: string
   params: Record<string, unknown>
   is_default: boolean
+  is_builtin: boolean
+  builtin_key?: string
   created_at: string
   updated_at: string
 }

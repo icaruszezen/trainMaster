@@ -23,6 +23,7 @@ import {
   Rocket,
   RotateCcw,
   Settings2,
+  ShieldCheck,
   Sparkles,
   Star,
 } from "lucide-react"
@@ -55,7 +56,9 @@ import { Input } from "@/components/ui/input"
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectSeparator,
   SelectTrigger,
   SelectValue,
@@ -120,6 +123,8 @@ import {
   buildTemplateParamsPayload,
   countModifiedParams,
   countTemplateParamDiffs,
+  partitionTemplatesBySource,
+  suggestedTemplateCopyName,
   validateTrainingParams,
 } from "@/features/training/training-params"
 import { TrainingParamsEditor } from "@/features/training/training-params-editor"
@@ -409,6 +414,11 @@ function NewTrainingJobForm({
         ? (templates.find((t) => t.id === activeTemplateId) ?? null)
         : null,
     [templates, activeTemplateId]
+  )
+
+  const { custom: customTemplates, builtin: builtinTemplates } = useMemo(
+    () => partitionTemplatesBySource(templates),
+    [templates]
   )
 
   const dataVersions = useQuery({
@@ -1019,11 +1029,32 @@ function NewTrainingJobForm({
                         <SelectValue placeholder="选择参数模板" />
                       </SelectTrigger>
                       <SelectContent>
-                        {templates.map((tpl) => (
-                          <SelectItem key={tpl.id} value={String(tpl.id)}>
-                            {tpl.is_default ? `★ ${tpl.name}（默认）` : tpl.name}
-                          </SelectItem>
-                        ))}
+                        {customTemplates.length > 0 && (
+                          <SelectGroup>
+                            <SelectLabel>自定义模板</SelectLabel>
+                            {customTemplates.map((tpl) => (
+                              <SelectItem key={tpl.id} value={String(tpl.id)}>
+                                {tpl.is_default
+                                  ? `★ ${tpl.name}（默认）`
+                                  : tpl.name}
+                              </SelectItem>
+                            ))}
+                          </SelectGroup>
+                        )}
+                        {customTemplates.length > 0 &&
+                          builtinTemplates.length > 0 && <SelectSeparator />}
+                        {builtinTemplates.length > 0 && (
+                          <SelectGroup>
+                            <SelectLabel>系统内置模板</SelectLabel>
+                            {builtinTemplates.map((tpl) => (
+                              <SelectItem key={tpl.id} value={String(tpl.id)}>
+                                {tpl.is_default
+                                  ? `★ ${tpl.name}（默认）`
+                                  : tpl.name}
+                              </SelectItem>
+                            ))}
+                          </SelectGroup>
+                        )}
                         {templates.length > 0 && <SelectSeparator />}
                         <SelectItem value={NO_TEMPLATE_VALUE}>
                           不使用模板（Ultralytics 官方默认）
@@ -1067,22 +1098,24 @@ function NewTrainingJobForm({
                           <RotateCcw />
                           恢复模板值
                         </Button>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          disabled={
-                            createMutation.isPending ||
-                            updateTemplateMutation.isPending
-                          }
-                          onClick={() => {
-                            updateTemplateMutation.reset()
-                            setUpdateConfirmOpen(true)
-                          }}
-                        >
-                          <BookmarkCheck />
-                          更新模板
-                        </Button>
+                        {!activeTemplate.is_builtin && (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={
+                              createMutation.isPending ||
+                              updateTemplateMutation.isPending
+                            }
+                            onClick={() => {
+                              updateTemplateMutation.reset()
+                              setUpdateConfirmOpen(true)
+                            }}
+                          >
+                            <BookmarkCheck />
+                            更新模板
+                          </Button>
+                        )}
                       </>
                     )}
 
@@ -1108,6 +1141,15 @@ function NewTrainingJobForm({
                         )}
                         当前模板：{activeTemplate.name}
                       </span>
+                      {activeTemplate.is_builtin && (
+                        <Badge
+                          variant="secondary"
+                          className="h-5 gap-1 px-1.5 text-[11px] font-normal"
+                        >
+                          <ShieldCheck className="size-3 text-primary" />
+                          系统内置
+                        </Badge>
+                      )}
                       {activeTemplate.description && (
                         <>
                           <span>·</span>
@@ -1119,7 +1161,9 @@ function NewTrainingJobForm({
                       <span>·</span>
                       <span>
                         {templateDiffCount > 0
-                          ? `已相对模板微调 ${templateDiffCount} 项，可直接提交训练，也可以更新原模板或另存为新模板。`
+                          ? activeTemplate.is_builtin
+                            ? `已相对系统内置模板微调 ${templateDiffCount} 项，可直接提交训练，或点击“另存为新模板”保存为自定义模板。`
+                            : `已相对模板微调 ${templateDiffCount} 项，可直接提交训练，也可以更新原模板或另存为新模板。`
                           : initialTemplateState.autoLoadedDefault
                             ? "已自动加载默认模板，可直接点击底部“开始训练”，或微调下方常用/高级参数。"
                             : "参数与模板一致，可直接点击底部“开始训练”，或微调下方常用/高级参数。"}
@@ -1224,7 +1268,9 @@ function NewTrainingJobForm({
         params={params}
         initMode={initMode}
         defaultName={
-          activeTemplate ? `${activeTemplate.name}-副本` : name.trim()
+          activeTemplate
+            ? suggestedTemplateCopyName(activeTemplate)
+            : name.trim()
         }
         defaultDescription={activeTemplate ? activeTemplate.description : ""}
         title={activeTemplate ? "另存为新的参数模板" : "存为参数模板"}
@@ -1235,7 +1281,7 @@ function NewTrainingJobForm({
 
       <AlertDialog open={updateConfirmOpen} onOpenChange={setUpdateConfirmOpen}>
         <AlertDialogContent>
-          {activeTemplate && (
+          {activeTemplate && !activeTemplate.is_builtin && (
             <>
               <AlertDialogHeader>
                 <AlertDialogTitle className="break-words">

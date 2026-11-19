@@ -267,13 +267,29 @@ func TestTrainingTemplatesAPI(t *testing.T) {
 		t.Fatalf("schema common count = %d, want 12", commonCount)
 	}
 
-	// Empty template list.
-	empty := want[List[training.ParamTemplate]](t, e.do("GET", "/api/v1/training/templates", nil), http.StatusOK)
-	if empty.Total != 0 {
-		t.Fatalf("initial templates = %+v", empty)
+	// Initial template list contains the 6 system built-in presets, none default.
+	initial := want[List[training.ParamTemplate]](t, e.do("GET", "/api/v1/training/templates", nil), http.StatusOK)
+	if initial.Total != 6 {
+		t.Fatalf("initial templates total = %d, want 6 (%+v)", initial.Total, initial)
+	}
+	builtin := initial.Items[0]
+	if !builtin.IsBuiltin || builtin.IsDefault || builtin.BuiltinKey != "fast_debug" {
+		t.Fatalf("unexpected first built-in template = %+v", builtin)
 	}
 
-	// Create template.
+	// Built-in template allows toggling is_default, rejects editing params/name, and rejects delete.
+	builtinDefault := want[training.ParamTemplate](t, e.do("PATCH", fmt.Sprintf("/api/v1/training/templates/%d", builtin.ID), map[string]any{
+		"is_default": true,
+	}), http.StatusOK)
+	if !builtinDefault.IsDefault || !builtinDefault.IsBuiltin {
+		t.Fatalf("built-in default toggle = %+v", builtinDefault)
+	}
+	wantError(t, e.do("PATCH", fmt.Sprintf("/api/v1/training/templates/%d", builtin.ID), map[string]any{
+		"name": "修改内置名称",
+	}), http.StatusConflict, codeConflict, "只读")
+	wantError(t, e.do("DELETE", fmt.Sprintf("/api/v1/training/templates/%d", builtin.ID), nil), http.StatusConflict, codeConflict, "不可删除")
+
+	// Create custom template (takes over is_default).
 	tpl := want[training.ParamTemplate](t, e.do("POST", "/api/v1/training/templates", map[string]any{
 		"name":        "小目标标准方案",
 		"description": "1280px + AdamW + 关闭左右翻转",
@@ -286,7 +302,7 @@ func TestTrainingTemplatesAPI(t *testing.T) {
 			"fliplr":    0.0,
 		},
 	}), http.StatusCreated)
-	if tpl.ID <= 0 || !tpl.IsDefault || tpl.Params["epochs"] != float64(200) {
+	if tpl.ID <= 0 || !tpl.IsDefault || tpl.IsBuiltin || tpl.Params["epochs"] != float64(200) {
 		t.Fatalf("created template = %+v", tpl)
 	}
 

@@ -197,6 +197,8 @@ type ParamTemplate struct {
 	Description string         `json:"description"`
 	Params      map[string]any `json:"params"`
 	IsDefault   bool           `json:"is_default"`
+	IsBuiltin   bool           `json:"is_builtin"`
+	BuiltinKey  string         `json:"builtin_key,omitempty"`
 	CreatedAt   time.Time      `json:"created_at"`
 	UpdatedAt   time.Time      `json:"updated_at"`
 }
