@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import contextlib
+import gzip
 import hashlib
 import http.client
 import json
@@ -186,6 +187,33 @@ class Client:
             headers=self._headers(
                 headers,
                 **{"Content-Type": "application/json; charset=utf-8", "Accept": "application/json"},
+            ),
+            method="POST",
+        )
+        return self._json_response(req, timeout)
+
+    def post_gzip(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout: float | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """POST gzip 压缩后的 JSON（用于上传较大体积的评估预测结果），返回解析后的 JSON 对象。"""
+        raw = json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        body = gzip.compress(raw, compresslevel=6)
+        req = urllib.request.Request(
+            self.base_url + path,
+            data=body,
+            headers=self._headers(
+                headers,
+                **{
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Content-Encoding": "gzip",
+                    "Content-Length": str(len(body)),
+                    "Accept": "application/json",
+                },
             ),
             method="POST",
         )

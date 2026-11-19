@@ -19,6 +19,9 @@ var (
 	// ErrHasTrainingJobs: a project with training jobs cannot be deleted
 	// until its training jobs are removed (a conflict too).
 	ErrHasTrainingJobs = errors.New("project has training jobs")
+	// ErrHasEvaluations: a project with evaluations cannot be deleted
+	// until its evaluations are removed (a conflict too).
+	ErrHasEvaluations = errors.New("project has evaluations")
 )
 
 // Error is a user-facing error. Message is written in Chinese and is shown

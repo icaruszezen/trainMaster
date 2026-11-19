@@ -120,7 +120,7 @@ def test_export_end_to_end(platform, tmp_path, fake_ml, caplog):
     assert all(r["headers"]["X-Node-Key"] == NODE_KEY for r in requests)
     assert all(r["headers"]["Authorization"] == f"Bearer {TOKEN}" for r in requests)
     claim = platform.claims[0]
-    kinds = ["model_export", "review_inference", "training_job"]
+    kinds = ["model_export", "review_inference", "training_job", "model_evaluation"]
     assert claim == {"node_key": NODE_KEY, "kinds": kinds, "wait_seconds": 25}
     messages = [r.getMessage() for r in caplog.records]
     assert any(f"model export {export_id} started" in m for m in messages)
@@ -226,7 +226,7 @@ def test_claim_uses_long_timeout():
     assert all(s["timeout"] == 25 + 15 for s in seen)
     assert seen[0]["payload"] == {
         "node_key": NODE_KEY,
-        "kinds": ["model_export", "review_inference", "training_job"],
+        "kinds": ["model_export", "review_inference", "training_job", "model_evaluation"],
         "wait_seconds": 25,
     }
     # 空结果立即返回（假时钟没有走）时稍等再领，避免空转
@@ -719,15 +719,20 @@ def test_missing_capabilities_are_rechecked(platform, tmp_path, caplog):
         find_spec=lambda name: object() if name in installed else None,
     ) as run:
         wait_until(lambda: run.waits.calls.count(300.0) >= 3)
-        assert platform.claims == []  # 缺少 ultralytics：三类任务都不领取
-        installed.add("ultralytics")  # 之后安装了依赖（裸机节点）：可以识别和训练，还不能转换
+        assert platform.claims == []  # 缺少 ultralytics：四类任务都不领取
+        installed.add("ultralytics")  # 之后安装了依赖（裸机节点）：可以识别、训练和评估，还不能转换
         wait_until(lambda: platform.claims)
-        assert platform.claims[0]["kinds"] == ["review_inference", "training_job"]
+        assert platform.claims[0]["kinds"] == [
+            "review_inference",
+            "training_job",
+            "model_evaluation",
+        ]
         installed.add("onnx")
         clock.now += 300  # 下一次检查时 model_export 也可以领取
         wait_until(
             lambda: (
-                platform.claims[-1]["kinds"] == ["model_export", "review_inference", "training_job"]
+                platform.claims[-1]["kinds"]
+                == ["model_export", "review_inference", "training_job", "model_evaluation"]
             )
         )
     messages = [r.getMessage() for r in caplog.records]
@@ -742,8 +747,13 @@ def test_missing_capabilities_are_rechecked(platform, tmp_path, caplog):
     assert (
         sum("not claiming training_job tasks: cannot find ultralytics" in m for m in messages) == 1
     )
+    assert (
+        sum("not claiming model_evaluation tasks: cannot find ultralytics" in m for m in messages)
+        == 1
+    )
     assert any("review_inference tasks enabled" in m for m in messages)
     assert any("training_job tasks enabled" in m for m in messages)
+    assert any("model_evaluation tasks enabled" in m for m in messages)
     assert any("model_export tasks enabled" in m for m in messages)
 
 
@@ -752,6 +762,7 @@ def test_review_inference_needs_torch_and_ultralytics_only():
         "model_export": ("torch", "ultralytics", "onnx"),
         "review_inference": ("torch", "ultralytics"),
         "training_job": ("torch", "ultralytics"),
+        "model_evaluation": ("torch", "ultralytics"),
     }
 
 
@@ -773,7 +784,7 @@ def test_resident_modules_do_not_import_ml_packages():
 
     code = (
         "import sys, trainmaster_trainer.agent, trainmaster_trainer.tasks, trainmaster_trainer.model_export,"
-        " trainmaster_trainer.review_inference, trainmaster_trainer.training;"
+        " trainmaster_trainer.review_inference, trainmaster_trainer.training, trainmaster_trainer.evaluation;"
         "print(sorted(m for m in ('torch', 'ultralytics', 'onnx', 'onnxruntime', 'numpy', 'cv2', 'PIL')"
         " if m in sys.modules))"
     )

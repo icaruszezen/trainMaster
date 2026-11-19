@@ -14,6 +14,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/compute"
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 	"github.com/icaruszezen/trainmaster/backend/internal/dataversion"
+	"github.com/icaruszezen/trainmaster/backend/internal/evaluation"
 	"github.com/icaruszezen/trainmaster/backend/internal/hostinfo"
 	"github.com/icaruszezen/trainmaster/backend/internal/model"
 	"github.com/icaruszezen/trainmaster/backend/internal/project"
@@ -71,6 +72,10 @@ type Options struct {
 	// compute-node callbacks under /api/v1/compute/agent/training-jobs.
 	// If nil, those routes are not mounted.
 	Training *training.Service
+	// Evaluations serves /api/v1/evaluations (model evaluations) and their
+	// compute-node callbacks under /api/v1/compute/agent/evaluations.
+	// If nil, those routes are not mounted.
+	Evaluations *evaluation.Service
 	// Reviews serves /api/v1/reviews (model reviews) and the review
 	// records of a dataset (/api/v1/datasets/{id}/reviews, with Datasets).
 	// The inference calls of the training nodes
@@ -104,7 +109,6 @@ type Options struct {
 var plannedModules = []string{
 	"/annotation/tasks",
 	"/annotation/labels",
-	"/evaluations",
 }
 
 type server struct {
@@ -118,6 +122,7 @@ type server struct {
 	models       *model.Service
 	reviews      *review.Service
 	training     *training.Service
+	evaluations  *evaluation.Service
 	host         *hostinfo.Host
 	nodeToken    string
 	startedAt    time.Time
@@ -135,7 +140,8 @@ type server struct {
 func NewHandler(o Options) http.Handler {
 	s := &server{log: o.Logger, db: o.DB, storage: o.Storage, storageNodes: o.StorageNodes,
 		datasets: o.Datasets, compute: o.Compute,
-		models: o.Models, reviews: o.Reviews, training: o.Training, reviewerTool: o.ReviewerTool, host: o.Host,
+		models: o.Models, reviews: o.Reviews, training: o.Training, evaluations: o.Evaluations,
+		reviewerTool: o.ReviewerTool, host: o.Host,
 		nodeToken: o.NodeToken, localTrainerMode: o.LocalTrainerMode, startedAt: o.StartedAt,
 		trainerPackage: trainerpkg.New(o.TrainerPackageDir), dataVersions: o.DataVersions}
 	if o.Datasets != nil {
@@ -187,6 +193,9 @@ func NewHandler(o Options) http.Handler {
 			}
 			if s.training != nil {
 				r.Route("/training", s.trainingRoutes)
+			}
+			if s.evaluations != nil {
+				r.Route("/evaluations", s.evaluationRoutes)
 			}
 			if s.datasets != nil {
 				r.Route("/recycle-bin", s.recycleBinRoutes)

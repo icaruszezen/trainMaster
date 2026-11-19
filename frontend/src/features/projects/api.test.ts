@@ -132,6 +132,15 @@ describe("project writes", () => {
     fetchMock = mockFetch(() => new Response(null, { status: 204 }))
     await deleteProject(9, { deleteModels: false, deleteDataVersions: false })
     expect(requestOf(fetchMock).path).toBe("/api/v1/projects/9")
+
+    fetchMock = mockFetch(() => new Response(null, { status: 204 }))
+    await deleteProject(9, {
+      deleteTrainingJobs: true,
+      deleteEvaluations: true,
+    })
+    expect(requestOf(fetchMock).path).toBe(
+      "/api/v1/projects/9?delete_training_jobs=true&delete_evaluations=true"
+    )
   })
 })
 

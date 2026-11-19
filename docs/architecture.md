@@ -62,6 +62,7 @@ flowchart LR
 | `internal/dataversion` | 数据版本：输入的校验与预览、编号与创建、重新生成、修改备注与删除（`create.go`）；划分（`split.go`，纯函数，预览与生成共用）；一次一个的后台生成与重启后的恢复（`build.go`：读取数据集快照、硬链接或复制原图、写 YOLO 标注与 `data.yaml`、增强）；版本文件夹（`folder.go`：`.pending` 标记、移开后在后台删除）；图片与缩略图（`images.go`）；YOLO / VOC / COCO 下载（`export.go`）；回收站与清理（`recycle.go`，删除前检查是否被训练任务引用）。面向用户的错误为 `dataversion.Error`（见第 13 节） |
 | `internal/augment` | 数据版本的离线增强：翻转与旋转（二面体群 D4 中的一个方向，框精确变换）、亮度 / 对比度、模糊、噪声，确定的增强计划，输出格式与编码；EXIF / TIFF 方向标记的识别与重置（`orientation.go`）。纯函数，没有数据库与文件 |
 | `internal/training` | 训练任务：Ultralytics YOLO 全量 86 项训练参数的规格、官方默认值与校验（`params.go`），训练任务的创建、修改、停止、重试、删除、日志增量读取、产物文件读取与权重注册到模型仓库（`jobs.go`），实现 `model.TaskSource` 的领取队列、租约续期、数据集与基础模型的流式下发、产物原子接收（`queue.go`）。面向用户的错误为 `training.Error`（见第 14 节） |
+| `internal/evaluation` | 模型评估：数据源预览与类别按名对齐（`preview.go`）、批量创建与管理（`create.go`）、实现 `model.TaskSource`（`model_evaluation`）的任务调度与结果上传（`queue.go`）、精确 COCO 10-IoU mAP / 101 点曲线 / 混淆矩阵 / 工业 OK/NG 指标动态计算引擎（`metrics.go`）、样本筛选与多模型同源逐图差异对比（`analysis.go`）、离线 HTML/CSV/JSON 报告生成（`report.go`）。面向用户的错误为 `evaluation.Error`（见第 15 节） |
 | `internal/compute` | 计算资源：训练节点的注册与心跳、上报数据的规范化与校验、在线状态判定、删除与重新检测、内存中的指标历史 |
 | `internal/hostinfo` | 平台服务器自身的 CPU、内存、负载、cgroup 限制与 NVIDIA 显卡（读 `/proc`、`/sys`，根目录可替换以便测试）；后台每 5 秒采样一次 CPU 利用率 |
 | `internal/httpapi` | chi 路由、中间件、统一 JSON 响应与错误信封、各 handler |
@@ -73,7 +74,7 @@ flowchart LR
 2. 初始化存储目录：创建根目录和 7 个子目录（见第 5 节）并做可写探测，失败则退出并提示检查挂载目录权限 / PUID、PGID。
 3. 连接数据库：指数退避重试，最长约 60 秒（数据库容器还在启动时会等待），仍失败则以非 0 退出。
 4. `TM_DB_AUTO_MIGRATE=true`（默认）时执行待执行的迁移。
-5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），整理崩溃留下的回收站文件夹（见第 12 节“文件夹”），然后启动任务执行器（见第 6 节）；启动模型仓库的后台任务（见第 10 节“存储与版本号”）、模型审图的后台任务（先把上次运行中断的合并记为失败、删除它们没有生成完的审图版本，见第 11 节“存储”）、数据版本的后台任务（先把上次运行中断的生成记为失败，再开始生成排队中的版本，见第 13 节“生成”），以及训练任务的后台任务（租约过期恢复与临时上传清理，见第 14 节）。
+5. 恢复上次关闭时未完成的数据集导入任务，补齐图片的排序键（见第 6 节“图片顺序”），整理崩溃留下的回收站文件夹（见第 12 节“文件夹”），然后启动任务执行器（见第 6 节）；启动模型仓库的后台任务（见第 10 节“存储与版本号”）、模型评估的后台任务（租约过期恢复与临时目录清理，见第 15 节）、模型审图的后台任务（先把上次运行中断的合并记为失败、删除它们没有生成完的审图版本，见第 11 节“存储”）、数据版本的后台任务（先把上次运行中断的生成记为失败，再开始生成排队中的版本，见第 13 节“生成”），以及训练任务的后台任务（租约过期恢复与临时上传清理，见第 14 节）。
 6. 启动 HTTP 服务；收到 SIGINT / SIGTERM 后停止接收新请求，等待进行中的请求完成（最长 15 秒）；超时后强制关闭剩余连接（取消其请求的 context），最后关闭数据库连接池。还在等待数据库或迁移锁时收到信号，则直接正常退出。收到信号时会立即取消正在执行的导入 / 扫描任务并记为失败（“服务重启，导入被中断”），排队中的任务保留到下次启动执行；正在生成的数据版本同样被取消（关闭期间不清理它的文件夹），下次启动时记为失败，可以重新生成。HTTP 服务关闭后再等待任务执行器的 worker 退出。进程在写入结果前异常退出时，下次启动由恢复逻辑把任务标记为中断，并重新计算受影响数据集的统计数据。长连接 handler 应通过 `http.Server.RegisterOnShutdown` 在关闭开始时主动结束：训练节点领取任务的长轮询（最长 30 秒）就是这样立即返回 `{"task": null}` 的，以后的 SSE 推送也应如此。
 
 ## 3. API 约定
@@ -107,13 +108,13 @@ flowchart LR
 | 404 | `not_found` | 接口或资源不存在（未设置 `TM_WEB_DIR` 时，非 `/api` 路径也返回它） |
 | 404 | `unknown_node` | 心跳或任务调用中的 `node_key`（`X-Node-Key`）尚未注册（或节点已被删除），训练节点收到后重新注册 |
 | 405 | `method_not_allowed` | 路径存在但不支持该方法（响应头 `Allow` 列出支持的方法） |
-| 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、下载 YOLO 时所选项目还没有类别列表、标注文件不能在平台中修改、删除在线的训练节点、重新检测离线的训练节点、删除有模型/数据版本/训练任务的项目、删除被训练任务引用的数据版本、模型文件未上传完就提交、模型上传的临时文件已丢失、转换/识别/训练任务已不属于该训练节点、审图图片还没有识别完成、审图任务正在合并时删除或再次合并、修改或删除正在生成的审图版本、所选版本中没有可以导出的图片、新建数据版本时项目还没有类别或类别列表已被修改、划分后训练集或验证集没有图片、数据版本还没有生成完成、重新生成不是失败的数据版本或来源已不能使用、停止已结束的训练任务、重试未失败/取消的训练任务等） |
+| 409 | `conflict` | 与当前状态冲突（同名数据集、数据集正在导入、任务状态不允许该操作、类别列表已被他人修改、下载 YOLO 时所选项目还没有类别列表、标注文件不能在平台中修改、删除在线的训练节点、重新检测离线的训练节点、删除有模型/数据版本/训练任务/模型评估的项目、删除被训练任务引用的数据版本、模型文件未上传完就提交、模型上传的临时文件已丢失、转换/识别/训练/评估任务已不属于该训练节点、审图图片还没有识别完成、审图任务正在合并时删除或再次合并、修改或删除正在生成的审图版本、所选版本中没有可以导出的图片、新建数据版本时项目还没有类别或类别列表已被修改、划分后训练集或验证集没有图片、数据版本还没有生成完成、重新生成不是失败的数据版本或来源已不能使用、停止已结束的训练或评估任务、重试未失败/取消的训练或评估任务等） |
 | 409 | `name_taken` | 从回收站恢复时名称已被占用：恢复数据集时有同名的数据集（或文件夹名已被使用），恢复模型或数据版本时一并恢复的项目有同名的项目。带新名称再次恢复即可（数据集为 `name`，模型与数据版本为 `project_name`），见“回收站接口” |
 | 409 | `annotation_conflict` | 保存 / 删除标注时，标注文件在 `base_version` 之后已被修改（他人在另一个窗口保存，或用其它工具改了文件）。客户端应重新读取图片详情，或带 `force: true` 覆盖 |
 | 409 | `annotation_unpatchable` | 保存标注时，已有的标注文件无法在保留其中平台不编辑的内容的情况下修改（极少见）；带 `regenerate: true` 时按平台的格式重新生成整个文件（`force: true` 只跳过版本检查，不会重新生成） |
 | 409 | `upload_offset_mismatch` | 分块上传（数据集压缩包、模型文件）的 `offset` 与服务端已接收的字节数不一致，客户端应重新获取任务或上传后从 `received_bytes` 续传 |
 | 413 | `payload_too_large` | 请求体超过限制（单个分块 64 MiB，单次文件夹批量上传 256 MiB，训练节点的 JSON 请求 1 MiB、上传的转换结果与训练产物 4 GiB，上传前的进度上报按同样的上限预检；保存标注 8 MiB，上传的审图结果 4 GiB） |
-| 422 | `validation_failed` | 字段校验失败，`message` 说明具体问题（如数据集名称不合法、ONNX 转换选项不允许、YOLO 训练参数超出合法范围） |
+| 422 | `validation_failed` | 字段校验失败，`message` 说明具体问题（如数据集名称不合法、ONNX 转换选项不允许、YOLO 训练参数超出合法范围、评估数据源为空或阈值越界） |
 | 422 | `unsupported_image` | 无法为该图片生成缩略图（格式不支持、文件损坏或像素过大），前端回退为原图或占位图 |
 | 422 | `invalid_model` | 提交的模型文件不是平台支持的 YOLO 模型（不是 PyTorch 文件、旧格式、损坏、不是 Ultralytics 检查点、原版 YOLOv5 仓库、RT-DETR、引用了安全加载不允许的对象等），`message` 说明原因；上传随之失败 |
 | 422 | `yolo_version_mismatch` | 模型文件中识别出的 YOLO 版本与所选的不同；上传保留，带识别出的版本（上传的 `detected_yolo_version`）再次提交即可 |
@@ -136,9 +137,10 @@ flowchart LR
 | 模型审图相关接口 | 见下方“模型审图接口” |
 | 数据版本相关接口 | 见下方“数据版本接口” |
 | 训练任务相关接口 | 见下方“训练任务接口” |
+| 模型评估相关接口 | 见第 15 节“模型评估” |
 | 计算资源相关接口（含训练节点的任务接口） | 见下方“计算资源接口” |
 | 回收站相关接口 | 见下方“回收站接口” |
-| `/api/v1/annotation/tasks`、`/api/v1/annotation/labels`、`/api/v1/evaluations` 及其子路径 | 预留给规划中的模块，任意方法均返回 `501 not_implemented` |
+| `/api/v1/annotation/tasks`、`/api/v1/annotation/labels` 及其子路径 | 预留给规划中的模块，任意方法均返回 `501 not_implemented` |
 
 `/api/readyz` 示例：
 
@@ -225,7 +227,7 @@ flowchart LR
 | `POST /api/v1/projects` | `{name, description?, dataset_ids?}` 新建项目，可同时纳入数据集，返回 201。名称不区分大小写唯一（重名 409 `conflict`），最长 64 个字符，不能含控制字符；描述最长 500 个字符，除换行与制表符外不能含控制字符；不合规时返回 422。所选数据集不存在时返回 422，不创建项目 |
 | `GET /api/v1/projects/{id}` | 项目详情（字段同列表项） |
 | `PATCH /api/v1/projects/{id}` | 修改名称和描述（规则同上） |
-| `DELETE /api/v1/projects/{id}?delete_models=&delete_data_versions=&delete_training_jobs=` | 删除项目，返回 204。其中的数据集保留，只是不再属于该项目；进行中的模型上传随项目删除（临时文件由清理任务删除）。项目中有模型时返回 409 `conflict`（“项目中有 N 个模型，请先删除模型，或选择同时删除模型”）；没有模型（或带了 `delete_models=true`）而有数据版本（不在回收站中的，任何状态）时返回 409 `conflict`（“项目中有 N 个数据版本，请先删除数据版本，或选择同时删除数据版本”）；还有训练任务（且未带 `delete_training_jobs=true`）时返回 409 `conflict`（“项目中有 N 个训练任务，请先删除训练任务，或选择同时删除训练任务”）。先按同样的规则检查（`project.CheckDeleteAll`），被拒绝的删除不做任何修改；然后 `?delete_training_jobs=true` 时先删除项目的全部训练任务及其 `runs/training/job-<ID>/` 产物目录（避免阻塞数据版本删除），`?delete_data_versions=true` 时处理其数据版本（同 `DELETE /api/v1/data-versions/{id}`：已生成的移入回收站，生成失败的删除，排队中与生成中的停止并删除），`?delete_models=true` 时把其模型移入回收站（同 `DELETE /api/v1/models/{modelID}`），最后删除项目。项目中有模型或数据版本在回收站中时，项目随它们留在回收站中（不显示，名称可以再用），恢复其中任何一个时一并恢复，最后一个模型与数据版本永久删除（且没有训练任务引用）时项目才删除（见第 12 节）；否则直接删除项目，并删除它的 `models/project-<ID>/` 与 `exports/data-versions/project-<ID>/` 文件夹。`delete_models`、`delete_data_versions`、`delete_training_jobs` 不是布尔值时返回 400 |
+| `DELETE /api/v1/projects/{id}?delete_models=&delete_data_versions=&delete_training_jobs=&delete_evaluations=` | 删除项目，返回 204。其中的数据集保留，只是不再属于该项目；进行中的模型上传随项目删除（临时文件由清理任务删除）。项目中有模型时返回 409 `conflict`（“项目中有 N 个模型，请先删除模型，或选择同时删除模型”）；没有模型（或带了 `delete_models=true`）而有数据版本（不在回收站中的，任何状态）时返回 409 `conflict`；还有训练任务（且未带 `delete_training_jobs=true`）时返回 409 `conflict`；还有模型评估（且未带 `delete_evaluations=true`）时返回 409 `conflict`（“项目中有 N 个模型评估，请先删除模型评估，或选择同时删除模型评估”）。先按同样的规则检查（`project.CheckDeleteAll`），被拒绝的删除不做任何修改；然后 `?delete_evaluations=true` 时先删除项目的全部模型评估及其 `runs/evaluations/eval-<ID>/` 推理缓存目录，`?delete_training_jobs=true` 时删除项目的全部训练任务及其 `runs/training/job-<ID>/` 产物目录（避免阻塞数据版本删除），`?delete_data_versions=true` 时处理其数据版本（同 `DELETE /api/v1/data-versions/{id}`：已生成的移入回收站，生成失败的删除，排队中与生成中的停止并删除），`?delete_models=true` 时把其模型移入回收站（同 `DELETE /api/v1/models/{modelID}`），最后删除项目。项目中有模型或数据版本在回收站中时，项目随它们留在回收站中（不显示，名称可以再用），恢复其中任何一个时一并恢复，最后一个模型与数据版本永久删除（且没有训练任务或评估引用）时项目才删除（见第 12 节）；否则直接删除项目，并删除它的 `models/project-<ID>/` 与 `exports/data-versions/project-<ID>/` 文件夹。`delete_models`、`delete_data_versions`、`delete_training_jobs`、`delete_evaluations` 不是布尔值时返回 400 |
 | `GET /api/v1/projects/{id}/datasets` | 项目中的数据集，格式同数据集列表。项目不存在时返回 404（`GET /api/v1/datasets?project_id=` 则返回空列表） |
 | `POST /api/v1/projects/{id}/datasets` | `{dataset_ids: [...]}` 把数据集纳入项目（已在项目中的忽略），返回更新后的项目；`dataset_ids` 为空或有数据集不存在时返回 422，不做任何修改 |
 | `DELETE /api/v1/projects/{id}/datasets/{datasetId}` | 把数据集移出项目，返回 204（数据集本身不受影响；本来就不在项目中也返回 204） |
@@ -235,7 +237,7 @@ flowchart LR
 | `POST /api/v1/projects/{id}/classes` | `{name, color?}` 在列表末尾追加一个类别（`color` 为 `""` 或 `#rrggbb`）；已有同名类别（去掉首尾空白后完全相同）时列表不变。校验同 PUT（超过 1000 个时返回 422），返回列表（格式同 GET）。读取与写入在同一事务中并锁定项目行，并发追加不会互相覆盖 |
 | `GET /api/v1/projects/{id}/models` | 项目中的模型（格式同模型列表），按版本号倒序；项目不存在时返回 404 |
 
-一次最多提交 1000 个 ID。增减数据集（包括删除其中的数据集）和修改类别列表会更新项目的 `updated_at`（提交的类别列表与原来相同时不更新）；项目与数据集之间的写操作都按“先数据集、后项目，各自按 ID 顺序”加行锁，修改类别列表只锁定项目这一行，并发修改同一关系时不会死锁或丢失更新。数据集或项目进入回收站时，它们之间的关联移到 `recycled_project_datasets`，恢复时（另一方仍在使用时）放回，永久删除时随之删除（见第 12 节）。一个模型只属于一个项目（`models.project_id`，`ON DELETE RESTRICT`：数据库不会在模型文件夹还在时删掉模型记录）；删除项目时在事务中锁定项目行并检查其中的模型数（包括回收站中的），与分配模型版本号使用同一把行锁，正在提交的模型不会漏删。数据版本同样只属于一个项目（`data_versions.project_id`，`ON DELETE RESTRICT`），按项目编号（`projects.data_version_seq`），删除项目时用同样的方式检查（见第 13 节）。训练任务也归属到项目（`training_jobs.project_id`，`ON DELETE RESTRICT`，见第 14 节）。
+一次最多提交 1000 个 ID。增减数据集（包括删除其中的数据集）和修改类别列表会更新项目的 `updated_at`（提交的类别列表与原来相同时不更新）；项目与数据集之间的写操作都按“先数据集、后项目，各自按 ID 顺序”加行锁，修改类别列表只锁定项目这一行，并发修改同一关系时不会死锁或丢失更新。数据集或项目进入回收站时，它们之间的关联移到 `recycled_project_datasets`，恢复时（另一方仍在使用时）放回，永久删除时随之删除（见第 12 节）。一个模型只属于一个项目（`models.project_id`，`ON DELETE RESTRICT`：数据库不会在模型文件夹还在时删掉模型记录）；删除项目时在事务中锁定项目行并检查其中的模型数（包括回收站中的），与分配模型版本号使用同一把行锁，正在提交的模型不会漏删。数据版本同样只属于一个项目（`data_versions.project_id`，`ON DELETE RESTRICT`），按项目编号（`projects.data_version_seq`），删除项目时用同样的方式检查（见第 13 节）。训练任务（`training_jobs.project_id`）与模型评估（`evaluations.project_id`）也归属到项目（均使用 `ON DELETE RESTRICT`，见第 14、15 节）。
 
 ### 模型仓库接口
 
@@ -1159,5 +1161,65 @@ exports/data-versions/
 ### 模型仓库自动与手动入库
 
 - **自动入库**：`auto_register = true`（默认开启）时，`POST .../complete` 在标记任务成功后自动调用 `model.Service.RegisterTrainedModel`，将 `runs/job-<ID>/weights/best.pt` 注册进所属项目的模型仓库（记录 `models.training_job_id = job.id`，更新 `training_jobs.best_model_id`）；若项目此时已被移入回收站或权重校验失败，任务本身仍保持 `succeeded`，日志记录原因，用户可在恢复后手动入库。
-- **手动入库**：对已有权重产物的任务（包括成功任务，以及中途停止或失败但已产出 `best.pt` / `last.pt` 的任务），用户可通过 `POST /api/v1/training/jobs/{id}/register-model` 选择 `variant = best` 或 `last` 并填写说明，将对应权重注册为模型仓库的新版本（已注册且仍在模型仓库中时返回 409；若此前注册的模型已被移入回收站或删除，允许重新入库）。模型详情页展示来源训练任务链接，训练任务详情页展示已入库模型的版本链接，形成“数据集 / 审图版本 → 数据版本 → 训练任务 → 模型仓库 → 模型审图 / ONNX 导出”的完整闭环。
+- **手动入库**：对已有权重产物的任务（包括成功任务，以及中途停止或失败但已产出 `best.pt` / `last.pt` 的任务），用户可通过 `POST /api/v1/training/jobs/{id}/register-model` 选择 `variant = best` 或 `last` 并填写说明，将对应权重注册为模型仓库的新版本（已注册且仍在模型仓库中时返回 409；若此前注册的模型已被移入回收站或删除，允许重新入库）。模型详情页展示来源训练任务链接，训练任务详情页展示已入库模型的版本链接，形成“数据集 / 审图版本 → 数据版本 → 训练任务 → 模型仓库 → 模型审图 / 模型评估 / ONNX 导出”的完整闭环。
+
+## 15. 模型评估
+
+模型评估（`internal/evaluation`、`internal/httpapi/evaluations.go` 与 `evaluation_agent.go`、`trainer/trainmaster_trainer/evaluation.py`、`frontend/src/features/evaluation/`）用于对模型仓库中已就绪的 Ultralytics YOLO 目标检测模型（`task = detect`）在指定数据源上执行批量离线推理、计算 COCO 10-IoU 与工业质检 OK/NG 指标、支持毫秒级动态 Conf / IoU 重算与样本检视、支持 2–6 个评估并排对比（同源数据源自动开启逐图差异）以及导出离线 HTML + SVG / CSV / JSON 报告。
+
+### 数据模型与存储布局
+
+- `0020_evaluations.sql` 定义两张表：
+  - `evaluations`：所属项目 `project_id`（`ON DELETE RESTRICT`，由项目删除流程通过 `delete_evaluations=true` 保护）、评估模型 `model_id`（`ON DELETE SET NULL`）及创建时冻结的 `model_ref` 快照（版本号、YOLO 版本、规模、类别列表、SHA256）、名称与描述、数据源类型 `source_type`（`data_version` / `datasets`）、关联数据版本 `data_version_id`（`ON DELETE SET NULL`）、冻结的来源配置快照 `source_config` 与规范化指纹 `source_fingerprint`（SHA256，用于判定两个评估是否严格同源）、推理与默认阈值选项 `options`（`conf`、`iou`、`store_min_conf`、`nms_iou`、`imgsz`、`batch`、`max_det`、`half`、`device`）、按名称并集对齐的类别映射 `classes`、任务队列状态（`queued` / `running` / `succeeded` / `failed` / `canceled`、`stage`、`node_id`、`attempts`、`lease_expires_at`、进度 `processed_images` / `total_images`）、当前默认工作点汇总 `summary`（mAP50、mAP75、mAP50-95、P/R/F1、最佳 F1 工作点、OK/NG 过杀漏杀统计、推理速度）以及预测归档信息 `predictions_size_bytes`。
+  - `evaluation_images`：创建任务时冻结的每张评估样本（`evaluation_id` `ON DELETE CASCADE`、`image_index`、`sample_key`、`file_name`、`rel_path`、`split`、`width`、`height`、`dataset_id`、`dataset_image_id`、`data_version_image_id`、`gt_boxes` 真实标注框 JSONB）。`sample_key` 在同源数据上保持确定性一致，用于多模型同源逐图差异对齐。
+- **推理缓存文件**（`runs/evaluations/eval-<评估ID>/predictions.json.gz`）：
+  - 训练节点以较低置信度下限（默认 `store_min_conf = 0.05`）完成一次批量推理后，将每张图的所有候选检测框 `[x1, y1, x2, y2, conf, class_name]` 经 gzip 压缩上传；服务端核验租约后先写临时文件并原子改名落盘。
+  - 删除评估（单个删除或随项目级联删除）时同步清理对应的 `runs/evaluations/eval-<ID>/` 目录；原模型或数据版本移入回收站不影响已完成的评估记录（通过快照与图片索引继续展示）。
+
+### 类别对齐与指标计算引擎（`internal/evaluation/metrics.go`）
+
+- **按名称取并集对齐**：不依赖数字 `class_id` 顺序，以评估数据源出现的所有 GT 类别名称与模型 `info.class_names` 取规范化并集，每个类别标注 `status`：`matched`（双方共有）、`dataset_only`（仅数据源存在，模型无法检出，AP 计 0 并参与宏平均）、`model_only`（仅模型存在，预测出该类框时记为背景误检 FP，不稀释 mAP 分母）。
+- **COCO 10-IoU 与 101 点插值**：
+  - 逐类按预测置信度降序贪心匹配 GT（单个 GT 至多匹配一次），在 10 个标准 IoU 阈值（`0.50, 0.55, …, 0.95`）下分别计算 101 点单调包络 Precision-Recall 曲线面积，产出精确的 `AP50`、`AP75`、`AP50-95` 与宏平均 `mAP50`、`mAP75`、`mAP50-95`。
+  - 同步在当前 `iou` 阈值下生成 101 个置信度采样点（`0.00..1.00`）的 `PR`、`F1-Conf`、`P-Conf`、`R-Conf` 曲线（含 `all` 宏观均值曲线与各类别曲线），并定位全局最大 F1 对应置信度 `best_f1_conf`。
+- **工业质检 OK/NG 指标**：按图片级别统计（无 GT 框为真 OK，有 ≥1 个 GT 框为真 NG；当前阈值下预测 0 框判为 OK，≥1 框判为 NG），计算 `true_ok`、`overkill`（过杀：OK→NG）、`true_ng`、`escape`（漏杀：NG→OK）、`overkill_rate` 与 `escape_rate`。
+- **含背景 `(N+1)×(N+1)` 混淆矩阵与样本匹配**：对每张图执行当前 `(conf, iou)` 下的贪心匹配，同时记录类内 TP、类间误分类、背景误检（FP 行）与漏检（FN 列），并支持服务端按错误类型、类别、混淆矩阵 `(gt_class, pred_class)` 单元格、关键词搜索、排序与分页检索样本及返回单图 GT/TP/FP/FN 叠加详情。
+- **动态阈值与 LRU 分析缓存**：`analysis.go` 对已落盘的 `predictions.json.gz` 缓存解压后的结构，在用户拖动 Conf / IoU 滑块或发起统一阈值多模型对比时直接纯内存重算（毫秒级响应）；确认满意后可通过 `PATCH /api/v1/evaluations/{id}` 将该 `(default_conf, default_iou)` 写回 `options` 与 `summary` 作为新的默认工作点。
+
+### 队列调度与训练节点执行协议
+
+- **任务领取**：`evaluation.Service` 实现 `model.TaskSource`（`Kind() = "model_evaluation"`），接入第 9 节统一长轮询领取接口 `POST /api/v1/compute/agent/tasks/claim`（`FOR UPDATE SKIP LOCKED`）。后台协程每 15 秒扫描租约超时（90 秒）的 `running` 任务：未满 3 次自动退回 `queued`，满 3 次标记 `failed`。
+- **训练节点执行**（`trainer/trainmaster_trainer/evaluation.py`）：
+  1. **权重下载与零拷贝图源**：下载模型 `.pt` 并校验 `X-Content-Sha256`；分页拉取冻结样本清单 `GET .../images?after=&limit=`。若为冻结数据版本且节点挂载了共享存储目录，直接原位读取图片文件（零复制）；否则按样本通过 `GET .../images/{sampleId}/file` 拉取图片到节点临时目录。
+  2. **离线安全推理与测速**：注入离线与安全加载环境变量（`YOLO_OFFLINE=1`、`ULTRALYTICS_OFFLINE=1`、`YOLO_AUTOINSTALL=False`、`ULTRALYTICS_SAFE_LOAD=1`），执行预热推理后以 `conf = store_min_conf`、`iou = nms_iou`、`max_det`、`imgsz`、`batch`、`half`、`device` 批量推理，累计 `preprocess_ms` / `inference_ms` / `postprocess_ms` / `total_ms` / `fps`，按批次调用 `POST .../progress` 续期并汇报进度（遇到 404/409 立即取消停止）。
+  3. **压缩上报与完成**：推理完成后先将全量预测框与测速汇总通过 gzip 压缩体上传至 `POST .../results`（`Content-Encoding: gzip`），服务端核验租约后原子落盘 `predictions.json.gz` 并计算默认工作点指标；节点随后调用 `POST .../complete` 提交运行元信息，服务端将状态原子更新为 `succeeded`。
+
+### 接口一览
+
+| 方法与路径 | 说明 |
+|---|---|
+| `POST /api/v1/evaluations/preview` | 实时预览数据源样本统计（总图数、总框数、OK/NG 比例）与每个所选模型的类别对齐结果（`matched` / `dataset_only` / `model_only`） |
+| `GET /api/v1/evaluations` | 评估列表 `{items, total}`，支持 `project_id`、`model_id`、`data_version_id`、`status`、`q` 筛选 |
+| `POST /api/v1/evaluations` | 批量创建评估（支持 `model_ids` 最多 12 个同源模型；返回 201 `{items, total}`）；校验数据源非空且模型为已就绪检测模型 |
+| `GET /api/v1/evaluations/{id}` | 评估详情（含排队位次 `queue_position`、在线评估节点数 `workers_online`、来源快照、类别对齐与默认汇总指标） |
+| `PATCH /api/v1/evaluations/{id}` | 更新名称、描述，或将指定 `default_conf` / `default_iou` 重算并保存为新的默认工作点 |
+| `DELETE /api/v1/evaluations/{id}` | 删除评估记录并清理 `runs/evaluations/eval-<ID>/` 目录（返回 204） |
+| `POST /api/v1/evaluations/{id}/cancel` | 取消排队中或执行中的评估任务 |
+| `POST /api/v1/evaluations/{id}/retry` | 对 `failed` / `canceled` 的评估重新入队 |
+| `GET /api/v1/evaluations/{id}/analysis?conf=&iou=` | 动态阈值分析：返回当前 `(conf, iou)` 下的汇总指标、各类别指标、101 点四组曲线、OK/NG 矩阵与 `(N+1)×(N+1)` 混淆矩阵 |
+| `GET /api/v1/evaluations/{id}/samples?conf=&iou=&error_type=&class_name=&gt_class=&pred_class=&q=&sort=&offset=&limit=` | 按错误类型、类别、混淆矩阵单元格下钻、关键词与排序分页检索样本列表 |
+| `GET /api/v1/evaluations/{id}/samples/{sampleId}?conf=&iou=` | 单图详情：返回原图/缩略图 URL、标注工作台深链与当前阈值下分类好的 GT / TP / FP / FN 检测框 |
+| `GET /api/v1/evaluations/{id}/export?format=&conf=&iou=&inline=` | 导出离线单文件报告（`html`）、完整指标（`json`）、各类别表（`classes_csv`）或样本明细（`samples_csv`） |
+| `GET /api/v1/evaluations/compare?ids=&mode=&conf=&iou=` | 2–6 个已完成评估并排对比（支持 `default` / `unified` 阈值模式），返回聚合对比、叠加曲线与 `same_source` 标记 |
+| `GET /api/v1/evaluations/compare/diff?ids=&mode=&conf=&iou=&diff_type=&q=&offset=&limit=` | 同源评估逐图差异列表（`improved` / `regressed` / `both_wrong` / `both_correct` / `all`），不同源时返回 409 |
+| `GET /api/v1/evaluations/compare/diff/{sampleKey}?ids=&mode=&conf=&iou=` | 同源单图跨模型检测框并排检视详情 |
+| `GET /api/v1/evaluations/compare/export?ids=&format=&mode=&conf=&iou=&inline=` | 导出多模型对比离线 HTML + SVG 报告（`html`）或指标对比表（`csv`） |
+| `GET /api/v1/compute/agent/evaluations/{id}/model` | 节点流式下载待评估 `.pt` 模型权重（带 `X-Content-Sha256`） |
+| `GET /api/v1/compute/agent/evaluations/{id}/images?after=&limit=` | 节点分页拉取冻结的评估样本清单 |
+| `GET /api/v1/compute/agent/evaluations/{id}/images/{sampleId}/file` | 节点按样本 ID 流式下载单张评估图片（非零拷贝场景） |
+| `POST /api/v1/compute/agent/evaluations/{id}/progress` | 节点上报进度与阶段并续期租约（任务取消或删除时返回 409 / 404） |
+| `POST /api/v1/compute/agent/evaluations/{id}/results` | 节点上传 gzip 压缩的原始预测框与测速汇总，服务端落盘并计算默认指标 |
+| `POST /api/v1/compute/agent/evaluations/{id}/complete` | 节点提交运行摘要完成评估并原子置为 `succeeded` |
+| `POST /api/v1/compute/agent/evaluations/{id}/fail` | 节点上报评估执行失败与异常堆栈 |
+
 

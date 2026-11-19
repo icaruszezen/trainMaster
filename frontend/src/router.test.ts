@@ -6,6 +6,10 @@ import { DataVersionDetailPage } from "@/features/data-versions/data-version-det
 import { DataVersionsPage } from "@/features/data-versions/data-versions-page"
 import { NewDataVersionPage } from "@/features/data-versions/new-data-version-page"
 import { DatasetDetailPage } from "@/features/datasets/dataset-detail-page"
+import { EvaluationComparePage } from "@/features/evaluation/evaluation-compare-page"
+import { EvaluationDetailPage } from "@/features/evaluation/evaluation-detail-page"
+import { EvaluationsPage } from "@/features/evaluation/evaluations-page"
+import { NewEvaluationPage } from "@/features/evaluation/new-evaluation-page"
 import { InferencePage } from "@/features/models/inference-page"
 import { ModelDetailPage } from "@/features/models/model-detail-page"
 import { ModelsPage } from "@/features/models/models-page"
@@ -122,6 +126,22 @@ describe("routes", () => {
     expect(leafComponent("/datasets/reviews/3/extra")).toBe(NotFoundPage)
     // 数据集详情不受影响。
     expect(leafComponent("/datasets/12")).toBe(DatasetDetailPage)
+  })
+
+  it("routes model evaluations and their subpages", () => {
+    expect(leafComponent("/evaluation")).toBe(EvaluationsPage)
+    expect(leafComponent("/evaluation/new")).toBe(NewEvaluationPage)
+    expect(leafComponent("/evaluation/compare")).toBe(EvaluationComparePage)
+    expect(leafComponent("/evaluation/42")).toBe(EvaluationDetailPage)
+    expect(leafComponent("/evaluation/42/extra")).toBe(NotFoundPage)
+    for (const path of [
+      "/evaluation",
+      "/evaluation/new",
+      "/evaluation/compare",
+      "/evaluation/42",
+    ]) {
+      expect(leaf(path)?.handle, path).toBeUndefined()
+    }
   })
 
   it("marks only the 404 route as not found", () => {

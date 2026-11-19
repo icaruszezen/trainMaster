@@ -248,8 +248,9 @@ export function updateProject(
 /**
  * 删除项目；其中的数据集保留，只是不再属于该项目。项目中有模型时必须同时删除
  * 模型（`deleteModels`，模型移入回收站），有数据版本时必须同时删除数据版本
- * （`deleteDataVersions`：已生成的移入回收站，其余直接删除），否则 409
- * `conflict`。
+ * （`deleteDataVersions`：已生成的移入回收站，其余直接删除），有训练任务或
+ * 模型评估时也需确认一并永久删除（`deleteTrainingJobs` / `deleteEvaluations`），
+ * 否则返回 409 `conflict`。
  */
 export function deleteProject(
   id: number,
@@ -257,6 +258,7 @@ export function deleteProject(
     deleteModels = false,
     deleteDataVersions = false,
     deleteTrainingJobs = false,
+    deleteEvaluations = false,
   } = {}
 ) {
   const params = new URLSearchParams()
@@ -268,6 +270,9 @@ export function deleteProject(
   }
   if (deleteTrainingJobs) {
     params.set("delete_training_jobs", "true")
+  }
+  if (deleteEvaluations) {
+    params.set("delete_evaluations", "true")
   }
   const query = params.toString()
   return apiSend<void>(

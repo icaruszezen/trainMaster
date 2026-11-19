@@ -4,10 +4,9 @@ import {
   Boxes,
   Database,
   FolderKanban,
+  Gauge,
   Images,
-  ListChecks,
   Rocket,
-  type LucideIcon,
 } from "lucide-react"
 import { Link } from "react-router"
 
@@ -23,6 +22,14 @@ import {
 import { Skeleton } from "@/components/ui/skeleton"
 import { getNavItem, type ModuleId } from "@/config/navigation"
 import { datasetsQuery } from "@/features/datasets/api"
+import {
+  evaluationsQuery,
+  isActiveEvaluation,
+} from "@/features/evaluation/api"
+import {
+  EVALUATIONS_PATH,
+  newEvaluationPath,
+} from "@/features/evaluation/paths"
 import { modelsQuery } from "@/features/models/api"
 import { projectsQuery } from "@/features/projects/api"
 import { SystemStatusCard } from "@/features/system/system-status-card"
@@ -33,11 +40,6 @@ import {
   TRAINING_JOBS_PATH,
 } from "@/features/training/paths"
 import { formatNumber, formatPercent, percentOf } from "@/lib/format"
-
-/** 尚未开发的模块的统计项：对应模块完成后再接入真实数据。 */
-const plannedStats: { title: string; icon: LucideIcon }[] = [
-  { title: "标注任务", icon: ListChecks },
-]
 
 const workflow: { moduleId: ModuleId; title: string; description: string }[] = [
   {
@@ -63,7 +65,7 @@ const workflow: { moduleId: ModuleId; title: string; description: string }[] = [
   {
     moduleId: "evaluations",
     title: "模型评估",
-    description: "评估 mAP 等指标，分析漏检误检",
+    description: "动态调阈值、分析曲线与混淆矩阵，定位漏检误检",
   },
   {
     moduleId: "models",
@@ -85,16 +87,7 @@ export function DashboardPage() {
         <DatasetStats />
         <ModelStat />
         <TrainingStat />
-        {plannedStats.map((stat) => (
-          <StatCard
-            key={stat.title}
-            title={stat.title}
-            icon={stat.icon}
-            value="—"
-          >
-            功能开发中
-          </StatCard>
-        ))}
+        <EvaluationStat />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-3">
@@ -232,6 +225,40 @@ function TrainingStat() {
           : data.total > 0
             ? "查看全部"
             : "发起训练"}
+        <ArrowRight className="size-3" />
+      </Link>
+    </StatCard>
+  )
+}
+
+/** 模型评估数量与活跃状态，数据来自评估任务列表。 */
+function EvaluationStat() {
+  const { data, isPending } = useQuery(evaluationsQuery())
+
+  if (data === undefined) {
+    return (
+      <StatCard
+        title="模型评估"
+        icon={Gauge}
+        value={isPending ? <Skeleton className="h-8 w-16" /> : "—"}
+      >
+        {isPending ? "正在加载…" : "无法获取数据"}
+      </StatCard>
+    )
+  }
+
+  const activeCount = data.items.filter(isActiveEvaluation).length
+  return (
+    <StatCard title="模型评估" icon={Gauge} value={formatNumber(data.total)}>
+      <Link
+        to={data.total > 0 ? EVALUATIONS_PATH : newEvaluationPath()}
+        className="inline-flex items-center gap-1 self-start underline-offset-4 hover:text-foreground hover:underline"
+      >
+        {activeCount > 0
+          ? `${formatNumber(activeCount)} 个进行中`
+          : data.total > 0
+            ? "查看全部"
+            : "发起评估"}
         <ArrowRight className="size-3" />
       </Link>
     </StatCard>
