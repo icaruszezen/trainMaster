@@ -127,7 +127,9 @@ func TestErrorEnvelopes(t *testing.T) {
 		{"POST", "/api/v1/annotation/tasks/42/items", 501, "not_implemented"},
 		{"PUT", "/api/v1/annotation/tasks/7", 501, "not_implemented"},
 		{"GET", "/api/v1/annotation/labels", 501, "not_implemented"},
-		{"DELETE", "/api/v1/evaluations/3/report", 501, "not_implemented"},
+		// Without an evaluation service the evaluation routes are not mounted.
+		{"GET", "/api/v1/evaluations", 404, "not_found"},
+		{"DELETE", "/api/v1/evaluations/3/report", 404, "not_found"},
 		// Without a model service the model routes are not mounted.
 		{"PATCH", "/api/v1/models", 404, "not_found"},
 		{"GET", "/api/v1/models/1", 404, "not_found"},

@@ -19,6 +19,7 @@ import (
 	"github.com/icaruszezen/trainmaster/backend/internal/database"
 	"github.com/icaruszezen/trainmaster/backend/internal/dataset"
 	"github.com/icaruszezen/trainmaster/backend/internal/dataversion"
+	"github.com/icaruszezen/trainmaster/backend/internal/evaluation"
 	"github.com/icaruszezen/trainmaster/backend/internal/hostinfo"
 	"github.com/icaruszezen/trainmaster/backend/internal/httpapi"
 	"github.com/icaruszezen/trainmaster/backend/internal/model"
@@ -113,14 +114,24 @@ func run() error {
 	// runs before the services whose data it reads.
 	dataVersions := dataversion.NewService(dataversion.Options{DB: db.Pool, Storage: store,
 		StorageNodes: storageNodes, Logger: log, Datasets: datasets, Projects: projects})
-	// Model reviews and YOLO training jobs register themselves as task sources
-	// with the model service before models.Start begins serving claims.
+	// Model evaluations, model reviews, and YOLO training jobs register
+	// themselves as task sources with the model service before models.Start
+	// begins serving claims (evaluations are short interactive jobs, so they
+	// precede long training jobs).
+	evaluations := evaluation.NewService(evaluation.ServiceOptions{
+		DB: db.Pool, Storage: store, StorageNodes: storageNodes, Logger: log,
+		Projects: projects, Datasets: datasets, DataVersions: dataVersions, Models: models,
+	})
 	reviews := review.NewService(review.Options{DB: db.Pool, Storage: store, Logger: log, Datasets: datasets,
 		Models: models, Projects: projects})
 	trainingJobs := training.NewService(training.Options{DB: db.Pool, Storage: store,
 		StorageNodes: storageNodes, Logger: log, Projects: projects, DataVersions: dataVersions, Models: models})
 	models.Start(ctx)
 	defer models.Stop()
+	if err := evaluations.Start(ctx); err != nil {
+		return interrupted(ctx, log, err)
+	}
+	defer evaluations.Stop()
 	if err := reviews.Start(ctx); err != nil {
 		return interrupted(ctx, log, err)
 	}
@@ -159,6 +170,7 @@ func run() error {
 		Reviews:           reviews,
 		DataVersions:      dataVersions,
 		Training:          trainingJobs,
+		Evaluations:       evaluations,
 		ReviewerTool:      cfg.ReviewerTool,
 		TrainerPackageDir: cfg.TrainerPackageDir,
 		Host:              host,

@@ -4,7 +4,12 @@
  * `/projects/3?tab=data-versions`。
  */
 export type DetailTab =
-  "datasets" | "classes" | "data-versions" | "training-jobs" | "models"
+  | "datasets"
+  | "classes"
+  | "data-versions"
+  | "training-jobs"
+  | "models"
+  | "evaluations"
 
 /** 某个标签页的链接。 */
 export function projectTabPath(projectId: number, tab: DetailTab) {
@@ -23,6 +28,7 @@ export function parseDetailTab(value: string | null): DetailTab {
     case "data-versions":
     case "training-jobs":
     case "models":
+    case "evaluations":
       return value
     default:
       return "datasets"

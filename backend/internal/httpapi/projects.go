@@ -54,7 +54,7 @@ func projectErrorStatus(kind error) (int, string) {
 		return http.StatusNotFound, codeNotFound
 	case project.ErrInvalid:
 		return http.StatusUnprocessableEntity, codeValidationFailed
-	case project.ErrConflict, project.ErrHasModels, project.ErrHasDataVersions, project.ErrHasTrainingJobs:
+	case project.ErrConflict, project.ErrHasModels, project.ErrHasDataVersions, project.ErrHasTrainingJobs, project.ErrHasEvaluations:
 		return http.StatusConflict, codeConflict
 	case project.ErrNameTaken:
 		return http.StatusConflict, codeNameTaken
@@ -165,12 +165,23 @@ func (s *server) deleteProject(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	deleteEvaluations, ok := boolQuery(w, r, "delete_evaluations")
+	if !ok {
+		return
+	}
 	deleteModels = deleteModels && s.models != nil
 	deleteDataVersions = deleteDataVersions && s.dataVersions != nil
 	deleteTrainingJobs = deleteTrainingJobs && s.training != nil
-	if err := s.projects.CheckDeleteAll(r.Context(), id, deleteModels, deleteDataVersions, deleteTrainingJobs); err != nil {
+	deleteEvaluations = deleteEvaluations && s.evaluations != nil
+	if err := s.projects.CheckDeleteFull(r.Context(), id, deleteModels, deleteDataVersions, deleteTrainingJobs, deleteEvaluations); err != nil {
 		s.projectError(w, r, err)
 		return
+	}
+	if deleteEvaluations {
+		if err := s.evaluations.DeleteProjectEvaluations(r.Context(), id); err != nil {
+			s.evaluationError(w, r, err)
+			return
+		}
 	}
 	if deleteTrainingJobs {
 		if err := s.training.DeleteProjectJobs(r.Context(), id); err != nil {

@@ -13,6 +13,8 @@ export type ProjectDependants = {
   readyDataVersions: number | null
   /** 项目下的训练任务数。 */
   trainingJobs?: number
+  /** 项目下的模型评估数。 */
+  evaluations?: number
 }
 
 /** 删除按钮的文字。 */
@@ -20,12 +22,14 @@ export function deleteProjectLabel({
   models,
   dataVersions,
   trainingJobs = 0,
+  evaluations = 0,
 }: ProjectDependants) {
   const items = [
     "项目",
     models > 0 ? "模型" : null,
     dataVersions > 0 ? "数据版本" : null,
     trainingJobs > 0 ? "训练任务" : null,
+    evaluations > 0 ? "模型评估" : null,
   ].filter((item): item is string => item !== null)
   if (items.length === 1) {
     return "删除项目"
@@ -38,11 +42,13 @@ export function dependantsNotice({
   models,
   dataVersions,
   trainingJobs = 0,
+  evaluations = 0,
 }: ProjectDependants) {
   const parts = [
     models > 0 ? `${formatNumber(models)} 个模型` : null,
     dataVersions > 0 ? `${formatNumber(dataVersions)} 个数据版本` : null,
     trainingJobs > 0 ? `${formatNumber(trainingJobs)} 个训练任务` : null,
+    evaluations > 0 ? `${formatNumber(evaluations)} 个模型评估` : null,
   ].filter((part) => part !== null)
   if (parts.length === 0) {
     return null
@@ -54,7 +60,9 @@ export function dependantsNotice({
         ? "模型"
         : dataVersions > 0
           ? "数据版本"
-          : "训练任务"
+          : trainingJobs > 0
+            ? "训练任务"
+            : "模型评估"
   return `项目中有 ${parts.join("、")}；${subject}只属于这个项目，需要一起删除。`
 }
 
@@ -94,18 +102,21 @@ export function deletedProjectDescription(
     dataVersions,
     readyDataVersions,
     trainingJobs = 0,
+    evaluations = 0,
   }: ProjectDependants,
   retentionDays: number
 ) {
-  const jobsSuffix =
-    trainingJobs > 0
-      ? `${formatNumber(trainingJobs)} 个训练任务已永久删除。`
-      : ""
+  const permParts = [
+    trainingJobs > 0 ? `${formatNumber(trainingJobs)} 个训练任务` : null,
+    evaluations > 0 ? `${formatNumber(evaluations)} 个模型评估` : null,
+  ].filter((part) => part !== null)
+  const permSuffix =
+    permParts.length > 0 ? `${permParts.join("与 ")}已永久删除。` : ""
   // 不知道哪些已生成时，按“已生成的移入回收站”笼统地说明。
   if (readyDataVersions === null && dataVersions > 0) {
     const modelText =
       models > 0 ? `${formatNumber(models)} 个模型已移入回收站；` : ""
-    return `${modelText}${formatNumber(dataVersions)} 个数据版本已删除，其中已生成的移入回收站。${retentionDays} 天内可以在“系统管理 · 回收站”中恢复，项目随之恢复。${jobsSuffix}`
+    return `${modelText}${formatNumber(dataVersions)} 个数据版本已删除，其中已生成的移入回收站。${retentionDays} 天内可以在“系统管理 · 回收站”中恢复，项目随之恢复。${permSuffix}`
   }
   const ready = readyDataVersions ?? 0
   const binned = [
@@ -120,7 +131,7 @@ export function deletedProjectDescription(
     other > 0
       ? `${ready > 0 ? "其余 " : ""}${formatNumber(other)} 个数据版本（生成失败或未生成完成）已直接删除。`
       : null,
-    jobsSuffix || null,
+    permSuffix || null,
   ].filter((sentence) => sentence !== null)
   return sentences.length > 0 ? sentences.join("") : undefined
 }

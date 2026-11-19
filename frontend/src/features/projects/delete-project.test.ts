@@ -35,11 +35,23 @@ describe("deleteProjectLabel", () => {
         trainingJobs: 3,
       })
     ).toBe("删除项目、模型、数据版本与训练任务")
+    expect(deleteProjectLabel({ ...none, evaluations: 4 })).toBe(
+      "删除项目与模型评估"
+    )
+    expect(
+      deleteProjectLabel({
+        models: 1,
+        dataVersions: 2,
+        readyDataVersions: 2,
+        trainingJobs: 3,
+        evaluations: 2,
+      })
+    ).toBe("删除项目、模型、数据版本、训练任务与模型评估")
   })
 })
 
 describe("dependantsNotice", () => {
-  it("explains why models, data versions, and training jobs go too", () => {
+  it("explains why models, data versions, training jobs, and evaluations go too", () => {
     expect(dependantsNotice(none)).toBeNull()
     expect(dependantsNotice({ ...none, models: 2 })).toBe(
       "项目中有 2 个模型；模型只属于这个项目，需要一起删除。"
@@ -49,6 +61,9 @@ describe("dependantsNotice", () => {
     )
     expect(dependantsNotice({ ...none, trainingJobs: 3 })).toBe(
       "项目中有 3 个训练任务；训练任务只属于这个项目，需要一起删除。"
+    )
+    expect(dependantsNotice({ ...none, evaluations: 5 })).toBe(
+      "项目中有 5 个模型评估；模型评估只属于这个项目，需要一起删除。"
     )
     expect(dependantsNotice({ ...none, models: 1, dataVersions: 4 })).toBe(
       "项目中有 1 个模型、4 个数据版本；它们只属于这个项目，需要一起删除。"
@@ -143,5 +158,14 @@ describe("deletedProjectDescription", () => {
     ).toBe(
       "2 个数据版本已删除，其中已生成的移入回收站。7 天内可以在“系统管理 · 回收站”中恢复，项目随之恢复。"
     )
+  })
+
+  it("mentions permanently deleted training jobs and evaluations", () => {
+    expect(deletedProjectDescription({ ...none, evaluations: 3 }, 7)).toBe(
+      "3 个模型评估已永久删除。"
+    )
+    expect(
+      deletedProjectDescription({ ...none, trainingJobs: 2, evaluations: 4 }, 7)
+    ).toBe("2 个训练任务与 4 个模型评估已永久删除。")
   })
 })

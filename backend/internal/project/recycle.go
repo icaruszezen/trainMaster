@@ -89,7 +89,7 @@ func (s *Service) deleteProject(ctx context.Context, id int64) (soft bool, err e
 		} else if err != nil {
 			return err
 		}
-		trashed, err := checkDelete(ctx, tx, id, false, false, false)
+		trashed, err := checkDelete(ctx, tx, id, false, false, false, false)
 		if err != nil {
 			return err
 		}
@@ -128,25 +128,31 @@ func (s *Service) deleteProject(ctx context.Context, id int64) (soft bool, err e
 // before any of them is moved. A project that is not in use is
 // ErrNotFound. DeleteProject checks again under its locks.
 func (s *Service) CheckDelete(ctx context.Context, id int64, withModels, withDataVersions bool) error {
-	return s.CheckDeleteAll(ctx, id, withModels, withDataVersions, false)
+	return s.CheckDeleteFull(ctx, id, withModels, withDataVersions, false, false)
 }
 
 // CheckDeleteAll is CheckDelete with an additional flag for training jobs
 // that are about to be deleted with the project.
 func (s *Service) CheckDeleteAll(ctx context.Context, id int64, withModels, withDataVersions, withTrainingJobs bool) error {
+	return s.CheckDeleteFull(ctx, id, withModels, withDataVersions, withTrainingJobs, false)
+}
+
+// CheckDeleteFull checks all resources owned by the project before deletion.
+func (s *Service) CheckDeleteFull(ctx context.Context, id int64, withModels, withDataVersions, withTrainingJobs, withEvaluations bool) error {
 	if err := s.Exists(ctx, id); err != nil {
 		return err
 	}
-	_, err := checkDelete(ctx, s.db, id, withModels, withDataVersions, withTrainingJobs)
+	_, err := checkDelete(ctx, s.db, id, withModels, withDataVersions, withTrainingJobs, withEvaluations)
 	return err
 }
 
 // checkDelete fails with ErrHasModels when the project has models in use
 // (unless skipModels), ErrHasDataVersions when it has data versions in use
-// (unless skipDataVersions), or ErrHasTrainingJobs when it has training jobs
-// (unless skipTrainingJobs). trashed reports whether models or data versions
+// (unless skipDataVersions), ErrHasTrainingJobs when it has training jobs
+// (unless skipTrainingJobs), or ErrHasEvaluations when it has evaluations
+// (unless skipEvaluations). trashed reports whether models or data versions
 // of it are in the recycle bin (the project must stay with them).
-func checkDelete(ctx context.Context, q querier, id int64, skipModels, skipDataVersions, skipTrainingJobs bool) (trashed bool, err error) {
+func checkDelete(ctx context.Context, q querier, id int64, skipModels, skipDataVersions, skipTrainingJobs, skipEvaluations bool) (trashed bool, err error) {
 	liveModels, trashedModels, err := countModels(ctx, q, id)
 	if err != nil {
 		return false, err
@@ -168,6 +174,13 @@ func checkDelete(ctx context.Context, q querier, id int64, skipModels, skipDataV
 	if trainingJobs > 0 && !skipTrainingJobs {
 		return false, newError(ErrHasTrainingJobs, "项目中有 %d 个训练任务，请先删除训练任务，或选择同时删除训练任务", trainingJobs)
 	}
+	evaluations, err := countEvaluations(ctx, q, id)
+	if err != nil {
+		return false, err
+	}
+	if evaluations > 0 && !skipEvaluations {
+		return false, newError(ErrHasEvaluations, "项目中有 %d 个评估任务，请先删除评估任务，或选择同时删除评估任务", evaluations)
+	}
 	return trashedModels > 0 || trashedVersions > 0, nil
 }
 
@@ -181,7 +194,8 @@ func PurgeEmptyProjects(ctx context.Context, db *pgxpool.Pool) ([]int64, error) 
 	const empty = `deleted_at IS NOT NULL
 		AND NOT EXISTS (SELECT 1 FROM models m WHERE m.project_id = p.id)
 		AND NOT EXISTS (SELECT 1 FROM data_versions v WHERE v.project_id = p.id)
-		AND NOT EXISTS (SELECT 1 FROM training_jobs j WHERE j.project_id = p.id)`
+		AND NOT EXISTS (SELECT 1 FROM training_jobs j WHERE j.project_id = p.id)
+		AND NOT EXISTS (SELECT 1 FROM evaluations e WHERE e.project_id = p.id)`
 	rows, err := db.Query(ctx, "SELECT id FROM projects p WHERE "+empty+" ORDER BY id")
 	if err != nil {
 		return nil, err

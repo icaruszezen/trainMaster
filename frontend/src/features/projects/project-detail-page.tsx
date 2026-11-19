@@ -33,6 +33,8 @@ import { Tabs, TabsContent, TabsTrigger } from "@/components/ui/tabs"
 import { ProjectDataVersions } from "@/features/data-versions/project-data-versions"
 import { watchImport } from "@/features/datasets/import-watch"
 import { LoadError } from "@/features/datasets/load-error"
+import { projectEvaluationsQuery } from "@/features/evaluation/api"
+import { ProjectEvaluations } from "@/features/evaluation/project-evaluations"
 import { yoloVersionLabel } from "@/features/models/yolo-versions"
 import {
   projectClassesQuery,
@@ -134,10 +136,11 @@ function useDetailTab() {
 function ProjectDetail({ id }: { id: number }) {
   const navigate = useNavigate()
   const query = useQuery(projectQuery(id))
-  // 类别数量与训练任务数量显示在标签页上，所以随页面一起加载。
+  // 类别数量、训练任务与模型评估数量显示在标签页上，所以随页面一起加载。
   const classes = useQuery(projectClassesQuery(id))
   const labels = useQuery(projectLabelsQuery(id))
   const trainingJobs = useQuery(projectTrainingJobsQuery(id))
+  const evaluations = useQuery(projectEvaluationsQuery(id))
   const [tab, setTab] = useDetailTab()
 
   const [addOpen, setAddOpen] = useState(false)
@@ -238,6 +241,14 @@ function ProjectDetail({ id }: { id: number }) {
               {formatNumber(project.model_count)}
             </span>
           </TabsTrigger>
+          <TabsTrigger value="evaluations" className="px-3">
+            模型评估
+            {evaluations.data && (
+              <span className="text-xs text-muted-foreground tabular-nums">
+                {formatNumber(evaluations.data.total)}
+              </span>
+            )}
+          </TabsTrigger>
         </ScrollingTabsList>
         <TabsContent value="datasets">
           <ProjectDatasets
@@ -266,6 +277,12 @@ function ProjectDetail({ id }: { id: number }) {
         </TabsContent>
         <TabsContent value="models">
           <ProjectModels project={project} />
+        </TabsContent>
+        <TabsContent value="evaluations">
+          <ProjectEvaluations
+            projectId={project.id}
+            projectName={project.name}
+          />
         </TabsContent>
       </Tabs>
 

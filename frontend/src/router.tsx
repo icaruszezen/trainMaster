@@ -13,7 +13,10 @@ import { DataVersionsPage } from "@/features/data-versions/data-versions-page"
 import { NewDataVersionPage } from "@/features/data-versions/new-data-version-page"
 import { DatasetDetailPage } from "@/features/datasets/dataset-detail-page"
 import { DatasetsPage } from "@/features/datasets/datasets-page"
+import { EvaluationComparePage } from "@/features/evaluation/evaluation-compare-page"
+import { EvaluationDetailPage } from "@/features/evaluation/evaluation-detail-page"
 import { EvaluationsPage } from "@/features/evaluation/evaluations-page"
+import { NewEvaluationPage } from "@/features/evaluation/new-evaluation-page"
 import { InferencePage } from "@/features/models/inference-page"
 import { ModelDetailPage } from "@/features/models/model-detail-page"
 import { ModelsPage } from "@/features/models/models-page"
@@ -116,6 +119,9 @@ export const routes: RouteObject[] = [
             Component: AnnotationEditorPage,
             handle: { fullBleed: true } satisfies RouteHandle,
           },
+          { path: "/evaluation/new", Component: NewEvaluationPage },
+          { path: "/evaluation/compare", Component: EvaluationComparePage },
+          { path: "/evaluation/:evaluationId", Component: EvaluationDetailPage },
           {
             path: "*",
             Component: NotFoundPage,

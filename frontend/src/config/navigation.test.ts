@@ -81,6 +81,11 @@ describe("navigation config", () => {
       item: { id: "training-templates" },
       exact: false,
     })
+    expect(getNavItem("evaluations")).toMatchObject({
+      status: "ready",
+      path: "/evaluation",
+      apiPath: "/api/v1/evaluations",
+    })
   })
 
   it("marks the model repository as implemented with its API", () => {

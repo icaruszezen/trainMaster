@@ -78,6 +78,11 @@ import {
 } from "@/components/ui/table"
 import { LoadError } from "@/features/datasets/load-error"
 import {
+  EvaluateModelButton,
+  ModelEvaluationsCard,
+  ModelEvaluationsLink,
+} from "@/features/evaluation/model-evaluation-entry"
+import {
   deleteModelExport,
   isActiveExport,
   modelExportsQuery,
@@ -246,6 +251,7 @@ function ModelDetail({ id }: { id: number }) {
                 </Button>
               )}
               <ReviewWithModelButton model={model} />
+              <EvaluateModelButton model={model} />
               <Button
                 variant="outline"
                 onClick={() => actions.download(model, "pt")}
@@ -283,6 +289,7 @@ function ModelDetail({ id }: { id: number }) {
 
       <ClassList names={model.info.class_names} />
       <ModelExports model={model} actions={actions} />
+      <ModelEvaluationsCard model={model} />
 
       {dialogs}
     </>
@@ -314,6 +321,7 @@ function ModelMeta({ model, onEdit }: { model: Model; onEdit: () => void }) {
         {formatRelativeTime(model.created_at)}
       </span>
       <ModelReviewsLink modelId={model.id} />
+      <ModelEvaluationsLink modelId={model.id} />
       <Button
         variant="ghost"
         size="xs"

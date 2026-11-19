@@ -544,7 +544,12 @@ def test_task_worker_starts_after_registration_and_stops(platform, tmp_path):
         assert h.agent.tasks is created[0] and created[0].alive
         claim = platform.claims[0]
         assert claim["node_key"] == "node-key-1"
-        assert claim["kinds"] == ["model_export", "review_inference", "training_job"]
+        assert claim["kinds"] == [
+            "model_export",
+            "review_inference",
+            "training_job",
+            "model_evaluation",
+        ]
         with platform.lock:
             platform.nodes.clear()  # 重新注册不会再启动一个任务线程
         wait_until(lambda: (registered(platform) or {}).get("registrations"))

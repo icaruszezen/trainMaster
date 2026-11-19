@@ -74,6 +74,7 @@ import { Tabs, TabsContent, TabsTrigger } from "@/components/ui/tabs"
 import { dataVersionDetailPath } from "@/features/data-versions/paths"
 import { LoadError } from "@/features/datasets/load-error"
 import { TaskProgress } from "@/features/datasets/task-progress"
+import { newEvaluationPath } from "@/features/evaluation/paths"
 import {
   fetchTrainingJobLogs,
   isActiveTrainingJob,
@@ -264,12 +265,28 @@ export function TrainingJobDetailPage() {
               )}
 
               {job.best_model ? (
-                <Button variant="outline" size="sm" asChild>
-                  <Link to={`/models/${job.best_model.id}`}>
-                    <Box />
-                    查看入库模型 v{job.best_model.version}
-                  </Link>
-                </Button>
+                <>
+                  <Button variant="outline" size="sm" asChild>
+                    <Link to={`/models/${job.best_model.id}`}>
+                      <Box />
+                      查看入库模型 v{job.best_model.version}
+                    </Link>
+                  </Button>
+                  <Button variant="outline" size="sm" asChild>
+                    <Link
+                      to={newEvaluationPath({
+                        projectId: job.project_id,
+                        modelId: job.best_model.id,
+                        dataVersionId: job.data_version_live
+                          ? job.data_version_id
+                          : undefined,
+                      })}
+                    >
+                      <Gauge />
+                      评估产出模型
+                    </Link>
+                  </Button>
+                </>
               ) : null}
 
               {canRegister && (

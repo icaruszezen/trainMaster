@@ -12,6 +12,7 @@ describe("parseDetailTab", () => {
     expect(parseDetailTab("data-versions")).toBe("data-versions")
     expect(parseDetailTab("training-jobs")).toBe("training-jobs")
     expect(parseDetailTab("models")).toBe("models")
+    expect(parseDetailTab("evaluations")).toBe("evaluations")
   })
 
   it("keeps old links to the label distribution working", () => {
@@ -31,6 +32,7 @@ describe("parseDetailTab", () => {
       "data-versions",
       "training-jobs",
       "models",
+      "evaluations",
     ]
     for (const tab of tabs) {
       const url = new URL(projectTabPath(3, tab), "http://localhost")
@@ -44,5 +46,6 @@ describe("parseDetailTab", () => {
     expect(projectTabPath(3, "training-jobs")).toBe(
       "/projects/3?tab=training-jobs"
     )
+    expect(projectTabPath(3, "evaluations")).toBe("/projects/3?tab=evaluations")
   })
 })

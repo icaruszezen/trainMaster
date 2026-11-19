@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from . import __version__
+from . import evaluation as evaluation_mod
 from . import model_export as model_export_mod
 from . import review_inference as review_inference_mod
 from . import training as training_mod
@@ -48,12 +49,14 @@ REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
     model_export_mod.KIND: ("torch", "ultralytics", "onnx"),
     review_inference_mod.KIND: ("torch", "ultralytics"),
     training_mod.KIND: ("torch", "ultralytics"),
+    evaluation_mod.KIND: ("torch", "ultralytics"),
 }
 # 各类任务在状态目录 work/ 中的工作目录；任务线程启动时删除上次运行（进程崩溃、被强制结束）的残留。
 WORK_DIR_PATTERNS = (
     "model-export-*",
     f"{review_inference_mod.WORK_DIR_PREFIX}*",
     f"{training_mod.WORK_DIR_PREFIX}*",
+    f"{evaluation_mod.WORK_DIR_PREFIX}*",
 )
 
 
@@ -115,6 +118,7 @@ class TaskWorker:
         inference_image_timeout: float = DEFAULT_INFERENCE_IMAGE_TIMEOUT,
         inference_command: Sequence[str] | None = None,
         training_command: Sequence[str] | None = None,
+        evaluation_command: Sequence[str] | None = None,
         dataset_cache: training_mod.DatasetCacheManager | None = None,
     ) -> None:
         self.client = client
@@ -129,6 +133,7 @@ class TaskWorker:
         self.inference_image_timeout = inference_image_timeout
         self.inference_command = list(inference_command) if inference_command else None
         self.training_command = list(training_command) if training_command else None
+        self.evaluation_command = list(evaluation_command) if evaluation_command else None
         self.dataset_cache = dataset_cache or training_mod.DatasetCacheManager(state_dir)
         self._find_spec = find_spec
         self._wait_fn = wait
@@ -323,6 +328,17 @@ class TaskWorker:
                 node_name=self.node_name,
                 timeout=self.export_timeout,
                 command=self.export_command,
+                progress_interval=self.progress_interval,
+            )
+        if kind == evaluation_mod.KIND:
+            return evaluation_mod.ModelEvaluationTask(
+                task,
+                client=self.client,
+                node_key=self.node_key,
+                state_dir=self.state_dir,
+                node_name=self.node_name,
+                data_dir=self.data_dir,
+                command=self.evaluation_command,
                 progress_interval=self.progress_interval,
             )
         if kind == review_inference_mod.KIND:
