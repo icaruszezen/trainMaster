@@ -6,18 +6,23 @@ import {
   buildDefaultParams,
   buildTemplateDefaultParams,
   buildTemplateParamsPayload,
+  cleanParamLabel,
   countModifiedParams,
   countTemplateParamDiffs,
   filterParamSpecs,
   filterTemplatesBySource,
   formatCompactParamValue,
   formatParamsYaml,
+  getAutoOptimizerHint,
+  groupCommonSpecs,
   isParamModified,
   isParamModifiedForMode,
   listModifiedParams,
   parseFreezeText,
   parseIntListText,
+  partitionAdvancedSpecs,
   partitionTemplatesBySource,
+  splitSpecsByControlKind,
   splitSpecsByTier,
   suggestedTemplateCopyName,
   validateTrainingParams,
@@ -364,3 +369,129 @@ describe("template source helpers", () => {
     ).toBe("产线焊点检测-副本")
   })
 })
+
+describe("UI layout & grouping helpers", () => {
+  it("strips duplicate key suffixes from labels while keeping units", () => {
+    expect(cleanParamLabel("训练轮数 (epochs)", "epochs")).toBe("训练轮数")
+    expect(cleanParamLabel("最大训练时长 (time, 小时)", "time")).toBe(
+      "最大训练时长 (小时)"
+    )
+    expect(cleanParamLabel("动量 / Beta1 (momentum)", "momentum")).toBe(
+      "动量 / Beta1"
+    )
+    expect(cleanParamLabel("无括号名称", "custom_param")).toBe("无括号名称")
+  })
+
+  it("groups common params into semantic subgroups with a fallback bucket", () => {
+    const common = [
+      ...splitSpecsByTier(sampleSpecs).common,
+      {
+        key: "future_common",
+        label: "未来常用项 (future_common)",
+        group: "train" as const,
+        common: true,
+        type: "int" as const,
+        default: 1,
+        description: "未知新增常用项",
+      },
+    ]
+    const groups = groupCommonSpecs(common)
+    expect(groups.map((g) => g.label)).toEqual([
+      "训练节奏与输入",
+      "优化器与增强",
+      "其他常用参数",
+    ])
+    expect(groups[0].wide).toBe(true)
+    expect(groups[0].specs.map((s) => s.key)).toEqual([
+      "epochs",
+      "batch",
+      "imgsz",
+    ])
+    expect(groups[1].specs.map((s) => s.key)).toEqual(["lr0", "mosaic"])
+    expect(groups[2].specs.map((s) => s.key)).toEqual(["future_common"])
+  })
+
+  it("partitions advanced params into semantic subgroups and collapsible task-specific specs", () => {
+    const trainAdvanced: ParamSpec[] = [
+      ...sampleSpecs.filter((s) => !s.common && s.group === "train"),
+      {
+        key: "close_mosaic",
+        label: "末尾关闭 Mosaic 轮数 (close_mosaic)",
+        group: "train",
+        common: false,
+        type: "int",
+        default: 10,
+        description: "关闭 Mosaic",
+      },
+      {
+        key: "dropout",
+        label: "分类 Dropout 概率 (dropout)",
+        group: "train",
+        common: false,
+        type: "float",
+        default: 0,
+        task_scope: "classify",
+        description: "分类专用",
+      },
+    ]
+
+    const detectPartition = partitionAdvancedSpecs(
+      trainAdvanced,
+      "train",
+      "detect"
+    )
+    expect(detectPartition.subgroups.map((g) => g.label)).toEqual([
+      "检查点与权重",
+      "训练控制与采样",
+    ])
+    expect(detectPartition.otherTaskSpecs.map((s) => s.key)).toEqual([
+      "overlap_mask",
+      "dropout",
+    ])
+
+    const segPartition = partitionAdvancedSpecs(
+      trainAdvanced,
+      "train",
+      "segment"
+    )
+    expect(segPartition.subgroups.map((g) => g.label)).toEqual([
+      "检查点与权重",
+      "训练控制与采样",
+      "当前任务专用",
+    ])
+    expect(segPartition.subgroups[2].specs.map((s) => s.key)).toEqual([
+      "overlap_mask",
+    ])
+    expect(segPartition.otherTaskSpecs.map((s) => s.key)).toEqual(["dropout"])
+  })
+
+  it("splits pure bool toggles from regular controls including nullable_bool", () => {
+    const mixed: ParamSpec[] = [
+      sampleSpecs[0], // float
+      sampleSpecs[4], // bool
+      {
+        key: "nms",
+        label: "验证启用 NMS (nms)",
+        group: "val",
+        common: false,
+        type: "nullable_bool",
+        default: null,
+        description: "三态下拉",
+      },
+      sampleSpecs[5], // bool
+    ]
+    const { fields, toggles } = splitSpecsByControlKind(mixed)
+    expect(fields.map((s) => s.key)).toEqual(["lr0", "nms"])
+    expect(toggles.map((s) => s.key)).toEqual(["pretrained", "resume"])
+  })
+
+  it("returns auto optimizer hints only for lr0 and momentum when optimizer is auto", () => {
+    expect(getAutoOptimizerHint("lr0", { optimizer: "auto" })?.badge).toBe(
+      "auto 接管"
+    )
+    expect(getAutoOptimizerHint("momentum", {})?.badge).toBe("auto 接管")
+    expect(getAutoOptimizerHint("lr0", { optimizer: "AdamW" })).toBeNull()
+    expect(getAutoOptimizerHint("epochs", { optimizer: "auto" })).toBeNull()
+  })
+})
+

@@ -108,6 +108,286 @@ export function splitSpecsByTier(specs: readonly ParamSpec[]): {
   return { common, advanced }
 }
 
+export const IMGSZ_QUICK_PRESETS = [640, 960, 1280] as const
+
+export type ParamSubgroup = {
+  id: string
+  label: string
+  specs: ParamSpec[]
+  /** 是否优先使用双列宽布局（适用于 batch / imgsz 等组合控件）。 */
+  wide?: boolean
+}
+
+type SubgroupDefinition = {
+  id: string
+  label: string
+  keys: readonly string[]
+  wide?: boolean
+}
+
+const COMMON_SUBGROUP_DEFS: readonly SubgroupDefinition[] = [
+  {
+    id: "common_schedule_input",
+    label: "训练节奏与输入",
+    keys: ["epochs", "patience", "batch", "imgsz"],
+    wide: true,
+  },
+  {
+    id: "common_optim_aug",
+    label: "优化器与增强",
+    keys: ["optimizer", "lr0", "mosaic", "cos_lr"],
+  },
+  {
+    id: "common_runtime_io",
+    label: "设备与数据加载",
+    keys: ["device", "workers", "cache", "amp"],
+  },
+]
+
+const ADVANCED_SUBGROUP_DEFS: Record<ParamGroupKey, readonly SubgroupDefinition[]> =
+  {
+    train: [
+      {
+        id: "train_checkpoint",
+        label: "检查点与权重",
+        keys: ["pretrained", "cls_remap", "resume", "save", "save_period"],
+      },
+      {
+        id: "train_control",
+        label: "训练控制与采样",
+        keys: [
+          "time",
+          "close_mosaic",
+          "fraction",
+          "multi_scale",
+          "freeze",
+          "seed",
+          "deterministic",
+          "single_cls",
+          "rect",
+        ],
+      },
+      {
+        id: "train_runtime",
+        label: "编译与运行调试",
+        keys: ["compile", "channels_last", "profile", "verbose"],
+      },
+    ],
+    hyperparameters: [
+      {
+        id: "hyp_lr",
+        label: "学习率与正则化",
+        keys: ["lrf", "momentum", "weight_decay", "nbs"],
+      },
+      {
+        id: "hyp_warmup",
+        label: "预热策略",
+        keys: ["warmup_epochs", "warmup_momentum", "warmup_bias_lr"],
+      },
+      {
+        id: "hyp_loss",
+        label: "基础损失权重",
+        keys: ["box", "cls", "cls_pw", "dfl", "dis"],
+      },
+    ],
+    augmentation: [
+      {
+        id: "aug_color",
+        label: "色彩空间扰动",
+        keys: ["hsv_h", "hsv_s", "hsv_v", "bgr"],
+      },
+      {
+        id: "aug_geo",
+        label: "几何变换与翻转",
+        keys: [
+          "degrees",
+          "translate",
+          "scale",
+          "shear",
+          "perspective",
+          "flipud",
+          "fliplr",
+        ],
+      },
+      {
+        id: "aug_mix",
+        label: "图像混合增强",
+        keys: ["mixup", "cutmix"],
+      },
+    ],
+    val: [
+      {
+        id: "val_eval",
+        label: "验证开关与阈值",
+        keys: ["val", "split", "iou", "conf", "max_det", "classes"],
+      },
+      {
+        id: "val_infer",
+        label: "NMS 与推理精度",
+        keys: ["nms", "agnostic_nms", "augment", "dnn", "quantize"],
+      },
+      {
+        id: "val_output",
+        label: "图表与结果输出",
+        keys: ["plots", "line_width", "save_json", "save_txt", "save_conf"],
+      },
+    ],
+  }
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+/**
+ * 清理后端参数名称中与 key 重复的括号后缀，避免与旁边的等宽 key 标签重复展示。
+ * 例：`"训练轮数 (epochs)"` -> `"训练轮数"`；`"最大训练时长 (time, 小时)"` -> `"最大训练时长 (小时)"`。
+ */
+export function cleanParamLabel(label: string, key: string): string {
+  const escaped = escapeRegExp(key)
+  const withUnit = label.replace(
+    new RegExp(`[（(]\\s*${escaped}\\s*[,，]\\s*([^)）]+)[)）]`, "i"),
+    "($1)"
+  )
+  const stripped = withUnit.replace(
+    new RegExp(`\\s*[（(]\\s*${escaped}\\s*[)）]\\s*$`, "i"),
+    ""
+  )
+  return stripped.trim() || label.trim()
+}
+
+function buildSubgroups(
+  specs: readonly ParamSpec[],
+  defs: readonly SubgroupDefinition[],
+  fallbackId: string,
+  fallbackLabel: string
+): ParamSubgroup[] {
+  const byKey = new Map(specs.map((spec) => [spec.key, spec]))
+  const consumed = new Set<string>()
+  const subgroups: ParamSubgroup[] = []
+
+  for (const def of defs) {
+    const items: ParamSpec[] = []
+    for (const key of def.keys) {
+      const found = byKey.get(key)
+      if (found) {
+        items.push(found)
+        consumed.add(key)
+      }
+    }
+    if (items.length > 0) {
+      subgroups.push({
+        id: def.id,
+        label: def.label,
+        specs: items,
+        wide: def.wide,
+      })
+    }
+  }
+
+  const remaining = specs.filter((spec) => !consumed.has(spec.key))
+  if (remaining.length > 0) {
+    subgroups.push({
+      id: fallbackId,
+      label: fallbackLabel,
+      specs: remaining,
+    })
+  }
+  return subgroups
+}
+
+/** 将常用参数按语义划分为「训练节奏与输入」「优化器与增强」「设备与数据加载」等子分组。 */
+export function groupCommonSpecs(commonSpecs: readonly ParamSpec[]): ParamSubgroup[] {
+  return buildSubgroups(
+    commonSpecs,
+    COMMON_SUBGROUP_DEFS,
+    "common_other",
+    "其他常用参数"
+  )
+}
+
+/**
+ * 将单个高级分组内的参数拆分为：
+ * - `subgroups`：通用参数（及匹配 `activeTask` 的当前任务专用参数）的语义子分组；
+ * - `otherTaskSpecs`：其他任务类型（分割/分类/姿态/旋转框/深度等）专用参数，用于底部折叠收纳。
+ */
+export function partitionAdvancedSpecs(
+  specs: readonly ParamSpec[],
+  group: ParamGroupKey,
+  activeTask?: string
+): {
+  subgroups: ParamSubgroup[]
+  otherTaskSpecs: ParamSpec[]
+} {
+  const generalSpecs: ParamSpec[] = []
+  const matchingTaskSpecs: ParamSpec[] = []
+  const otherTaskSpecs: ParamSpec[] = []
+
+  for (const spec of specs) {
+    if (!spec.task_scope) {
+      generalSpecs.push(spec)
+    } else if (activeTask && spec.task_scope === activeTask) {
+      matchingTaskSpecs.push(spec)
+    } else {
+      otherTaskSpecs.push(spec)
+    }
+  }
+
+  const subgroups = buildSubgroups(
+    generalSpecs,
+    ADVANCED_SUBGROUP_DEFS[group],
+    `${group}_other`,
+    "其他参数"
+  )
+
+  if (matchingTaskSpecs.length > 0) {
+    subgroups.push({
+      id: `${group}_active_task`,
+      label: "当前任务专用",
+      specs: matchingTaskSpecs,
+    })
+  }
+
+  return { subgroups, otherTaskSpecs }
+}
+
+/** 将一组参数拆分为常规表单控件项与纯布尔开关项，保持各自原始顺序。 */
+export function splitSpecsByControlKind(specs: readonly ParamSpec[]): {
+  fields: ParamSpec[]
+  toggles: ParamSpec[]
+} {
+  const fields: ParamSpec[] = []
+  const toggles: ParamSpec[] = []
+  for (const spec of specs) {
+    if (spec.type === "bool") {
+      toggles.push(spec)
+    } else {
+      fields.push(spec)
+    }
+  }
+  return { fields, toggles }
+}
+
+/**
+ * 当 optimizer=auto 时，Ultralytics 会自动计算并覆盖 lr0 与 momentum；
+ * 为这两个字段返回轻量提示，避免用户误以为调整后已生效。
+ */
+export function getAutoOptimizerHint(
+  specKey: string,
+  values: Record<string, unknown>
+): { badge: string; detail: string } | null {
+  if (specKey !== "lr0" && specKey !== "momentum") {
+    return null
+  }
+  const optimizer = values.optimizer ?? "auto"
+  if (optimizer !== "auto") {
+    return null
+  }
+  return {
+    badge: "auto 接管",
+    detail: `当前 optimizer 为 auto，Ultralytics 会在训练启动时自动计算并覆盖 ${specKey}；如需手动生效，请先切换为 SGD / AdamW 等具体优化器。`,
+  }
+}
+
 /** 从参数规格列表生成一份全新的官方默认参数拷贝。 */
 export function buildDefaultParams(
   specs: readonly ParamSpec[],
