@@ -981,9 +981,9 @@ function NewTrainingJobForm({
         </CardContent>
       </Card>
 
-      {/* 3. YOLO 分级参数编辑器与模板快捷栏 */}
+      {/* 3. YOLO 分级参数编辑器与轻量模板条 */}
       <Card>
-        <CardContent className="pt-6">
+        <CardContent>
           <TrainingParamsEditor
             schema={schema}
             values={params}
@@ -992,193 +992,177 @@ function NewTrainingJobForm({
               setFormError(null)
             }}
             initMode={initMode}
+            activeTask={
+              initMode === "scratch"
+                ? "detect"
+                : (selectedBaseModel?.task ?? "detect")
+            }
+            title="3. YOLO 训练参数配置"
             disabled={createMutation.isPending}
             headerSlot={
-              <div
-                className={cn(
-                  "grid gap-2.5 rounded-xl border p-3.5 transition-colors",
-                  activeTemplate
-                    ? "border-primary/30 bg-primary/[0.025]"
-                    : "bg-muted/25"
-                )}
-              >
-                <div className="flex flex-wrap items-center justify-between gap-2.5">
-                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
-                    <label
-                      htmlFor={templateSelectId}
-                      className="flex shrink-0 items-center gap-1.5 text-sm font-medium"
-                    >
-                      <Bookmark className="size-4 text-primary" />
-                      参数模板
-                    </label>
+              <div className="flex flex-wrap items-center justify-between gap-2.5">
+                <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                  <label
+                    htmlFor={templateSelectId}
+                    className="flex shrink-0 items-center gap-1.5 text-xs font-medium text-muted-foreground"
+                  >
+                    <Bookmark className="size-3.5 text-primary" />
+                    参数模板
+                  </label>
 
-                    <Select
-                      value={
-                        activeTemplate
-                          ? String(activeTemplate.id)
-                          : NO_TEMPLATE_VALUE
-                      }
-                      disabled={createMutation.isPending}
-                      onValueChange={handleSelectTemplate}
+                  <Select
+                    value={
+                      activeTemplate
+                        ? String(activeTemplate.id)
+                        : NO_TEMPLATE_VALUE
+                    }
+                    disabled={createMutation.isPending}
+                    onValueChange={handleSelectTemplate}
+                  >
+                    <SelectTrigger
+                      id={templateSelectId}
+                      className="h-8 w-full bg-background text-xs sm:w-64 md:w-72"
+                      aria-label="选择参数模板"
                     >
-                      <SelectTrigger
-                        id={templateSelectId}
-                        className="w-full bg-background sm:w-88"
-                        aria-label="选择参数模板"
+                      <SelectValue placeholder="选择参数模板" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {customTemplates.length > 0 && (
+                        <SelectGroup>
+                          <SelectLabel>自定义模板</SelectLabel>
+                          {customTemplates.map((tpl) => (
+                            <SelectItem key={tpl.id} value={String(tpl.id)}>
+                              {tpl.is_default
+                                ? `★ ${tpl.name}（默认）`
+                                : tpl.name}
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      )}
+                      {customTemplates.length > 0 &&
+                        builtinTemplates.length > 0 && <SelectSeparator />}
+                      {builtinTemplates.length > 0 && (
+                        <SelectGroup>
+                          <SelectLabel>系统内置模板</SelectLabel>
+                          {builtinTemplates.map((tpl) => (
+                            <SelectItem key={tpl.id} value={String(tpl.id)}>
+                              {tpl.is_default
+                                ? `★ ${tpl.name}（默认）`
+                                : tpl.name}
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      )}
+                      {templates.length > 0 && <SelectSeparator />}
+                      <SelectItem value={NO_TEMPLATE_VALUE}>
+                        不使用模板（Ultralytics 官方默认）
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+
+                  {activeTemplate?.is_builtin && (
+                    <Badge
+                      variant="secondary"
+                      className="h-5 gap-1 px-1.5 text-[11px] font-normal"
+                    >
+                      <ShieldCheck className="size-3 text-primary" />
+                      内置
+                    </Badge>
+                  )}
+
+                  {activeTemplate?.is_default && (
+                    <Badge
+                      variant="outline"
+                      className="h-5 gap-1 px-1.5 text-[11px] font-normal"
+                    >
+                      <Star className="size-3 fill-amber-500 text-amber-500" />
+                      {initialTemplateState.autoLoadedDefault &&
+                      templateDiffCount === 0
+                        ? "默认已加载"
+                        : "默认"}
+                    </Badge>
+                  )}
+
+                  {activeTemplate && templateDiffCount > 0 && (
+                    <Badge
+                      variant="outline"
+                      className="h-5 border-primary/30 bg-primary/5 px-1.5 text-[11px] font-normal text-primary tabular-nums"
+                    >
+                      微调 {templateDiffCount} 项
+                    </Badge>
+                  )}
+
+                  {activeTemplate?.description && (
+                    <span
+                      className="hidden max-w-60 truncate text-xs text-muted-foreground xl:inline"
+                      title={activeTemplate.description}
+                    >
+                      {activeTemplate.description}
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {activeTemplate && templateDiffCount > 0 && (
+                    <>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="xs"
+                        className="text-muted-foreground hover:text-foreground"
+                        disabled={
+                          createMutation.isPending ||
+                          updateTemplateMutation.isPending
+                        }
+                        onClick={handleRestoreTemplate}
                       >
-                        <SelectValue placeholder="选择参数模板" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {customTemplates.length > 0 && (
-                          <SelectGroup>
-                            <SelectLabel>自定义模板</SelectLabel>
-                            {customTemplates.map((tpl) => (
-                              <SelectItem key={tpl.id} value={String(tpl.id)}>
-                                {tpl.is_default
-                                  ? `★ ${tpl.name}（默认）`
-                                  : tpl.name}
-                              </SelectItem>
-                            ))}
-                          </SelectGroup>
-                        )}
-                        {customTemplates.length > 0 &&
-                          builtinTemplates.length > 0 && <SelectSeparator />}
-                        {builtinTemplates.length > 0 && (
-                          <SelectGroup>
-                            <SelectLabel>系统内置模板</SelectLabel>
-                            {builtinTemplates.map((tpl) => (
-                              <SelectItem key={tpl.id} value={String(tpl.id)}>
-                                {tpl.is_default
-                                  ? `★ ${tpl.name}（默认）`
-                                  : tpl.name}
-                              </SelectItem>
-                            ))}
-                          </SelectGroup>
-                        )}
-                        {templates.length > 0 && <SelectSeparator />}
-                        <SelectItem value={NO_TEMPLATE_VALUE}>
-                          不使用模板（Ultralytics 官方默认）
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="text-muted-foreground hover:text-foreground"
-                      asChild
-                    >
-                      <Link to={TRAINING_TEMPLATES_PATH}>
-                        <Settings2 />
-                        管理模板
-                      </Link>
-                    </Button>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    {activeTemplate && templateDiffCount > 0 && (
-                      <>
-                        <Badge
-                          variant="secondary"
-                          className="font-normal text-primary tabular-nums"
-                        >
-                          已微调 {templateDiffCount} 项
-                        </Badge>
+                        <RotateCcw />
+                        恢复模板
+                      </Button>
+                      {!activeTemplate.is_builtin && (
                         <Button
                           type="button"
-                          variant="ghost"
-                          size="sm"
+                          variant="outline"
+                          size="xs"
                           disabled={
                             createMutation.isPending ||
                             updateTemplateMutation.isPending
                           }
-                          onClick={handleRestoreTemplate}
+                          onClick={() => {
+                            updateTemplateMutation.reset()
+                            setUpdateConfirmOpen(true)
+                          }}
                         >
-                          <RotateCcw />
-                          恢复模板值
+                          <BookmarkCheck />
+                          更新模板
                         </Button>
-                        {!activeTemplate.is_builtin && (
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            disabled={
-                              createMutation.isPending ||
-                              updateTemplateMutation.isPending
-                            }
-                            onClick={() => {
-                              updateTemplateMutation.reset()
-                              setUpdateConfirmOpen(true)
-                            }}
-                          >
-                            <BookmarkCheck />
-                            更新模板
-                          </Button>
-                        )}
-                      </>
-                    )}
-
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={createMutation.isPending}
-                      onClick={() => setSaveDialogOpen(true)}
-                    >
-                      <BookmarkPlus />
-                      {activeTemplate ? "另存为新模板" : "存为参数模板"}
-                    </Button>
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
-                  {activeTemplate ? (
-                    <>
-                      <span className="inline-flex items-center gap-1 font-medium text-foreground">
-                        {activeTemplate.is_default && (
-                          <Star className="size-3.5 fill-amber-500 text-amber-500" />
-                        )}
-                        当前模板：{activeTemplate.name}
-                      </span>
-                      {activeTemplate.is_builtin && (
-                        <Badge
-                          variant="secondary"
-                          className="h-5 gap-1 px-1.5 text-[11px] font-normal"
-                        >
-                          <ShieldCheck className="size-3 text-primary" />
-                          系统内置
-                        </Badge>
                       )}
-                      {activeTemplate.description && (
-                        <>
-                          <span>·</span>
-                          <span className="truncate">
-                            {activeTemplate.description}
-                          </span>
-                        </>
-                      )}
-                      <span>·</span>
-                      <span>
-                        {templateDiffCount > 0
-                          ? activeTemplate.is_builtin
-                            ? `已相对系统内置模板微调 ${templateDiffCount} 项，可直接提交训练，或点击“另存为新模板”保存为自定义模板。`
-                            : `已相对模板微调 ${templateDiffCount} 项，可直接提交训练，也可以更新原模板或另存为新模板。`
-                          : initialTemplateState.autoLoadedDefault
-                            ? "已自动加载默认模板，可直接点击底部“开始训练”，或微调下方常用/高级参数。"
-                            : "参数与模板一致，可直接点击底部“开始训练”，或微调下方常用/高级参数。"}
-                      </span>
                     </>
-                  ) : templates.length === 0 ? (
-                    <span>
-                      暂无已保存的参数模板；调整好下方常用或高级参数后，可点击右侧“存为参数模板”方便后续一键加载。
-                    </span>
-                  ) : (
-                    <span>
-                      当前使用 Ultralytics
-                      官方默认基准参数；可从左侧下拉快速加载常用模板，或将当前配置保存为新模板。
-                    </span>
                   )}
+
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="xs"
+                    disabled={createMutation.isPending}
+                    onClick={() => setSaveDialogOpen(true)}
+                  >
+                    <BookmarkPlus />
+                    {activeTemplate ? "另存为新模板" : "存为模板"}
+                  </Button>
+
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    className="text-muted-foreground hover:text-foreground"
+                    asChild
+                  >
+                    <Link to={TRAINING_TEMPLATES_PATH}>
+                      <Settings2 />
+                      管理
+                    </Link>
+                  </Button>
                 </div>
               </div>
             }

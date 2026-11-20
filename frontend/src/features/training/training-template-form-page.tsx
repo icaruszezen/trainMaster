@@ -330,12 +330,13 @@ function BuiltinTemplateDetailView({
 
       {/* 2. 只读参数预览 */}
       <Card>
-        <CardContent className="pt-6">
+        <CardContent>
           <TrainingParamsEditor
             schema={schema}
             values={params}
             onChange={() => {}}
             mode="template"
+            title="2. YOLO 模板参数配置"
             readOnly
           />
         </CardContent>
@@ -550,67 +551,65 @@ function TrainingTemplateForm({
 
   const prefillHeaderSlot =
     !isEdit && availableTemplates.length > 0 ? (
-      <div className="grid gap-2 rounded-xl border bg-muted/25 p-3.5">
-        <div className="flex flex-wrap items-center gap-2.5">
-          <label
-            htmlFor={prefillSelectId}
-            className="flex shrink-0 items-center gap-1.5 text-sm font-medium"
-          >
-            <Bookmark className="size-4 text-primary" />
-            从模板快速预填
-          </label>
+      <div className="flex flex-wrap items-center gap-2">
+        <label
+          htmlFor={prefillSelectId}
+          className="flex shrink-0 items-center gap-1.5 text-xs font-medium text-muted-foreground"
+        >
+          <Bookmark className="size-3.5 text-primary" />
+          从模板预填
+        </label>
 
-          <Select
-            value={
-              prefillTemplate ? String(prefillTemplate.id) : BLANK_PREFILL_VALUE
-            }
-            disabled={saveMutation.isPending}
-            onValueChange={handlePrefillSelect}
+        <Select
+          value={
+            prefillTemplate ? String(prefillTemplate.id) : BLANK_PREFILL_VALUE
+          }
+          disabled={saveMutation.isPending}
+          onValueChange={handlePrefillSelect}
+        >
+          <SelectTrigger
+            id={prefillSelectId}
+            className="h-8 w-full bg-background text-xs sm:w-64 md:w-72"
+            aria-label="选择预填模板"
           >
-            <SelectTrigger
-              id={prefillSelectId}
-              className="w-full bg-background sm:w-88"
-              aria-label="选择预填模板"
-            >
-              <SelectValue placeholder="从官方默认或已有模板起步" />
-            </SelectTrigger>
-            <SelectContent>
-              {customTemplates.length > 0 && (
-                <SelectGroup>
-                  <SelectLabel>自定义模板</SelectLabel>
-                  {customTemplates.map((tpl) => (
-                    <SelectItem key={tpl.id} value={String(tpl.id)}>
-                      {tpl.is_default ? `★ ${tpl.name}（默认）` : tpl.name}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              )}
-              {customTemplates.length > 0 && builtinTemplates.length > 0 && (
-                <SelectSeparator />
-              )}
-              {builtinTemplates.length > 0 && (
-                <SelectGroup>
-                  <SelectLabel>系统内置模板</SelectLabel>
-                  {builtinTemplates.map((tpl) => (
-                    <SelectItem key={tpl.id} value={String(tpl.id)}>
-                      {tpl.is_default ? `★ ${tpl.name}（默认）` : tpl.name}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              )}
+            <SelectValue placeholder="从官方默认或已有模板起步" />
+          </SelectTrigger>
+          <SelectContent>
+            {customTemplates.length > 0 && (
+              <SelectGroup>
+                <SelectLabel>自定义模板</SelectLabel>
+                {customTemplates.map((tpl) => (
+                  <SelectItem key={tpl.id} value={String(tpl.id)}>
+                    {tpl.is_default ? `★ ${tpl.name}（默认）` : tpl.name}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            )}
+            {customTemplates.length > 0 && builtinTemplates.length > 0 && (
               <SelectSeparator />
-              <SelectItem value={BLANK_PREFILL_VALUE}>
-                从空白起步（Ultralytics 官方默认）
-              </SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
+            )}
+            {builtinTemplates.length > 0 && (
+              <SelectGroup>
+                <SelectLabel>系统内置模板</SelectLabel>
+                {builtinTemplates.map((tpl) => (
+                  <SelectItem key={tpl.id} value={String(tpl.id)}>
+                    {tpl.is_default ? `★ ${tpl.name}（默认）` : tpl.name}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            )}
+            <SelectSeparator />
+            <SelectItem value={BLANK_PREFILL_VALUE}>
+              从空白起步（Ultralytics 官方默认）
+            </SelectItem>
+          </SelectContent>
+        </Select>
 
-        <p className="text-xs text-muted-foreground">
+        <span className="text-xs text-muted-foreground">
           {prefillTemplate
-            ? `已以${prefillTemplate.is_builtin ? "系统内置模板" : "模板"}“${prefillTemplate.name}”的参数为起点预填；微调下方参数后即可保存为新的自定义模板。`
-            : "可直接基于系统内置预设或已有模板一键预填参数，再按产线需求微调保存。"}
-        </p>
+            ? `已载入“${prefillTemplate.name}”作为起点`
+            : "选择已有模板快速起稿，再按需微调"}
+        </span>
       </div>
     ) : undefined
 
@@ -723,7 +722,7 @@ function TrainingTemplateForm({
 
       {/* 2. 参数编辑器 */}
       <Card>
-        <CardContent className="pt-6">
+        <CardContent>
           <TrainingParamsEditor
             schema={schema}
             values={params}
@@ -732,6 +731,7 @@ function TrainingTemplateForm({
               setFormError(null)
             }}
             mode="template"
+            title="2. YOLO 模板参数配置"
             disabled={saveMutation.isPending}
             headerSlot={prefillHeaderSlot}
           />
