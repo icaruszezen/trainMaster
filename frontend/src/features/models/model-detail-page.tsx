@@ -111,8 +111,12 @@ import {
 } from "@/features/models/model-info"
 import {
   exportOptionsText,
+  isBoxTask,
+  isDualHeadModel,
   modelArchLabel,
   modelFileName,
+  supportsEnd2end,
+  supportsOne2Many,
   taskLabel,
   yoloVersionLabel,
 } from "@/features/models/yolo-versions"
@@ -371,6 +375,21 @@ function ModelAlerts({ model }: { model: Model }) {
 function ModelStats({ model }: { model: Model }) {
   const { info } = model
   const classes = info.class_names.length
+  const dualHead = isDualHeadModel(model)
+  const onlyEnd2end =
+    isBoxTask(model.task) && supportsEnd2end(model) && !supportsOne2Many(model)
+  const headSubtitle = dualHead
+    ? " · 双头"
+    : onlyEnd2end
+      ? " · 仅端到端"
+      : ""
+  const headTitle = dualHead
+    ? info.train_nms === false
+      ? `${modelArchLabel(model)} · 双检测头（端到端选优）`
+      : `${modelArchLabel(model)} · 双检测头（默认 NMS 选优）`
+    : onlyEnd2end
+      ? `${modelArchLabel(model)} · 仅端到端（已融合）`
+      : modelArchLabel(model)
   return (
     <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
       <StatCard
@@ -378,9 +397,9 @@ function ModelStats({ model }: { model: Model }) {
         value={yoloVersionLabel(model.yolo_version)}
         icon={Layers}
       >
-        <span className="truncate">
+        <span className="truncate" title={headTitle}>
           {modelArchLabel(model)}
-          {info.end2end && " · 端到端"}
+          {headSubtitle}
         </span>
       </StatCard>
       <StatCard title="任务" value={taskLabel(model.task)} icon={Boxes}>
@@ -608,6 +627,16 @@ const versionSourceLabels: Record<VersionSource, string> = {
 
 function FileInfo({ model }: { model: Model }) {
   const { info } = model
+  const hasBoxes = isBoxTask(model.task)
+  const dualHead = isDualHeadModel(model)
+  const onlyEnd2end =
+    hasBoxes && supportsEnd2end(model) && !supportsOne2Many(model)
+  const fusedOne2ManyOnly =
+    hasBoxes &&
+    info.one2one === false &&
+    (model.yolo_version === "yolo26" || model.yolo_version === "yolov10")
+  const showTrainNms =
+    dualHead || (info.train_nms !== null && info.train_nms !== undefined)
   return (
     <Card className="min-w-0">
       <CardHeader>
@@ -670,9 +699,26 @@ function FileInfo({ model }: { model: Model }) {
               unknown
             )}
           </Fact>
-          <Fact label="端到端">
-            {info.end2end ? "是（NMS-free 检测头）" : "否"}
+          <Fact label="检测头分支">
+            {!hasBoxes
+              ? "无检测框输出（无需 NMS）"
+              : dualHead
+                ? "双检测头（one-to-many + one-to-one，导出可切换）"
+                : onlyEnd2end
+                  ? "仅端到端（已融合，移除 one-to-many 分支）"
+                  : fusedOne2ManyOnly
+                    ? "仅 one-to-many（已融合，移除端到端分支）"
+                    : "标准单头（one-to-many，需 NMS）"}
           </Fact>
+          {showTrainNms && (
+            <Fact label="训练验证模式">
+              {info.train_nms === false
+                ? "one-to-one 端到端（nms=false，无 NMS）"
+                : info.train_nms === true
+                  ? "one-to-many + NMS（nms=true，优先精度）"
+                  : "one-to-many + NMS（默认，优先精度）"}
+            </Fact>
+          )}
         </Section>
       </CardContent>
     </Card>

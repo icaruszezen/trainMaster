@@ -230,6 +230,9 @@ def make_ultralytics(
     *,
     version: str = "8.4.198",
     task: str = "detect",
+    end2end_head: bool = False,
+    one2many_head: bool = True,
+    train_nms: bool | None = None,
     names: list[str] | None = None,
     boxes: dict[str, list[list[float]]] | None = None,
     default_boxes: list[list[float]] | None = None,
@@ -281,6 +284,12 @@ def make_ultralytics(
 
     default_task = task
 
+    class Head:
+        def __init__(self) -> None:
+            self.cv2 = object() if one2many_head else None
+            if end2end_head:
+                self.one2one_cv2 = object()
+
     class Result:
         def __init__(self, rows: list[list[float]], obb: bool) -> None:
             self.boxes = None if obb else FakeBoxes(rows)
@@ -295,6 +304,8 @@ def make_ultralytics(
                 raise error(load_error)
             self.task = task or default_task
             self.names = dict(enumerate(names if names is not None else COCO_NAMES))
+            self.model = types.SimpleNamespace(model=[object(), Head()])
+            self.ckpt = {"train_args": {"nms": train_nms}}
 
         def predict(self, source: FakeImage, **kwargs: Any) -> list[Result]:
             record({"call": "predict", "tag": source.tag, "shape": list(source.shape), **kwargs})

@@ -43,7 +43,7 @@ export type ModelInfo = {
   model_class: string
   /** 最后一层（检测头）的类名，如 `Detect`、`v10Detect`、`Segment`。 */
   head: string
-  /** 模型的 yaml 文件名，如 `yolo11n.yaml`。 */
+  /** 模型的 yaml 文件名，如 `yolo26n.yaml`。 */
   yaml_file: string
   /** 规模：n / s / m / l / x 等，`""` 未知。 */
   scale: string
@@ -56,8 +56,14 @@ export type ModelInfo = {
   image_size: number | null
   channels: number
   parameters: number | null
-  /** 带端到端（one-to-one，NMS-free）检测头。 */
+  /** 带端到端（one-to-one，NMS-free）检测头分支。 */
   end2end: boolean
+  /** 保留 one-to-many 检测分支（未融合移除）；旧记录未知时为 null。 */
+  one2many?: boolean | null
+  /** 保留 one-to-one（NMS-free）检测分支；旧记录未知时为 null。 */
+  one2one?: boolean | null
+  /** 训练期 train_args.nms：null / true 走 one-to-many + NMS，false 走端到端。 */
+  train_nms?: boolean | null
   /** 保存时的 Ultralytics 版本。 */
   ultralytics_version: string
   /** 文件中记录的保存时间（ISO 字符串，原样）。 */
@@ -70,7 +76,7 @@ export type ModelInfo = {
   metrics: Record<string, number>
   /** 训练使用的数据集配置（train_args.data）。 */
   train_data: string
-  /** 训练的起点（train_args.model），如 `yolo11n.pt`。 */
+  /** 训练的起点（train_args.model），如 `yolo26n.pt`。 */
   base_model: string
   /** 含优化器状态（last.pt 这类可以继续训练的检查点）。 */
   training_checkpoint: boolean

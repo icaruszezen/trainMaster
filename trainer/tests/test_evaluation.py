@@ -324,6 +324,150 @@ print(json.dumps({"event": "done", "ok": True, "meta": out["meta"]}), flush=True
         self.assertIn(evaluation.KIND, tasks.REQUIRED_MODULES)
         self.assertIn(f"{evaluation.WORK_DIR_PREFIX}*", tasks.WORK_DIR_PATTERNS)
 
+    def test_subprocess_dual_head_nms_selection(self) -> None:
+        import contextlib
+        import io
+        import os
+        import types
+        from unittest import mock
+
+        for end2end_head, one2many_head, train_nms, want_e2e in (
+            (True, True, None, False),
+            (True, True, True, False),
+            (True, True, False, True),
+            (True, False, None, True),
+            (False, True, False, False),
+        ):
+            with self.subTest(
+                end2end_head=end2end_head, one2many_head=one2many_head, train_nms=train_nms
+            ):
+                predict_calls: list[dict[str, Any]] = []
+
+                class _Arr:
+                    def __init__(self, vals: list[Any]) -> None:
+                        self._v = vals
+
+                    def detach(self) -> _Arr:
+                        return self
+
+                    def cpu(self) -> _Arr:
+                        return self
+
+                    def tolist(self) -> list[Any]:
+                        return list(self._v)
+
+                class _Boxes:
+                    def __init__(self) -> None:
+                        self.xyxy = _Arr([[10.0, 10.0, 60.0, 60.0]])
+                        self.conf = _Arr([0.91])
+                        self.cls = _Arr([0.0])
+
+                    def __len__(self) -> int:
+                        return 1
+
+                class _Head:
+                    _one2many = one2many_head
+                    _end2end = end2end_head
+
+                    def __init__(self) -> None:
+                        self.cv2 = object() if self._one2many else None
+                        if self._end2end:
+                            self.one2one_cv2 = object()
+
+                class _YOLO:
+                    _train_nms = train_nms
+                    _calls = predict_calls
+
+                    def __init__(self, weights: str, task: str | None = None) -> None:
+                        self.task = task or "detect"
+                        self.names = {0: "scratch"}
+                        self.model = types.SimpleNamespace(model=[object(), _Head()])
+                        self.ckpt = {"train_args": {"nms": self._train_nms}}
+
+                    def predict(self, source: list[str], **kwargs: Any) -> list[Any]:
+                        self._calls.append(dict(kwargs))
+                        return [
+                            types.SimpleNamespace(
+                                boxes=_Boxes(),
+                                obb=None,
+                                orig_shape=(100, 100),
+                                speed={"preprocess": 1.0, "inference": 2.0, "postprocess": 0.5},
+                            )
+                            for _ in source
+                        ]
+
+                fake_torch = types.ModuleType("torch")
+                fake_torch.__version__ = "2.6.0+cpu"  # type: ignore[attr-defined]
+                fake_torch.cuda = types.SimpleNamespace(is_available=lambda: False)  # type: ignore[attr-defined]
+
+                fake_ultra = types.ModuleType("ultralytics")
+                fake_ultra.__version__ = "8.4.198"  # type: ignore[attr-defined]
+                fake_ultra.__path__ = []  # type: ignore[attr-defined]
+                fake_ultra.YOLO = _YOLO  # type: ignore[attr-defined]
+                fake_nn = types.ModuleType("ultralytics.nn")
+                fake_nn.__path__ = []  # type: ignore[attr-defined]
+                fake_tasks = types.ModuleType("ultralytics.nn.tasks")
+                fake_tasks.SAFE_LOAD = True  # type: ignore[attr-defined]
+                fake_tasks._SafeLoad = type("_SafeLoad", (), {"SUPPORTED": True})  # type: ignore[attr-defined]
+                fake_nn.tasks = fake_tasks  # type: ignore[attr-defined]
+                fake_ultra.nn = fake_nn  # type: ignore[attr-defined]
+
+                with TemporaryDirectory() as tmp:
+                    tmp_path = Path(tmp)
+                    weights_path = tmp_path / "best.pt"
+                    weights_path.write_bytes(b"fake-pt")
+                    img_path = tmp_path / "a.jpg"
+                    img_path.write_bytes(b"\xff\xd8\xff\xd9")
+                    manifest_path = tmp_path / "manifest.json"
+                    manifest_path.write_text(
+                        json.dumps(
+                            [
+                                {
+                                    "sample_id": 1,
+                                    "width": 100,
+                                    "height": 100,
+                                    "local_path": str(img_path),
+                                    "gt_objects": [
+                                        {
+                                            "name": "scratch",
+                                            "xmin": 10,
+                                            "ymin": 10,
+                                            "xmax": 60,
+                                            "ymax": 60,
+                                        }
+                                    ],
+                                }
+                            ]
+                        ),
+                        encoding="utf-8",
+                    )
+                    out_path = tmp_path / "out.json"
+                    spec = evaluation.EvaluationSpec(
+                        weights=str(weights_path),
+                        manifest_path=str(manifest_path),
+                        output_path=str(out_path),
+                        classes=({"name": "scratch", "color": "#2563eb"},),
+                        yolo_version="yolo26",
+                    )
+                    patched_mods = {
+                        "torch": fake_torch,
+                        "ultralytics": fake_ultra,
+                        "ultralytics.nn": fake_nn,
+                        "ultralytics.nn.tasks": fake_tasks,
+                    }
+                    with (
+                        mock.patch.dict(sys.modules, patched_mods),
+                        mock.patch.dict(os.environ, {"ULTRALYTICS_SAFE_LOAD": "1"}),
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        meta = evaluation.run_evaluation_subprocess(spec)
+                    self.assertEqual(meta["end2end"], want_e2e)
+                    self.assertEqual(len(predict_calls), 1)
+                    if want_e2e:
+                        self.assertIs(predict_calls[0].get("nms"), False)
+                    else:
+                        self.assertNotIn("nms", predict_calls[0])
+
 
 if __name__ == "__main__":
     unittest.main()

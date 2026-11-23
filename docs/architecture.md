@@ -710,7 +710,7 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 - 操作数、对象数、栈深度、MARK 与 MEMO 的数量都有上限；解析中构造的字符串（类名、路径、编码转换、`bytes`、张量形状等）总长度不超过 16 MiB 加 `data.pkl` 的大小，解析时间不超过 10 秒（真实的检查点最多用到约 15 KB、30 毫秒），超出时以 `too_large` 拒绝（“模型文件的结构过于复杂（data.pkl 第 N 字节：字符串总长度超过上限 / 解析时间超过上限）…”）。构造的文件不能耗尽内存或 CPU；解析器对任何输入都不应 panic（`FuzzInspect` 模糊测试），万一 panic 也被恢复为“文件损坏”的错误。
 - 模型对象取 `ckpt["ema"]`，为空时取 `ckpt["model"]`。任务来自模型类：`DetectionModel` → detect、`SegmentationModel` → segment、`ClassificationModel` → classify、`PoseModel` → pose、`OBBModel` → obb、`SemanticSegmentationModel` → semantic、`DepthModel` → depth（YOLO26 的语义分割与深度估计），YOLO-World / YOLOE 按检测或分割处理，其它 Ultralytics 模型类按 `train_args.task`、模型的 `task` 或检测头推断。
 
-读出的信息存为 `models.info`（接口中的 `info`，字符串与数量都有上限）：模型类与检测头、模型配置文件名与规模（n / s / m / l / x …）、识别出的 YOLO 版本与识别方式、类别名称、训练输入尺寸、输入通道数、参数量、是否带端到端检测头、保存时的 Ultralytics 版本、训练时间、总轮数与当前轮次（-1 为训练完成的最终权重）、best fitness、`train_metrics` 中的指标（最多 64 个，如 `metrics/mAP50(B)`）、训练数据与基础模型、是否含优化器状态（可续训的 `last.pt`）。未知的数值为 null。
+读出的信息存为 `models.info`（接口中的 `info`，字符串与数量都有上限）：模型类与检测头、模型配置文件名与规模（n / s / m / l / x …）、识别出的 YOLO 版本与识别方式、类别名称、训练输入尺寸、输入通道数、参数量、是否带端到端检测头（`end2end`）以及分支存在标记（`one2many`、`one2one`）、训练期 `train_args.nms` 设置（`train_nms`）、保存时的 Ultralytics 版本、训练时间、总轮数与当前轮次（-1 为训练完成的最终权重）、best fitness、`train_metrics` 中的指标（最多 64 个，如 `metrics/mAP50(B)`、`val/l1_loss`）、训练数据与基础模型、是否含优化器状态（可续训的 `last.pt`）。未知的数值为 null。
 
 拒绝的文件返回 422 `invalid_model`，`message` 为中文原因（`checkpoint.Error` 的 `Reason`）：不是 zip 或没有 `data.pkl`（`not_torch`）、PyTorch 1.6 之前的旧格式（`legacy_format`）、zip 或 pickle 损坏 / 截断（`corrupt`）、不是 Ultralytics 检查点（纯 `state_dict`、TorchScript 等，`not_ultralytics`）、原版 YOLOv5 仓库训练的模型（类来自 `models.yolo` / `models.common`，`yolov5_repo`）、RT-DETR、YOLO-NAS 等不支持的模型（`unsupported_model`）、`data.pkl` 过大或结构过于复杂（`too_large`）、引用了安全加载不允许的对象（`unsafe`，见上）。测试夹具（`internal/model/checkpoint/testdata/`）是真实的 Ultralytics 检查点，只保留其中的 `data.pkl`，生成方法见其中的 README。
 
@@ -718,14 +718,14 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 支持的版本（`internal/model/versions.go`；前端 `yolo-versions.ts` 与训练节点 `model_export.py` 中有同样的表）：
 
-| 值 | 显示 | 端到端（NMS-free）检测头 | ONNX 默认后处理 |
+| 值 | 显示 | 双检测头（含 one-to-one 端到端分支） | ONNX 默认后处理 |
 |---|---|---|---|
 | `yolov8` | YOLOv8 | 否 | `raw` |
 | `yolov9` | YOLOv9 | 否 | `raw` |
-| `yolov10` | YOLOv10 | 是 | `end2end` |
+| `yolov10` | YOLOv10 | 是 | 跟随 `train_nms`：默认 `raw`（`train_nms=false` 或已融合纯端到端时为 `end2end`） |
 | `yolo11` | YOLO11 | 否 | `raw` |
 | `yolo12` | YOLO12 | 否 | `raw` |
-| `yolo26` | YOLO26 | 是 | `end2end` |
+| `yolo26` | YOLO26 | 是 | 跟随 `train_nms`：默认 `raw`（`train_nms=false` 或已融合纯端到端时为 `end2end`） |
 
 `models.yolo_version` 由应用层校验，增加版本不需要迁移。上传时由用户选择版本，解析器同时从文件中识别：
 
@@ -741,12 +741,12 @@ JSON 接口都带 `Cache-Control: no-store`；原图与缩略图带 `?v=<版本>
 
 - `imgsz`：`[高, 宽]`，每边 32–4096 且是 32 的倍数；可以只给一个整数（正方形）。省略时为训练时的输入尺寸（向上取 32 的倍数），不知道时为 640。
 - `dynamic`：动态输入（batch、高、宽），默认 false；不能与 `postprocess: nms` 同时使用（422：嵌入的 NMS 只能固定 batch 为 1，见第 9 节“模型转换”）。
-- `postprocess`：`raw`（原始输出，需要自行 NMS；Ultralytics `nms=None`）、`nms`（导出时嵌入 NMS；`nms=True`）、`end2end`（端到端检测头，不需要 NMS；`nms=False`）。允许的方式：只有有检测框的任务（检测、分割、姿态、旋转框）有 `end2end` 与 `nms`，其中 YOLOv10、YOLO26（以及文件中带端到端检测头的模型）有 `end2end`，并作为默认，其余默认 `raw`；分类与 YOLO26 的语义分割、深度估计模型只有 `raw`。不允许的组合返回 422，说明中只建议允许的方式（如“语义分割模型没有检测框，不能导出为 end2end，请选择 raw”）。
+- `postprocess`：`raw`（one-to-many 原始输出，优先精度，需自行 NMS；Ultralytics `nms=None`）、`nms`（one-to-many 导出时嵌入 NMS；`nms=True`）、`end2end`（one-to-one 端到端检测头，无需 NMS、延迟更低；`nms=False`）。允许的方式：只有有检测框的任务（检测、分割、姿态、旋转框）有 `end2end` 与 `nms`，其中未融合的 YOLOv10、YOLO26（以及文件中同时保留 `one2many` 与 `one2one` 双头的模型）三种方式均可选，默认跟随训练期 `train_args.nms`（Ultralytics 8.4+ 默认 `null` / `true` 走 one-to-many + NMS 优先精度 → 默认导出 `raw`；显式 `nms=false` → 默认导出 `end2end`）；若权重已融合并移除了 `one2many` 分支，则只允许 `end2end`；若已融合并移除了 `one2one` 分支，则只允许 `raw` / `nms`；分类与 YOLO26 的语义分割、深度估计模型只有 `raw`。不允许的组合返回 422，说明中只建议允许的方式（如“语义分割模型没有检测框，不能导出为 end2end，请选择 raw”）。
 - `opset`：null（由 Ultralytics 选择）或 11–21。
 
 规范化后的选项写成 `options_key`（如 `imgsz=640x640;dynamic=0;postprocess=raw;opset=auto`），`model_exports` 对 `(model_id, format, options_key)` 唯一：**一条转换记录同时是该选项的缓存**。同样的选项已成功且结果文件还在时直接返回（200）；正在排队或转换时返回同一条记录；失败过或结果文件已不在时把同一条记录重新排队（尝试次数与错误清零）；新的选项新建一条记录。入队后唤醒正在长轮询的训练节点，之后的领取、续租、重试与上传见第 9 节。
 
-下载文件名：PT 为 `<项目名>_v<版本>.pt`；ONNX 为 `<项目名>_v<版本>_<高>x<宽>[_dynamic][_nms|_end2end][_opset<N>].onnx`，正方形时 `<高>x<宽>` 写作边长（如 `A线外观检测_v3_640_end2end.onnx`）。项目名中的 `\ / : * ? " < > |` 与控制字符替换为 `_`。
+下载文件名：PT 为 `<项目名>_v<版本>.pt`；ONNX 为 `<项目名>_v<版本>_<高>x<宽>[_dynamic][_nms|_end2end][_opset<N>].onnx`，正方形时 `<高>x<宽>` 写作边长（如 `A线外观检测_v3_640.onnx`、`A线外观检测_v3_640_end2end.onnx`）。项目名中的 `\ / : * ? " < > |` 与控制字符替换为 `_`。
 
 节点上报的 `result`（版本、opset、输入输出、是否验证、耗时、节点名）由平台按类型与长度清洗后存储；动态维度的形状元素为字符串（如 `"batch"`）。
 
@@ -1130,7 +1130,7 @@ exports/data-versions/
 
 | 方式 | `init_mode` | 模型构建与权重加载 | 校验规则 |
 |---|---|---|---|
-| 从头训练 | `scratch` | 用 Ultralytics 内置网络结构配置 `<yolo_version><model_scale>.yaml`（如 `yolo11n.yaml`、`yolov8s.yaml`）随机初始化权重，并强制覆写 `pretrained=false`，离线环境不联网下载任何预训练权重 | 校验 `yolo_version`（平台支持的各代检测模型，不含仅支持旧版外部仓库或非原生 YAML 构建的条目时按 `SupportsScratch` 判断）与 `model_scale`（`n` / `s` / `m` / `l` / `x`） |
+| 从头训练 | `scratch` | 用 Ultralytics 内置网络结构配置 `<yolo_version><model_scale>.yaml`（前端默认推荐 `yolo26n.yaml`，支持 `yolov8`–`yolo26`）随机初始化权重，并强制覆写 `pretrained=false`，离线环境不联网下载任何预训练权重 | 校验 `yolo_version`（平台支持的各代检测模型，不含仅支持旧版外部仓库或非原生 YAML 构建的条目时按 `SupportsScratch` 判断）与 `model_scale`（`n` / `s` / `m` / `l` / `x`） |
 | 预训练微调 | `finetune` | 从模型仓库中已就绪（不在回收站中、`task = detect`）的 `.pt` 模型加载预训练权重，自动适配当前数据版本的类别数 `nc` | `base_model_id` 必填（允许跨项目复用预训练底模）；`yolo_version` 与 `model_scale` 自动继承自基础模型 |
 | 断点续训 | `resume` | 从包含优化器与轮次状态的检查点模型（如入库的 `last.pt`）恢复未完成的训练，强制开启 `resume=true` | `base_model_id` 必填且其 `metadata.training_checkpoint` 必须为 `true`，否则返回 422（提示改用“预训练微调”） |
 
@@ -1138,10 +1138,12 @@ exports/data-versions/
 
 后端 `internal/training/params.go` 与前端 `frontend/src/features/training/training-params.ts` 维护完全一致的参数注册表（86 项参数，对齐 Ultralytics 8.4.198 官方 `ultralytics/cfg/default.yaml`），分为 4 个分组：
 
-- **`train`（基础训练，36 项）**：`epochs`（100）、`time`（`null`）、`patience`（100）、`batch`（16，支持 `-1` 自动批大小与小数显存占比）、`imgsz`（640，支持整数或 `[高, 宽]`）、`save`（`true`）、`save_period`（`-1`）、`cache`（`false`，支持布尔值或 `"ram"` / `"disk"`）、`device`（`null`，自动选择空闲 GPU 或填写 `"0"` / `"0,1"` / `"cpu"`）、`workers`（8）、`pretrained`（`true`，`scratch` 模式自动置为 `false`）、`optimizer`（`"auto"`，可选 `SGD` / `Adam` / `Adamax` / `AdamW` / `NAdam` / `RAdam` / `RMSProp`）、`seed`（0）、`deterministic`（`true`）、`single_cls`（`false`）、`classes`（`null` 或类别编号数组）、`rect`（`false`）、`cos_lr`（`false`）、`close_mosaic`（10）、`resume`（`false`，`resume` 模式自动置为 `true`）、`amp`（`true`）、`fraction`（1.0）、`profile`（`false`）、`freeze`（`null`，支持整数层数或层号数组）、`multi_scale`（0.0）、`compile`（`false`，支持布尔值或 `"default"` / `"reduce-overhead"` / `"max-autotune-no-cudagraphs"`）、`quantize`（`null`）以及日志/保存选项（`verbose`、`plots`、`save_frames`、`save_txt`、`save_conf`、`save_crop`、`show_labels`、`show_conf`、`show_boxes`、`line_width`）等。
-- **`hyperparameters`（优化器与损失超参，16 项）**：`lr0`（0.01）、`lrf`（0.01）、`momentum`（0.937）、`weight_decay`（0.0005）、`warmup_epochs`（3.0）、`warmup_momentum`（0.8）、`warmup_bias_lr`（0.1）、`box`（7.5）、`cls`（0.5）、`dfl`（1.5）、`pose`（12.0）、`kobj`（1.0）、`rle`（1.0）、`angle`（1.0）、`nbs`（64）、`dropout`（0.0）。
+- **`train`（基础训练，36 项）**：`epochs`（100）、`time`（`null`）、`patience`（100）、`batch`（16，支持 `-1` 自动批大小与小数显存占比）、`imgsz`（640，支持整数或 `[高, 宽]`）、`save`（`true`）、`save_period`（`-1`）、`cache`（`false`，支持布尔值或 `"ram"` / `"disk"`）、`device`（`null`，自动选择空闲 GPU 或填写 `"0"` / `"0,1"` / `"cpu"`）、`workers`（8）、`pretrained`（`true`、`scratch` 模式自动置为 `false`）、`optimizer`（`"auto"`，迭代数 > 10000 时自动选择 `MuSGD`，否则 `AdamW`；可选 `SGD` / `Adam` / `Adamax` / `AdamW` / `NAdam` / `RAdam` / `RMSProp` / `MuSGD`）、`seed`（0）、`deterministic`（`true`）、`single_cls`（`false`）、`classes`（`null` 或类别编号数组）、`rect`（`false`）、`cos_lr`（`false`）、`close_mosaic`（10）、`resume`（`false`，`resume` 模式自动置为 `true`）、`amp`（`true`）、`fraction`（1.0）、`profile`（`false`）、`freeze`（`null`，支持整数层数或层号数组）、`multi_scale`（0.0）、`compile`（`false`，支持布尔值或 `"default"` / `"reduce-overhead"` / `"max-autotune-no-cudagraphs"`）、`quantize`（`null`）以及日志/保存选项（`verbose`、`plots`、`save_frames`、`save_txt`、`save_conf`、`save_crop`、`show_labels`、`show_conf`、`show_boxes`、`line_width`）等。
+- **`hyperparameters`（优化器与损失超参，16 项）**：`lr0`（0.01）、`lrf`（0.01）、`momentum`（0.937）、`weight_decay`（0.0005）、`warmup_epochs`（3.0）、`warmup_momentum`（0.8）、`warmup_bias_lr`（0.1）、`box`（7.5）、`cls`（0.5）、`dfl`（1.5，YOLOv8/9/10/11/12 对应 `dfl_loss`，无 DFL 的 YOLO26 对应 `l1_loss`）、`pose`（12.0）、`kobj`（1.0）、`rle`（1.0）、`angle`（1.0）、`nbs`（64）、`dropout`（0.0）。
 - **`augmentation`（在线数据增强，19 项）**：`hsv_h`（0.015）、`hsv_s`（0.7）、`hsv_v`（0.4）、`degrees`（0.0）、`translate`（0.1）、`scale`（0.5）、`shear`（0.0）、`perspective`（0.0）、`flipud`（0.0）、`fliplr`（0.5）、`bgr`（0.0）、`mosaic`（1.0）、`mixup`（0.0）、`cutmix`（0.0）、`copy_paste`（0.0）、`copy_paste_mode`（`"flip"`）、`auto_augment`（`"randaugment"`，允许清空以关闭）、`erasing`（0.4）、`overlap_mask` / `mask_ratio`。
-- **`val`（验证与后处理，15 项）**：`val`（`true`）、`split`（`"val"`）、`save_json`（`false`）、`conf`（`null`）、`iou`（0.7）、`max_det`（300）、`half`（`false`）、`dnn`（`false`）、`augment`（`false`）、`agnostic_nms`（`false`）、`retina_masks`（`false`）、`embed`（`null`）、`visualize`（`false`）等。
+- **`val`（验证与后处理，15 项）**：`val`（`true`）、`split`（`"val"`）、`nms`（`null`，双头模型默认走 one-to-many + NMS 验证选优；设为 `false` 走端到端无 NMS 验证选优）、`save_json`（`false`）、`conf`（`null`）、`iou`（0.7）、`max_det`（300）、`half`（`false`）、`dnn`（`false`）、`augment`（`false`）、`agnostic_nms`（`false`）、`retina_masks`（`false`）、`embed`（`null`）、`visualize`（`false`）等。
+
+**双检测头训练产物与指标**：YOLO26 / YOLOv10 在 Ultralytics 8.4+ 训练期间始终对 `one-to-many` 与 `one-to-one` 双头联合监督，产出的 `best.pt` / `last.pt` 完整保留双头并记录 `train_args.nms`。训练节点同时提取 `train/l1_loss`、`val/l1_loss`（无 DFL 的 YOLO26）与 `train/dfl_loss`、`val/dfl_loss`（其他版本），前后端自动按实际指标展示 L1 或 DFL 损失曲线与逐轮明细；模型评估与审图推理自动检查 `train_args.nms` 与检测头分支，默认走 one-to-many + NMS，仅在 `train_args.nms=false` 或权重已融合为纯端到端时启用 `nms=False`。
 
 **归一化与安全边界**：
 - 新建任务时以官方默认表为基底合并用户传入的 `params`：未知参数键一律返回 422（防止拼写错误静默失效或注入平台管理字段）；平台托管的路径与运行目录键（`model`、`data`、`project`、`name`、`exist_ok`、`mode`、`task`）禁止在 `params` 中传入，由执行器在运行目录内生成确定值。

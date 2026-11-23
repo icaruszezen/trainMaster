@@ -30,6 +30,9 @@ func newInfo(ci *checkpoint.Info) Info {
 		ClassNames:         make([]string, 0, min(len(ci.ClassNames), maxClassNames)),
 		Channels:           ci.Channels,
 		End2End:            ci.End2End,
+		One2Many:           cloneBoolPtr(ci.One2Many),
+		One2One:            cloneBoolPtr(ci.One2One),
+		TrainNMS:           cloneBoolPtr(ci.TrainNMS),
 		UltralyticsVersion: cleanLabel(ci.UltralyticsVersion, 64),
 		TrainedAt:          cleanLabel(ci.Date, 64),
 		Epoch:              ci.Epoch,
@@ -75,6 +78,14 @@ func newInfo(ci *checkpoint.Info) Info {
 }
 
 func isFinite(f float64) bool { return !math.IsNaN(f) && !math.IsInf(f, 0) }
+
+func cloneBoolPtr(p *bool) *bool {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
 
 // decodeInfo reads a stored info; slices and maps are never nil, so they
 // encode as [] and {}.

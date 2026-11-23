@@ -36,7 +36,8 @@ var (
 	modelKeys = []string{"id", "project", "version", "description", "source", "training_job_id", "yolo_version", "task",
 		"file_name", "size_bytes", "sha256", "info", "file_missing", "export_count", "download_url", "created_at", "updated_at"}
 	modelInfoKeys = []string{"task", "model_class", "head", "yaml_file", "scale", "detected_yolo_version", "version_source",
-		"class_names", "image_size", "channels", "parameters", "end2end", "ultralytics_version", "trained_at", "epochs",
+		"class_names", "image_size", "channels", "parameters", "end2end", "one2many", "one2one", "train_nms",
+		"ultralytics_version", "trained_at", "epochs",
 		"epoch", "best_fitness", "metrics", "train_data", "base_model", "training_checkpoint"}
 	exportKeys = []string{"id", "model_id", "format", "options", "status", "stage", "attempts", "node", "queue_position",
 		"workers_online", "file_name", "size_bytes", "sha256", "result", "error", "error_detail", "download_url",
@@ -458,13 +459,13 @@ func TestModelAPIExportFlow(t *testing.T) {
 	wantKeys(t, "export", raw, exportKeys...)
 	opts := object(t, raw["options"], "options")
 	wantKeys(t, "export options", opts, exportOptionKeys...)
-	if fmt.Sprint(opts["imgsz"]) != "[640 640]" || opts["dynamic"] != false || opts["postprocess"] != "end2end" ||
+	if fmt.Sprint(opts["imgsz"]) != "[640 640]" || opts["dynamic"] != false || opts["postprocess"] != "raw" ||
 		opts["opset"] != nil {
 		t.Errorf("options = %v", opts)
 	}
 	if raw["status"] != "queued" || raw["queue_position"] != 1.0 || raw["workers_online"] != 0.0 || raw["node"] != nil ||
 		raw["result"] != nil || raw["download_url"] != nil || raw["size_bytes"] != nil ||
-		raw["file_name"] != "A 线外观检测_v1_640_end2end.onnx" {
+		raw["file_name"] != "A 线外观检测_v1_640.onnx" {
 		t.Errorf("export = %v", raw)
 	}
 	exportID := int64(raw["id"].(float64))
@@ -598,9 +599,9 @@ func TestModelAPIExportFlow(t *testing.T) {
 
 	// Complete.
 	result := `{"result": {"ultralytics_version": "8.4.198", "torch_version": "2.14.1+cpu", "onnx_version": "1.23.2",
-		"onnxruntime_version": "1.23.2", "opset": 19, "end2end": true, "nms": false, "dynamic": false,
+		"onnxruntime_version": "1.23.2", "opset": 19, "end2end": false, "nms": false, "dynamic": false,
 		"inputs": [{"name": "images", "shape": [1, 3, 640, 640], "type": "float32"}],
-		"outputs": [{"name": "output0", "shape": [1, 300, 6], "type": "float32"}],
+		"outputs": [{"name": "output0", "shape": [1, 6, 8400], "type": "float32"}],
 		"verified": true, "duration_ms": 8123, "node_name": "gpu-server-01"}}`
 	wantError(t, e.do("POST", taskBase+"complete", result, intruder...), 409, codeConflict, "")
 	done := want[map[string]any](t, e.do("POST", taskBase+"complete", result, node...), 200)
@@ -615,7 +616,7 @@ func TestModelAPIExportFlow(t *testing.T) {
 	wantError(t, e.do("POST", taskBase+"progress", `{"stage": "uploading"}`, node...), 409, codeConflict, "")
 
 	// The cache, the download.
-	if cached := want[model.Export](t, e.do("POST", exportsURL, map[string]any{"format": "onnx", "postprocess": "end2end"}), 200); cached.ID != exportID {
+	if cached := want[model.Export](t, e.do("POST", exportsURL, map[string]any{"format": "onnx", "postprocess": "raw"}), 200); cached.ID != exportID {
 		t.Errorf("cached = %+v", cached)
 	}
 	if m := want[model.Model](t, e.do("GET", fmt.Sprintf("/api/v1/models/%d", m.ID), nil), 200); m.ExportCount != 1 {
@@ -623,7 +624,7 @@ func TestModelAPIExportFlow(t *testing.T) {
 	}
 	rec = e.do("GET", fmt.Sprintf("%s/%d/file", exportsURL, exportID), nil)
 	if rec.Code != 200 || !bytes.Equal(rec.Body.Bytes(), onnx) ||
-		rec.Header().Get("Content-Disposition") != attachmentDisposition("A 线外观检测_v1_640_end2end.onnx") {
+		rec.Header().Get("Content-Disposition") != attachmentDisposition("A 线外观检测_v1_640.onnx") {
 		t.Errorf("export download = %d %v", rec.Code, rec.Header())
 	}
 	if rec := e.do("GET", fmt.Sprintf("%s/%d/file", exportsURL, exportID), nil, "Range", "bytes=0-3"); rec.Code != 206 || rec.Body.String() != "onnx" {

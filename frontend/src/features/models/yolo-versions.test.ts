@@ -33,9 +33,19 @@ import {
 function target(
   yolo_version: YoloVersion,
   task: ModelTask = "detect",
-  { end2end = false, image_size = 640 as number | null } = {}
+  {
+    end2end = false,
+    image_size = 640 as number | null,
+    one2many = null as boolean | null,
+    one2one = null as boolean | null,
+    train_nms = null as boolean | null,
+  } = {}
 ) {
-  return { yolo_version, task, info: { end2end, image_size } }
+  return {
+    yolo_version,
+    task,
+    info: { end2end, image_size, one2many, one2one, train_nms },
+  }
 }
 
 const options = (overrides: Partial<ExportOptions> = {}): ExportOptions => ({
@@ -59,7 +69,7 @@ describe("yolo versions", () => {
     expect(new Set(yoloVersions.map((v) => v.label)).size).toBe(6)
   })
 
-  it("marks only YOLOv10 and YOLO26 as end-to-end", () => {
+  it("marks only YOLOv10 and YOLO26 as dual-head end2end-capable", () => {
     expect(yoloVersions.filter((v) => v.end2end).map((v) => v.value)).toEqual([
       "yolov10",
       "yolo26",
@@ -69,13 +79,14 @@ describe("yolo versions", () => {
   it("labels versions, architectures and tasks", () => {
     expect(yoloVersionLabel("yolov8")).toBe("YOLOv8")
     expect(yoloVersionLabel("yolo11")).toBe("YOLO11")
+    expect(yoloVersionLabel("yolo26")).toBe("YOLO26")
     expect(yoloVersionLabel("yolo99")).toBe("yolo99")
     expect(yoloVersionLabel(null)).toBe("未知版本")
     expect(findYoloVersion("YOLO11")).toBeUndefined()
 
     expect(
-      modelArchLabel({ yolo_version: "yolo11", info: { scale: "s" } })
-    ).toBe("YOLO11s")
+      modelArchLabel({ yolo_version: "yolo26", info: { scale: "s" } })
+    ).toBe("YOLO26s")
     expect(
       modelArchLabel({ yolo_version: "yolov8", info: { scale: "" } })
     ).toBe("YOLOv8")
@@ -100,23 +111,52 @@ describe("allowedPostprocess", () => {
     }
   })
 
-  it("defaults to end-to-end for YOLOv10 and YOLO26", () => {
+  it("defaults to raw for Ultralytics 8.4+ dual-head YOLOv10 and YOLO26 unless trained with nms=false", () => {
     expect(allowedPostprocess(target("yolov10"))).toEqual([
-      "end2end",
       "raw",
       "nms",
-    ])
-    expect(allowedPostprocess(target("yolo26", "segment"))).toEqual([
       "end2end",
-      "raw",
-      "nms",
     ])
+    expect(
+      allowedPostprocess(target("yolo26", "segment", { train_nms: true }))
+    ).toEqual(["raw", "nms", "end2end"])
+    expect(
+      allowedPostprocess(target("yolo26", "detect", { train_nms: false }))
+    ).toEqual(["end2end", "raw", "nms"])
+    expect(
+      allowedPostprocess(target("yolov10", "detect", { train_nms: false }))
+    ).toEqual(["end2end", "raw", "nms"])
+  })
+
+  it("respects fused single-branch checkpoints", () => {
+    // Fused one-to-one-only: only end2end allowed
+    const fusedE2E = target("yolo26", "detect", {
+      end2end: true,
+      one2many: false,
+      one2one: true,
+    })
+    expect(allowedPostprocess(fusedE2E)).toEqual(["end2end"])
+    expect(defaultExportOptions(fusedE2E).postprocess).toBe("end2end")
+
+    // Fused one-to-many-only: end2end disallowed even for YOLO26
+    const fusedO2M = target("yolo26", "detect", {
+      end2end: false,
+      one2many: true,
+      one2one: false,
+    })
+    expect(supportsEnd2end(fusedO2M)).toBe(false)
+    expect(allowedPostprocess(fusedO2M)).toEqual(["raw", "nms"])
   })
 
   it("trusts an end-to-end head found in the file", () => {
     const model = target("yolo11", "detect", { end2end: true })
     expect(supportsEnd2end(model)).toBe(true)
-    expect(allowedPostprocess(model)[0]).toBe("end2end")
+    expect(allowedPostprocess(model)).toEqual(["raw", "nms", "end2end"])
+    const modelE2E = target("yolo11", "detect", {
+      end2end: true,
+      train_nms: false,
+    })
+    expect(allowedPostprocess(modelE2E)[0]).toBe("end2end")
   })
 
   it("only offers raw output for classification", () => {
@@ -136,15 +176,17 @@ describe("allowedPostprocess", () => {
     for (const task of ["semantic", "depth", "classify", ""] as const) {
       expect(allowedPostprocess(target("yolo26", task)), task).toEqual(["raw"])
       expect(
-        allowedPostprocess(target("yolo11", task, { end2end: true })),
+        allowedPostprocess(
+          target("yolo11", task, { end2end: true, train_nms: false })
+        ),
         task
       ).toEqual(["raw"])
     }
     for (const task of ["detect", "segment", "pose", "obb"] as const) {
       expect(allowedPostprocess(target("yolo26", task)), task).toEqual([
-        "end2end",
         "raw",
         "nms",
+        "end2end",
       ])
     }
     expect(defaultExportOptions(target("yolo26", "semantic")).postprocess).toBe(
@@ -193,6 +235,12 @@ describe("dynamic size and embedded NMS", () => {
         options({ dynamic: true, postprocess: "nms" }),
         target("yolo26")
       )
+    ).toEqual(options({ dynamic: true, postprocess: "raw" }))
+    expect(
+      fitExportOptions(
+        options({ dynamic: true, postprocess: "nms" }),
+        target("yolo26", "detect", { train_nms: false })
+      )
     ).toEqual(options({ dynamic: true, postprocess: "end2end" }))
     // 其它组合保持不变（同一个对象）。
     const raw = options({ dynamic: true, postprocess: "raw" })
@@ -220,6 +268,12 @@ describe("dynamic size and embedded NMS", () => {
     expect(
       fitExportOptions(options({ postprocess: "end2end" }), target("yolo11"))
     ).toEqual(options({ postprocess: "raw" }))
+    expect(
+      fitExportOptions(
+        options({ postprocess: "raw" }),
+        target("yolo26", "detect", { end2end: true, one2many: false, one2one: true })
+      )
+    ).toEqual(options({ postprocess: "end2end" }))
   })
 
   it("keeps the other fields of a draft", () => {
@@ -245,12 +299,17 @@ describe("export options", () => {
     expect(roundImgSize(5000)).toBe(4096)
   })
 
-  it("defaults to the training size, static input and the version's postprocess", () => {
+  it("defaults to the training size, static input and the model's postprocess", () => {
     expect(defaultExportOptions(target("yolo11"))).toEqual(
       options({ imgsz: [640, 640], postprocess: "raw" })
     )
     expect(
       defaultExportOptions(target("yolo26", "detect", { image_size: 1000 }))
+    ).toEqual(options({ imgsz: [1024, 1024], postprocess: "raw" }))
+    expect(
+      defaultExportOptions(
+        target("yolo26", "detect", { image_size: 1000, train_nms: false })
+      )
     ).toEqual(options({ imgsz: [1024, 1024], postprocess: "end2end" }))
     expect(
       defaultExportOptions(target("yolov8", "detect", { image_size: null }))

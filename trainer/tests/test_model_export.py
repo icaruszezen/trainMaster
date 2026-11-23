@@ -141,20 +141,57 @@ def test_end2end_allowed_by_the_head_not_the_version(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("version", "task", "expected"),
-    [("yolo26", "detect", "end2end"), ("yolov10", "detect", "end2end"), ("yolo11", "detect", "raw"),
-     ("yolov8", "segment", "raw"), ("yolo26", "classify", "raw"),
-     # 没有检测框的任务即使（自定义结构）带 one2one 头也是 raw，与平台相同
-     ("yolo26", "semantic", "raw"), ("yolo26", "depth", "raw")],
-)  # fmt: skip
-def test_default_postprocess_follows_the_model(monkeypatch, tmp_path, version, task, expected):
+    ("version", "task", "train_nms", "one2many_head", "expected"),
+    [
+        # Ultralytics 8.4+ YOLO26 / YOLOv10 双头模型默认按 NMS（one-to-many）训练，默认导出 raw
+        ("yolo26", "detect", None, True, "raw"),
+        ("yolo26", "detect", True, True, "raw"),
+        ("yolov10", "detect", None, True, "raw"),
+        # 训练时显式指定 nms=False（端到端选优）时，默认导出 end2end
+        ("yolo26", "detect", False, True, "end2end"),
+        ("yolov10", "detect", False, True, "end2end"),
+        # 已融合移除 one-to-many 分支的纯端到端模型，默认导出 end2end
+        ("yolo26", "detect", None, False, "end2end"),
+        ("yolo11", "detect", None, True, "raw"),
+        ("yolov8", "segment", None, True, "raw"),
+        ("yolo26", "classify", False, True, "raw"),
+        # 没有检测框的任务即使（自定义结构）带 one2one 头也是 raw，与平台相同
+        ("yolo26", "semantic", False, True, "raw"),
+        ("yolo26", "depth", False, True, "raw"),
+    ],
+)
+def test_default_postprocess_follows_the_model(
+    monkeypatch, tmp_path, version, task, train_nms, one2many_head, expected
+):
     ultralytics, _ = install(
-        monkeypatch, task=task, end2end_head=version in END2END_VERSIONS and task != "classify"
+        monkeypatch,
+        task=task,
+        end2end_head=version in END2END_VERSIONS and task != "classify",
+        one2many_head=one2many_head,
+        train_nms=train_nms,
     )
     out = run_export(spec(tmp_path, yolo_version=version, task=task, postprocess=None))
     assert out["ok"], out
     nms = export_calls(ultralytics)[0]["nms"]
     assert nms == {"raw": None, "end2end": False}[expected]
+
+
+@pytest.mark.parametrize("postprocess", ["raw", "nms"])
+def test_fused_one2one_only_rejects_raw_and_nms(monkeypatch, tmp_path, postprocess):
+    ultralytics, _ = install(monkeypatch, end2end_head=True, one2many_head=False)
+    out = run_export(spec(tmp_path, yolo_version="yolo26", postprocess=postprocess))
+    assert not out["ok"]
+    assert "移除了 one-to-many 检测分支" in out["error"]
+    assert "end2end" in out["error"]
+    assert export_calls(ultralytics) == []
+
+
+def test_fused_one2many_only_yolo26_rejects_end2end(monkeypatch, tmp_path):
+    ultralytics, _ = install(monkeypatch, end2end_head=False, one2many_head=True)
+    out = run_export(spec(tmp_path, yolo_version="yolo26", postprocess="end2end"))
+    assert not out["ok"]
+    assert "没有端到端（NMS-free）检测头" in out["error"]
+    assert export_calls(ultralytics) == []
 
 
 @pytest.mark.parametrize("postprocess", ["nms", "end2end"])
@@ -939,6 +976,7 @@ def test_cli_export_summary(tmp_path):
 def test_cli_export_json_and_output(tmp_path):
     w = weights(tmp_path)
     target = tmp_path / "exported" / "best.onnx"
+    # 双头模型默认按 NMS（train_args.nms=None）训练，CLI 缺省导出 raw（end2end=False）
     proc = run_cli(
         tmp_path, "--weights", w, "--output", str(target), "--dynamic", "--opset", "12", "--json",
         end2end_head=True,
@@ -946,9 +984,20 @@ def test_cli_export_json_and_output(tmp_path):
     assert proc.returncode == 0, proc.stderr
     data = json.loads(proc.stdout)
     assert data["ok"] is True and data["onnx_path"] == str(target)
-    assert data["result"]["end2end"] is True  # 端到端模型默认 end2end
+    assert data["result"]["end2end"] is False
     assert data["result"]["opset"] == 12 and data["result"]["dynamic"] is True
     assert target.is_file()
+
+    # 训练时显式指定 nms=False 的双头模型，CLI 缺省导出 end2end
+    target_e2e = tmp_path / "exported" / "best_e2e.onnx"
+    proc_e2e = run_cli(
+        tmp_path, "--weights", w, "--output", str(target_e2e), "--dynamic", "--opset", "12", "--json",
+        end2end_head=True, train_nms=False,
+    )  # fmt: skip
+    assert proc_e2e.returncode == 0, proc_e2e.stderr
+    data_e2e = json.loads(proc_e2e.stdout)
+    assert data_e2e["ok"] is True and data_e2e["result"]["end2end"] is True
+    assert target_e2e.is_file()
 
 
 def test_cli_export_failure(tmp_path):

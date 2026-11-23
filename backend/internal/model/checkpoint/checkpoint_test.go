@@ -62,6 +62,7 @@ func numbered(n int) []string {
 
 func intp(n int) *int               { return &n }
 func floatp(f float64) *float64     { return &f }
+func boolp(b bool) *bool            { return &b }
 func noMetrics() map[string]float64 { return map[string]float64{} }
 
 // trainedNames are the classes of the tiny dataset the trained fixtures
@@ -71,11 +72,16 @@ var trainedNames = []string{"scratch", "划痕-凹坑"}
 // untrained is the Info of a model built from an Ultralytics yaml and
 // saved without training (testdata/README.md).
 func untrained(class, task, version, yaml, head, date string, params int64) Info {
-	return Info{
+	info := Info{
 		ModelClass: class, Task: task, YOLOVersion: version, VersionSource: VersionSourceYAMLFile, YAMLFile: yaml,
 		Scale: "n", ClassNames: numbered(80), ImageSize: 640, Channels: 3, Parameters: params, Head: head,
 		UltralyticsVersion: "8.4.198", Date: date, Metrics: noMetrics(),
 	}
+	if task != "classify" {
+		info.One2Many = boolp(true)
+		info.One2One = boolp(false)
+	}
+	return info
 }
 
 var yolo11Metrics = map[string]float64{
@@ -87,6 +93,7 @@ func yolo11Best() Info {
 	return Info{
 		ModelClass: "DetectionModel", Task: "detect", YOLOVersion: "yolo11", VersionSource: VersionSourceYAMLFile,
 		YAMLFile: "yolo11n.yaml", Scale: "n", ClassNames: trainedNames, ImageSize: 96, Channels: 3, Parameters: 2590230,
+		One2Many: boolp(true), One2One: boolp(false),
 		Head: "Detect", UltralyticsVersion: "8.4.198", Date: "2026-11-03T01:50:30.249939+00:00", Epochs: 2, Epoch: intp(-1),
 		Metrics: yolo11Metrics, TrainData: "/var/tmp/work-checkpoint/gen/tinyds/data.yaml", BaseModel: "yolo11n.yaml",
 	}
@@ -96,7 +103,8 @@ func yolo26Best() Info {
 	return Info{
 		ModelClass: "DetectionModel", Task: "detect", YOLOVersion: "yolo26", VersionSource: VersionSourceYAMLFile,
 		YAMLFile: "yolo26n.yaml", Scale: "n", ClassNames: trainedNames, ImageSize: 96, Channels: 3, Parameters: 2504580,
-		End2End: true, Head: "Detect", UltralyticsVersion: "8.4.198", Date: "2026-11-03T01:50:32.672166+00:00", Epochs: 2,
+		End2End: true, One2Many: boolp(true), One2One: boolp(true),
+		Head: "Detect", UltralyticsVersion: "8.4.198", Date: "2026-11-03T01:50:32.672166+00:00", Epochs: 2,
 		Epoch: intp(-1), TrainData: "/var/tmp/work-checkpoint/gen/tinyds/data.yaml", BaseModel: "yolo26n.yaml",
 		Metrics: map[string]float64{
 			"metrics/precision(B)": 0, "metrics/recall(B)": 0, "metrics/mAP50(B)": 0, "metrics/mAP50-95(B)": 0,
@@ -120,7 +128,7 @@ func TestInspectFixtures(t *testing.T) {
 	v9 := untrained("DetectionModel", "detect", "yolov9", "yolov9t.yaml", "Detect", "2026-11-03T01:50:22.989212+00:00", 2128720)
 	v9.Scale = "t" // yolov9t.yaml has no scales: from the file name
 	custom26 := untrained("DetectionModel", "detect", "yolo26", "line-a-detector.yaml", "Detect", "2026-11-03T01:50:25.547922+00:00", 2572280)
-	custom26.VersionSource, custom26.End2End = VersionSourceArchitecture, true // scale: the first in the yaml, as Ultralytics builds it
+	custom26.VersionSource, custom26.End2End, custom26.One2One = VersionSourceArchitecture, true, boolp(true) // scale: the first in the yaml, as Ultralytics builds it
 	customV8 := untrained("DetectionModel", "detect", "yolov8", "my-model.yaml", "Detect", "2026-11-03T01:50:25.710053+00:00", 3157200)
 	customV8.VersionSource = VersionSourceArchitecture
 	// yolo26-cls.yaml under a custom name: the network is the same as
@@ -128,11 +136,11 @@ func TestInspectFixtures(t *testing.T) {
 	custom26cls := untrained("ClassificationModel", "classify", "", "parts-cls.yaml", "Classify", "2026-11-03T04:48:18.883173+00:00", 2812104)
 	custom26cls.VersionSource, custom26cls.ClassNames = "", numbered(1000)
 	v10 := untrained("DetectionModel", "detect", "yolov10", "yolov10n.yaml", "v10Detect", "2026-11-03T01:50:23.201358+00:00", 2775520)
-	v10.End2End = true
+	v10.End2End, v10.One2One = true, boolp(true)
 	y26 := untrained("DetectionModel", "detect", "yolo26", "yolo26n.yaml", "Detect", "2026-11-03T01:50:23.684984+00:00", 2572280)
-	y26.End2End = true
+	y26.End2End, y26.One2One = true, boolp(true)
 	y26seg := untrained("SegmentationModel", "segment", "yolo26", "yolo26n-seg.yaml", "Segment26", "2026-11-03T01:50:24.459063+00:00", 3126280)
-	y26seg.End2End = true
+	y26seg.End2End, y26seg.One2One = true, boolp(true)
 
 	tests := map[string]Info{
 		"yolov8n.pt":          untrained("DetectionModel", "detect", "yolov8", "yolov8n.yaml", "Detect", "2026-11-03T01:50:22.743539+00:00", 3157200),
@@ -743,6 +751,59 @@ func TestExtract(t *testing.T) {
 			func(t *testing.T, info *Info) {
 				if info.UltralyticsVersion != "8.4\ufffd" || info.Date != "\ufffd" || len(info.TrainData) != maxTextLen {
 					t.Errorf("%q %q %d", info.UltralyticsVersion, info.Date, len(info.TrainData))
+				}
+			}},
+		{"train_args.nms false (end2end trained)", ckpt(ultralyticsModel(dict("yaml", dict("end2end", true))),
+			"train_args", dict("nms", false)),
+			func(t *testing.T, info *Info) {
+				if info.TrainNMS == nil || *info.TrainNMS != false {
+					t.Errorf("TrainNMS = %v, want false", info.TrainNMS)
+				}
+			}},
+		{"train_args.nms true", ckpt(ultralyticsModel(dict()), "train_args", dict("nms", true)),
+			func(t *testing.T, info *Info) {
+				if info.TrainNMS == nil || *info.TrainNMS != true {
+					t.Errorf("TrainNMS = %v, want true", info.TrainNMS)
+				}
+			}},
+		{"train_args.nms None overrides model.args.nms false", ckpt(ultralyticsModel(dict("args", dict("nms", false))),
+			"train_args", dict("nms", nil)),
+			func(t *testing.T, info *Info) {
+				if info.TrainNMS != nil {
+					t.Errorf("TrainNMS = %v, want nil", *info.TrainNMS)
+				}
+			}},
+		{"fused one-to-one only head", ckpt(ultralyticsModel(dict(
+			"yaml", dict("end2end", true, "backbone", list(list(int64(-1), int64(1), "C3k2", list()))),
+			"_modules", dict("model", object("torch.nn.modules.container.Sequential", dict(
+				"_modules", dict("0", object("ultralytics.nn.modules.head.Detect", dict(
+					"_modules", dict("cv2", nil, "one2one_cv2", object("torch.nn.modules.container.ModuleList", dict())),
+				))),
+			))),
+		))),
+			func(t *testing.T, info *Info) {
+				if !info.End2End || info.One2Many == nil || *info.One2Many || info.One2One == nil || !*info.One2One {
+					t.Errorf("End2End=%v One2Many=%v One2One=%v, want true/false/true", info.End2End, info.One2Many, info.One2One)
+				}
+				if info.YOLOVersion != "yolo26" {
+					t.Errorf("YOLOVersion = %q, want yolo26", info.YOLOVersion)
+				}
+			}},
+		{"fused one-to-many only head (one2one stripped)", ckpt(ultralyticsModel(dict(
+			"yaml", dict("end2end", true, "backbone", list(list(int64(-1), int64(1), "C3k2", list()))),
+			"_modules", dict("model", object("torch.nn.modules.container.Sequential", dict(
+				"_modules", dict("0", object("ultralytics.nn.modules.head.Detect", dict(
+					"_modules", dict("cv2", object("torch.nn.modules.container.ModuleList", dict()), "one2one_cv2", nil),
+				))),
+			))),
+		))),
+			func(t *testing.T, info *Info) {
+				if info.End2End || info.One2Many == nil || !*info.One2Many || info.One2One == nil || *info.One2One {
+					t.Errorf("End2End=%v One2Many=%v One2One=%v, want false/true/false", info.End2End, info.One2Many, info.One2One)
+				}
+				// Still recognized as YOLO26 from yaml.end2end + C3k2 architecture.
+				if info.YOLOVersion != "yolo26" {
+					t.Errorf("YOLOVersion = %q, want yolo26", info.YOLOVersion)
 				}
 			}},
 	}

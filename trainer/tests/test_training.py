@@ -253,17 +253,47 @@ def test_normalize_log_line_and_parse_results_csv(tmp_path: Path):
 
     csv_file = tmp_path / "results.csv"
     csv_file.write_text(
-        "  epoch , time , train/box_loss , metrics/mAP50(B) , metrics/mAP50-95(B) , lr/pg0 \n"
-        "   1 , 2.5 , 1.234 , 0.456 , 0.234 , 0.01 \n"
-        "   2 , 2.4 , 0.987 , 0.678 , 0.412 , 0.009 \n",
+        "  epoch , time , train/box_loss , train/cls_loss , train/l1_loss , "
+        "val/box_loss , val/cls_loss , val/l1_loss , metrics/mAP50(B) , metrics/mAP50-95(B) , lr/pg0 \n"
+        "   1 , 2.5 , 1.234 , 0.654 , 0.215 , 1.11 , 0.52 , 0.19 , 0.456 , 0.234 , 0.01 \n"
+        "   2 , 2.4 , 0.987 , 0.543 , 0.172 , 0.91 , 0.48 , 0.15 , 0.678 , 0.412 , 0.009 \n",
         encoding="utf-8",
     )
     rows = training.parse_results_csv(csv_file, total_epochs=10)
     assert len(rows) == 2
     assert rows[0]["epoch"] == 1 and rows[0]["total_epochs"] == 10
     assert rows[0]["train_box_loss"] == 1.234
+    assert rows[0]["train_l1_loss"] == 0.215
+    assert rows[0]["val_l1_loss"] == 0.19
+    assert "train_dfl_loss" not in rows[0] and "val_dfl_loss" not in rows[0]
     assert rows[0]["map50"] == 0.456
     assert rows[1]["epoch"] == 2 and rows[1]["map50_95"] == 0.412
+    assert rows[1]["train_l1_loss"] == 0.172 and rows[1]["val_l1_loss"] == 0.15
+
+    # YOLO26（reg_max=1 无 DFL）通过回调上报 train/l1_loss 与 val/l1_loss
+    import types
+
+    fake_trainer = types.SimpleNamespace(
+        tloss=[0.75, 0.41, 0.16],
+        label_loss_items=lambda tloss, prefix="train": {
+            f"{prefix}/box_loss": float(tloss[0]),
+            f"{prefix}/cls_loss": float(tloss[1]),
+            f"{prefix}/l1_loss": float(tloss[2]),
+        },
+        metrics={
+            "val/box_loss": 0.72,
+            "val/cls_loss": 0.39,
+            "val/l1_loss": 0.14,
+            "metrics/mAP50(B)": 0.81,
+        },
+        lr={"lr/pg0": 0.005},
+        fitness=0.62,
+    )
+    ep = training._extract_epoch_metrics(
+        fake_trainer, epoch_num=3, total_epochs=10, duration_sec=1.5, gpu_mem_gb=2.1
+    )
+    assert ep["train_l1_loss"] == 0.16 and ep["val_l1_loss"] == 0.14
+    assert "train_dfl_loss" not in ep and "val_dfl_loss" not in ep
 
 
 def test_safe_extract_zip_blocks_traversal(tmp_path: Path):

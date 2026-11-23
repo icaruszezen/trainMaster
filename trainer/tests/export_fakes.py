@@ -105,6 +105,8 @@ def make_ultralytics(
     version: str = "8.4.198",
     task: str = "detect",
     end2end_head: bool = False,
+    one2many_head: bool = True,
+    train_nms: bool | None = None,
     nc: int = 2,
     train_imgsz: int = 640,
     load_error: list[str] | None = None,
@@ -170,6 +172,7 @@ def make_ultralytics(
 
     class Head:
         def __init__(self) -> None:
+            self.cv2 = object() if one2many_head else None
             if end2end_head:
                 self.one2one_cv2 = object()
 
@@ -181,6 +184,7 @@ def make_ultralytics(
                 raise build_error(load_error) from (build_error(load_cause) if load_cause else None)
             self.task = task or default_task
             self.model = types.SimpleNamespace(model=[object(), Head()])
+            self.ckpt = {"train_args": {"nms": train_nms}}
             self.weights = weights
 
         def export(self, **kwargs: Any) -> str | None:
@@ -193,8 +197,8 @@ def make_ultralytics(
             if nms and self.task == "classify":
                 raise AssertionError("'nms=True' is not valid for classification models.")
             # 规则同 ultralytics 8.4.198：nms=False 只对带 one2one 头的模型生效（否则静默忽略），
-            # nms=True 打开 NMSModel（端到端头随之关闭）。
-            end2end = nms is False and end2end_head
+            # 已融合移除 cv2 时强制 end2end；nms=True 打开 NMSModel（端到端头随之关闭）。
+            end2end = end2end_head and (nms is False or not one2many_head)
             embedded = bool(nms) and not ignore_nms
             imgsz = kwargs.get("imgsz") or [train_imgsz, train_imgsz]
             h, w = imgsz

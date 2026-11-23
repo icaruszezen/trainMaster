@@ -564,9 +564,11 @@ func sanitizeEpoch(e EpochMetrics) EpochMetrics {
 	e.TrainBoxLoss = cleanMetricPtr(e.TrainBoxLoss)
 	e.TrainClsLoss = cleanMetricPtr(e.TrainClsLoss)
 	e.TrainDFLLoss = cleanMetricPtr(e.TrainDFLLoss)
+	e.TrainL1Loss = cleanMetricPtr(e.TrainL1Loss)
 	e.ValBoxLoss = cleanMetricPtr(e.ValBoxLoss)
 	e.ValClsLoss = cleanMetricPtr(e.ValClsLoss)
 	e.ValDFLLoss = cleanMetricPtr(e.ValDFLLoss)
+	e.ValL1Loss = cleanMetricPtr(e.ValL1Loss)
 	e.Precision = cleanMetricPtr(e.Precision)
 	e.Recall = cleanMetricPtr(e.Recall)
 	e.MAP50 = cleanMetricPtr(e.MAP50)
@@ -588,6 +590,9 @@ func mergeSummary(cur SummaryMetrics, e EpochMetrics) SummaryMetrics {
 	if e.TrainDFLLoss != nil {
 		cur.TrainDFLLoss = e.TrainDFLLoss
 	}
+	if e.TrainL1Loss != nil {
+		cur.TrainL1Loss = e.TrainL1Loss
+	}
 	if e.ValBoxLoss != nil {
 		cur.ValBoxLoss = e.ValBoxLoss
 	}
@@ -596,6 +601,9 @@ func mergeSummary(cur SummaryMetrics, e EpochMetrics) SummaryMetrics {
 	}
 	if e.ValDFLLoss != nil {
 		cur.ValDFLLoss = e.ValDFLLoss
+	}
+	if e.ValL1Loss != nil {
+		cur.ValL1Loss = e.ValL1Loss
 	}
 	if e.Precision != nil {
 		cur.Precision = e.Precision

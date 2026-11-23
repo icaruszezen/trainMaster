@@ -15,11 +15,11 @@ import type {
 
 export type YoloVersionInfo = {
   value: YoloVersion
-  /** 界面上的名称，如 `YOLO11`。 */
+  /** 界面上的名称，如 `YOLO26`。 */
   label: string
-  /** 检测头带端到端（one-to-one，NMS-free）分支，ONNX 默认导出为 end2end。 */
+  /** 架构默认带双检测头（含 one-to-one 端到端分支，可导出 end2end；默认按训练期 NMS 模式决定导出项）。 */
   end2end: boolean
-  /** 上传时选择版本的简短说明。 */
+  /** 上传与新建训练时选择版本的简短说明。 */
   description: string
 }
 
@@ -41,7 +41,7 @@ export const yoloVersions: readonly YoloVersionInfo[] = [
     value: "yolov10",
     label: "YOLOv10",
     end2end: true,
-    description: "端到端检测头，推理时不需要 NMS",
+    description: "双检测头（默认 NMS 优先精度，可选端到端无 NMS）",
   },
   {
     value: "yolo11",
@@ -59,7 +59,7 @@ export const yoloVersions: readonly YoloVersionInfo[] = [
     value: "yolo26",
     label: "YOLO26",
     end2end: true,
-    description: "端到端检测头，推理时不需要 NMS，适合边缘部署",
+    description: "最新推荐 · 双检测头（默认 NMS 优先精度，可选端到端无 NMS），无 DFL 更易部署",
   },
 ]
 
@@ -72,7 +72,7 @@ export function yoloVersionLabel(value: string | null | undefined) {
   return findYoloVersion(value)?.label ?? (value || "未知版本")
 }
 
-/** 版本 + 规模，如 `YOLO11s`、`YOLOv8n`；规模未知时只有版本。 */
+/** 版本 + 规模，如 `YOLO26s`、`YOLOv8n`；规模未知时只有版本。 */
 export function modelArchLabel(
   model: Pick<Model, "yolo_version"> & { info: { scale: string } }
 ) {
@@ -101,34 +101,83 @@ export function taskLabel(task: string) {
 const NMS_TASKS: readonly string[] = ["detect", "segment", "pose", "obb"]
 
 type ExportTarget = Pick<Model, "yolo_version" | "task"> & {
-  info: Pick<Model["info"], "end2end" | "image_size">
+  info: Pick<Model["info"], "end2end" | "image_size"> & {
+    one2many?: boolean | null
+    one2one?: boolean | null
+    train_nms?: boolean | null
+  }
 }
 
 /**
- * 模型带端到端检测头：YOLOv10、YOLO26 都有，其它版本以文件中的标记为准。
+ * 模型是否保留端到端（one-to-one, NMS-free）检测头：优先依据文件中解析出的
+ * `info.one2one`（已融合并移除端到端头的 YOLO26 为 false），未知时按版本或 `info.end2end`。
  * 只对带检测框的任务有意义（见 allowedPostprocess）。
  */
 export function supportsEnd2end(model: ExportTarget) {
+  if (typeof model.info.one2one === "boolean") {
+    return model.info.one2one
+  }
   return (
     findYoloVersion(model.yolo_version)?.end2end === true || model.info.end2end
   )
 }
 
 /**
- * 模型可以使用的后处理方式，默认的在前（与后端 AllowedPostprocess 一致）：只有
- * 带检测框的任务有端到端检测头、可以嵌入 NMS，其它任务（分类、语义分割、深度估计，
- * 即使是 YOLO26）只有原始输出；带端到端检测头的模型默认 end2end（也可以在
- * one-to-many 头上嵌入 NMS）。
+ * 模型是否保留标准 one-to-many 检测分支：仅当文件显式标注 `info.one2many === false`
+ * （已融合移除 one-to-many 分支）时为 false。
+ */
+export function supportsOne2Many(model: ExportTarget) {
+  return model.info.one2many !== false
+}
+
+/** 模型同时包含 one-to-many 与 one-to-one 两个可切换检测头（标准未融合 YOLO26 / YOLOv10）。 */
+export function isDualHeadModel(model: ExportTarget) {
+  return (
+    NMS_TASKS.includes(model.task) &&
+    supportsEnd2end(model) &&
+    supportsOne2Many(model)
+  )
+}
+
+/**
+ * 带检测框模型是否默认优先导出端到端（end2end）：
+ * - 已融合且仅剩 one-to-one 分支（`one2many === false`）；
+ * - 或双头模型在训练时显式设置了 `train_nms === false`。
+ * Ultralytics 8.4+ 默认训练（`train_nms` 为 null / true）优先保证精度，默认导出 `raw`。
+ */
+export function prefersEnd2end(model: ExportTarget) {
+  if (!NMS_TASKS.includes(model.task) || !supportsEnd2end(model)) {
+    return false
+  }
+  if (!supportsOne2Many(model)) {
+    return true
+  }
+  return model.info.train_nms === false
+}
+
+/**
+ * 模型可以使用的后处理方式，默认的在前（与后端 AllowedPostprocess 一致）：
+ * - 没有检测框的任务（分类、语义分割、深度估计）只有 `raw`；
+ * - 已融合移除 one-to-many 的纯端到端权重只有 `end2end`；
+ * - 双头模型（YOLO26 / YOLOv10）同时支持 `raw`、`nms`、`end2end`：训练期显式
+ *   `nms=false` 时默认 `end2end` 在前，其余默认（优先精度）`raw` 在前。
  */
 export function allowedPostprocess(model: ExportTarget): Postprocess[] {
   if (!NMS_TASKS.includes(model.task)) {
     return ["raw"]
   }
-  const modes: Postprocess[] = []
-  if (supportsEnd2end(model)) {
+  const hasE2E = supportsEnd2end(model)
+  const hasO2M = supportsOne2Many(model)
+  if (hasE2E && !hasO2M) {
+    return ["end2end"]
+  }
+  if (prefersEnd2end(model)) {
+    return ["end2end", "raw", "nms"]
+  }
+  const modes: Postprocess[] = ["raw", "nms"]
+  if (hasE2E) {
     modes.push("end2end")
   }
-  modes.push("raw", "nms")
   return modes
 }
 
@@ -140,6 +189,29 @@ export function rawOnlyNote(model: ExportTarget) {
   return model.task === ""
     ? "无法识别模型的任务，只能导出原始输出。"
     : `${taskLabel(model.task)}模型只有原始输出。`
+}
+
+/** 仅允许单一后处理方式时的说明（无检测框任务或已融合纯端到端模型），否则为 null。 */
+export function singlePostprocessNote(model: ExportTarget) {
+  const rawNote = rawOnlyNote(model)
+  if (rawNote) {
+    return rawNote
+  }
+  if (supportsEnd2end(model) && !supportsOne2Many(model)) {
+    return "该模型已融合且移除了 one-to-many 检测分支，只能导出端到端（end2end）。"
+  }
+  return null
+}
+
+/** 双头模型（YOLO26 / YOLOv10）在导出弹窗中解释默认后处理选择的提示文字。 */
+export function dualHeadExportHint(model: ExportTarget) {
+  if (!isDualHeadModel(model)) {
+    return null
+  }
+  if (model.info.train_nms === false) {
+    return "该模型包含双检测头且训练时按端到端（nms=false）选优，默认导出 end2end；如需外部 NMS 也可切换为 raw 或 nms。"
+  }
+  return "该模型完整保留双检测头（Ultralytics 8.4+ 默认按 one-to-many + NMS 选优以优先保证精度），默认导出 raw；也可按需切换为 nms 或端到端 end2end。"
 }
 
 /**
@@ -286,6 +358,13 @@ type DescribeContext = {
   classCount: number | null
   imgsz: readonly [number, number]
   dynamic: boolean
+  /** 模型同时包含 one-to-many 与 one-to-one 两个检测头（YOLO26 / YOLOv10）。 */
+  dualHead?: boolean
+}
+
+/** 任务是否输出检测框（检测、分割、姿态、旋转框）。 */
+export function isBoxTask(task: string) {
+  return NMS_TASKS.includes(task)
 }
 
 /**
@@ -295,7 +374,7 @@ type DescribeContext = {
  */
 export function describePostprocess(
   mode: Postprocess,
-  { task, classCount, imgsz, dynamic }: DescribeContext
+  { task, classCount, imgsz, dynamic, dualHead = false }: DescribeContext
 ): PostprocessDescription {
   const label = postprocessLabels[mode]
   const nc = classCount === null ? "类别数" : String(classCount)
@@ -311,6 +390,9 @@ export function describePostprocess(
     shape: `1 × 32 × ${dynamic ? "H/4 × W/4" : `${height / 4} × ${width / 4}`}`,
     meaning: "掩码原型，与掩码系数相乘得到每个目标的掩码",
   }
+  const rawBoxSummary = dualHead
+    ? "one-to-many 检测头，精度优先；推理后需自行 NMS"
+    : "需要自行 NMS"
 
   if (mode === "raw") {
     switch (task) {
@@ -323,7 +405,7 @@ export function describePostprocess(
       case "segment":
         return {
           label,
-          summary: "需要自行 NMS",
+          summary: rawBoxSummary,
           outputs: [
             {
               shape: `1 × ${channels(36, "(4 + 类别数 + 32)")} × ${anchors}`,
@@ -335,7 +417,7 @@ export function describePostprocess(
       case "pose":
         return {
           label,
-          summary: "需要自行 NMS",
+          summary: rawBoxSummary,
           outputs: [
             {
               shape: `1 × (4 + ${nc} + 关键点数 × 3) × ${anchors}`,
@@ -346,7 +428,7 @@ export function describePostprocess(
       case "obb":
         return {
           label,
-          summary: "需要自行 NMS",
+          summary: rawBoxSummary,
           outputs: [
             {
               shape: `1 × ${channels(5, "(4 + 类别数 + 1)")} × ${anchors}`,
@@ -357,7 +439,7 @@ export function describePostprocess(
       case "detect":
         return {
           label,
-          summary: "需要自行 NMS",
+          summary: rawBoxSummary,
           outputs: [
             {
               shape: `1 × ${channels(4, "(4 + 类别数)")} × ${anchors}`,
@@ -370,7 +452,14 @@ export function describePostprocess(
     }
   }
 
-  const summary = mode === "end2end" ? "不需要 NMS" : "NMS 已嵌入模型"
+  const summary =
+    mode === "end2end"
+      ? dualHead
+        ? "one-to-one 端到端头，无需 NMS，推理延迟更低"
+        : "不需要 NMS"
+      : dualHead
+        ? "one-to-many 检测头 + 图内嵌入 NMS（固定 batch=1）"
+        : "NMS 已嵌入模型"
   const boxes = "每张图最多 300 个目标，每个为 x1, y1, x2, y2, 置信度, 类别"
   switch (task) {
     case "segment":

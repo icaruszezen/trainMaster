@@ -263,3 +263,66 @@ func TestCommonParamsTierAndTemplateNormalization(t *testing.T) {
 		t.Errorf("template resume must always be normalized to false, got %v", norm["resume"])
 	}
 }
+
+func TestYOLO26ParamsAndL1LossMetrics(t *testing.T) {
+	// Verify nms accepts nil / true / false and defaults to nil (one-to-many + NMS in Ultralytics 8.4+).
+	schema := ParamsSchema()
+	if got, ok := schema.Defaults["nms"]; !ok || got != nil {
+		t.Fatalf("default[nms] = %#v (ok=%v), want nil", got, ok)
+	}
+	for _, val := range []any{nil, true, false} {
+		norm, err := NormalizeParams(map[string]any{"nms": val}, InitScratch)
+		if err != nil {
+			t.Fatalf("NormalizeParams(nms=%v) error: %v", val, err)
+		}
+		if norm["nms"] != val {
+			t.Errorf("normalized nms = %#v, want %#v", norm["nms"], val)
+		}
+	}
+	if yamlName, err := ArchYAML("yolo26", "s"); err != nil || yamlName != "yolo26s.yaml" {
+		t.Errorf("ArchYAML(yolo26, s) = (%q, %v)", yamlName, err)
+	}
+
+	// Verify sanitizeEpoch and mergeSummary preserve YOLO26 L1 loss alongside box/cls loss.
+	f := func(v float64) *float64 { return &v }
+	ep1 := sanitizeEpoch(EpochMetrics{
+		Epoch:        1,
+		TotalEpochs:  10,
+		TrainBoxLoss: f(0.82),
+		TrainClsLoss: f(0.45),
+		TrainL1Loss:  f(0.18),
+		ValBoxLoss:   f(0.79),
+		ValClsLoss:   f(0.41),
+		ValL1Loss:    f(0.16),
+		MAP50:        f(0.72),
+		MAP50_95:     f(0.51),
+		Fitness:      f(0.53),
+	})
+	if ep1.TrainL1Loss == nil || *ep1.TrainL1Loss != 0.18 || ep1.ValL1Loss == nil || *ep1.ValL1Loss != 0.16 {
+		t.Fatalf("sanitizeEpoch dropped L1 loss: %+v", ep1)
+	}
+	if ep1.TrainDFLLoss != nil || ep1.ValDFLLoss != nil {
+		t.Errorf("YOLO26 epoch should keep DFL loss nil: %+v", ep1)
+	}
+
+	summary := mergeSummary(SummaryMetrics{}, ep1)
+	if summary.TrainL1Loss == nil || *summary.TrainL1Loss != 0.18 || summary.ValL1Loss == nil || *summary.ValL1Loss != 0.16 {
+		t.Fatalf("mergeSummary dropped L1 loss: %+v", summary)
+	}
+	if summary.BestEpoch == nil || *summary.BestEpoch != 1 {
+		t.Errorf("BestEpoch = %v, want 1", summary.BestEpoch)
+	}
+
+	// Subsequent epoch updates latest L1 loss in summary.
+	ep2 := sanitizeEpoch(EpochMetrics{
+		Epoch:       2,
+		TotalEpochs: 10,
+		TrainL1Loss: f(0.12),
+		ValL1Loss:   f(0.11),
+		Fitness:     f(0.60),
+	})
+	summary = mergeSummary(summary, ep2)
+	if summary.TrainL1Loss == nil || *summary.TrainL1Loss != 0.12 || summary.ValL1Loss == nil || *summary.ValL1Loss != 0.11 {
+		t.Errorf("summary L1 loss not updated: %+v", summary)
+	}
+}

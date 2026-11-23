@@ -24,6 +24,9 @@ type Info struct {
 	Channels           int                // input channels, 3 by default
 	Parameters         int64              // elements of the model's nn.Parameter tensors, 0 if unknown
 	End2End            bool               // the detection head has an end-to-end (one-to-one, NMS-free) branch
+	One2Many           *bool              // Detect head has the one-to-many (NMS) branch (cv2); nil if not a Detect head
+	One2One            *bool              // Detect head has the one-to-one (NMS-free) branch (one2one_cv2); nil if not a Detect head
+	TrainNMS           *bool              // train_args.nms (or model.args.nms): nil/true = one-to-many + NMS, false = one-to-one end2end
 	Head               string             // class name of the last layer: Detect, v10Detect, Segment, ...
 	UltralyticsVersion string             // ckpt["version"]
 	Date               string             // ckpt["date"] as saved
@@ -32,7 +35,7 @@ type Info struct {
 	BestFitness        *float64           // ckpt["best_fitness"]
 	Metrics            map[string]float64 // numeric entries of ckpt["train_metrics"], keys as saved
 	TrainData          string             // train_args.data
-	BaseModel          string             // train_args.model, e.g. yolo11n.pt
+	BaseModel          string             // train_args.model, e.g. yolo26n.pt
 	TrainingCheckpoint bool               // has optimizer state (a resumable checkpoint such as last.pt)
 }
 

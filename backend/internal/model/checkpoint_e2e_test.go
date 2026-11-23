@@ -75,7 +75,7 @@ func TestIntegrationRealCheckpoints(t *testing.T) {
 		}
 	})
 
-	t.Run("end-to-end model and the version check", func(t *testing.T) {
+	t.Run("dual-head model and the version check", func(t *testing.T) {
 		data := fixture(t, "yolo26n-best.pt")
 		e := newRealEnv(t)
 		projectID := e.project(t, "p")
@@ -91,15 +91,20 @@ func TestIntegrationRealCheckpoints(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !m.Info.End2End || m.YOLOVersion != "yolo26" {
+		if !m.Info.End2End || m.Info.One2Many == nil || !*m.Info.One2Many || m.Info.One2One == nil || !*m.Info.One2One ||
+			m.Info.TrainNMS != nil || m.YOLOVersion != "yolo26" {
 			t.Errorf("model = %+v", m)
 		}
-		if got := AllowedPostprocess(m); !slices.Equal(got, []string{PostprocessEnd2End, PostprocessRaw, PostprocessNMS}) {
+		if got := AllowedPostprocess(m); !slices.Equal(got, []string{PostprocessRaw, PostprocessNMS, PostprocessEnd2End}) {
 			t.Errorf("allowed postprocess = %v", got)
 		}
 		exp, _, err := e.svc.RequestExport(ctx, m.ID, ExportRequest{Format: FormatONNX})
-		if err != nil || exp.Options.Postprocess != PostprocessEnd2End {
+		if err != nil || exp.Options.Postprocess != PostprocessRaw {
 			t.Errorf("export = %+v, %v", exp, err)
+		}
+		e2eExp, _, err := e.svc.RequestExport(ctx, m.ID, ExportRequest{Format: FormatONNX, Postprocess: PostprocessEnd2End})
+		if err != nil || e2eExp.Options.Postprocess != PostprocessEnd2End {
+			t.Errorf("end2end export = %+v, %v", e2eExp, err)
 		}
 	})
 

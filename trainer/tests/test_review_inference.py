@@ -305,6 +305,41 @@ def test_session_loads_warms_up_and_infers(monkeypatch, tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    ("end2end_head", "one2many_head", "train_nms", "want_nms_false"),
+    [
+        # YOLO26 默认（双头 + train_args.nms=None/True）走 one-to-many + NMS，不传 nms=False
+        (True, True, None, False),
+        (True, True, True, False),
+        # 训练时显式指定 nms=False 时，审图推理自动走端到端（nms=False）
+        (True, True, False, True),
+        # 已融合移除 one-to-many 分支时，强制走端到端（nms=False）
+        (True, False, None, True),
+        # 标准单头模型即使异常带 train_nms=False 也不传 nms=False
+        (False, True, False, False),
+    ],
+)
+def test_session_dual_head_nms_selection(
+    monkeypatch, tmp_path, end2end_head, one2many_head, train_nms, want_nms_false
+):
+    ultralytics = install(
+        monkeypatch,
+        tmp_path,
+        end2end_head=end2end_head,
+        one2many_head=one2many_head,
+        train_nms=train_nms,
+    )
+    session = Session.load(InferenceSpec(weights=weights(tmp_path), yolo_version="yolo26"))
+    predict_call = ultralytics.calls[1]
+    assert predict_call["call"] == "predict"
+    if want_nms_false:
+        assert predict_call.get("nms") is False
+        assert session.kwargs.get("nms") is False
+    else:
+        assert "nms" not in predict_call
+        assert "nms" not in session.kwargs
+
+
 def test_session_uses_the_first_gpu(monkeypatch, tmp_path):
     ultralytics = install(monkeypatch, tmp_path, cuda=True, device_name="NVIDIA GeForce RTX 4090")
     session = Session.load(InferenceSpec(weights=weights(tmp_path)))

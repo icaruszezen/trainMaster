@@ -31,18 +31,32 @@ type ExportRequest struct {
 // AllowedPostprocess returns the postprocessing modes a model can be
 // exported with, its default first. Only tasks with boxes have an
 // end-to-end head or can embed NMS; the others (classification, semantic
-// segmentation, depth) only have raw outputs, even in YOLO26. Box models
-// with an end-to-end head default to it (and can still embed NMS on their
-// one-to-many head).
+// segmentation, depth) only have raw outputs, even in YOLO26.
+//
+// In Ultralytics 8.4+, dual-head box models (YOLO26, YOLOv10) train both
+// branches and use one-to-many + NMS by default for higher accuracy, so their
+// ONNX export defaults to raw (external NMS) unless the checkpoint was
+// explicitly trained with nms=false (or fused to one-to-one only), in which
+// case it defaults to end2end.
 func AllowedPostprocess(m Model) []string {
 	if !hasBoxes(m.Task) {
 		return []string{PostprocessRaw}
 	}
-	var modes []string
-	if end2endCapable(m.YOLOVersion, m.Info) {
-		modes = append(modes, PostprocessEnd2End)
+	hasO2M := one2manyCapable(m.Info)
+	hasO2O := end2endCapable(m.YOLOVersion, m.Info)
+	switch {
+	case hasO2M && hasO2O:
+		if prefersEnd2End(m.YOLOVersion, m.Info) {
+			return []string{PostprocessEnd2End, PostprocessRaw, PostprocessNMS}
+		}
+		return []string{PostprocessRaw, PostprocessNMS, PostprocessEnd2End}
+	case hasO2O && !hasO2M:
+		return []string{PostprocessEnd2End}
+	case hasO2M:
+		return []string{PostprocessRaw, PostprocessNMS}
+	default:
+		return []string{PostprocessRaw}
 	}
-	return append(modes, PostprocessRaw, PostprocessNMS)
 }
 
 // NormalizeExport validates a conversion request for m and fills in the
@@ -111,7 +125,7 @@ func NormalizeExport(m Model, req ExportRequest) (ExportOptions, error) {
 }
 
 // postprocessNotAllowed explains why mode is not in AllowedPostprocess(m);
-// it only suggests nms for tasks with boxes.
+// it only suggests modes the checkpoint's remaining branches actually support.
 func postprocessNotAllowed(m Model, mode string) error {
 	switch {
 	case m.Task == taskClassify:
@@ -120,6 +134,12 @@ func postprocessNotAllowed(m Model, mode string) error {
 		return newError(ErrInvalid, "%s模型没有检测框，不能嵌入 NMS，请选择 raw", taskLabel(m.Task))
 	case !hasBoxes(m.Task):
 		return newError(ErrInvalid, "%s模型没有检测框，不能导出为 end2end，请选择 raw", taskLabel(m.Task))
+	case mode != PostprocessEnd2End && !one2manyCapable(m.Info) && end2endCapable(m.YOLOVersion, m.Info):
+		return &Error{Kind: ErrInvalid, Message: "该模型已融合且移除了 one-to-many 检测分支，只能导出为 end2end"}
+	}
+	if v, ok := LookupYOLOVersion(m.YOLOVersion); ok && v.End2End && m.Info.One2One != nil && !*m.Info.One2One {
+		return newError(ErrInvalid, "%s 模型已融合且移除了端到端（one-to-one）检测分支，不能导出为 end2end，请选择 raw 或 nms",
+			versionLabel(m.YOLOVersion))
 	}
 	return newError(ErrInvalid, "%s 模型没有端到端（NMS-free）检测头，不能导出为 end2end，请选择 raw 或 nms",
 		versionLabel(m.YOLOVersion))

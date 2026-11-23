@@ -363,6 +363,12 @@ func asFloat(v any) (float64, bool) {
 	return 0, false
 }
 
+// asBool accepts Python bool values (None and ints return false).
+func asBool(v any) (bool, bool) {
+	b, ok := v.(bool)
+	return b, ok
+}
+
 // truthy reports whether v is True or a non-zero int.
 func truthy(v any) bool {
 	switch x := v.(type) {

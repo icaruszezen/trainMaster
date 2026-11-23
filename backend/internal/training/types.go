@@ -83,9 +83,11 @@ type SummaryMetrics struct {
 	TrainBoxLoss *float64 `json:"train_box_loss,omitempty"`
 	TrainClsLoss *float64 `json:"train_cls_loss,omitempty"`
 	TrainDFLLoss *float64 `json:"train_dfl_loss,omitempty"`
+	TrainL1Loss  *float64 `json:"train_l1_loss,omitempty"`
 	ValBoxLoss   *float64 `json:"val_box_loss,omitempty"`
 	ValClsLoss   *float64 `json:"val_cls_loss,omitempty"`
 	ValDFLLoss   *float64 `json:"val_dfl_loss,omitempty"`
+	ValL1Loss    *float64 `json:"val_l1_loss,omitempty"`
 	Precision    *float64 `json:"precision,omitempty"`
 	Recall       *float64 `json:"recall,omitempty"`
 	MAP50        *float64 `json:"map50,omitempty"`
@@ -106,9 +108,11 @@ type EpochMetrics struct {
 	TrainBoxLoss *float64 `json:"train_box_loss,omitempty"`
 	TrainClsLoss *float64 `json:"train_cls_loss,omitempty"`
 	TrainDFLLoss *float64 `json:"train_dfl_loss,omitempty"`
+	TrainL1Loss  *float64 `json:"train_l1_loss,omitempty"`
 	ValBoxLoss   *float64 `json:"val_box_loss,omitempty"`
 	ValClsLoss   *float64 `json:"val_cls_loss,omitempty"`
 	ValDFLLoss   *float64 `json:"val_dfl_loss,omitempty"`
+	ValL1Loss    *float64 `json:"val_l1_loss,omitempty"`
 	Precision    *float64 `json:"precision,omitempty"`
 	Recall       *float64 `json:"recall,omitempty"`
 	MAP50        *float64 `json:"map50,omitempty"`
@@ -285,7 +289,7 @@ type Task struct {
 	InitMode       string                               `json:"init_mode"`
 	YOLOVersion    string                               `json:"yolo_version"`
 	ModelScale     string                               `json:"model_scale"`
-	ArchYAML       string                               `json:"arch_yaml"` // e.g. "yolo11n.yaml" when scratch
+	ArchYAML       string                               `json:"arch_yaml"` // e.g. "yolo26n.yaml" when scratch
 	Task           string                               `json:"task"`
 	DataVersion    DataVersionRef                       `json:"data_version"`
 	DVTotalBytes   int64                                `json:"dv_total_bytes"`
