@@ -108,7 +108,10 @@ type Info struct {
 	ImageSize           *int               `json:"image_size"`     // training image size
 	Channels            int                `json:"channels"`
 	Parameters          *int64             `json:"parameters"`
-	End2End             bool               `json:"end2end"` // has an end-to-end (NMS-free) head
+	End2End             bool               `json:"end2end"`   // has an end-to-end (one-to-one, NMS-free) branch
+	One2Many            *bool              `json:"one2many"`  // has the one-to-many (NMS) branch (cv2); null if unknown / not a Detect head
+	One2One             *bool              `json:"one2one"`   // has the one-to-one (NMS-free) branch (one2one_cv2); null if unknown / not a Detect head
+	TrainNMS            *bool              `json:"train_nms"` // train_args.nms: null/true = one-to-many + NMS, false = one-to-one end2end
 	UltralyticsVersion  string             `json:"ultralytics_version"`
 	TrainedAt           string             `json:"trained_at"` // as saved in the file
 	Epochs              *int               `json:"epochs"`
@@ -116,7 +119,7 @@ type Info struct {
 	BestFitness         *float64           `json:"best_fitness"`
 	Metrics             map[string]float64 `json:"metrics"` // e.g. "metrics/mAP50(B)"
 	TrainData           string             `json:"train_data"`
-	BaseModel           string             `json:"base_model"`          // e.g. yolo11n.pt
+	BaseModel           string             `json:"base_model"`          // e.g. yolo26n.pt
 	TrainingCheckpoint  bool               `json:"training_checkpoint"` // resumable (has optimizer state)
 }
 

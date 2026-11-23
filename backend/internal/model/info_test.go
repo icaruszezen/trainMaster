@@ -49,12 +49,13 @@ func TestNewInfo(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantKeys := []string{"task", "model_class", "head", "yaml_file", "scale", "detected_yolo_version", "version_source",
-		"class_names", "image_size", "channels", "parameters", "end2end", "ultralytics_version", "trained_at", "epochs",
-		"epoch", "best_fitness", "metrics", "train_data", "base_model", "training_checkpoint"}
+		"class_names", "image_size", "channels", "parameters", "end2end", "one2many", "one2one", "train_nms",
+		"ultralytics_version", "trained_at", "epochs", "epoch", "best_fitness", "metrics", "train_data", "base_model",
+		"training_checkpoint"}
 	if len(raw) != len(wantKeys) {
 		t.Errorf("info keys = %v", raw)
 	}
-	for _, k := range []string{"detected_yolo_version", "image_size", "parameters", "epochs", "epoch", "best_fitness"} {
+	for _, k := range []string{"detected_yolo_version", "image_size", "parameters", "one2many", "one2one", "train_nms", "epochs", "epoch", "best_fitness"} {
 		if v, ok := raw[k]; !ok || v != nil {
 			t.Errorf("%s = %v, want null", k, v)
 		}

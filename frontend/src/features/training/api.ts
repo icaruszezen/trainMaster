@@ -152,9 +152,11 @@ export type SummaryMetrics = {
   train_box_loss?: number
   train_cls_loss?: number
   train_dfl_loss?: number
+  train_l1_loss?: number
   val_box_loss?: number
   val_cls_loss?: number
   val_dfl_loss?: number
+  val_l1_loss?: number
   precision?: number
   recall?: number
   map50?: number
@@ -174,9 +176,11 @@ export type EpochMetrics = {
   train_box_loss?: number
   train_cls_loss?: number
   train_dfl_loss?: number
+  train_l1_loss?: number
   val_box_loss?: number
   val_cls_loss?: number
   val_dfl_loss?: number
+  val_l1_loss?: number
   precision?: number
   recall?: number
   map50?: number

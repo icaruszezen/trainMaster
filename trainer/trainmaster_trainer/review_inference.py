@@ -73,6 +73,7 @@ from .model_export import (
     format_bytes,
     report_failure,
     require_safe_load,
+    should_use_end2end_inference,
     translate_load_error,
     verify_download,
 )
@@ -490,6 +491,7 @@ class Session:
         for key, value in dict(raw_names).items():
             with contextlib.suppress(TypeError, ValueError):
                 names[int(key)] = str(value)
+        use_end2end = should_use_end2end_inference(model)
         kwargs: dict[str, Any] = {
             "conf": spec.conf,
             "iou": spec.iou,
@@ -497,9 +499,13 @@ class Session:
             "device": device,
             "verbose": False,
         }
+        if use_end2end:
+            kwargs["nms"] = False
         if spec.imgsz:
             kwargs["imgsz"] = list(spec.imgsz)
-        print(f"predict: {json.dumps(kwargs)} (task={task})", file=sys.stderr)
+        print(
+            f"predict: {json.dumps(kwargs)} (task={task}, end2end={use_end2end})", file=sys.stderr
+        )
 
         # 预热：在启动时暴露设备、显存与模型本身的问题，而不是在每张图片上失败
         height, width = spec.imgsz or (640, 640)

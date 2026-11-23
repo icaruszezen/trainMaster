@@ -178,7 +178,7 @@ func TestIntegrationExportLifecycle(t *testing.T) {
 	other := e.node(t, "gpu-server-02")
 
 	exp, _ := e.requestExport(t, m.ID, ExportRequest{Dynamic: boolPtr(true)})
-	if exp.Options.Postprocess != PostprocessEnd2End || !exp.Options.Dynamic || exp.WorkersOnline != 0 {
+	if exp.Options.Postprocess != PostprocessRaw || !exp.Options.Dynamic || exp.WorkersOnline != 0 {
 		t.Errorf("export = %+v", exp)
 	}
 
@@ -273,9 +273,9 @@ func TestIntegrationExportLifecycle(t *testing.T) {
 	}
 
 	// Complete.
-	result := json.RawMessage(`{"ultralytics_version": "8.4.198", "opset": 19, "end2end": true, "nms": false,
+	result := json.RawMessage(`{"ultralytics_version": "8.4.198", "opset": 19, "end2end": false, "nms": false,
 		"dynamic": true, "inputs": [{"name": "images", "shape": ["batch", 3, "height", "width"], "type": "float32"}],
-		"outputs": [{"name": "output0", "shape": ["batch", 300, 6], "type": "float32"}], "verified": true,
+		"outputs": [{"name": "output0", "shape": ["batch", 6, "anchors"], "type": "float32"}], "verified": true,
 		"duration_ms": 8123, "evil": "x"}`)
 	done, err := e.svc.CompleteTask(ctx, exp.ID, node, result)
 	if err != nil {
@@ -284,7 +284,7 @@ func TestIntegrationExportLifecycle(t *testing.T) {
 	wantURL := fmt.Sprintf("/api/v1/models/%d/exports/%d/file", m.ID, exp.ID)
 	if done.Status != ExportSucceeded || done.Stage != "" || done.SizeBytes == nil || *done.SizeBytes != int64(len(onnx)) ||
 		done.SHA256 != sum || done.DownloadURL == nil || *done.DownloadURL != wantURL || done.FinishedAt == nil ||
-		done.Node == nil || done.Node.ID != node || done.FileName != "p_v1_640_dynamic_end2end.onnx" || done.Error != "" {
+		done.Node == nil || done.Node.ID != node || done.FileName != "p_v1_640_dynamic.onnx" || done.Error != "" {
 		t.Errorf("done = %+v", done)
 	}
 	var res ExportResult
@@ -320,12 +320,12 @@ func TestIntegrationExportLifecycle(t *testing.T) {
 	}
 	got, _ = io.ReadAll(df.Content)
 	df.Close()
-	if !bytes.Equal(got, onnx) || df.Name != "p_v1_640_dynamic_end2end.onnx" || df.Size != int64(len(onnx)) {
+	if !bytes.Equal(got, onnx) || df.Name != "p_v1_640_dynamic.onnx" || df.Size != int64(len(onnx)) {
 		t.Errorf("download: %d bytes, %q", len(got), df.Name)
 	}
 
 	// The cache: the same options are ready at once.
-	cached, ready := e.requestExport(t, m.ID, ExportRequest{Dynamic: boolPtr(true), Postprocess: "end2end"})
+	cached, ready := e.requestExport(t, m.ID, ExportRequest{Dynamic: boolPtr(true), Postprocess: PostprocessRaw})
 	if !ready || cached.ID != exp.ID || cached.Status != ExportSucceeded {
 		t.Errorf("cached = %+v, ready %v", cached, ready)
 	}

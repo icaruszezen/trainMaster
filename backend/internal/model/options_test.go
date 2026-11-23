@@ -32,11 +32,12 @@ func TestAllowedPostprocess(t *testing.T) {
 		{"yolov9", "segment", false, []string{"raw", "nms"}},
 		{"yolo11", "pose", false, []string{"raw", "nms"}},
 		{"yolo12", "obb", false, []string{"raw", "nms"}},
-		{"yolov10", "detect", false, []string{"end2end", "raw", "nms"}},
-		{"yolo26", "detect", false, []string{"end2end", "raw", "nms"}},
-		{"yolo26", "segment", true, []string{"end2end", "raw", "nms"}},
+		// Dual-head models default to raw (one-to-many + external NMS) when trained with default nms=None.
+		{"yolov10", "detect", false, []string{"raw", "nms", "end2end"}},
+		{"yolo26", "detect", false, []string{"raw", "nms", "end2end"}},
+		{"yolo26", "segment", true, []string{"raw", "nms", "end2end"}},
 		// A file with an end-to-end head of a version without one by default.
-		{"yolo11", "detect", true, []string{"end2end", "raw", "nms"}},
+		{"yolo11", "detect", true, []string{"raw", "nms", "end2end"}},
 		// Classification: raw only, whatever the version.
 		{"yolo11", "classify", false, []string{"raw"}},
 		{"yolo26", "classify", false, []string{"raw"}},
@@ -54,9 +55,52 @@ func TestAllowedPostprocess(t *testing.T) {
 			t.Errorf("AllowedPostprocess(%s %s end2end=%v) = %v, want %v", tt.yolo, tt.task, tt.end2end, got, tt.want)
 		}
 	}
+
+	// Dual-head model trained with nms=false defaults to end2end while still offering raw and nms.
+	y26End2End := testModel("yolo26", "detect", 640, true)
+	y26End2End.Info.One2Many = boolPtr(true)
+	y26End2End.Info.One2One = boolPtr(true)
+	y26End2End.Info.TrainNMS = boolPtr(false)
+	if got := AllowedPostprocess(y26End2End); !slices.Equal(got, []string{"end2end", "raw", "nms"}) {
+		t.Errorf("AllowedPostprocess(yolo26 train_nms=false) = %v, want [end2end raw nms]", got)
+	}
+
+	// Dual-head model trained with nms=true still defaults to raw.
+	y26TrainNMSTrue := testModel("yolo26", "detect", 640, true)
+	y26TrainNMSTrue.Info.One2Many = boolPtr(true)
+	y26TrainNMSTrue.Info.One2One = boolPtr(true)
+	y26TrainNMSTrue.Info.TrainNMS = boolPtr(true)
+	if got := AllowedPostprocess(y26TrainNMSTrue); !slices.Equal(got, []string{"raw", "nms", "end2end"}) {
+		t.Errorf("AllowedPostprocess(yolo26 train_nms=true) = %v, want [raw nms end2end]", got)
+	}
+
+	// Fused one-to-one-only checkpoint: only end2end is possible.
+	y26FusedO2O := testModel("yolo26", "detect", 640, true)
+	y26FusedO2O.Info.One2Many = boolPtr(false)
+	y26FusedO2O.Info.One2One = boolPtr(true)
+	if got := AllowedPostprocess(y26FusedO2O); !slices.Equal(got, []string{"end2end"}) {
+		t.Errorf("AllowedPostprocess(yolo26 fused one2one-only) = %v, want [end2end]", got)
+	}
+
+	// Fused one-to-many-only YOLO26 checkpoint: end2end head was stripped, only raw and nms remain.
+	y26FusedO2M := testModel("yolo26", "detect", 640, false)
+	y26FusedO2M.Info.One2Many = boolPtr(true)
+	y26FusedO2M.Info.One2One = boolPtr(false)
+	if got := AllowedPostprocess(y26FusedO2M); !slices.Equal(got, []string{"raw", "nms"}) {
+		t.Errorf("AllowedPostprocess(yolo26 fused one2many-only) = %v, want [raw nms]", got)
+	}
 }
 
 func TestNormalizeExportDefaults(t *testing.T) {
+	y26TrainedE2E := testModel("yolo26", "detect", 640, true)
+	y26TrainedE2E.Info.One2Many = boolPtr(true)
+	y26TrainedE2E.Info.One2One = boolPtr(true)
+	y26TrainedE2E.Info.TrainNMS = boolPtr(false)
+
+	y26FusedO2O := testModel("yolo26", "detect", 640, true)
+	y26FusedO2O.Info.One2Many = boolPtr(false)
+	y26FusedO2O.Info.One2One = boolPtr(true)
+
 	for _, tt := range []struct {
 		name string
 		m    Model
@@ -72,9 +116,13 @@ func TestNormalizeExportDefaults(t *testing.T) {
 			ExportOptions{ImgSize: [2]int{32, 32}, Postprocess: "raw"}},
 		{"huge training size", testModel("yolo11", "detect", 10000, false),
 			ExportOptions{ImgSize: [2]int{4096, 4096}, Postprocess: "raw"}},
-		{"yolo26 end2end", testModel("yolo26", "detect", 640, false),
+		{"yolo26 default nms trained -> raw", testModel("yolo26", "detect", 640, true),
+			ExportOptions{ImgSize: [2]int{640, 640}, Postprocess: "raw"}},
+		{"yolov10 default nms trained -> raw", testModel("yolov10", "detect", 0, true),
+			ExportOptions{ImgSize: [2]int{640, 640}, Postprocess: "raw"}},
+		{"yolo26 trained with nms=false -> end2end", y26TrainedE2E,
 			ExportOptions{ImgSize: [2]int{640, 640}, Postprocess: "end2end"}},
-		{"yolov10 end2end", testModel("yolov10", "detect", 0, false),
+		{"yolo26 fused one2one-only -> end2end", y26FusedO2O,
 			ExportOptions{ImgSize: [2]int{640, 640}, Postprocess: "end2end"}},
 		{"yolo26 classify raw", testModel("yolo26", "classify", 224, false),
 			ExportOptions{ImgSize: [2]int{224, 224}, Postprocess: "raw"}},
@@ -84,7 +132,9 @@ func TestNormalizeExportDefaults(t *testing.T) {
 			ExportOptions{ImgSize: [2]int{640, 640}, Postprocess: "raw"}},
 		{"dynamic keeps the default", testModel("yolo11", "detect", 640, false),
 			ExportOptions{ImgSize: [2]int{640, 640}, Dynamic: true, Postprocess: "raw"}},
-		{"dynamic yolo26 end2end", testModel("yolo26", "detect", 640, false),
+		{"dynamic yolo26 default raw", testModel("yolo26", "detect", 640, true),
+			ExportOptions{ImgSize: [2]int{640, 640}, Dynamic: true, Postprocess: "raw"}},
+		{"dynamic yolo26 trained end2end", y26TrainedE2E,
 			ExportOptions{ImgSize: [2]int{640, 640}, Dynamic: true, Postprocess: "end2end"}},
 	} {
 		req := ExportRequest{Format: "onnx"}
@@ -149,6 +199,13 @@ func TestNormalizeExportExplicit(t *testing.T) {
 
 func TestNormalizeExportInvalid(t *testing.T) {
 	v11 := testModel("yolo11", "detect", 640, false)
+	y26FusedO2O := testModel("yolo26", "detect", 640, true)
+	y26FusedO2O.Info.One2Many = boolPtr(false)
+	y26FusedO2O.Info.One2One = boolPtr(true)
+	y26FusedO2M := testModel("yolo26", "detect", 640, false)
+	y26FusedO2M.Info.One2Many = boolPtr(true)
+	y26FusedO2M.Info.One2One = boolPtr(false)
+
 	for _, tt := range []struct {
 		name string
 		m    Model
@@ -166,6 +223,9 @@ func TestNormalizeExportInvalid(t *testing.T) {
 		// Ultralytics silently ignores nms=False without an end-to-end head.
 		{"end2end without the head", v11, ExportRequest{Format: "onnx", Postprocess: "end2end"}, "YOLO11 模型没有端到端"},
 		{"end2end for yolov8", testModel("yolov8", "segment", 0, false), ExportRequest{Format: "onnx", Postprocess: "end2end"}, "YOLOv8 模型"},
+		{"fused one2one-only rejects raw", y26FusedO2O, ExportRequest{Format: "onnx", Postprocess: "raw"}, "移除了 one-to-many 检测分支，只能导出为 end2end"},
+		{"fused one2one-only rejects nms", y26FusedO2O, ExportRequest{Format: "onnx", Postprocess: "nms"}, "移除了 one-to-many 检测分支，只能导出为 end2end"},
+		{"fused one2many-only rejects end2end", y26FusedO2M, ExportRequest{Format: "onnx", Postprocess: "end2end"}, "YOLO26 模型已融合且移除了端到端（one-to-one）检测分支"},
 		{"classify nms", testModel("yolo11", "classify", 224, false), ExportRequest{Format: "onnx", Postprocess: "nms"}, "分类模型只支持原始输出"},
 		{"classify end2end", testModel("yolo26", "classify", 224, false), ExportRequest{Format: "onnx", Postprocess: "end2end"}, "分类模型只支持原始输出"},
 		{"nms without boxes", testModel("yolo11", "", 0, false), ExportRequest{Format: "onnx", Postprocess: "nms"}, "不能嵌入 NMS"},

@@ -84,15 +84,17 @@ import {
   allowedPostprocess,
   defaultExportOptions,
   describePostprocess,
+  dualHeadExportHint,
   exportFileName,
   exportOptionsText,
   fitExportOptions,
+  isDualHeadModel,
   modelArchLabel,
   modelFileName,
   opsetChoices,
   postprocessConflict,
-  rawOnlyNote,
   sameExportOptions,
+  singlePostprocessNote,
   taskLabel,
   validateImgSize,
 } from "@/features/models/yolo-versions"
@@ -331,7 +333,9 @@ function DownloadForm({
     enabled: format === "onnx",
   })
   const allowed = allowedPostprocess(model)
-  const onlyRaw = rawOnlyNote(model)
+  const dualHead = isDualHeadModel(model)
+  const singleNote = singlePostprocessNote(model)
+  const dualHint = dualHeadExportHint(model)
   const heightError = validateImgSize(options.height)
   const widthError = validateImgSize(options.width)
   const sizeError = heightError ?? widthError
@@ -511,7 +515,14 @@ function DownloadForm({
           </div>
 
           <div className="grid gap-3">
-            <Label id={postprocessId}>后处理方式</Label>
+            <div className="grid gap-1">
+              <Label id={postprocessId}>后处理方式</Label>
+              {dualHint && (
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  {dualHint}
+                </p>
+              )}
+            </div>
             <RadioGroup
               value={options.postprocess}
               onValueChange={(value) =>
@@ -527,6 +538,7 @@ function DownloadForm({
                   classCount,
                   imgsz,
                   dynamic: options.dynamic,
+                  dualHead,
                 })
                 const conflict = postprocessConflict(mode, options.dynamic)
                 return (
@@ -558,8 +570,8 @@ function DownloadForm({
                 )
               })}
             </RadioGroup>
-            {onlyRaw && (
-              <p className="text-xs text-muted-foreground">{onlyRaw}</p>
+            {singleNote && (
+              <p className="text-xs text-muted-foreground">{singleNote}</p>
             )}
           </div>
 

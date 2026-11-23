@@ -309,9 +309,11 @@ def _extract_epoch_metrics(
         "train_box_loss": _first_metric(losses, "train/box_loss"),
         "train_cls_loss": _first_metric(losses, "train/cls_loss"),
         "train_dfl_loss": _first_metric(losses, "train/dfl_loss"),
+        "train_l1_loss": _first_metric(losses, "train/l1_loss"),
         "val_box_loss": _first_metric(metrics, "val/box_loss"),
         "val_cls_loss": _first_metric(metrics, "val/cls_loss"),
         "val_dfl_loss": _first_metric(metrics, "val/dfl_loss"),
+        "val_l1_loss": _first_metric(metrics, "val/l1_loss"),
         "precision": _first_metric(
             metrics,
             "metrics/precision(B)",
@@ -380,9 +382,11 @@ def parse_results_csv(csv_path: Path, total_epochs: int = 0) -> list[dict[str, A
                     "train_box_loss": _first_metric(nums, "train/box_loss"),
                     "train_cls_loss": _first_metric(nums, "train/cls_loss"),
                     "train_dfl_loss": _first_metric(nums, "train/dfl_loss"),
+                    "train_l1_loss": _first_metric(nums, "train/l1_loss"),
                     "val_box_loss": _first_metric(nums, "val/box_loss"),
                     "val_cls_loss": _first_metric(nums, "val/cls_loss"),
                     "val_dfl_loss": _first_metric(nums, "val/dfl_loss"),
+                    "val_l1_loss": _first_metric(nums, "val/l1_loss"),
                     "precision": _first_metric(
                         nums, "metrics/precision(B)", "metrics/precision(M)", "metrics/precision"
                     ),

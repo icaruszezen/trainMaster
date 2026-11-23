@@ -39,6 +39,7 @@ from .model_export import (
     PROGRESS_INTERVAL,
     SAFE_LOAD_ENV,
     TRANSFER_TIMEOUT,
+    ExportSpec,
     TaskAbandoned,
     TaskFailed,
     _clean_message,
@@ -48,6 +49,7 @@ from .model_export import (
     fail_url_of,
     report_failure,
     require_safe_load,
+    should_use_end2end_inference,
     translate_load_error,
     verify_download,
 )
@@ -486,9 +488,11 @@ def _extract_predictions(result: Any, names_map: Mapping[int, str]) -> list[dict
 def run_evaluation_subprocess(spec: EvaluationSpec) -> dict[str, Any]:
     """在子进程内加载模型并执行低置信度全量批量推理 + COCO 指标计算。"""
     import torch
+    import ultralytics
     from ultralytics import YOLO
 
-    require_safe_load()
+    node_version = str(getattr(ultralytics, "__version__", "")) or "unknown"
+    require_safe_load(node_version)
 
     device = spec.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     use_half = spec.half and device != "cpu" and ("cpu" not in device.lower())
@@ -496,7 +500,8 @@ def run_evaluation_subprocess(spec: EvaluationSpec) -> dict[str, Any]:
     try:
         model = YOLO(spec.weights, task=spec.task)
     except Exception as exc:
-        msg = translate_load_error(exc, spec.yolo_version)
+        load_spec = ExportSpec(weights=spec.weights, task=spec.task, yolo_version=spec.yolo_version)
+        msg = translate_load_error(exc, load_spec, node_version)
         raise RuntimeError(msg) from exc
 
     raw_names = getattr(model, "names", None) or {}
@@ -510,6 +515,7 @@ def run_evaluation_subprocess(spec: EvaluationSpec) -> dict[str, Any]:
     manifest = json.loads(Path(spec.manifest_path).read_text(encoding="utf-8"))
     total = len(manifest)
 
+    use_end2end = should_use_end2end_inference(model)
     predict_kwargs: dict[str, Any] = {
         "conf": spec.low_conf,
         "iou": spec.nms_iou,
@@ -518,6 +524,8 @@ def run_evaluation_subprocess(spec: EvaluationSpec) -> dict[str, Any]:
         "device": device,
         "verbose": False,
     }
+    if use_end2end:
+        predict_kwargs["nms"] = False
     if spec.imgsz is not None:
         predict_kwargs["imgsz"] = list(spec.imgsz)
 
@@ -698,6 +706,7 @@ def run_evaluation_subprocess(spec: EvaluationSpec) -> dict[str, Any]:
         "trainer_version": __version__,
         "device": device,
         "half": use_half,
+        "end2end": use_end2end,
         "total_images": total,
         "timed_images": timed_images,
         "model_names": names_map,

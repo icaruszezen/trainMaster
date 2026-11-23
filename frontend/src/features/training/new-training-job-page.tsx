@@ -18,6 +18,7 @@ import {
   Bookmark,
   BookmarkCheck,
   BookmarkPlus,
+  Info,
   Layers,
   Plus,
   Rocket,
@@ -381,7 +382,7 @@ function NewTrainingJobForm({
   )
   const [initMode, setInitMode] = useState<InitMode>(initialMode)
   const [yoloVersion, setYoloVersion] = useState<YoloVersion>(
-    () => fromJob?.yolo_version ?? "yolo11"
+    () => fromJob?.yolo_version ?? "yolo26"
   )
   const [modelScale, setModelScale] = useState<string>(
     () => fromJob?.model_scale || "n"
@@ -474,6 +475,11 @@ function NewTrainingJobForm({
   const selectedBaseModel: Model | undefined = eligibleModels.find(
     (m) => m.id === baseModelId
   )
+  const activeYoloVersion =
+    initMode === "scratch" ? yoloVersion : selectedBaseModel?.yolo_version
+  const isDualHeadArch =
+    activeYoloVersion === "yolo26" || activeYoloVersion === "yolov10"
+  const isEnd2EndVal = params.nms === false
   const availableScales = useMemo(
     () => schema.scales[yoloVersion] ?? [],
     [schema.scales, yoloVersion]
@@ -801,7 +807,7 @@ function NewTrainingJobForm({
                 value={name}
                 maxLength={120}
                 disabled={createMutation.isPending}
-                placeholder="如：安全帽检测-YOLO11s-高分辨率实验"
+                placeholder="如：安全帽检测-YOLO26s-高分辨率实验"
                 onChange={(event) => setName(event.target.value)}
               />
             </Field>
@@ -924,7 +930,7 @@ function NewTrainingJobForm({
                 <div className="rounded-md border border-dashed px-3.5 py-3 text-xs text-muted-foreground">
                   {initMode === "resume"
                     ? "模型仓库中暂无包含优化器状态的训练检查点（如已注册的 last.pt）。你可以改选“预训练微调”或“从头训练”，也可以先在模型仓库上传检查点。"
-                    : "模型仓库中暂无可用的 .pt 模型。你可以先在“模型仓库”上传官方预训练权重（如 yolo11n.pt），或改选“从头训练”。"}
+                    : "模型仓库中暂无可用的 .pt 模型。你可以先在“模型仓库”上传官方预训练权重（如 yolo26n.pt），或改选“从头训练”。"}
                 </div>
               ) : (
                 <Select
@@ -960,6 +966,68 @@ function NewTrainingJobForm({
                 </p>
               )}
             </Field>
+          )}
+
+          {isDualHeadArch && (
+            <div className="flex items-start gap-2.5 rounded-xl border border-primary/20 bg-primary/[0.03] px-3.5 py-3 text-xs leading-relaxed text-muted-foreground">
+              <Info className="mt-0.5 size-4 shrink-0 text-primary" />
+              <div className="grid gap-1">
+                <div className="flex flex-wrap items-center gap-2 font-medium text-foreground">
+                  <span>
+                    {yoloVersionLabel(activeYoloVersion)} 双检测头训练与产物说明
+                  </span>
+                  <Badge
+                    variant="outline"
+                    className="h-5 px-1.5 text-[11px] font-normal"
+                  >
+                    {isEnd2EndVal
+                      ? "当前验证选优：端到端（nms=false）"
+                      : "当前验证选优：one-to-many + NMS（默认，优先精度）"}
+                  </Badge>
+                </div>
+                <p>
+                  Ultralytics 8.4+ 训练时始终对{" "}
+                  <code className="font-mono text-[11px] text-foreground">
+                    one-to-many
+                  </code>{" "}
+                  与{" "}
+                  <code className="font-mono text-[11px] text-foreground">
+                    one-to-one
+                  </code>{" "}
+                  双检测头联合监督，
+                  {isEnd2EndVal
+                    ? "当前已通过高级验证参数 nms=false 切换为端到端（NMS-free）路径评估与挑选 best.pt，后续评估、审图及默认 ONNX 导出也将自动对齐为端到端模式。"
+                    : "默认走 one-to-many + NMS 路径评估与挑选 best.pt，优先保证检测精度（可在下方「高级选项 → 验证与可视化设置 → nms」切换为 false 改走端到端选优）。"}
+                </p>
+                <p>
+                  训练产出的{" "}
+                  <code className="font-mono text-[11px] text-foreground">
+                    best.pt
+                  </code>{" "}
+                  /{" "}
+                  <code className="font-mono text-[11px] text-foreground">
+                    last.pt
+                  </code>{" "}
+                  均完整保留双检测头；入库后导出 ONNX 默认与训练路径一致（
+                  <code className="font-mono text-[11px] text-foreground">
+                    {isEnd2EndVal ? "end2end" : "raw"}
+                  </code>
+                  ），也可随时按需自由切换{" "}
+                  <code className="font-mono text-[11px] text-foreground">
+                    raw
+                  </code>
+                  、
+                  <code className="font-mono text-[11px] text-foreground">
+                    nms
+                  </code>{" "}
+                  或{" "}
+                  <code className="font-mono text-[11px] text-foreground">
+                    end2end
+                  </code>
+                  。
+                </p>
+              </div>
+            </div>
           )}
 
           <label className="flex cursor-pointer items-center justify-between gap-4 rounded-xl border bg-muted/20 p-3.5">

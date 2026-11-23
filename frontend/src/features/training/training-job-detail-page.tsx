@@ -555,6 +555,16 @@ function OverviewTab({
   const bestMap5095 = job.metrics.best_map50_95 ?? job.metrics.map50_95
   const latestBoxLoss = job.metrics.train_box_loss
   const latestClsLoss = job.metrics.train_cls_loss
+  const useL1Loss =
+    job.metrics.train_l1_loss !== undefined ||
+    job.epochs.some((ep) => ep.train_l1_loss !== undefined) ||
+    (job.yolo_version === "yolo26" &&
+      job.metrics.train_dfl_loss === undefined &&
+      !job.epochs.some((ep) => ep.train_dfl_loss !== undefined))
+  const regLossLabel = useL1Loss ? "L1" : "DFL"
+  const latestRegLoss = useL1Loss
+    ? job.metrics.train_l1_loss
+    : job.metrics.train_dfl_loss
 
   return (
     <div className="grid gap-4">
@@ -584,8 +594,8 @@ function OverviewTab({
           icon={Activity}
         >
           <span>
-            Cls {formatLoss(latestClsLoss)} · DFL{" "}
-            {formatLoss(job.metrics.train_dfl_loss)}
+            Cls {formatLoss(latestClsLoss)} · {regLossLabel}{" "}
+            {formatLoss(latestRegLoss)}
           </span>
         </StatCard>
 
@@ -619,7 +629,9 @@ function OverviewTab({
                     <TableHead className="pl-4 sm:pl-6">轮次</TableHead>
                     <TableHead className="text-right">训练 Box</TableHead>
                     <TableHead className="text-right">训练 Cls</TableHead>
-                    <TableHead className="text-right">训练 DFL</TableHead>
+                    <TableHead className="text-right">
+                      训练 {regLossLabel}
+                    </TableHead>
                     <TableHead className="text-right">精确率 P</TableHead>
                     <TableHead className="text-right">召回率 R</TableHead>
                     <TableHead className="text-right">mAP50</TableHead>
@@ -657,7 +669,9 @@ function OverviewTab({
                           {formatLoss(ep.train_cls_loss)}
                         </TableCell>
                         <TableCell className="text-right tabular-nums">
-                          {formatLoss(ep.train_dfl_loss)}
+                          {formatLoss(
+                            useL1Loss ? ep.train_l1_loss : ep.train_dfl_loss
+                          )}
                         </TableCell>
                         <TableCell className="text-right tabular-nums">
                           {formatMap(ep.precision)}

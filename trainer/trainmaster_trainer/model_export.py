@@ -44,7 +44,8 @@ log = logging.getLogger(__name__)
 CHILD_MODULE = "trainmaster_trainer.model_export"
 KIND = "model_export"
 
-# YOLO 版本（平台 models.yolo_version 的取值）与显示名；yolov10 / yolo26 带端到端（NMS-free）检测头。
+# YOLO 版本（平台 models.yolo_version 的取值）与显示名；
+# yolov10 / yolo26 为双检测头（默认 NMS 优先精度，可选端到端无 NMS）。
 YOLO_LABELS = {
     "yolov8": "YOLOv8",
     "yolov9": "YOLOv9",
@@ -183,7 +184,7 @@ def _is_out_of_memory(exc: BaseException) -> bool:
 @dataclass(frozen=True)
 class ExportSpec:
     """一次转换的参数（子进程的 --spec）。imgsz 为 None 时用模型训练时的尺寸；postprocess 为 None 时
-    按模型选择（端到端模型 end2end，其余 raw）。"""
+    按模型选择（仅保留 one-to-one 端到端分支或训练时显式设置 nms=False 的双头模型默认 end2end，其余默认 raw）。"""
 
     weights: str
     output: str | None = None
@@ -415,21 +416,67 @@ def has_end2end_head(model: Any) -> bool:
     return getattr(_head(model), "one2one_cv2", None) is not None
 
 
+def has_one2many_head(model: Any) -> bool:
+    """模型带标准 one-to-many 检测头（cv2 / cv3）。仅当检测头显式移除了 cv2（已融合为纯端到端分支）时返回 False。"""
+    head = _head(model)
+    if head is None:
+        return True
+    if hasattr(head, "cv2"):
+        return getattr(head, "cv2", None) is not None
+    return True
+
+
+def checkpoint_train_nms(model: Any) -> bool | None:
+    """读取检查点中记录的训练期 train_args.nms（True / False / None）。
+    Ultralytics 8.4+ 在 YOLO._load 中会通过 _reset_ckpt_args 清除 model.model.args 中的 nms，
+    只有 model.ckpt['train_args']['nms'] 保留了训练期设置。"""
+    ckpt = getattr(model, "ckpt", None)
+    if isinstance(ckpt, Mapping):
+        train_args = ckpt.get("train_args")
+        if isinstance(train_args, Mapping):
+            val = train_args.get("nms")
+            if isinstance(val, bool):
+                return val
+    return None
+
+
+def should_use_end2end_inference(model: Any) -> bool:
+    """推理（评估 / 审图）与默认 ONNX 导出是否应走端到端（one-to-one, nms=False）分支：
+    - 没有 one2one 端到端头：False（走 one-to-many + NMS）；
+    - 已融合且移除了 one-to-many 分支（cv2 为 None）：True（只能走 end2end）；
+    - 双头均存在：仅当训练时显式设置了 train_args.nms=False 时返回 True，
+      默认（None / True）走 one-to-many + NMS 以优先保证精度。"""
+    if not has_end2end_head(model):
+        return False
+    if not has_one2many_head(model):
+        return True
+    return checkpoint_train_nms(model) is False
+
+
 def _raw_or_nms(dynamic: bool) -> str:
     """有检测框的模型不能导出 end2end 时建议的其它后处理方式（与平台允许的组合相同）：嵌入 NMS 不能
     与动态尺寸同时使用。没有检测框的任务只能选择 raw（resolve_postprocess 先检查）。"""
     return "raw（关闭动态尺寸后也可以选择 nms）" if dynamic else "raw 或 nms"
 
 
-def resolve_postprocess(spec: ExportSpec, task: str, end2end_head: bool) -> str:
+def resolve_postprocess(
+    spec: ExportSpec,
+    task: str,
+    end2end_head: bool,
+    *,
+    one2many_head: bool = True,
+    train_nms: bool | None = None,
+) -> str:
     """选择后处理方式并检查组合是否可行；不可行时抛出 ExportError（平台已经校验过，这里再防一次）。
     与平台的规则相同：嵌入 NMS 与 end2end 只用于有检测框的任务（NMS_TASKS），end2end 还需要端到端头；
+    双头模型默认跟随训练模式（train_args.nms=False 或已融合为纯端到端分支时默认 end2end，其余默认 raw）；
     嵌入 NMS 不能与动态尺寸同时使用。"""
     boxes = task in NMS_TASKS
     end2end_ok = end2end_head and boxes
+    one2many_ok = one2many_head and boxes
     postprocess = spec.postprocess
     if postprocess is None:
-        postprocess = "end2end" if end2end_ok else "raw"
+        postprocess = "end2end" if end2end_ok and (not one2many_ok or train_nms is False) else "raw"
     label = f"（{yolo_label(spec.yolo_version)}）" if spec.yolo_version else ""
     if task == "classify" and postprocess != "raw":
         raise ExportError(
@@ -440,6 +487,10 @@ def resolve_postprocess(spec: ExportSpec, task: str, end2end_head: bool) -> str:
         what = "嵌入 NMS" if postprocess == "nms" else "导出 end2end"
         raise ExportError(
             f"{TASK_LABELS.get(task, task) or '该'}模型没有检测框，不能{what}，请选择原始输出（raw）"
+        )
+    if postprocess in ("raw", "nms") and end2end_head and not one2many_head:
+        raise ExportError(
+            f"该模型{label}已融合且移除了 one-to-many 检测分支，只能导出端到端（end2end）"
         )
     if postprocess == "nms" and spec.dynamic:
         # NMSModel 按 batch 逐张处理，导出时循环被展开：动态 batch 的图只处理第一张图片，其余输出全为 0。
@@ -687,10 +738,16 @@ def _run_export(spec: ExportSpec, start: float) -> dict[str, Any]:
         ) from exc
     task = str(getattr(model, "task", "") or spec.task or "")
     end2end_head = has_end2end_head(model)
-    postprocess = resolve_postprocess(spec, task, end2end_head)
+    one2many_head = has_one2many_head(model)
+    train_nms = checkpoint_train_nms(model)
+    postprocess = resolve_postprocess(
+        spec, task, end2end_head, one2many_head=one2many_head, train_nms=train_nms
+    )
     kwargs = _export_kwargs(spec, postprocess)
     print(
-        f"export: {json.dumps(kwargs)} (task={task}, end2end_head={end2end_head})", file=sys.stderr
+        f"export: {json.dumps(kwargs)} (task={task}, end2end_head={end2end_head}, "
+        f"one2many_head={one2many_head}, train_nms={train_nms})",
+        file=sys.stderr,
     )
 
     try:

@@ -103,13 +103,25 @@ func extract(root any) (*Info, error) {
 	if info.Head == "" {
 		info.Head = lastLayer
 	}
+	yamlEnd2End := false
 	if v, _ := yaml.get("end2end"); truthy(v) {
-		info.End2End = true
+		yamlEnd2End = true
 	}
 	if head != nil {
-		if v, ok := lookupDict(head, "_modules").get("one2one_cv2"); ok && v != nil {
+		hm := lookupDict(head, "_modules")
+		cv2Val, hasCV2Key := hm.get("cv2")
+		o2oVal, hasO2OKey := hm.get("one2one_cv2")
+		if hasCV2Key || hasO2OKey {
+			o2m := hasCV2Key && cv2Val != nil
+			o2o := hasO2OKey && o2oVal != nil
+			info.One2Many = &o2m
+			info.One2One = &o2o
+			info.End2End = o2o
+		} else if yamlEnd2End {
 			info.End2End = true
 		}
+	} else if yamlEnd2End {
+		info.End2End = true
 	}
 	if n, ok := asInt(first(yaml, "channels", "ch")); ok && n > 0 && n <= 1024 {
 		info.Channels = int(n)
@@ -156,7 +168,7 @@ func extract(root any) (*Info, error) {
 	case version != "":
 		info.YOLOVersion, info.VersionSource = version, VersionSourceYAMLFile
 	default:
-		if v := versionFromArchitecture(modules, info.Head, info.End2End); v != "" {
+		if v := versionFromArchitecture(modules, info.Head, info.End2End || yamlEnd2End); v != "" {
 			info.YOLOVersion, info.VersionSource = v, VersionSourceArchitecture
 		}
 	}
@@ -175,6 +187,15 @@ func extract(root any) (*Info, error) {
 	info.ImageSize = imageSize(lookupValue(trainArgs, "imgsz"))
 	if info.ImageSize == 0 {
 		info.ImageSize = imageSize(lookupValue(args, "imgsz"))
+	}
+	if v, ok := lookup(trainArgs, "nms"); ok {
+		if b, ok := asBool(v); ok {
+			info.TrainNMS = &b
+		}
+	} else if v, ok := lookup(args, "nms"); ok {
+		if b, ok := asBool(v); ok {
+			info.TrainNMS = &b
+		}
 	}
 	if n, ok := asInt(lookupValue(trainArgs, "epochs")); ok && n > 0 && n <= math.MaxInt32 {
 		info.Epochs = int(n)

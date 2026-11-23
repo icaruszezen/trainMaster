@@ -81,7 +81,7 @@ ENV TM_TORCH_VARIANT=${TORCH_VARIANT} \
     HOME=/var/lib/trainmaster
 
 # 冒烟检查（构建时没有 GPU）：依赖能导入，CPU 上的 YOLO 前向推理正常；再离线做一次模型仓库的 ONNX 转换
-# （YOLO11n 由配置构建、保存为临时的 pt，不下载权重；用与平台转换任务相同的子进程导出 320×320），
+# （YOLO26n 由配置构建、保存为临时的 pt，不下载权重；用与平台转换任务相同的子进程导出 320×320），
 # 保证镜像中 onnx / onnxslim / onnxruntime 完整（ultralytics 离线时不会自动安装它们）。
 # 状态写到临时目录，不留在镜像里。
 RUN set -eu; \
@@ -89,8 +89,8 @@ RUN set -eu; \
     export HOME="$smoke" TM_STATE_DIR="$smoke" TM_DATA_DIR="$smoke" YOLO_CONFIG_DIR="$smoke/ultralytics"; \
     mkdir -p "$smoke"; \
     python -m trainmaster_trainer selftest; \
-    python -c "import sys; from ultralytics import YOLO; YOLO('yolo11n.yaml').save(sys.argv[1])" "$smoke/yolo11n.pt"; \
-    python -m trainmaster_trainer export --weights "$smoke/yolo11n.pt" --imgsz 320; \
+    python -c "import sys; from ultralytics import YOLO; YOLO('yolo26n.yaml').save(sys.argv[1])" "$smoke/yolo26n.pt"; \
+    python -m trainmaster_trainer export --weights "$smoke/yolo26n.pt" --imgsz 320; \
     rm -rf "$smoke"
 
 # 运行时的工作目录为状态目录（也是 HOME）。

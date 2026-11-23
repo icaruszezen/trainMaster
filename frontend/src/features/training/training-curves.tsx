@@ -3,7 +3,7 @@
  *
  * 展示：
  * 1. 验证评估指标曲线（mAP50、mAP50-95、Precision、Recall）
- * 2. 训练与验证损失曲线（box_loss、cls_loss、dfl_loss）
+ * 2. 训练与验证损失曲线（box_loss、cls_loss、dfl_loss / YOLO26 的 l1_loss）
  * 3. 学习率调度曲线（lr）
  */
 import { useMemo, useState, type MouseEvent } from "react"
@@ -70,6 +70,12 @@ const LOSS_SERIES: readonly SeriesDef[] = [
     format: (v) => formatLoss(v),
   },
   {
+    key: "train_l1_loss",
+    label: "训练 L1 Loss",
+    color: "#f59e0b",
+    format: (v) => formatLoss(v),
+  },
+  {
     key: "val_box_loss",
     label: "验证 Box Loss",
     color: "#ef4444",
@@ -86,6 +92,13 @@ const LOSS_SERIES: readonly SeriesDef[] = [
   {
     key: "val_dfl_loss",
     label: "验证 DFL Loss",
+    color: "#ec4899",
+    dashed: true,
+    format: (v) => formatLoss(v),
+  },
+  {
+    key: "val_l1_loss",
+    label: "验证 L1 Loss",
     color: "#ec4899",
     dashed: true,
     format: (v) => formatLoss(v),

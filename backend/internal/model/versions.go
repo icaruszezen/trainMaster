@@ -13,8 +13,8 @@ import (
 type YOLOVersion struct {
 	Value string // stored in models.yolo_version
 	Label string // shown to users
-	// End2End: the detection head has an end-to-end (one-to-one, NMS-free)
-	// branch, and ONNX exports default to it.
+	// End2End: the detection head includes an optional end-to-end (one-to-one,
+	// NMS-free) branch alongside the default one-to-many (NMS) branch.
 	End2End bool
 }
 
@@ -116,8 +116,36 @@ func taskLabel(task string) string {
 }
 
 // end2endCapable reports whether a box model (hasBoxes) has an end-to-end
-// head: YOLOv10 and YOLO26 always do; other files say so themselves.
+// (one-to-one, NMS-free) branch. When the checkpoint inspection observed the
+// Detect head's modules (info.One2One != nil), that result is authoritative
+// (so a fused one-to-many-only YOLO26 checkpoint reports false); otherwise we
+// fall back to the YOLO version table and info.End2End.
 func end2endCapable(yoloVersion string, info Info) bool {
+	if info.One2One != nil {
+		return *info.One2One
+	}
 	v, _ := LookupYOLOVersion(yoloVersion)
 	return v.End2End || info.End2End
+}
+
+// one2manyCapable reports whether a box model still has its one-to-many (NMS)
+// detection branch. Unfused checkpoints and legacy records without branch info
+// default to true; only checkpoints fused to one-to-one only have false.
+func one2manyCapable(info Info) bool {
+	return info.One2Many == nil || *info.One2Many
+}
+
+// prefersEnd2End reports whether a box model should default to end2end export:
+// true only when it has an end-to-end head and either its one-to-many branch
+// was removed by fusion, or it was explicitly trained with nms=false.
+// Standard Ultralytics 8.4+ YOLO26/YOLOv10 checkpoints trained with default
+// nms=None (or nms=True) default to raw one-to-many output (external NMS).
+func prefersEnd2End(yoloVersion string, info Info) bool {
+	if !end2endCapable(yoloVersion, info) {
+		return false
+	}
+	if !one2manyCapable(info) {
+		return true
+	}
+	return info.TrainNMS != nil && !*info.TrainNMS
 }
