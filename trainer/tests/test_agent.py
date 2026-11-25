@@ -172,10 +172,11 @@ def test_register_then_heartbeat_with_environment(platform, tmp_path, caplog):
         gate.set()
         wait_until(lambda: node.get("environment_updates") == 1)
         assert node["environment"]["run"] == 1
-        heartbeats = wait_until(lambda: node["heartbeats"] >= 6 and node["heartbeats"])
+        target = max(6, node["heartbeats"] + 2)
+        heartbeats = wait_until(lambda: node["heartbeats"] >= target and node["heartbeats"])
         # 检测结果只上报一次；之后的心跳 environment 为 null
         assert node["environment_updates"] == 1
-        assert heartbeats >= 6
+        assert heartbeats >= target
         last = [r for r in platform.requests if r["path"] == HEARTBEAT][-1]["body"]
         assert last["environment"] is None and last["hardware"] is None
         assert isinstance(last["metrics"]["cpu_percent"], float)
