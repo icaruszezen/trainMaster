@@ -17,6 +17,7 @@ import { EvaluationComparePage } from "@/features/evaluation/evaluation-compare-
 import { EvaluationDetailPage } from "@/features/evaluation/evaluation-detail-page"
 import { EvaluationsPage } from "@/features/evaluation/evaluations-page"
 import { NewEvaluationPage } from "@/features/evaluation/new-evaluation-page"
+import { GuidePage } from "@/features/guide/guide-page"
 import { InferencePage } from "@/features/models/inference-page"
 import { ModelDetailPage } from "@/features/models/model-detail-page"
 import { ModelsPage } from "@/features/models/models-page"
@@ -66,6 +67,7 @@ export const pages: Record<ModuleId, ComponentType> = {
   storage: StoragePage,
   "recycle-bin": RecycleBinPage,
   settings: SettingsPage,
+  guide: GuidePage,
 }
 
 /** 路由表：由导航配置生成，外加 404 与错误边界。 */
@@ -121,7 +123,11 @@ export const routes: RouteObject[] = [
           },
           { path: "/evaluation/new", Component: NewEvaluationPage },
           { path: "/evaluation/compare", Component: EvaluationComparePage },
-          { path: "/evaluation/:evaluationId", Component: EvaluationDetailPage },
+          {
+            path: "/evaluation/:evaluationId",
+            Component: EvaluationDetailPage,
+          },
+          { path: "/system/guide/:chapterId", Component: GuidePage },
           {
             path: "*",
             Component: NotFoundPage,

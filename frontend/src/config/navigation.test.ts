@@ -158,6 +158,23 @@ describe("navigation config", () => {
       item: { id: "recycle-bin" },
       exact: true,
     })
+    expect(getNavItem("guide")).toMatchObject({
+      status: "ready",
+      title: "操作指南",
+      path: "/system/guide",
+    })
+    const systemGroup = navGroups.find((g) => g.id === "system")
+    expect(systemGroup?.items.at(-1)?.id).toBe("guide")
+    expect(findActiveNavItem("/system/guide")).toMatchObject({
+      group: { id: "system" },
+      item: { id: "guide" },
+      exact: true,
+    })
+    expect(findActiveNavItem("/system/guide/datasets")).toMatchObject({
+      group: { id: "system" },
+      item: { id: "guide" },
+      exact: false,
+    })
   })
 
   it("looks up items by id", () => {
