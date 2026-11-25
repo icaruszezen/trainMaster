@@ -4,6 +4,11 @@ import {
   ArrowLeft,
   ArrowRight,
   BookOpen,
+  ChevronDown,
+  Download,
+  FileDown,
+  FileText,
+  Globe,
   Info,
   Keyboard,
   Lightbulb,
@@ -13,6 +18,7 @@ import {
   X,
 } from "lucide-react"
 import { Link, useLocation, useParams } from "react-router"
+import { toast } from "sonner"
 
 import { PageHeader } from "@/components/page-header"
 import { Badge } from "@/components/ui/badge"
@@ -24,6 +30,14 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   Empty,
   EmptyContent,
@@ -43,6 +57,7 @@ import {
   SheetTitle,
   SheetTrigger,
 } from "@/components/ui/sheet"
+import { Spinner } from "@/components/ui/spinner"
 import {
   Table,
   TableBody,
@@ -56,8 +71,14 @@ import { AnnotatedScreenshot } from "@/features/guide/annotated-screenshot"
 import {
   guideChapters,
   guideGroups,
+  guideWorkflowStages,
   getGuideChapter,
 } from "@/features/guide/chapters"
+import {
+  exportGuideDocument,
+  type GuideExportFormat,
+  type GuideExportProgress,
+} from "@/features/guide/download-guide"
 import {
   DEFAULT_GUIDE_CHAPTER,
   GUIDE_PATH,
@@ -75,57 +96,22 @@ import type {
   GuideTip,
 } from "@/features/guide/types"
 import { usePageTitle } from "@/hooks/use-page-title"
+import { formatBytes } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
-const WORKFLOW_STAGES: {
-  step: string
-  title: string
-  desc: string
-  chapterId: GuideChapterId
-}[] = [
-  {
-    step: "01",
-    title: "建项目与导数据",
-    desc: "定义 YOLO 类别顺序，批量导入图片与 VOC/YOLO/X-AnyLabeling 标注",
-    chapterId: "datasets",
-  },
-  {
-    step: "02",
-    title: "在线标注与审图",
-    desc: "在标注工作台画框，或用已有模型跑审图筛查难例并合并审图版本",
-    chapterId: "annotation",
-  },
-  {
-    step: "03",
-    title: "冻结数据版本",
-    desc: "叠加基础标注与审图版本，稳定划分 train/val/test 并按需离线增强",
-    chapterId: "data-versions",
-  },
-  {
-    step: "04",
-    title: "发起模型训练",
-    desc: "加载参数模板启动 YOLO 训练，实时追踪 Loss/mAP 曲线与训练日志",
-    chapterId: "training-jobs",
-  },
-  {
-    step: "05",
-    title: "模型评估与对比",
-    desc: "实时拖动 Conf/IoU 阈值看漏杀过杀，下钻混淆矩阵与多模型逐图对比",
-    chapterId: "evaluations",
-  },
-  {
-    step: "06",
-    title: "仓库发布与导出",
-    desc: "管理项目版本迭代，下载原始 PT 或由训练节点自动转换缓存 ONNX",
-    chapterId: "models",
-  },
-]
+const TOTAL_GUIDE_FIGURES = guideChapters.reduce(
+  (sum, ch) =>
+    sum + ch.sections.reduce((acc, s) => acc + (s.figures?.length ?? 0), 0),
+  0
+)
 
 export function GuidePage() {
   const { chapterId: rawChapterId } = useParams()
   const { hash } = useLocation()
   const [query, setQuery] = useState("")
   const [drawerOpen, setDrawerOpen] = useState(false)
+  const [exportProgress, setExportProgress] =
+    useState<GuideExportProgress | null>(null)
 
   const resolvedId: GuideChapterId | null =
     rawChapterId === undefined
@@ -162,6 +148,32 @@ export function GuidePage() {
     window.scrollTo({ top: 0, behavior: "instant" })
   }, [resolvedId, hash])
 
+  const handleDownload = async (format: GuideExportFormat) => {
+    if (exportProgress !== null) {
+      return
+    }
+    setExportProgress({ stage: "rendering", completed: 0, total: 0 })
+    try {
+      const result = await exportGuideDocument({
+        format,
+        chapters: guideChapters,
+        groups: guideGroups,
+        activeChapter: chapter,
+        onProgress: setExportProgress,
+      })
+      toast.success(`已开始下载 ${result.fileName}`, {
+        description: `共打包 ${result.figureCount} 张带标注截图，文件大小 ${formatBytes(result.sizeBytes)}。`,
+      })
+    } catch (err) {
+      toast.error("文档生成失败", {
+        description:
+          err instanceof Error ? err.message : "请稍后重试或刷新页面。",
+      })
+    } finally {
+      setExportProgress(null)
+    }
+  }
+
   if (!chapter) {
     return (
       <Empty className="min-h-[60svh]">
@@ -193,6 +205,10 @@ export function GuidePage() {
       ? guideChapters[chapterIndex + 1]
       : null
   const currentGroup = guideGroups.find((g) => g.id === chapter.groupId)
+  const chapterFigureCount = chapter.sections.reduce(
+    (sum, s) => sum + (s.figures?.length ?? 0),
+    0
+  )
 
   return (
     <div className="space-y-6">
@@ -200,29 +216,109 @@ export function GuidePage() {
         title="操作指南"
         description="按工业视觉质检工作流整理的界面操作手册，涵盖全部 13 个已上线模块，配真实界面截图与交互式编号标注。"
         actions={
-          <Sheet open={drawerOpen} onOpenChange={setDrawerOpen}>
-            <SheetTrigger asChild>
-              <Button variant="outline" size="sm" className="lg:hidden">
-                <List className="size-4" />
-                章节目录
-              </Button>
-            </SheetTrigger>
-            <SheetContent side="left" className="w-80 p-4">
-              <SheetHeader className="px-0 pb-2 text-left">
-                <SheetTitle>操作指南目录</SheetTitle>
-                <SheetDescription>
-                  共 {guideChapters.length} 个章节，支持关键词搜索快速定位。
-                </SheetDescription>
-              </SheetHeader>
-              <GuideDirectory
-                query={query}
-                onQueryChange={setQuery}
-                matches={matches}
-                activeChapterId={chapter.id}
-                onSelect={() => setDrawerOpen(false)}
-              />
-            </SheetContent>
-          </Sheet>
+          <>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={exportProgress !== null}
+                >
+                  {exportProgress !== null ? (
+                    <>
+                      <Spinner className="size-4" aria-hidden />
+                      {exportProgress.stage === "packaging"
+                        ? "正在封装文档…"
+                        : exportProgress.total > 0
+                          ? `渲染配图 ${exportProgress.completed}/${exportProgress.total}…`
+                          : "正在准备文档…"}
+                    </>
+                  ) : (
+                    <>
+                      <Download className="size-4" />
+                      下载文档
+                      <ChevronDown className="size-3.5 text-muted-foreground" />
+                    </>
+                  )}
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-80">
+                <DropdownMenuLabel className="text-xs text-muted-foreground">
+                  导出本地离线文档
+                </DropdownMenuLabel>
+                <DropdownMenuItem
+                  className="items-start gap-2.5 py-2"
+                  onSelect={() => void handleDownload("docx-all")}
+                >
+                  <FileText className="mt-0.5 size-4 text-primary" />
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="text-sm font-medium">
+                      完整操作手册（Word .docx）
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      含封面、总目录、全部 {guideChapters.length} 章与{" "}
+                      {TOTAL_GUIDE_FIGURES} 张带标注截图
+                    </div>
+                  </div>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="items-start gap-2.5 py-2"
+                  onSelect={() => void handleDownload("docx-chapter")}
+                >
+                  <FileDown className="mt-0.5 size-4 text-muted-foreground" />
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="text-sm font-medium">
+                      当前章节（Word .docx）
+                    </div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      仅导出「{chapter.shortTitle}」（{chapterFigureCount}{" "}
+                      张图）
+                    </div>
+                  </div>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="items-start gap-2.5 py-2"
+                  onSelect={() => void handleDownload("html-all")}
+                >
+                  <Globe className="mt-0.5 size-4 text-muted-foreground" />
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="text-sm font-medium">
+                      完整离线网页版（.html）
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      单文件内嵌全部标注图，支持无网浏览与打印 PDF
+                    </div>
+                  </div>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            <Sheet open={drawerOpen} onOpenChange={setDrawerOpen}>
+              <SheetTrigger asChild>
+                <Button variant="outline" size="sm" className="lg:hidden">
+                  <List className="size-4" />
+                  章节目录
+                </Button>
+              </SheetTrigger>
+              <SheetContent side="left" className="w-80 p-4">
+                <SheetHeader className="px-0 pb-2 text-left">
+                  <SheetTitle>操作指南目录</SheetTitle>
+                  <SheetDescription>
+                    共 {guideChapters.length} 个章节，支持关键词搜索快速定位。
+                  </SheetDescription>
+                </SheetHeader>
+                <GuideDirectory
+                  query={query}
+                  onQueryChange={setQuery}
+                  matches={matches}
+                  activeChapterId={chapter.id}
+                  onSelect={() => setDrawerOpen(false)}
+                />
+              </SheetContent>
+            </Sheet>
+          </>
         }
       />
 
@@ -461,7 +557,7 @@ function QuickWorkflowStrip() {
       </CardHeader>
       <CardContent>
         <ol className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          {WORKFLOW_STAGES.map((stage) => (
+          {guideWorkflowStages.map((stage) => (
             <li key={stage.step}>
               <Link
                 to={guideChapterPath(stage.chapterId)}
