@@ -10,6 +10,7 @@ import { EvaluationComparePage } from "@/features/evaluation/evaluation-compare-
 import { EvaluationDetailPage } from "@/features/evaluation/evaluation-detail-page"
 import { EvaluationsPage } from "@/features/evaluation/evaluations-page"
 import { NewEvaluationPage } from "@/features/evaluation/new-evaluation-page"
+import { GuidePage } from "@/features/guide/guide-page"
 import { InferencePage } from "@/features/models/inference-page"
 import { ModelDetailPage } from "@/features/models/model-detail-page"
 import { ModelsPage } from "@/features/models/models-page"
@@ -142,6 +143,13 @@ describe("routes", () => {
     ]) {
       expect(leaf(path)?.handle, path).toBeUndefined()
     }
+  })
+
+  it("routes the user guide and chapter subpages", () => {
+    expect(leafComponent("/system/guide")).toBe(GuidePage)
+    expect(leafComponent("/system/guide/datasets")).toBe(GuidePage)
+    expect(leafComponent("/system/guide/datasets/extra")).toBe(NotFoundPage)
+    expect(leaf("/system/guide/datasets")?.handle).toBeUndefined()
   })
 
   it("marks only the 404 route as not found", () => {

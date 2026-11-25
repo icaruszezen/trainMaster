@@ -6,6 +6,7 @@
  * src/features/ 下新建页面文件 → 在 src/router.tsx 的 pages 中登记。
  */
 import {
+  BookOpen,
   Boxes,
   Database,
   FolderKanban,
@@ -48,6 +49,7 @@ export type ModuleId =
   | "storage"
   | "recycle-bin"
   | "settings"
+  | "guide"
 
 export type NavItem = {
   id: ModuleId
@@ -403,6 +405,21 @@ export const navGroups: NavGroup[] = [
         description: "平台级的基础配置与默认参数。",
         status: "planned",
         features: ["平台基础配置", "默认训练参数", "视觉大模型 API 配置"],
+      },
+      {
+        id: "guide",
+        title: "操作指南",
+        path: "/system/guide",
+        icon: BookOpen,
+        description:
+          "按工作流整理的界面操作手册，配合真实截图与交互式编号标注，覆盖全部已上线功能模块。",
+        status: "ready",
+        features: [
+          "覆盖端到端全流程速览与全部 13 个已上线模块的分步界面操作指引",
+          "配真实高清界面截图与交互式 ①②③ 编号标注，支持点击放大查看与一键隐藏标注",
+          "按工作流分组的章节目录、站内关键词检索与快捷直达对应功能页面",
+          "标注工作台与模型审图快捷键速查表、离线审图与训练节点接入指引",
+        ],
       },
     ],
   },

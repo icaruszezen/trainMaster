@@ -1,5 +1,6 @@
 import { Link } from "react-router"
 
+import { HelpButton } from "@/components/help-button"
 import { ModeToggle } from "@/components/mode-toggle"
 import {
   Breadcrumb,
@@ -24,6 +25,7 @@ export function SiteHeader() {
       />
       <AppBreadcrumb />
       <div className="ml-auto flex items-center gap-1">
+        <HelpButton />
         <ModeToggle />
       </div>
     </header>
